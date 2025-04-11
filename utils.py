@@ -2,6 +2,35 @@ import os
 import subprocess
 from urllib.parse import urlparse
 
+def standardize_repo_name(repo_name):
+    """
+    Convert various GitHub repository reference formats to a standard 'org/repo' format.
+    
+    Args:
+        repo_name: A GitHub repository name, either as a full URL (https://github.com/org/repo)
+                   or in the shorter format (org/repo).
+    
+    Returns:
+        A standardized repository name in 'org/repo' format.
+        
+    Raises:
+        ValueError: If the repository name cannot be parsed into a valid org/repo format.
+    """
+    if repo_name.startswith("http"):
+        # It's a full URL, extract the path
+        parsed_url = urlparse(repo_name)
+        path_parts = [p for p in parsed_url.path.split("/") if p]
+        if len(path_parts) >= 2:
+            org, repo = path_parts[:2]
+            return f"{org}/{repo}"
+        else:
+            raise ValueError(f"Invalid GitHub URL: {repo_name}")
+    else:
+        # Assume it's in org/repo format
+        if repo_name.count("/") != 1:
+            raise ValueError(f"Repository name should be in 'org/repo' format: {repo_name}")
+        return repo_name
+
 def clone_repo_to_cache(repo_name):
     """
     Clone a GitHub repository into the cached-repos directory.
@@ -19,21 +48,8 @@ def clone_repo_to_cache(repo_name):
         os.makedirs(cache_dir)
         print(f"Created cache directory: {cache_dir}")
     
-    # Parse repo_name into a standard format
-    if repo_name.startswith("http"):
-        # It's a full URL, extract the path
-        parsed_url = urlparse(repo_name)
-        path_parts = [p for p in parsed_url.path.split("/") if p]
-        if len(path_parts) >= 2:
-            org, repo = path_parts[:2]
-            std_repo_name = f"{org}/{repo}"
-        else:
-            raise ValueError(f"Invalid GitHub URL: {repo_name}")
-    else:
-        # Assume it's in org/repo format
-        if repo_name.count("/") != 1:
-            raise ValueError(f"Repository name should be in 'org/repo' format: {repo_name}")
-        std_repo_name = repo_name
+    # Standardize the repository name
+    std_repo_name = standardize_repo_name(repo_name)
     
     # Generate target directory name
     org, repo = std_repo_name.split("/")
