@@ -82,3 +82,48 @@ def clone_repo_to_cache(repo_name):
     except subprocess.CalledProcessError as e:
         print(f"Error cloning repository: {e.stderr}")
         raise
+
+
+def get_file_modification_history(repo_path, filepath):
+    """
+    Find all commits that modified a specific file, following only the first parent path.
+
+    Args:
+        repo_path: Path to the local git repository
+        filepath: Path to the file within the repository
+
+    Returns:
+        A list of commit hashes that modified the file, from newest to oldest,
+        including the commit that created the file.
+
+    Raises:
+        ValueError: If the file doesn't exist in the repository's main branch
+        subprocess.CalledProcessError: If the git command fails
+    """
+    # Check if the file exists in the repository
+    absolute_filepath = os.path.join(repo_path, filepath)
+    if not os.path.exists(absolute_filepath):
+        raise ValueError(
+            f"File '{filepath}' does not exist in the repository at '{repo_path}'"
+        )
+
+    # Change to the repository directory
+    original_dir = os.getcwd()
+    os.chdir(repo_path)
+
+    try:
+        # Run git log command to find commits that modified the file, following first parent
+        result = subprocess.run(
+            ["git", "log", "--first-parent", "--format=%H", "--", filepath],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # Split the output into individual commit hashes and filter out empty lines
+        commits = [commit for commit in result.stdout.strip().split("\n") if commit]
+
+        return commits
+    finally:
+        # Always change back to the original directory
+        os.chdir(original_dir)

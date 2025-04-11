@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from utils import clone_repo_to_cache
+from utils import clone_repo_to_cache, get_file_modification_history
 
 
 def main():
@@ -12,6 +12,11 @@ def main():
         required=True,
         help="GitHub repository to clone (format: 'org/repo' or full URL)",
     )
+    parser.add_argument(
+        "--file",
+        "-f",
+        help="Find all commits that modified this file (following first parent path)",
+    )
 
     # Parse arguments
     args = parser.parse_args()
@@ -21,8 +26,22 @@ def main():
         repo_path = clone_repo_to_cache(args.repo)
         print(f"Repository ready at: {repo_path}")
 
-        # In the future, additional benchmark functionality will be added here
-        print("Ready for benchmarking.")
+        # If file is specified, find its modification history
+        if args.file:
+            try:
+                commits = get_file_modification_history(repo_path, args.file)
+                if commits:
+                    print(f"\nCommits that modified '{args.file}' (newest to oldest):")
+                    for i, commit in enumerate(commits, 1):
+                        print(f"{i}. {commit}")
+                else:
+                    print(f"\nNo commits found that modified '{args.file}'")
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 1
+        else:
+            # In the future, additional benchmark functionality will be added here
+            print("Ready for benchmarking.")
 
     except ValueError as e:
         print(f"Error: {e}")
