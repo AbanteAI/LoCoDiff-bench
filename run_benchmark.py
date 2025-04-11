@@ -17,7 +17,6 @@ def is_public_repo(repo_name):
     """
     import urllib.request
     import urllib.error
-    import json
 
     std_repo_name = standardize_repo_name(repo_name)
     org, repo = std_repo_name.split("/")
@@ -27,8 +26,7 @@ def is_public_repo(repo_name):
     try:
         # Create a request with a custom user agent
         req = urllib.request.Request(url, headers={"User-Agent": "LoCoDiff-bench"})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
+        with urllib.request.urlopen(req, timeout=10):
             # If we got a response without auth, it's public
             return True
     except urllib.error.HTTPError as e:
