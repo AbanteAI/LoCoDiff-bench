@@ -6,6 +6,10 @@ if [ ! -d ".venv" ]; then
   uv venv .venv
 fi
 
-# Install dependencies using uv in the virtual environment
+# Activate the virtual environment
+echo "Activating virtual environment..."
+source .venv/bin/activate
+
+# Install dependencies using uv in the activated environment
 echo "Installing dependencies..."
-uv pip install -r requirements.txt --venv .venv
+uv pip install -r requirements.txt
