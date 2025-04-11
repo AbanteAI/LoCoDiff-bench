@@ -71,14 +71,13 @@ def clone_repo_to_cache(repo_name):
     # Clone the repository
     github_url = f"https://github.com/{std_repo_name}.git"
     try:
+        # Don't capture output so clone progress is visible to the user
         subprocess.run(
             ["git", "clone", github_url, target_dir],
             check=True,
-            capture_output=True,
-            text=True,
         )
         print(f"Successfully cloned {std_repo_name} to {target_dir}")
         return target_dir
     except subprocess.CalledProcessError as e:
-        print(f"Error cloning repository: {e.stderr}")
+        print(f"Error cloning repository: {e}")
         raise
