@@ -2,14 +2,15 @@ import os
 import subprocess
 from urllib.parse import urlparse
 
+
 def clone_repo_to_cache(repo_name):
     """
     Clone a GitHub repository into the cached-repos directory.
-    
+
     Args:
         repo_name: A GitHub repository name, either as a full URL (https://github.com/org/repo)
                    or in the shorter format (org/repo).
-    
+
     Returns:
         The path to the cloned repository (cached-repos/org/repo).
     """
@@ -18,7 +19,7 @@ def clone_repo_to_cache(repo_name):
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
         print(f"Created cache directory: {cache_dir}")
-    
+
     # Parse repo_name into a standard format
     if repo_name.startswith("http"):
         # It's a full URL, extract the path
@@ -32,22 +33,24 @@ def clone_repo_to_cache(repo_name):
     else:
         # Assume it's in org/repo format
         if repo_name.count("/") != 1:
-            raise ValueError(f"Repository name should be in 'org/repo' format: {repo_name}")
+            raise ValueError(
+                f"Repository name should be in 'org/repo' format: {repo_name}"
+            )
         std_repo_name = repo_name
-    
+
     # Generate target directory name
     org, repo = std_repo_name.split("/")
     target_dir = os.path.join(cache_dir, org, repo)
-    
+
     # Check if repo already exists
     if os.path.exists(target_dir):
         print(f"Repository already exists at {target_dir}")
         # Optionally, you could pull the latest changes here
         return target_dir
-    
+
     # Create parent directory if needed
     os.makedirs(os.path.dirname(target_dir), exist_ok=True)
-    
+
     # Clone the repository
     github_url = f"https://github.com/{std_repo_name}.git"
     try:
@@ -55,7 +58,7 @@ def clone_repo_to_cache(repo_name):
             ["git", "clone", github_url, target_dir],
             check=True,
             capture_output=True,
-            text=True
+            text=True,
         )
         print(f"Successfully cloned {std_repo_name} to {target_dir}")
         return target_dir
