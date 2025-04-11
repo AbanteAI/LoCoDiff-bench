@@ -29,7 +29,9 @@ def standardize_repo_name(repo_name):
     else:
         # Assume it's in org/repo format
         if repo_name.count("/") != 1:
-            raise ValueError(f"Repository name should be in 'org/repo' format: {repo_name}")
+            raise ValueError(
+                f"Repository name should be in 'org/repo' format: {repo_name}"
+            )
         return repo_name
 
 
