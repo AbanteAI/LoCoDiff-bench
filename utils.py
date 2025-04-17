@@ -223,7 +223,7 @@ def write_prompt_and_expected(
     repo_name: str,
     repo_path: str | os.PathLike,
     file_path: Path,
-    output_dir: Path | None = None,
+    output_dir: str | os.PathLike | Path | None = None,
 ) -> None:
     """
     For *file_path*, write a prompt file and expected output file.
