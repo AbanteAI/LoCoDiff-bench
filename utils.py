@@ -1,7 +1,7 @@
 import os
 import subprocess
 from urllib.parse import urlparse
-from typing import List
+from typing import List, Optional
 
 
 def standardize_repo_name(repo_name):
@@ -111,7 +111,7 @@ def generate_prompt_and_expected_outputs(
     repo_path: str,
     extensions: List[str],
     output_dir: str,
-    repo_name: str = None,
+    repo_name: Optional[str] = None,
 ):
     """
     For each file in repo_path with the given extensions, create a prompt and expected output file.
