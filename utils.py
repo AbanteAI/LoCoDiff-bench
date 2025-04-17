@@ -83,6 +83,74 @@ def clone_repo_to_cache(repo_name):
         raise
 
 
+import tiktoken
+
+
+def count_tokens(text, encoding_name="gpt2"):
+    """
+    Count the number of tokens in a given text string using the specified tiktoken encoder.
+    """
+    encoder = tiktoken.get_encoding(encoding_name)
+    return len(encoder.encode(text))
+
+
+def analyze_file_history(repo_path, rel_path):
+    """
+    Analyze Git history for a single file to get:
+      - commits: number of commits touching the file
+      - lines_added: total lines added in its history
+      - lines_removed: total lines removed in its history
+      - final_lines: number of lines in the final file state
+    """
+    # Count commits
+    result = subprocess.run(
+        ["git", "rev-list", "--count", "HEAD", "--", rel_path],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commits = int(result.stdout.strip())
+
+    # Sum added/removed lines
+    result = subprocess.run(
+        ["git", "log", "--pretty=tformat:", "--numstat", "--", rel_path],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines_added = 0
+    lines_removed = 0
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            try:
+                a, r, _ = parts
+                lines_added += int(a)
+                lines_removed += int(r)
+            except ValueError:
+                continue
+
+    # Count final lines
+    full_path = os.path.join(repo_path, rel_path)
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        final_lines = content.count("\n")
+        if content and not content.endswith("\n"):
+            final_lines += 1
+    except FileNotFoundError:
+        final_lines = 0
+
+    return {
+        "commits": commits,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "final_lines": final_lines,
+    }
+
+
 def generate_prompts_and_expected(
     repo_path, extensions, output_dir="generated_prompts"
 ):
@@ -93,11 +161,15 @@ def generate_prompts_and_expected(
         a reconstruction prompt with git history.
       - {repo_name}_{relative_path_with_underscores}_expectedoutput.txt containing
         the file's final content.
+    Returns:
+        A list of dicts for each processed file with keys:
+          'rel_path', 'prompt_path', 'expected_path'
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
     repo_name = os.path.basename(os.path.normpath(repo_path))
+    file_info = []
 
     for root, _, files in os.walk(repo_path):
         for filename in files:
@@ -143,3 +215,13 @@ def generate_prompts_and_expected(
 
                 with open(expected_path, "w", encoding="utf-8") as ef:
                     ef.write(final_content)
+
+                file_info.append(
+                    {
+                        "rel_path": rel_path,
+                        "prompt_path": prompt_path,
+                        "expected_path": expected_path,
+                    }
+                )
+
+    return file_info
