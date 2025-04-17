@@ -1,6 +1,7 @@
 import os
 import subprocess
 from urllib.parse import urlparse
+from typing import List
 
 
 def standardize_repo_name(repo_name):
@@ -81,3 +82,106 @@ def clone_repo_to_cache(repo_name):
     except subprocess.CalledProcessError as e:
         print(f"Error cloning repository: {e}")
         raise
+
+
+def find_files_with_extensions(root_dir: str, extensions: List[str]) -> List[str]:
+    """
+    Recursively find all files in root_dir with the given extensions.
+
+    Args:
+        root_dir: Directory to search.
+        extensions: List of file extensions (e.g., ['.py', '.js']).
+
+    Returns:
+        List of file paths (relative to root_dir) matching the extensions.
+    """
+    matches = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            for ext in extensions:
+                if filename.endswith(ext):
+                    full_path = os.path.join(dirpath, filename)
+                    rel_path = os.path.relpath(full_path, root_dir)
+                    matches.append(rel_path)
+                    break
+    return matches
+
+
+def generate_prompt_and_expected_outputs(
+    repo_path: str,
+    extensions: List[str],
+    output_dir: str,
+    repo_name: str = None,
+):
+    """
+    For each file in repo_path with the given extensions, create a prompt and expected output file.
+
+    Args:
+        repo_path: Path to the cloned repo.
+        extensions: List of file extensions to process.
+        output_dir: Directory to write prompt/expected output files.
+        repo_name: Optional, used for naming output files. If None, uses the repo directory name.
+    """
+    if repo_name is None:
+        repo_name = os.path.basename(repo_path.rstrip("/"))
+
+    os.makedirs(output_dir, exist_ok=True)
+    files = find_files_with_extensions(repo_path, extensions)
+    if not files:
+        print(f"No files with extensions {extensions} found in {repo_path}")
+        return
+
+    for rel_file in files:
+        abs_file = os.path.join(repo_path, rel_file)
+        # Prepare output filenames
+        safe_rel_file = rel_file.replace(os.sep, "_")
+        prompt_filename = f"{repo_name}_{safe_rel_file}_prompt.txt"
+        expected_filename = f"{repo_name}_{safe_rel_file}_expectedoutput.txt"
+        prompt_path = os.path.join(output_dir, prompt_filename)
+        expected_path = os.path.join(output_dir, expected_filename)
+
+        # Run git log command
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo_path,
+                    "log",
+                    "-p",
+                    "--cc",
+                    "--follow",
+                    "--topo-order",
+                    "--reverse",
+                    "--",
+                    rel_file,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            git_log_output = result.stdout
+        except subprocess.CalledProcessError as e:
+            git_log_output = f"Error running git log: {e}"
+
+        # Write prompt file
+        prompt_content = (
+            "You are being tested. Your goal is to reconstruct the current state of a file, given the history of changes made to that file. For your response, simply output the exact final state of the file, wrapped in triple backticks (```):\n\n"
+            f"> git log -p --cc --follow --topo-order --reverse -- {rel_file}\n\n"
+            f"{git_log_output}"
+        )
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(prompt_content)
+
+        # Write expected output file
+        try:
+            with open(abs_file, "r", encoding="utf-8") as src:
+                file_contents = src.read()
+        except Exception as e:
+            file_contents = f"Error reading file: {e}"
+
+        expected_content = f"```\n{file_contents}\n```"
+        with open(expected_path, "w", encoding="utf-8") as f:
+            f.write(expected_content)
+
+        print(f"Wrote prompt and expected output for {rel_file}")
