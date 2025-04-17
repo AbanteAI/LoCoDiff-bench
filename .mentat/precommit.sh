@@ -3,6 +3,10 @@
 # Activate the virtual environment
 source .venv/bin/activate
 
+# Install dependencies to ensure new packages are available for type checking
+echo "Installing dependencies..."
+uv pip install --system -r requirements.txt
+
 # Run formatter
 echo "Running formatter..."
 ruff format .
