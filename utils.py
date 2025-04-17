@@ -1,7 +1,7 @@
 import os
 import subprocess
 from urllib.parse import urlparse
-import tiktoken
+import tiktoken  # type: ignore
 
 
 def standardize_repo_name(repo_name):
