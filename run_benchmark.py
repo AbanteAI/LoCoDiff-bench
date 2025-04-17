@@ -29,11 +29,8 @@ def main():
         print(f"Repository ready at: {repo_path}")
 
         # Generate prompts and expected outputs for specified file types
-        try:
-            generate_prompts_and_expected(repo_path, args.extensions)
-            print("Generated prompts and expected outputs in 'generated_prompts/'.")
-        except Exception as e:
-            print(f"Error generating prompts and expected outputs: {e}")
+        generate_prompts_and_expected(repo_path, args.extensions)
+        print("Generated prompts and expected outputs in 'generated_prompts/'.")
 
         # In the future, additional benchmark functionality will be added here
         print("Ready for benchmarking.")

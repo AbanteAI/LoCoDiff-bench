@@ -110,43 +110,36 @@ def generate_prompts_and_expected(
                 prompt_path = os.path.join(output_dir, prompt_fname)
                 expected_path = os.path.join(output_dir, expected_fname)
 
-                try:
-                    result = subprocess.run(
-                        [
-                            "git",
-                            "log",
-                            "-p",
-                            "--cc",
-                            "--follow",
-                            "--topo-order",
-                            "--reverse",
-                            "--",
-                            rel_path,
-                        ],
-                        cwd=repo_path,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    git_history = result.stdout
-                except subprocess.CalledProcessError as e:
-                    git_history = f"Error retrieving git history: {e}"
+                result = subprocess.run(
+                    [
+                        "git",
+                        "log",
+                        "-p",
+                        "--cc",
+                        "--topo-order",
+                        "--reverse",
+                        "--",
+                        rel_path,
+                    ],
+                    cwd=repo_path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                git_history = result.stdout
 
                 prompt_content = (
                     "You are being tested. Your goal is to reconstruct the current state of a file, "
                     "given the history of changes made to that file. For your response, simply output "
                     "the exact final state of the file, wrapped in triple backticks (```):\n\n"
-                    f"> git log -p --cc --follow --topo-order --reverse -- {rel_path}\n\n"
+                    f"> git log -p --cc --topo-order --reverse -- {rel_path}\n\n"
                     f"{git_history}"
                 )
                 with open(prompt_path, "w", encoding="utf-8") as pf:
                     pf.write(prompt_content)
 
-                try:
-                    with open(full_path, "r", encoding="utf-8") as original:
-                        final_content = original.read()
-                except Exception as e:
-                    final_content = f"Error reading file content: {e}"
+                with open(full_path, "r", encoding="utf-8") as original:
+                    final_content = original.read()
 
                 with open(expected_path, "w", encoding="utf-8") as ef:
                     ef.write(final_content)
