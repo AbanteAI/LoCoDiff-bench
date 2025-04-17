@@ -1,6 +1,7 @@
 import os
 import subprocess
 from urllib.parse import urlparse
+import tiktoken
 
 
 def standardize_repo_name(repo_name):
@@ -81,9 +82,6 @@ def clone_repo_to_cache(repo_name):
     except subprocess.CalledProcessError as e:
         print(f"Error cloning repository: {e}")
         raise
-
-
-import tiktoken
 
 
 def count_tokens(text, encoding_name="gpt2"):
