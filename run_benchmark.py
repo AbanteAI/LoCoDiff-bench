@@ -9,6 +9,9 @@ def print_stats_table(stats_list):
         print("No statistics generated.")
         return
 
+    # Sort by prompt tokens (descending) before printing
+    stats_list.sort(key=lambda x: x["prompt_tokens"], reverse=True)
+
     # Determine column widths dynamically
     max_len_filename = max(len(s["filename"]) for s in stats_list) if stats_list else 10
     col_widths = {
@@ -64,12 +67,8 @@ def main():
         default=[".py"],
         help="File extensions to process (include the dot), e.g. .py .txt",
     )
-    parser.add_argument(
-        "--output-dir",
-        "-o",
-        default="generated_prompts",
-        help="Directory to store generated prompts and expected outputs.",
-    )
+    # Output directory is now hardcoded
+    output_dir = "generated_prompts"
 
     # Parse arguments
     args = parser.parse_args()
@@ -80,11 +79,12 @@ def main():
         print(f"Repository ready at: {repo_path}")
 
         # Generate prompts and expected outputs for specified file types
-        print(f"Generating prompts and expected outputs in '{args.output_dir}/'...")
+        # tqdm progress bar is handled within generate_prompts_and_expected
+        print(f"Generating prompts and expected outputs in '{output_dir}/'...")
         stats_list = generate_prompts_and_expected(
-            repo_path, args.extensions, args.output_dir
+            repo_path, args.extensions, output_dir
         )
-        print("Generation complete.")
+        # No "Generation complete." message needed as tqdm shows completion
 
         # Print statistics table
         print("\n--- Statistics ---")
@@ -94,15 +94,10 @@ def main():
         print("\nReady for benchmarking.")
 
     except ValueError as e:
-        print(f"Error: {e}")
+        # Handle specific error from clone_repo_to_cache
+        print(f"Error cloning or validating repository: {e}")
         return 1
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        # Consider more specific error handling if needed
-        import traceback
-
-        traceback.print_exc()
-        return 1
+    # Removed the broad except Exception block
 
     return 0
 
