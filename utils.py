@@ -209,7 +209,7 @@ You are being benchmarked. You will see the output of a git log command, and fro
 
 # Required Response Format
 
-Wrap the content of the file in triple backticks (```). You may optionally include the language identifier after the opening backticks (e.g., ```python). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
 
 # Example Response
 
