@@ -5,8 +5,10 @@ import sys
 import difflib
 import json
 import re
-from datetime import datetime, timezone  # Added timezone
-from utils import get_model_response_openrouter
+from datetime import datetime, timezone
+from utils import (
+    get_model_response_openrouter,
+)  # Added InvalidResponseError
 
 
 def sanitize_filename(name):
@@ -242,9 +244,36 @@ def main():
         # import traceback
         # traceback.print_exc()
         exit_code = 1
+    except FileNotFoundError as e:
+        print(f"\nError: {e}")
+        run_metadata["error"] = str(e)
+        exit_code = 1
+    except IOError as e:
+        print(f"\nError reading file: {e}")
+        run_metadata["error"] = f"IOError: {e}"
+        exit_code = 1
+    except ValueError as e:  # Catches missing API key or other ValueErrors
+        print(f"\nConfiguration Error: {e}")
+        run_metadata["error"] = f"ValueError: {e}"
+        exit_code = 1
+    except Exception as e:  # Catch other unexpected issues
+        error_message = f"An unexpected error occurred during testing: {e}"
+        print(f"\n{error_message}")
+        run_metadata["error"] = error_message
+        # import traceback # Uncomment for debugging
+        # traceback.print_exc() # Uncomment for debugging
+        exit_code = 1
     finally:
         # --- Save Metadata ---
-        if run_metadata.get("results_dir"):
+        # Only save metadata if the results directory was created AND
+        # the API call didn't fail terminally (i.e., raw_model_response is not None)
+        # or if a non-API error occurred before the API call (e.g., FileNotFoundError).
+        # Simpler: Only save if results_dir exists and the error wasn't an API failure after retries.
+        should_save_metadata = run_metadata.get("results_dir") and not (
+            raw_model_response is None and api_error is not None
+        )
+
+        if should_save_metadata:
             metadata_path = os.path.join(run_metadata["results_dir"], "metadata.json")
             try:
                 print(f"Saving run metadata to: {metadata_path}")
@@ -252,6 +281,31 @@ def main():
                     json.dump(run_metadata, f_meta, indent=4)
             except Exception as meta_e:
                 print(f"\nWarning: Failed to save metadata.json: {meta_e}")
+        elif run_metadata.get("results_dir"):
+            # Clean up the results directory if it was created but the API call failed
+            try:
+                print(
+                    f"Cleaning up results directory due to API failure: {run_metadata['results_dir']}"
+                )
+                # Be cautious with rmtree, ensure path is correct
+                import shutil
+
+                # Add a safety check to prevent accidental deletion outside the expected base directory
+                results_base_dir = (
+                    "benchmark_results"  # Define it here for safety check
+                )
+                if os.path.exists(run_metadata["results_dir"]) and run_metadata[
+                    "results_dir"
+                ].startswith(results_base_dir + os.sep):
+                    shutil.rmtree(run_metadata["results_dir"])
+                else:
+                    print(
+                        f"\nWarning: Skipped cleanup for potentially unsafe path: {run_metadata['results_dir']}"
+                    )
+            except Exception as clean_e:
+                print(
+                    f"\nWarning: Failed to clean up results directory {run_metadata['results_dir']}: {clean_e}"
+                )
 
     print("\n--- Test Complete ---")
     return exit_code

@@ -9,6 +9,13 @@ from tqdm import tqdm
 from urllib.parse import urlparse
 
 
+# Custom Exception for Invalid API Responses
+class InvalidResponseError(Exception):
+    """Custom exception for invalid or error responses from the API."""
+
+    pass
+
+
 def standardize_repo_name(repo_name):
     """
     Convert various GitHub repository reference formats to a standard 'org/repo' format.
@@ -367,18 +374,40 @@ def get_model_response_openrouter(prompt_content: str, model_name: str) -> str:
             # temperature=0.7,
             # max_tokens=2000, # Example: Set a token limit if needed
         )
-        # Ensure response structure is as expected before accessing content
-        if completion.choices and completion.choices[0].message:
+
+        # Check for explicit errors in the response object (like the example in issue #31)
+        # The exact structure might vary, adapt as needed based on observed errors.
+        # Assuming the 'error' attribute exists directly on the completion object for error responses.
+        if hasattr(completion, "error") and completion.error:
+            error_details = getattr(completion, "error", "Unknown error structure")
+            raise InvalidResponseError(
+                f"OpenRouter returned an error object: {error_details}"
+            )
+
+        # Ensure response structure has choices and message content
+        if (
+            completion.choices
+            and completion.choices[0].message
+            and completion.choices[0].message.content is not None
+        ):
             response_content = completion.choices[0].message.content
-            return response_content if response_content is not None else ""
+            return response_content
         else:
-            # Handle unexpected response structure
-            print("Warning: Unexpected response structure from OpenRouter.")
-            print(f"Full response: {completion}")
-            return ""  # Return empty string or raise an error
-    except openai.APIError as e:
-        print(f"OpenRouter API error: {e}")
+            # Handle unexpected valid (but empty or malformed) response structure
+            raise InvalidResponseError(
+                f"Unexpected response structure or empty content from OpenRouter. Full response: {completion}"
+            )
+
+    except openai.APIError:
+        # Let APIErrors (like connection issues, rate limits, server errors) be handled by the caller for retries
+        # No need to print here, the caller will handle logging/retries
         raise  # Re-raise the exception to be handled by the caller
+    except InvalidResponseError:
+        # Re-raise our custom exception if it was raised above
+        raise
     except Exception as e:
-        print(f"An unexpected error occurred during the API call: {e}")
-        raise  # Re-raise other potential exceptions
+        # Catch any other unexpected errors during the API call process
+        print(f"An unexpected error occurred during the API call processing: {e}")
+        # Wrap unexpected errors into our custom type or re-raise, depending on desired handling
+        # For now, re-raise to ensure visibility
+        raise
