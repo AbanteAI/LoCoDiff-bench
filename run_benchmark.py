@@ -5,9 +5,9 @@ import sys
 import difflib
 import json
 import re
-import shutil  # Moved import to top
-import time  # Added for retries
-import openai  # Added for APIError exception
+import shutil
+import time
+import openai
 from datetime import datetime, timezone
 from utils import (
     get_model_response_openrouter,
