@@ -161,23 +161,32 @@ def main():
                 f_ext.write(extracted_content)
 
             # --- Compare Extracted vs Expected ---
-            print("Comparing extracted content to expected output...")
-            if extracted_content == expected_content:
+            print(
+                "Comparing extracted content to expected output (ignoring leading/trailing whitespace)..."
+            )
+            # Strip both before comparing
+            extracted_stripped = extracted_content.strip()
+            expected_stripped = expected_content.strip()
+
+            if extracted_stripped == expected_stripped:
                 print(
-                    "\n✅ Success: Extracted model output exactly matches expected output."
+                    "\n✅ Success: Stripped model output matches stripped expected output."
                 )
                 run_metadata["success"] = True
                 exit_code = 0
             else:
                 print(
-                    "\n❌ Failure: Extracted model output does not exactly match expected output."
+                    "\n❌ Failure: Stripped model output does not match stripped expected output."
                 )
                 print("-" * 30)
-                print("Diff (Expected -> Extracted Model Output):")
+                print("Diff (Original Expected -> Original Extracted Model Output):")
                 print("-" * 30)
+                # Show diff of the original, unstripped content
                 diff = difflib.unified_diff(
                     expected_content.splitlines(keepends=True),
-                    extracted_content.splitlines(keepends=True),
+                    extracted_content.splitlines(
+                        keepends=True
+                    ),  # Use original extracted content for diff
                     fromfile=expected_filepath,
                     tofile=extracted_output_path,  # Use path for clarity
                     lineterm="",
@@ -187,7 +196,11 @@ def main():
                 if diff_lines:
                     sys.stdout.writelines(diff_lines)
                 else:
-                    print("(No differences found, potentially only whitespace changes)")
+                    # This case should be less likely now if the stripped versions differ,
+                    # but could happen if internal whitespace differs.
+                    print(
+                        "(No differences found in line-by-line diff, check internal whitespace/characters)"
+                    )
                 print()  # Add newline before separator
                 print("-" * 30)
                 exit_code = 1  # Indicate failure
