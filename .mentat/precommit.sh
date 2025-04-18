@@ -13,8 +13,8 @@ ruff check --fix .
 
 # Run type checking
 echo "Running type checker..."
-# Explicitly run pyright as a module using the venv's python executable
-$(pwd)/.venv/bin/python -m pyright utils.py
+# Explicitly run pyright as a module using the venv's python executable on the whole project
+$(pwd)/.venv/bin/python -m pyright
 
 # Note: Skipping pytest as there are currently no tests in the repository
 # If tests are added in the future, uncomment the following lines:
