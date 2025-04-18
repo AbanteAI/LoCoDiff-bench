@@ -5,9 +5,12 @@ import sys
 import difflib
 import json
 import re
+import time  # Added for retries
+import openai  # Added for APIError exception
 from datetime import datetime, timezone
 from utils import (
     get_model_response_openrouter,
+    InvalidResponseError,
 )  # Added InvalidResponseError
 
 
@@ -94,6 +97,9 @@ def main():
     api_error = (
         None  # Initialize api_error here to ensure it's defined for the finally block
     )
+    raw_model_response = (
+        None  # Initialize raw_model_response for the finally block check
+    )
     run_metadata = {
         "model": args.model,
         "benchmark_case": args.benchmark_case,
@@ -146,14 +152,57 @@ def main():
             f"Expected output read successfully ({len(expected_content)} characters)."
         )
 
-        # --- Call Model API ---
+        # --- Call Model API with Retries ---
         print(f"Sending prompt to model '{args.model}' via OpenRouter...")
-        raw_model_response = get_model_response_openrouter(prompt_content, args.model)
-        run_metadata["raw_response_length"] = len(raw_model_response)
-        print(f"Received response from model ({len(raw_model_response)} characters).")
+        # raw_model_response and api_error are initialized outside this try block
+        MAX_RETRIES = 3
+        INITIAL_BACKOFF = 1.0  # seconds
+        backoff = INITIAL_BACKOFF
+        api_call_succeeded = False
 
-        # --- Save Raw Response ---
-        raw_response_path = os.path.join(results_dir, "raw_response.txt")
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Attempt the API call
+                current_response = get_model_response_openrouter(
+                    prompt_content, args.model
+                )
+                # If successful, store response, clear error, mark success, and break loop
+                raw_model_response = current_response
+                run_metadata["raw_response_length"] = len(raw_model_response)
+                print(
+                    f"Received response from model ({len(raw_model_response)} characters)."
+                )
+                api_error = None  # Clear any previous error on success
+                api_call_succeeded = True
+                break  # Exit retry loop on success
+            except (openai.APIError, InvalidResponseError) as e:
+                # If APIError or InvalidResponse, store the error and handle retry logic
+                api_error = e  # Store the last error
+                print(
+                    f"Warning: API Error/Invalid Response (Attempt {attempt + 1}/{MAX_RETRIES}): {e}"
+                )
+                if attempt < MAX_RETRIES - 1:
+                    print(f"Retrying in {backoff:.1f} seconds...")
+                    time.sleep(backoff)
+                    backoff *= 2  # Exponential backoff
+                else:
+                    # If max retries reached, print error and let loop finish
+                    print("Error: Max retries reached. Failing benchmark run.")
+                    # api_error already holds the last error
+
+        # Check if the API call ultimately failed after retries
+        if not api_call_succeeded:
+            # If the loop finished without success, record the final error and set exit code
+            print("\n❌ Error: Failed to get valid response from API after retries.")
+            run_metadata["error"] = (
+                f"API Failure after {MAX_RETRIES} retries: {api_error}"
+            )
+            exit_code = 1
+            # Skip subsequent processing by raising a specific exception or returning early?
+            # For now, subsequent code relies on raw_model_response being None
+        else:
+            # --- Save Raw Response (only if API call succeeded) ---
+            raw_response_path = os.path.join(results_dir, "raw_response.txt")
         print(f"Saving raw response to: {raw_response_path}")
         with open(raw_response_path, "w", encoding="utf-8") as f_raw:
             f_raw.write(raw_model_response)
@@ -246,25 +295,6 @@ def main():
         # Consider adding traceback logging here for debugging
         # import traceback
         # traceback.print_exc()
-        exit_code = 1
-    except FileNotFoundError as e:
-        print(f"\nError: {e}")
-        run_metadata["error"] = str(e)
-        exit_code = 1
-    except IOError as e:
-        print(f"\nError reading file: {e}")
-        run_metadata["error"] = f"IOError: {e}"
-        exit_code = 1
-    except ValueError as e:  # Catches missing API key or other ValueErrors
-        print(f"\nConfiguration Error: {e}")
-        run_metadata["error"] = f"ValueError: {e}"
-        exit_code = 1
-    except Exception as e:  # Catch other unexpected issues
-        error_message = f"An unexpected error occurred during testing: {e}"
-        print(f"\n{error_message}")
-        run_metadata["error"] = error_message
-        # import traceback # Uncomment for debugging
-        # traceback.print_exc() # Uncomment for debugging
         exit_code = 1
     finally:
         # --- Save Metadata ---

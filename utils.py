@@ -375,13 +375,11 @@ def get_model_response_openrouter(prompt_content: str, model_name: str) -> str:
             # max_tokens=2000, # Example: Set a token limit if needed
         )
 
-        # Check for explicit errors in the response object (like the example in issue #31)
-        # The exact structure might vary, adapt as needed based on observed errors.
-        # Assuming the 'error' attribute exists directly on the completion object for error responses.
-        if hasattr(completion, "error") and completion.error:
-            error_details = getattr(completion, "error", "Unknown error structure")
+        # Check for explicit errors in the response object using getattr for type safety
+        completion_error = getattr(completion, "error", None)
+        if completion_error:
             raise InvalidResponseError(
-                f"OpenRouter returned an error object: {error_details}"
+                f"OpenRouter returned an error object: {completion_error}"
             )
 
         # Ensure response structure has choices and message content
