@@ -204,13 +204,16 @@ def main():
             # --- Save Raw Response (only if API call succeeded) ---
             raw_response_path = os.path.join(results_dir, "raw_response.txt")
             print(f"Saving raw response to: {raw_response_path}")
-            # Type check: raw_model_response is guaranteed to be str here
+            # Type check: raw_model_response should be str here due to api_call_succeeded logic
+            # Add assert for explicit type narrowing for pyright
+            assert raw_model_response is not None
             with open(raw_response_path, "w", encoding="utf-8") as f_raw:
                 f_raw.write(raw_model_response)
 
             # --- Extract Content ---
             print("Extracting content using triple backticks (```)...")
-            # Type check: raw_model_response is guaranteed to be str here
+            # Add assert for explicit type narrowing for pyright
+            assert raw_model_response is not None
             extracted_content = extract_code_from_backticks(raw_model_response)
 
             if extracted_content is None:
