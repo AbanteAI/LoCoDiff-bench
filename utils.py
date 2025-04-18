@@ -204,8 +204,16 @@ def generate_prompts_and_expected(
         # 2. Construct prompt content
         prompt_content = (
             "You are being tested. Your goal is to reconstruct the current state of a file, "
-            "given the history of changes made to that file. For your response, simply output "
-            "the exact final state of the file, wrapped in triple backticks (```):\n\n"
+            "given the history of changes made to that file.\n\n"
+            "For your response, output ONLY the exact final state of the file, wrapped in "
+            "<final_state_of_file> tags. Do not include any other text, explanations, or formatting "
+            "outside these tags.\n\n"
+            "Example:\n"
+            "<final_state_of_file>\n"
+            "#!/usr/bin/env python\n"
+            "print('Hello, world!')\n"
+            "</final_state_of_file>\n\n"
+            "Now, here is the file history:\n"
             f"> git log -p --cc --topo-order --reverse -- {rel_path}\n\n"
             f"{git_history}"
         )

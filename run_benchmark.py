@@ -3,7 +3,33 @@ import argparse
 import os
 import sys
 import difflib
+import json
+import re
+from datetime import datetime
 from utils import get_model_response_openrouter
+
+
+def sanitize_filename(name):
+    """Removes characters that are problematic for filenames/paths."""
+    # Replace slashes with underscores
+    name = name.replace(os.path.sep, "_")
+    # Remove other potentially problematic characters (add more as needed)
+    name = re.sub(r'[<>:"|?*]', "", name)
+    return name
+
+
+def extract_code_from_tags(text: str) -> str | None:
+    """Extracts content between <final_state_of_file> tags."""
+    # Regex to find content between the tags, handling potential leading/trailing whitespace
+    # DOTALL flag allows '.' to match newlines
+    match = re.search(
+        r"<final_state_of_file>(.*?)</final_state_of_file>", text, re.DOTALL
+    )
+    if match:
+        # Strip leading/trailing whitespace from the captured group
+        return match.group(1).strip()
+    else:
+        return None  # Indicate tags not found or no content
 
 
 def main():
@@ -49,8 +75,38 @@ def main():
     print(f"Expected Output File: {expected_filepath}")
     print("-" * 30)
 
+    exit_code = 1  # Default to failure
+    run_metadata = {
+        "model": args.model,
+        "benchmark_case": args.benchmark_case,
+        "benchmark_dir": args.benchmark_dir,
+        "prompt_file": prompt_filepath,
+        "expected_file": expected_filepath,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "success": False,
+        "error": None,
+        "raw_response_length": 0,
+        "extracted_output_length": None,  # None if extraction fails
+        "expected_output_length": 0,
+        "results_dir": None,
+    }
+
     try:
-        # 1. Read prompt file
+        # --- Setup Results Directory ---
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sanitized_model_name = sanitize_filename(args.model)
+        results_base_dir = "benchmark_results"
+        results_dir = os.path.join(
+            results_base_dir,
+            args.benchmark_case,
+            sanitized_model_name,
+            timestamp_str,
+        )
+        os.makedirs(results_dir, exist_ok=True)
+        run_metadata["results_dir"] = results_dir
+        print(f"Results will be saved to: {results_dir}")
+
+        # --- Read Input Files ---
         print(f"Reading prompt file: {prompt_filepath}")
         if not os.path.exists(prompt_filepath):
             raise FileNotFoundError(f"Prompt file not found: {prompt_filepath}")
@@ -58,7 +114,6 @@ def main():
             prompt_content = f_prompt.read()
         print(f"Prompt read successfully ({len(prompt_content)} characters).")
 
-        # 2. Read expected output file
         print(f"Reading expected output file: {expected_filepath}")
         if not os.path.exists(expected_filepath):
             raise FileNotFoundError(
@@ -66,67 +121,104 @@ def main():
             )
         with open(expected_filepath, "r", encoding="utf-8") as f_expected:
             expected_content = f_expected.read()
+        run_metadata["expected_output_length"] = len(expected_content)
         print(
             f"Expected output read successfully ({len(expected_content)} characters)."
         )
 
-        # 3. Call OpenRouter API
+        # --- Call Model API ---
         print(f"Sending prompt to model '{args.model}' via OpenRouter...")
-        model_response = get_model_response_openrouter(prompt_content, args.model)
-        print(f"Received response from model ({len(model_response)} characters).")
+        raw_model_response = get_model_response_openrouter(prompt_content, args.model)
+        run_metadata["raw_response_length"] = len(raw_model_response)
+        print(f"Received response from model ({len(raw_model_response)} characters).")
 
-        # 4. Compare the model's response with the expected output
-        print("Comparing model response to expected output...")
-        # Use strip() to potentially ignore leading/trailing whitespace differences if desired,
-        # but for exact reconstruction, direct comparison might be better. Let's stick to direct.
-        # expected_stripped = expected_content.strip()
-        # response_stripped = model_response.strip()
+        # --- Save Raw Response ---
+        raw_response_path = os.path.join(results_dir, "raw_response.txt")
+        print(f"Saving raw response to: {raw_response_path}")
+        with open(raw_response_path, "w", encoding="utf-8") as f_raw:
+            f_raw.write(raw_model_response)
 
-        if model_response == expected_content:
-            print("\n✅ Success: Model output exactly matches expected output.")
-            exit_code = 0
-        else:
-            print("\n❌ Failure: Model output does not exactly match expected output.")
-            print("-" * 30)
-            # print("Expected Output:")
-            # print("-" * 30)
-            # print(expected_content)
-            # print("-" * 30)
-            # print("Model Response:")
-            # print("-" * 30)
-            # print(model_response)
-            # print("-" * 30)
-            print("Diff (Expected -> Model Response):")
-            print("-" * 30)
-            # Generate and print a diff
-            diff = difflib.unified_diff(
-                expected_content.splitlines(keepends=True),
-                model_response.splitlines(keepends=True),
-                fromfile=expected_filepath,
-                tofile="model_response",
-                lineterm="",
+        # --- Extract Content ---
+        print("Extracting content using <final_state_of_file> tags...")
+        extracted_content = extract_code_from_tags(raw_model_response)
+
+        if extracted_content is None:
+            print(
+                "❌ Error: Could not find <final_state_of_file> tags in the response."
             )
-            sys.stdout.writelines(diff)
-            if not any(diff):  # Check if the generator yields anything
-                print("(No differences found, potentially only whitespace changes)")
-            print("-" * 30)
-            exit_code = 1  # Indicate failure
+            run_metadata["error"] = "Extraction tags not found"
+            # Keep exit_code = 1 (failure)
+        else:
+            run_metadata["extracted_output_length"] = len(extracted_content)
+            print(
+                f"Extracted content successfully ({len(extracted_content)} characters)."
+            )
+            extracted_output_path = os.path.join(results_dir, "extracted_output.txt")
+            print(f"Saving extracted output to: {extracted_output_path}")
+            with open(extracted_output_path, "w", encoding="utf-8") as f_ext:
+                f_ext.write(extracted_content)
+
+            # --- Compare Extracted vs Expected ---
+            print("Comparing extracted content to expected output...")
+            if extracted_content == expected_content:
+                print(
+                    "\n✅ Success: Extracted model output exactly matches expected output."
+                )
+                run_metadata["success"] = True
+                exit_code = 0
+            else:
+                print(
+                    "\n❌ Failure: Extracted model output does not exactly match expected output."
+                )
+                print("-" * 30)
+                print("Diff (Expected -> Extracted Model Output):")
+                print("-" * 30)
+                diff = difflib.unified_diff(
+                    expected_content.splitlines(keepends=True),
+                    extracted_content.splitlines(keepends=True),
+                    fromfile=expected_filepath,
+                    tofile=extracted_output_path,  # Use path for clarity
+                    lineterm="",
+                )
+                # Check if diff is empty (only whitespace changes) before printing
+                diff_lines = list(diff)
+                if diff_lines:
+                    sys.stdout.writelines(diff_lines)
+                else:
+                    print("(No differences found, potentially only whitespace changes)")
+                print("-" * 30)
+                exit_code = 1  # Indicate failure
 
     except FileNotFoundError as e:
         print(f"\nError: {e}")
+        run_metadata["error"] = str(e)
         exit_code = 1
     except IOError as e:
         print(f"\nError reading file: {e}")
+        run_metadata["error"] = f"IOError: {e}"
         exit_code = 1
     except ValueError as e:  # Catches missing API key from utils function
         print(f"\nConfiguration Error: {e}")
+        run_metadata["error"] = f"ValueError: {e}"
         exit_code = 1
     except Exception as e:  # Catch API errors or other unexpected issues
-        print(f"\nAn unexpected error occurred during testing: {e}")
+        error_message = f"An unexpected error occurred during testing: {e}"
+        print(f"\n{error_message}")
+        run_metadata["error"] = error_message
         # Consider adding traceback logging here for debugging
         # import traceback
         # traceback.print_exc()
         exit_code = 1
+    finally:
+        # --- Save Metadata ---
+        if run_metadata.get("results_dir"):
+            metadata_path = os.path.join(run_metadata["results_dir"], "metadata.json")
+            try:
+                print(f"Saving run metadata to: {metadata_path}")
+                with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                    json.dump(run_metadata, f_meta, indent=4)
+            except Exception as meta_e:
+                print(f"\nWarning: Failed to save metadata.json: {meta_e}")
 
     print("\n--- Test Complete ---")
     return exit_code
