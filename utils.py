@@ -19,7 +19,8 @@ def standardize_repo_name(repo_name):
         A standardized repository name in 'org/repo' format.
 
     Raises:
-        ValueError: If the repository name cannot be parsed into a valid org/repo format.
+        ValueError: If the repository name cannot be parsed into a valid
+                    org/repo format.
     """
     if repo_name.startswith("http"):
         # It's a full URL, extract the path
