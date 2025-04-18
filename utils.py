@@ -3,6 +3,8 @@ import os
 import re
 import subprocess
 import tiktoken
+import openai
+from dotenv import load_dotenv
 from tqdm import tqdm
 from urllib.parse import urlparse
 
@@ -199,14 +201,31 @@ def generate_prompts_and_expected(
             print("\nWarning: git command not found. Skipping history generation.")
             git_history = "git command not found.\n"
 
-        # 2. Construct prompt content
-        prompt_content = (
-            "You are being tested. Your goal is to reconstruct the current state of a file, "
-            "given the history of changes made to that file. For your response, simply output "
-            "the exact final state of the file, wrapped in triple backticks (```):\n\n"
-            f"> git log -p --cc --topo-order --reverse -- {rel_path}\n\n"
-            f"{git_history}"
-        )
+        # 2. Construct prompt content using Markdown structure
+        prompt_content = f"""\
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- {rel_path}
+
+{git_history}
+"""
         with open(prompt_path, "w", encoding="utf-8") as pf:
             pf.write(prompt_content)
 
@@ -302,3 +321,64 @@ def generate_prompts_and_expected(
         print(f"\nWarning: Failed to save metadata to {metadata_path}: {e}")
 
     return stats_list  # Still return the list for table printing
+
+
+def get_model_response_openrouter(prompt_content: str, model_name: str) -> str:
+    """
+    Sends a prompt to a specified model via OpenRouter and returns the response.
+
+    Args:
+        prompt_content: The full content of the prompt to send to the model.
+        model_name: The identifier of the model on OpenRouter (e.g., 'openai/gpt-4o').
+
+    Returns:
+        The content of the model's response message.
+
+    Raises:
+        ValueError: If the OPENROUTER_API_KEY environment variable is not set.
+        openai.APIError: If there's an issue communicating with the OpenRouter API.
+    """
+    load_dotenv()  # Load environment variables from .env file
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY not found in environment variables. "
+            "Ensure it's set in a .env file or exported."
+        )
+
+    # Configure the OpenAI client for OpenRouter
+    # Using the openai library >= 1.0.0
+    client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt_content,
+                },
+            ],
+            # Optional: Add other parameters like temperature, max_tokens if needed
+            # temperature=0.7,
+            # max_tokens=2000, # Example: Set a token limit if needed
+        )
+        # Ensure response structure is as expected before accessing content
+        if completion.choices and completion.choices[0].message:
+            response_content = completion.choices[0].message.content
+            return response_content if response_content is not None else ""
+        else:
+            # Handle unexpected response structure
+            print("Warning: Unexpected response structure from OpenRouter.")
+            print(f"Full response: {completion}")
+            return ""  # Return empty string or raise an error
+    except openai.APIError as e:
+        print(f"OpenRouter API error: {e}")
+        raise  # Re-raise the exception to be handled by the caller
+    except Exception as e:
+        print(f"An unexpected error occurred during the API call: {e}")
+        raise  # Re-raise other potential exceptions
