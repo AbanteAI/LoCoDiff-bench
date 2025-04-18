@@ -203,78 +203,77 @@ def main():
         else:
             # --- Save Raw Response (only if API call succeeded) ---
             raw_response_path = os.path.join(results_dir, "raw_response.txt")
-        print(f"Saving raw response to: {raw_response_path}")
-        with open(raw_response_path, "w", encoding="utf-8") as f_raw:
-            f_raw.write(raw_model_response)
+            print(f"Saving raw response to: {raw_response_path}")
+            # Type check: raw_model_response is guaranteed to be str here
+            with open(raw_response_path, "w", encoding="utf-8") as f_raw:
+                f_raw.write(raw_model_response)
 
-        # --- Extract Content ---
-        print("Extracting content using triple backticks (```)...")
-        extracted_content = extract_code_from_backticks(raw_model_response)
+            # --- Extract Content ---
+            print("Extracting content using triple backticks (```)...")
+            # Type check: raw_model_response is guaranteed to be str here
+            extracted_content = extract_code_from_backticks(raw_model_response)
 
-        if extracted_content is None:
-            print(
-                "❌ Error: Could not find triple backticks (```) wrapping the code in the response."
-            )
-            run_metadata["error"] = "Extraction backticks not found"
-            # Keep exit_code = 1 (failure)
-        else:
-            run_metadata["extracted_output_length"] = len(extracted_content)
-            print(
-                f"Extracted content successfully ({len(extracted_content)} characters)."
-            )
-            extracted_output_path = os.path.join(results_dir, "extracted_output.txt")
-            print(f"Saving extracted output to: {extracted_output_path}")
-            with open(extracted_output_path, "w", encoding="utf-8") as f_ext:
-                f_ext.write(extracted_content)
-
-            # --- Compare Extracted vs Expected ---
-            print(
-                "Comparing extracted content to expected output (ignoring leading/trailing whitespace)..."
-            )
-            # Strip both before comparing
-            extracted_stripped = extracted_content.strip()
-            expected_stripped = expected_content.strip()
-
-            if extracted_stripped == expected_stripped:
+            if extracted_content is None:
                 print(
-                    "\n✅ Success: Stripped model output matches stripped expected output."
+                    "❌ Error: Could not find triple backticks (```) wrapping the code in the response."
                 )
-                run_metadata["success"] = True
-                exit_code = 0
+                run_metadata["error"] = "Extraction backticks not found"
+                exit_code = (
+                    1  # Indicate failure (even though API succeeded, processing failed)
+                )
             else:
+                run_metadata["extracted_output_length"] = len(extracted_content)
                 print(
-                    "\n❌ Failure: Stripped model output does not match stripped expected output."
+                    f"Extracted content successfully ({len(extracted_content)} characters)."
                 )
-                print("-" * 30)
+                extracted_output_path = os.path.join(
+                    results_dir, "extracted_output.txt"
+                )
+                print(f"Saving extracted output to: {extracted_output_path}")
+                with open(extracted_output_path, "w", encoding="utf-8") as f_ext:
+                    f_ext.write(extracted_content)
+
+                # --- Compare Extracted vs Expected ---
                 print(
-                    "Diff (Stripped Expected -> Stripped Extracted Model Output):"
-                )  # Updated title
-                print("-" * 30)
-                # Show diff of the stripped content
-                diff = difflib.unified_diff(
-                    expected_stripped.splitlines(
-                        keepends=True
-                    ),  # Use stripped expected
-                    extracted_stripped.splitlines(  # Use stripped extracted
-                        keepends=True
-                    ),
-                    fromfile=f"{expected_filepath} (stripped)",  # Update fromfile label
-                    tofile=f"{extracted_output_path} (stripped)",  # Update tofile label
-                    lineterm="",
+                    "Comparing extracted content to expected output (ignoring leading/trailing whitespace)..."
                 )
-                # Check if diff is empty (only whitespace changes) before printing
-                diff_lines = list(diff)
-                if diff_lines:
-                    sys.stdout.writelines(diff_lines)
-                else:
-                    # This case should be less likely now if the stripped versions differ,
-                    # but could happen if internal whitespace differs.
+                # Strip both before comparing
+                extracted_stripped = extracted_content.strip()
+                expected_stripped = expected_content.strip()
+
+                if extracted_stripped == expected_stripped:
                     print(
-                        "(No differences found in line-by-line diff, check internal whitespace/characters)"
+                        "\n✅ Success: Stripped model output matches stripped expected output."
                     )
-                print()  # Add newline before separator
-                print("-" * 30)
-                exit_code = 1  # Indicate failure
+                    run_metadata["success"] = True
+                    exit_code = 0
+                else:
+                    print(
+                        "\n❌ Failure: Stripped model output does not match stripped expected output."
+                    )
+                    print("-" * 30)
+                    print(
+                        "Diff (Stripped Expected -> Stripped Extracted Model Output):"
+                    )
+                    print("-" * 30)
+                    # Show diff of the stripped content
+                    diff = difflib.unified_diff(
+                        expected_stripped.splitlines(keepends=True),
+                        extracted_stripped.splitlines(keepends=True),
+                        fromfile=f"{expected_filepath} (stripped)",
+                        tofile=f"{extracted_output_path} (stripped)",
+                        lineterm="",
+                    )
+                    diff_lines = list(diff)
+                    if diff_lines:
+                        sys.stdout.writelines(diff_lines)
+                    else:
+                        print(
+                            "(No differences found in line-by-line diff, check internal whitespace/characters)"
+                        )
+                    print()
+                    print("-" * 30)
+                    exit_code = 1  # Indicate failure
 
     except FileNotFoundError as e:
         print(f"\nError: {e}")
