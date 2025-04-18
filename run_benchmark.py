@@ -192,16 +192,20 @@ def main():
                     "\n❌ Failure: Stripped model output does not match stripped expected output."
                 )
                 print("-" * 30)
-                print("Diff (Original Expected -> Original Extracted Model Output):")
+                print(
+                    "Diff (Stripped Expected -> Stripped Extracted Model Output):"
+                )  # Updated title
                 print("-" * 30)
-                # Show diff of the original, unstripped content
+                # Show diff of the stripped content
                 diff = difflib.unified_diff(
-                    expected_content.splitlines(keepends=True),
-                    extracted_content.splitlines(
+                    expected_stripped.splitlines(
                         keepends=True
-                    ),  # Use original extracted content for diff
-                    fromfile=expected_filepath,
-                    tofile=extracted_output_path,  # Use path for clarity
+                    ),  # Use stripped expected
+                    extracted_stripped.splitlines(  # Use stripped extracted
+                        keepends=True
+                    ),
+                    fromfile=f"{expected_filepath} (stripped)",  # Update fromfile label
+                    tofile=f"{extracted_output_path} (stripped)",  # Update tofile label
                     lineterm="",
                 )
                 # Check if diff is empty (only whitespace changes) before printing
