@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -270,6 +271,33 @@ def generate_prompts_and_expected(
             "lines_deleted": lines_deleted,
             "final_lines": final_lines,
         }
+        # Include generated filenames in the stats for metadata
+        file_stats["prompt_filename"] = prompt_fname
+        file_stats["expected_filename"] = expected_fname
         stats_list.append(file_stats)
 
-    return stats_list
+    # After processing all files, save the metadata
+    metadata = {
+        stats["filename"]: {
+            "prompt_filename": stats["prompt_filename"],
+            "expected_filename": stats["expected_filename"],
+            "stats": {
+                "prompt_tokens": stats["prompt_tokens"],
+                "expected_tokens": stats["expected_tokens"],
+                "num_commits": stats["num_commits"],
+                "lines_added": stats["lines_added"],
+                "lines_deleted": stats["lines_deleted"],
+                "final_lines": stats["final_lines"],
+            },
+        }
+        for stats in stats_list
+    }
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    try:
+        with open(metadata_path, "w", encoding="utf-8") as mf:
+            json.dump(metadata, mf, indent=4)
+        print(f"\nSaved statistics metadata to {metadata_path}")
+    except Exception as e:
+        print(f"\nWarning: Failed to save metadata to {metadata_path}: {e}")
+
+    return stats_list  # Still return the list for table printing
