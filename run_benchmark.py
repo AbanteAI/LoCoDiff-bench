@@ -5,6 +5,7 @@ import sys
 import difflib
 import json
 import re
+import shutil  # Moved import to top
 import time  # Added for retries
 import openai  # Added for APIError exception
 from datetime import datetime, timezone
@@ -323,7 +324,7 @@ def main():
                     f"Cleaning up results directory due to API failure: {run_metadata['results_dir']}"
                 )
                 # Be cautious with rmtree, ensure path is correct
-                import shutil
+                # import shutil # Moved to top
 
                 # Add a safety check to prevent accidental deletion outside the expected base directory
                 results_base_dir = (
