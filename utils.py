@@ -201,22 +201,29 @@ def generate_prompts_and_expected(
             print("\nWarning: git command not found. Skipping history generation.")
             git_history = "git command not found.\n"
 
-        # 2. Construct prompt content
-        prompt_content = (
-            "You are being tested. Your goal is to reconstruct the current state of a file, "
-            "given the history of changes made to that file.\n\n"
-            "For your response, output ONLY the exact final state of the file, wrapped in "
-            "<final_state_of_file> tags. Do not include any other text, explanations, or formatting "
-            "outside these tags.\n\n"
-            "Example:\n"
-            "<final_state_of_file>\n"
-            "#!/usr/bin/env python\n"
-            "print('Hello, world!')\n"
-            "</final_state_of_file>\n\n"
-            "Now, here is the file history:\n"
-            f"> git log -p --cc --topo-order --reverse -- {rel_path}\n\n"
-            f"{git_history}"
-        )
+        # 2. Construct prompt content using Markdown structure
+        prompt_content = f"""\
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+# Required Response Format
+
+Wrap the content of the file in <final_state_of_file> tags. Any text outside these tags will be ignored. End your response after outputting the </final_state_of_file> closing tag.
+
+# Example Response
+
+<final_state_of_file>
+#!/usr/bin/env python
+print('Hello, world!')
+</final_state_of_file>
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- {rel_path}
+
+{git_history}
+"""
         with open(prompt_path, "w", encoding="utf-8") as pf:
             pf.write(prompt_content)
 
