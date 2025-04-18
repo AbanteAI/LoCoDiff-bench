@@ -18,18 +18,31 @@ def sanitize_filename(name):
     return name
 
 
-def extract_code_from_tags(text: str) -> str | None:
-    """Extracts content between <final_state_of_file> tags."""
-    # Regex to find content between the tags, handling potential leading/trailing whitespace
-    # DOTALL flag allows '.' to match newlines
-    match = re.search(
-        r"<final_state_of_file>(.*?)</final_state_of_file>", text, re.DOTALL
-    )
+def extract_code_from_backticks(text: str) -> str | None:
+    """
+    Extracts content wrapped in triple backticks, handling optional language identifiers
+    and stripping leading/trailing whitespace.
+    """
+    # Regex explanation:
+    # ```                  - Match the opening triple backticks
+    # (?:\w+)?           - Optionally match (non-capturing group) a language identifier (word characters)
+    # \s*?\n             - Match optional whitespace and a newline (non-greedy)
+    # (.*?)              - Capture the content (non-greedy) - this is group 1
+    # \n?```             - Match an optional newline and the closing triple backticks
+    # re.DOTALL          - Make '.' match newline characters
+    match = re.search(r"```(?:\w+)?\s*?\n(.*?)\n?```", text, re.DOTALL)
+
     if match:
-        # Strip leading/trailing whitespace from the captured group
+        # Return the captured group, stripped of leading/trailing whitespace
         return match.group(1).strip()
     else:
-        return None  # Indicate tags not found or no content
+        # Fallback: Maybe the model just returned the code without the newlines after/before backticks,
+        # or maybe no language identifier was present.
+        match = re.search(r"```(?:\w+)?(.*?)```", text, re.DOTALL)
+        if match:
+            # Return the captured group, stripped of leading/trailing whitespace
+            return match.group(1).strip()
+        return None  # Indicate backticks not found or no content
 
 
 def main():
@@ -141,14 +154,14 @@ def main():
             f_raw.write(raw_model_response)
 
         # --- Extract Content ---
-        print("Extracting content using <final_state_of_file> tags...")
-        extracted_content = extract_code_from_tags(raw_model_response)
+        print("Extracting content using triple backticks (```)...")
+        extracted_content = extract_code_from_backticks(raw_model_response)
 
         if extracted_content is None:
             print(
-                "❌ Error: Could not find <final_state_of_file> tags in the response."
+                "❌ Error: Could not find triple backticks (```) wrapping the code in the response."
             )
-            run_metadata["error"] = "Extraction tags not found"
+            run_metadata["error"] = "Extraction backticks not found"
             # Keep exit_code = 1 (failure)
         else:
             run_metadata["extracted_output_length"] = len(extracted_content)

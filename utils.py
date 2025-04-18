@@ -209,14 +209,14 @@ You are being benchmarked. You will see the output of a git log command, and fro
 
 # Required Response Format
 
-Wrap the content of the file in <final_state_of_file> tags. Any text outside these tags will be ignored. End your response after outputting the </final_state_of_file> closing tag.
+Wrap the content of the file in triple backticks (```). You may optionally include the language identifier after the opening backticks (e.g., ```python). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
 
 # Example Response
 
-<final_state_of_file>
+```python
 #!/usr/bin/env python
 print('Hello, world!')
-</final_state_of_file>
+```
 
 # File History
 
