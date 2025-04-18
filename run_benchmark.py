@@ -188,6 +188,7 @@ def main():
                     sys.stdout.writelines(diff_lines)
                 else:
                     print("(No differences found, potentially only whitespace changes)")
+                print()  # Add newline before separator
                 print("-" * 30)
                 exit_code = 1  # Indicate failure
 
