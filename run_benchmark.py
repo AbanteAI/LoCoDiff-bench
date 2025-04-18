@@ -5,7 +5,7 @@ import sys
 import difflib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone  # Added timezone
 from utils import get_model_response_openrouter
 
 
@@ -82,7 +82,9 @@ def main():
         "benchmark_dir": args.benchmark_dir,
         "prompt_file": prompt_filepath,
         "expected_file": expected_filepath,
-        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "timestamp_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),  # Use timezone-aware UTC now
         "success": False,
         "error": None,
         "raw_response_length": 0,
