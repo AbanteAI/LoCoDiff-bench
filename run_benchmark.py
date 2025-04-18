@@ -91,6 +91,9 @@ def main():
     print("-" * 30)
 
     exit_code = 1  # Default to failure
+    api_error = (
+        None  # Initialize api_error here to ensure it's defined for the finally block
+    )
     run_metadata = {
         "model": args.model,
         "benchmark_case": args.benchmark_case,
