@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import os
+import random
+import math  # For ceiling division if needed, or just general math ops
+from collections import defaultdict
+from statistics import mean
+
 from utils import (
     clone_repo_to_cache,
     generate_prompts_and_expected,
@@ -55,6 +61,194 @@ def print_stats_table(stats_list):
         print(row)
 
 
+def filter_bucket_sample_stats(
+    stats_list, output_dir, max_tokens=100000, bucket_size=20000, max_per_bucket=10
+):
+    """
+    Filters stats, assigns them to buckets, samples buckets, and deletes discarded files.
+
+    Args:
+        stats_list: List of dictionaries containing statistics for each file.
+        output_dir: Directory where prompt and expected files are stored.
+        max_tokens: Maximum prompt tokens allowed.
+        bucket_size: Size of each token bucket.
+        max_per_bucket: Maximum number of items allowed per bucket after sampling.
+
+    Returns:
+        A dictionary where keys are bucket range tuples (min_token, max_token)
+        and values are lists of stats dictionaries belonging to that bucket after filtering and sampling.
+    """
+    print(
+        f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {max_per_bucket}) ---"
+    )
+    filtered_stats = []
+    deleted_count = 0
+
+    # 1. Filter by max_tokens and delete corresponding files
+    print(f"Filtering prompts with more than {max_tokens} tokens...")
+    for stats in stats_list:
+        if stats["prompt_tokens"] <= max_tokens:
+            filtered_stats.append(stats)
+        else:
+            prompt_file = os.path.join(output_dir, stats["prompt_filename"])
+            expected_file = os.path.join(output_dir, stats["expected_filename"])
+            try:
+                os.remove(prompt_file)
+                # print(f"Deleted {prompt_file}")
+            except FileNotFoundError:
+                print(f"Warning: Prompt file not found for deletion: {prompt_file}")
+            try:
+                os.remove(expected_file)
+                # print(f"Deleted {expected_file}")
+            except FileNotFoundError:
+                print(f"Warning: Expected file not found for deletion: {expected_file}")
+            deleted_count += 1
+    print(f"Filtered out {deleted_count} prompts exceeding token limit.")
+
+    # 2. Bucket the filtered stats
+    print("Assigning remaining prompts to buckets...")
+    num_buckets = math.ceil(max_tokens / bucket_size)
+    buckets = defaultdict(list)
+    bucket_ranges = {}  # Store range tuple for printing
+
+    for i in range(num_buckets):
+        min_tk = i * bucket_size + (
+            1 if i > 0 else 0
+        )  # Start from 1 for non-zero buckets
+        max_tk = (i + 1) * bucket_size
+        # Ensure the last bucket goes exactly up to max_tokens
+        if max_tk > max_tokens:
+            max_tk = max_tokens
+        bucket_key = (min_tk, max_tk)
+        buckets[bucket_key] = []  # Initialize empty list
+        bucket_ranges[i] = bucket_key  # Map index to range for lookup
+
+    for stats in filtered_stats:
+        tokens = stats["prompt_tokens"]
+        # Find the correct bucket index
+        bucket_index = (tokens - 1) // bucket_size if tokens > 0 else 0
+        # Ensure index is within bounds (handles edge case of exactly max_tokens)
+        bucket_index = min(bucket_index, num_buckets - 1)
+
+        bucket_key = bucket_ranges[bucket_index]
+        buckets[bucket_key].append(stats)
+
+    # 3. Sample buckets exceeding max_per_bucket and delete corresponding files
+    print(f"Sampling buckets to have at most {max_per_bucket} prompts each...")
+    final_buckets = {}
+    total_sampled_out = 0
+    for bucket_key, items in buckets.items():
+        if len(items) > max_per_bucket:
+            items_to_keep = random.sample(items, max_per_bucket)
+            items_to_discard = [item for item in items if item not in items_to_keep]
+            print(
+                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {max_per_bucket}."
+            )
+            total_sampled_out += len(items_to_discard)
+
+            for stats in items_to_discard:
+                prompt_file = os.path.join(output_dir, stats["prompt_filename"])
+                expected_file = os.path.join(output_dir, stats["expected_filename"])
+                try:
+                    os.remove(prompt_file)
+                except FileNotFoundError:
+                    print(
+                        f"Warning: Prompt file not found for deletion during sampling: {prompt_file}"
+                    )
+                try:
+                    os.remove(expected_file)
+                except FileNotFoundError:
+                    print(
+                        f"Warning: Expected file not found for deletion during sampling: {expected_file}"
+                    )
+
+            final_buckets[bucket_key] = items_to_keep
+        else:
+            # Keep all items if count is within limit
+            final_buckets[bucket_key] = items
+            if items:  # Only print if bucket wasn't empty
+                print(f"  Bucket {bucket_key}: Kept all {len(items)} items.")
+
+    print(f"Removed {total_sampled_out} prompts during sampling.")
+    print("Filtering, bucketing, and sampling complete.")
+    return final_buckets
+
+
+def print_bucket_stats_table(buckets):
+    """Prints a formatted table of the bucket statistics."""
+    print("\n--- Bucket Statistics (Averages) ---")
+    if not buckets:
+        print("No buckets to display statistics for.")
+        return
+
+    # Define columns and widths
+    col_widths = {
+        "bucket_range": 25,  # e.g., "0 - 20000 tokens"
+        "count": 8,
+        "avg_prompt_tokens": 18,
+        "avg_expected_tokens": 19,
+        "avg_num_commits": 15,
+        "avg_lines_added": 15,
+        "avg_lines_deleted": 17,
+        "avg_final_lines": 17,
+    }
+
+    # Header
+    header = (
+        f"{'Bucket Range':<{col_widths['bucket_range']}} | "
+        f"{'Count':>{col_widths['count']}} | "
+        f"{'Avg Prompt Tokens':>{col_widths['avg_prompt_tokens']}} | "
+        f"{'Avg Expected Tokens':>{col_widths['avg_expected_tokens']}} | "
+        f"{'Avg Commits':>{col_widths['avg_num_commits']}} | "
+        f"{'Avg Added':>{col_widths['avg_lines_added']}} | "
+        f"{'Avg Deleted':>{col_widths['avg_lines_deleted']}} | "
+        f"{'Avg Final Lines':>{col_widths['avg_final_lines']}}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    # Sort buckets by the lower bound of the token range for consistent order
+    sorted_bucket_keys = sorted(buckets.keys(), key=lambda x: x[0])
+
+    # Rows
+    for bucket_key in sorted_bucket_keys:
+        items = buckets[bucket_key]
+        count = len(items)
+        range_str = f"{bucket_key[0]} - {bucket_key[1]} tokens"
+
+        if count > 0:
+            avg_prompt_tokens = mean(item["prompt_tokens"] for item in items)
+            avg_expected_tokens = mean(item["expected_tokens"] for item in items)
+            avg_num_commits = mean(item["num_commits"] for item in items)
+            avg_lines_added = mean(item["lines_added"] for item in items)
+            avg_lines_deleted = mean(item["lines_deleted"] for item in items)
+            avg_final_lines = mean(item["final_lines"] for item in items)
+
+            row = (
+                f"{range_str:<{col_widths['bucket_range']}} | "
+                f"{count:>{col_widths['count']}} | "
+                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']:.1f}} | "
+                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']:.1f}} | "
+                f"{avg_num_commits:>{col_widths['avg_num_commits']:.1f}} | "
+                f"{avg_lines_added:>{col_widths['avg_lines_added']:.1f}} | "
+                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']:.1f}} | "
+                f"{avg_final_lines:>{col_widths['avg_final_lines']:.1f}}"
+            )
+        else:
+            # Display empty buckets clearly
+            row = (
+                f"{range_str:<{col_widths['bucket_range']}} | "
+                f"{count:>{col_widths['count']}} | "
+                f"{'-':>{col_widths['avg_prompt_tokens']}} | "
+                f"{'-':>{col_widths['avg_expected_tokens']}} | "
+                f"{'-':>{col_widths['avg_num_commits']}} | "
+                f"{'-':>{col_widths['avg_lines_added']}} | "
+                f"{'-':>{col_widths['avg_lines_deleted']}} | "
+                f"{'-':>{col_widths['avg_final_lines']}}"
+            )
+        print(row)
+
+
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(
@@ -93,13 +287,21 @@ def main():
             repo_path, args.extensions, output_dir
         )
 
-        # Print statistics table
-        print("\n--- Statistics ---")
+        # Print initial statistics table
+        print("\n--- Initial Generation Statistics ---")
         print_stats_table(stats_list)
-        print("\nBenchmark creation complete.")
+
+        # Filter, bucket, and sample the results
+        # Uses defaults: max_tokens=100000, bucket_size=20000, max_per_bucket=10
+        final_buckets = filter_bucket_sample_stats(stats_list, output_dir)
+
+        # Print statistics for the final buckets
+        print_bucket_stats_table(final_buckets)
+
+        print("\nBenchmark creation and processing complete.")
 
     except ValueError as e:
-        print(f"Error during benchmark creation: {e}")
+        print(f"Error during benchmark creation or processing: {e}")
         return 1
     except Exception as e:
         print(f"An unexpected error occurred during benchmark creation: {e}")
