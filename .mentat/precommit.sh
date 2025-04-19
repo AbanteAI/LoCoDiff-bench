@@ -13,8 +13,10 @@ ruff check --fix .
 
 # Run type checking
 echo "Running type checker..."
-# Ensure pyright is installed in the venv and run it using the venv's executable path
-uv pip install pyright &> /dev/null # Install quietly if already present
+# Ensure all dependencies, including type checking tools, are installed
+echo "Ensuring dependencies are installed..."
+uv pip install -r requirements.txt
+# Now run pyright using the venv's executable path
 .venv/bin/pyright .
 
 # Note: Skipping pytest as there are currently no tests in the repository
