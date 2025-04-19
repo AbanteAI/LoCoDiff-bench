@@ -285,7 +285,15 @@ def generate_plot(analysis_results: dict, output_filename: str):
             ]
             success_rates.append(rate if runs_found > 0 else float("nan"))
 
-        plt.plot(x_indices, success_rates, marker="o", linestyle="-", label=model_name)
+        # Get total cost for the legend
+        total_cost = analysis_results["models"][model_name].get("total_cost_usd", 0.0)
+        legend_label = (
+            f"{model_name} (${total_cost:.2f})"  # Format cost to 2 decimal places
+        )
+
+        plt.plot(
+            x_indices, success_rates, marker="o", linestyle="-", label=legend_label
+        )
 
     # Formatting the plot
     plt.title("Benchmark Success Rate per Prompt Token Bucket")
