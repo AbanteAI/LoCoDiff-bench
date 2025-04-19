@@ -338,10 +338,10 @@ print('Hello, world!')
         file_stats["prompt_filename"] = prompt_fname
         file_stats["expected_filename"] = expected_fname
         # Generate a unique prefix for this benchmark case
-        # Format: {repo_org}_{repo_name}_{relative_path_with_underscores}
-        # Example: AbanteAI_mentat_mentat_agent_py
-        repo_org, repo_base = full_repo_name.split("/")
-        benchmark_case_prefix = f"{repo_org}_{repo_base}_{safe_rel}"
+        # Format: {repo_name}_{relative_path_with_underscores}
+        # Example: celery_celery_app___init__.py
+        # This MUST match the prefix derived from filenames by run_benchmark.py
+        benchmark_case_prefix = f"{repo_name}_{safe_rel}"
         file_stats["benchmark_case_prefix"] = benchmark_case_prefix
 
         stats_list.append(file_stats)
