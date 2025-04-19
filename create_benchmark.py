@@ -139,10 +139,32 @@ def filter_bucket_sample_stats(
     total_sampled_out = 0
     for bucket_key, items in buckets.items():
         if len(items) > max_per_bucket:
-            items_to_keep = random.sample(items, max_per_bucket)
-            items_to_discard = [item for item in items if item not in items_to_keep]
+            # Targeted sampling: Instead of pure random sampling, select items closest to
+            # randomly chosen target token counts within the bucket range. This aims to
+            # create a sample whose average token count is closer to the midpoint of the
+            # bucket, counteracting potential skew towards lower token counts.
+            min_tk, max_tk = bucket_key
+            items_to_keep = []
+            available_items = list(items)  # Copy to modify
+
+            for _ in range(max_per_bucket):
+                if (
+                    not available_items
+                ):  # Should not happen if len(items) > max_per_bucket
+                    break
+                target_token_count = random.uniform(min_tk, max_tk)
+                # Find item in available_items closest to target_token_count
+                closest_item = min(
+                    available_items,
+                    key=lambda item: abs(item["prompt_tokens"] - target_token_count),
+                )
+                items_to_keep.append(closest_item)
+                available_items.remove(closest_item)  # Remove selected item
+
+            # Items remaining in available_items are discarded
+            items_to_discard = available_items
             print(
-                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {max_per_bucket}."
+                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {max_per_bucket} (targeted sampling)."
             )
             total_sampled_out += len(items_to_discard)
 
