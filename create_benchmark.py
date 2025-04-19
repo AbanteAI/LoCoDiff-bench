@@ -181,28 +181,28 @@ def print_bucket_stats_table(buckets):
         print("No buckets to display statistics for.")
         return
 
-    # Define columns and widths
+    # Define columns and widths (reduced for better terminal fit)
     col_widths = {
-        "bucket_range": 25,  # e.g., "0 - 20000 tokens"
-        "count": 8,
-        "avg_prompt_tokens": 18,
-        "avg_expected_tokens": 19,
-        "avg_num_commits": 15,
-        "avg_lines_added": 15,
-        "avg_lines_deleted": 17,
-        "avg_final_lines": 17,
+        "bucket_range": 22,  # e.g., "0 - 20000 tokens"
+        "count": 6,
+        "avg_prompt_tokens": 12,  # Reduced width
+        "avg_expected_tokens": 13,  # Reduced width
+        "avg_num_commits": 10,  # Reduced width
+        "avg_lines_added": 10,  # Reduced width
+        "avg_lines_deleted": 11,  # Reduced width
+        "avg_final_lines": 11,  # Reduced width
     }
 
     # Header
     header = (
         f"{'Bucket Range':<{col_widths['bucket_range']}} | "
         f"{'Count':>{col_widths['count']}} | "
-        f"{'Avg Prompt Tokens':>{col_widths['avg_prompt_tokens']}} | "
-        f"{'Avg Expected Tokens':>{col_widths['avg_expected_tokens']}} | "
+        f"{'Avg Prompt':>{col_widths['avg_prompt_tokens']}} | "  # Shortened title
+        f"{'Avg Expected':>{col_widths['avg_expected_tokens']}} | "  # Shortened title
         f"{'Avg Commits':>{col_widths['avg_num_commits']}} | "
         f"{'Avg Added':>{col_widths['avg_lines_added']}} | "
         f"{'Avg Deleted':>{col_widths['avg_lines_deleted']}} | "
-        f"{'Avg Final Lines':>{col_widths['avg_final_lines']}}"
+        f"{'Avg Final':>{col_widths['avg_final_lines']}}"  # Shortened title
     )
     print(header)
     print("-" * len(header))
@@ -227,12 +227,12 @@ def print_bucket_stats_table(buckets):
             row = (
                 f"{range_str:<{col_widths['bucket_range']}} | "
                 f"{count:>{col_widths['count']}} | "
-                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']}f} | "  # Use :f (default float precision)
-                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']}f} | "
-                f"{avg_num_commits:>{col_widths['avg_num_commits']}f} | "
-                f"{avg_lines_added:>{col_widths['avg_lines_added']}f} | "
-                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']}f} | "
-                f"{avg_final_lines:>{col_widths['avg_final_lines']}f}"
+                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']:.0f}} | "  # Use :.0f (integer format)
+                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']:.0f}} | "
+                f"{avg_num_commits:>{col_widths['avg_num_commits']:.0f}} | "
+                f"{avg_lines_added:>{col_widths['avg_lines_added']:.0f}} | "
+                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']:.0f}} | "
+                f"{avg_final_lines:>{col_widths['avg_final_lines']:.0f}}"
             )
         else:
             # Display empty buckets clearly
