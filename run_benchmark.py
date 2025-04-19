@@ -5,8 +5,11 @@ import sys
 import difflib
 import json
 import re
-from datetime import datetime, timezone  # Added timezone
-from utils import get_model_response_openrouter
+from datetime import datetime, timezone
+from utils import (
+    get_model_response_openrouter,
+    get_generation_stats_openrouter,
+)  # Added stats function
 
 
 def sanitize_filename(name):
@@ -104,6 +107,15 @@ def main():
         "extracted_output_length": None,  # None if extraction fails
         "expected_output_length": 0,
         "results_dir": None,
+        # Fields for cost and token tracking
+        "generation_id": None,
+        "cost_usd": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "native_prompt_tokens": None,
+        "native_completion_tokens": None,
+        "stats_error": None,  # To record errors during stats fetching
     }
 
     try:
@@ -143,9 +155,34 @@ def main():
 
         # --- Call Model API ---
         print(f"Sending prompt to model '{args.model}' via OpenRouter...")
-        raw_model_response = get_model_response_openrouter(prompt_content, args.model)
+        raw_model_response, generation_id = get_model_response_openrouter(
+            prompt_content, args.model
+        )
         run_metadata["raw_response_length"] = len(raw_model_response)
-        print(f"Received response from model ({len(raw_model_response)} characters).")
+        run_metadata["generation_id"] = generation_id
+        print(
+            f"Received response from model ({len(raw_model_response)} characters). Generation ID: {generation_id}"
+        )
+
+        # --- Get Generation Stats ---
+        if generation_id:
+            print(f"Querying generation stats for ID: {generation_id}...")
+            stats = get_generation_stats_openrouter(generation_id)
+            if stats:
+                print(
+                    f"Successfully retrieved stats: Cost=${stats['cost_usd']:.6f}, Tokens={stats['total_tokens']}"
+                )
+                run_metadata.update(stats)  # Add all stats fields to metadata
+            else:
+                print("Warning: Failed to retrieve generation stats.")
+                run_metadata["stats_error"] = (
+                    "Failed to retrieve stats from OpenRouter API"
+                )
+        else:
+            print("Warning: No generation ID received, cannot query stats.")
+            run_metadata["stats_error"] = (
+                "No generation ID received from chat completion"
+            )
 
         # --- Save Raw Response ---
         raw_response_path = os.path.join(results_dir, "raw_response.txt")
