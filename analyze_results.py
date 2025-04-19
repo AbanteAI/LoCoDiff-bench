@@ -5,6 +5,7 @@ import json
 import glob
 import re
 import sys
+from typing import Any  # Add this import
 
 # Attempt to import pandas and matplotlib, provide guidance if missing
 try:
