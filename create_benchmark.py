@@ -227,12 +227,12 @@ def print_bucket_stats_table(buckets):
             row = (
                 f"{range_str:<{col_widths['bucket_range']}} | "
                 f"{count:>{col_widths['count']}} | "
-                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']:.1f}} | "
-                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']:.1f}} | "
-                f"{avg_num_commits:>{col_widths['avg_num_commits']:.1f}} | "
-                f"{avg_lines_added:>{col_widths['avg_lines_added']:.1f}} | "
-                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']:.1f}} | "
-                f"{avg_final_lines:>{col_widths['avg_final_lines']:.1f}}"
+                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']}f} | "  # Use :f (default float precision)
+                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']}f} | "
+                f"{avg_num_commits:>{col_widths['avg_num_commits']}f} | "
+                f"{avg_lines_added:>{col_widths['avg_lines_added']}f} | "
+                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']}f} | "
+                f"{avg_final_lines:>{col_widths['avg_final_lines']}f}"
             )
         else:
             # Display empty buckets clearly
