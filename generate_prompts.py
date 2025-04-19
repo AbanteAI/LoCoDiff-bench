@@ -10,6 +10,7 @@ from utils import (
     print_stats_table,
     filter_bucket_sample_stats,
     print_bucket_stats_table,
+    save_benchmark_metadata,  # Import the new function
 )
 
 
@@ -123,6 +124,17 @@ def main():
 
     # Print statistics for the final buckets
     print_bucket_stats_table(final_buckets)
+
+    # Save the final benchmark structure metadata
+    generation_params = {
+        "extensions": args.extensions,
+        "cache_dir": args.cache_dir,
+        "output_dir": args.output_dir,
+        "max_tokens": args.max_tokens,
+        "bucket_size": args.bucket_size,
+        "max_per_bucket": args.max_per_bucket,
+    }
+    save_benchmark_metadata(args.output_dir, final_buckets, generation_params)
 
     print("\nBenchmark prompt generation and processing complete.")
     return 0

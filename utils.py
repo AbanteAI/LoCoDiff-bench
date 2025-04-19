@@ -332,50 +332,66 @@ print('Hello, world!')
             "lines_deleted": lines_deleted,
             "final_lines": final_lines,
         }
-        # Include generated filenames in the stats for metadata
+        # Include generated filenames and repo info in the stats for metadata/analysis
+        file_stats["repo_name"] = full_repo_name
+        file_stats["repo_commit_hash"] = head_commit_hash
         file_stats["prompt_filename"] = prompt_fname
         file_stats["expected_filename"] = expected_fname
+        # Generate a unique prefix for this benchmark case
+        # Format: {repo_org}_{repo_name}_{relative_path_with_underscores}
+        # Example: AbanteAI_mentat_mentat_agent_py
+        repo_org, repo_base = full_repo_name.split("/")
+        benchmark_case_prefix = f"{repo_org}_{repo_base}_{safe_rel}"
+        file_stats["benchmark_case_prefix"] = benchmark_case_prefix
+
         stats_list.append(file_stats)
 
-    # After processing all files, save the metadata
-    # Create a structured metadata with clear sections
+    # Return the raw list of stats for all generated files before filtering/bucketing
+    return stats_list
+
+
+def save_benchmark_metadata(output_dir, final_buckets, generation_params):
+    """
+    Saves the final benchmark structure and generation parameters to metadata.json.
+
+    Args:
+        output_dir: The directory where prompts are saved.
+        final_buckets: Dictionary mapping bucket ranges to lists of kept prompt stats.
+        generation_params: Dictionary of parameters used for generation/filtering.
+    """
     metadata = {
-        # Repository information section
-        "repository": {
-            "name": full_repo_name,
-            "head_commit_hash": head_commit_hash,
-        },
-        # Files section to store all file entries
-        "files": {},
+        "generation_parameters": generation_params,
+        "benchmark_buckets": {},
     }
 
-    # Add file statistics to the files section
-    for stats in stats_list:
-        metadata["files"][stats["filename"]] = {
-            "prompt_filename": stats["prompt_filename"],
-            "expected_filename": stats["expected_filename"],
-            "stats": {
-                "prompt_tokens": stats["prompt_tokens"],
-                "expected_tokens": stats["expected_tokens"],
-                "num_commits": stats["num_commits"],
-                "lines_added": stats["lines_added"],
-                "lines_deleted": stats["lines_deleted"],
-                "final_lines": stats["final_lines"],
-            },
-        }
+    # Convert tuple keys to string representation for JSON compatibility
+    for bucket_key, stats_list in final_buckets.items():
+        # Only include buckets that have prompts in them
+        if stats_list:
+            # Convert tuple key (min_token, max_token) to string "min_token-max_token"
+            bucket_key_str = f"{bucket_key[0]}-{bucket_key[1]}"
+            # Store only the necessary info for analysis: benchmark_case_prefix and original filename
+            metadata["benchmark_buckets"][bucket_key_str] = [
+                {
+                    "benchmark_case_prefix": stats["benchmark_case_prefix"],
+                    "original_filename": stats["filename"],
+                    "repo_name": stats["repo_name"],
+                    "repo_commit_hash": stats["repo_commit_hash"],
+                    "prompt_tokens": stats["prompt_tokens"],
+                }
+                for stats in stats_list
+            ]
 
     metadata_path = os.path.join(output_dir, "metadata.json")
     try:
         with open(metadata_path, "w", encoding="utf-8") as mf:
             json.dump(metadata, mf, indent=4)
-        print(f"\nSaved statistics metadata to {metadata_path}")
+        print(f"\nSaved final benchmark structure metadata to {metadata_path}")
     except Exception as e:
         print(f"\nWarning: Failed to save metadata to {metadata_path}: {e}")
 
-    return stats_list  # Still return the list for table printing
 
-
-# --- Statistics and Filtering Functions (Moved from create_benchmark.py) ---
+# --- Statistics and Filtering Functions ---
 
 
 def print_stats_table(stats_list):
@@ -558,12 +574,13 @@ def filter_bucket_sample_stats(
 
     print(f"Removed {total_sampled_out} prompts during sampling.")
     print("Filtering, bucketing, and sampling complete.")
+    # Return the final buckets containing the stats of the kept prompts
     return final_buckets
 
 
 def print_bucket_stats_table(buckets):
     """Prints a formatted table of the bucket statistics."""
-    print("\n--- Bucket Statistics (Averages) ---")
+    print("\n--- Final Benchmark Set Statistics (Averages per Bucket) ---")
     if not buckets:
         print("No buckets to display statistics for.")
         return
@@ -595,47 +612,42 @@ def print_bucket_stats_table(buckets):
     print("-" * len(header))
 
     # Sort buckets by the lower bound of the token range for consistent order
-    sorted_bucket_keys = sorted(buckets.keys(), key=lambda x: x[0])
+    # Filter out empty buckets before sorting and printing
+    sorted_bucket_keys = sorted(
+        [key for key, items in buckets.items() if items], key=lambda x: x[0]
+    )
 
+    total_count = 0
     # Rows
     for bucket_key in sorted_bucket_keys:
         items = buckets[bucket_key]
         count = len(items)
+        total_count += count
         range_str = f"{bucket_key[0]} - {bucket_key[1]} tokens"
 
-        if count > 0:
-            # Calculate averages and round them to the nearest integer
-            avg_prompt_tokens = round(mean(item["prompt_tokens"] for item in items))
-            avg_expected_tokens = round(mean(item["expected_tokens"] for item in items))
-            avg_num_commits = round(mean(item["num_commits"] for item in items))
-            avg_lines_added = round(mean(item["lines_added"] for item in items))
-            avg_lines_deleted = round(mean(item["lines_deleted"] for item in items))
-            avg_final_lines = round(mean(item["final_lines"] for item in items))
+        # Calculate averages and round them to the nearest integer
+        avg_prompt_tokens = round(mean(item["prompt_tokens"] for item in items))
+        avg_expected_tokens = round(mean(item["expected_tokens"] for item in items))
+        avg_num_commits = round(mean(item["num_commits"] for item in items))
+        avg_lines_added = round(mean(item["lines_added"] for item in items))
+        avg_lines_deleted = round(mean(item["lines_deleted"] for item in items))
+        avg_final_lines = round(mean(item["final_lines"] for item in items))
 
-            # Format rounded averages as integers (:d)
-            row = (
-                f"{range_str:<{col_widths['bucket_range']}} | "
-                f"{count:>{col_widths['count']}} | "
-                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']}d} | "
-                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']}d} | "
-                f"{avg_num_commits:>{col_widths['avg_num_commits']}d} | "
-                f"{avg_lines_added:>{col_widths['avg_lines_added']}d} | "
-                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']}d} | "
-                f"{avg_final_lines:>{col_widths['avg_final_lines']}d}"
-            )
-        else:
-            # Display empty buckets clearly
-            row = (
-                f"{range_str:<{col_widths['bucket_range']}} | "
-                f"{count:>{col_widths['count']}} | "
-                f"{'-':>{col_widths['avg_prompt_tokens']}} | "
-                f"{'-':>{col_widths['avg_expected_tokens']}} | "
-                f"{'-':>{col_widths['avg_num_commits']}} | "
-                f"{'-':>{col_widths['avg_lines_added']}} | "
-                f"{'-':>{col_widths['avg_lines_deleted']}} | "
-                f"{'-':>{col_widths['avg_final_lines']}}"
-            )
+        # Format rounded averages as integers (:d)
+        row = (
+            f"{range_str:<{col_widths['bucket_range']}} | "
+            f"{count:>{col_widths['count']}} | "
+            f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']}d} | "
+            f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']}d} | "
+            f"{avg_num_commits:>{col_widths['avg_num_commits']}d} | "
+            f"{avg_lines_added:>{col_widths['avg_lines_added']}d} | "
+            f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']}d} | "
+            f"{avg_final_lines:>{col_widths['avg_final_lines']}d}"
+        )
         print(row)
+
+    print("-" * len(header))
+    print(f"Total prompts in final set: {total_count}")
 
 
 # --- Model Interaction (Async) ---
