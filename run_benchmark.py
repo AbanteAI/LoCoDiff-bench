@@ -161,6 +161,8 @@ async def run_single_benchmark(
 
             # --- Get Generation Stats (Async) ---
             if generation_id:
+                # Add a small delay as stats might not be immediately available
+                await asyncio.sleep(0.5)
                 stats = await get_generation_stats_openrouter(generation_id)
                 if stats:
                     run_metadata.update(stats)
