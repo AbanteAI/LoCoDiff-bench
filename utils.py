@@ -103,31 +103,24 @@ def get_repo_head_commit_hash(repo_path):
         repo_path: Path to the cloned repository.
 
     Returns:
-        The full commit hash as a string, or None on failure.
+        The full commit hash as a string.
+
+    Raises:
+        subprocess.CalledProcessError: If git command fails.
+        FileNotFoundError: If git command is not found.
     """
-    try:
-        # Get commit hash
-        hash_result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_path,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-        commit_hash = hash_result.stdout.strip()
-        return commit_hash
-    except subprocess.CalledProcessError as e:
-        print(
-            f"\nWarning: Error getting HEAD commit hash for repository at {repo_path}: {e}"
-        )
-        return None
-    except FileNotFoundError:
-        print(
-            f"\nWarning: git command not found. Unable to get HEAD commit hash for {repo_path}"
-        )
-        return None
+    # Get commit hash - will raise an exception if it fails
+    hash_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    commit_hash = hash_result.stdout.strip()
+    return commit_hash
 
 
 # Global tiktoken encoder instance
@@ -199,10 +192,7 @@ def generate_prompts_and_expected(
     # Get repository head commit hash
     print(f"Getting head commit hash for {full_repo_name}...")
     head_commit_hash = get_repo_head_commit_hash(repo_path)
-    if head_commit_hash:
-        print(f"Repository at commit: {head_commit_hash}")
-    else:
-        print("Could not determine repository head commit hash")
+    print(f"Repository at commit: {head_commit_hash}")
 
     # First, collect all files matching the extensions
     for root, _, files in os.walk(repo_path):
@@ -352,7 +342,7 @@ print('Hello, world!')
         # Repository information section
         "repository": {
             "name": full_repo_name,
-            "head_commit_hash": head_commit_hash or "unknown",
+            "head_commit_hash": head_commit_hash,
         },
         # Files section to store all file entries
         "files": {},
