@@ -4,7 +4,7 @@ import re
 import subprocess
 import tiktoken
 import openai
-import requests  # Added for querying generation stats
+import aiohttp  # For async requests
 from dotenv import load_dotenv
 import math
 from collections import defaultdict
@@ -638,15 +638,36 @@ def print_bucket_stats_table(buckets):
         print(row)
 
 
-# --- Model Interaction ---
+# --- Model Interaction (Async) ---
+
+# Global async client instance
+_ASYNC_CLIENT = None
 
 
-def get_model_response_openrouter(
+def _get_async_openai_client():
+    """Initializes and returns the async OpenAI client for OpenRouter."""
+    global _ASYNC_CLIENT
+    if _ASYNC_CLIENT is None:
+        load_dotenv()
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY not found in environment variables. "
+                "Ensure it's set in a .env file or exported."
+            )
+        _ASYNC_CLIENT = openai.AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+    return _ASYNC_CLIENT
+
+
+async def get_model_response_openrouter(
     prompt_content: str, model_name: str
 ) -> tuple[str, str | None]:
     """
-    Sends a prompt to a specified model via OpenRouter and returns the response content
-    and the generation ID.
+    Sends a prompt to a specified model via OpenRouter asynchronously and returns
+    the response content and the generation ID.
 
     Args:
         prompt_content: The full content of the prompt to send to the model.
@@ -661,23 +682,10 @@ def get_model_response_openrouter(
         ValueError: If the OPENROUTER_API_KEY environment variable is not set.
         openai.APIError: If there's an issue communicating with the OpenRouter API.
     """
-    load_dotenv()  # Load environment variables from .env file
-
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "OPENROUTER_API_KEY not found in environment variables. "
-            "Ensure it's set in a .env file or exported."
-        )
-
-    # Configure the OpenAI client for OpenRouter
-    client = openai.OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
+    client = _get_async_openai_client()
 
     try:
-        completion = client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model=model_name,
             messages=[
                 {
@@ -697,26 +705,30 @@ def get_model_response_openrouter(
         if completion.choices and completion.choices[0].message:
             response_content = completion.choices[0].message.content or ""
 
-        # Extract generation ID (assuming it's in the top-level response object)
+        # Extract generation ID
         if hasattr(completion, "id") and isinstance(completion.id, str):
             generation_id = completion.id
         else:
-            print("Warning: Could not extract generation ID from OpenRouter response.")
-            print(f"Full response object: {completion}")  # Log for debugging
+            # Log the full response if ID extraction fails, might reveal structure changes
+            print(
+                f"Warning: Could not extract generation ID from OpenRouter response object: {completion}"
+            )
 
         return response_content, generation_id
 
     except openai.APIError as e:
-        print(f"OpenRouter API error during chat completion: {e}")
-        raise  # Re-raise the exception to be handled by the caller
+        print(f"OpenRouter API error during async chat completion: {e}")
+        raise
     except Exception as e:
-        print(f"An unexpected error occurred during the chat completion API call: {e}")
-        raise  # Re-raise other potential exceptions
+        print(
+            f"An unexpected error occurred during the async chat completion API call: {e}"
+        )
+        raise
 
 
-def get_generation_stats_openrouter(generation_id: str) -> dict | None:
+async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
     """
-    Queries the OpenRouter Generation Stats API for cost and token information.
+    Queries the OpenRouter Generation Stats API asynchronously for cost and token information.
 
     Args:
         generation_id: The ID of the generation to query (e.g., "gen-12345").
@@ -736,12 +748,10 @@ def get_generation_stats_openrouter(generation_id: str) -> dict | None:
 
     Raises:
         ValueError: If the OPENROUTER_API_KEY environment variable is not set.
-        requests.exceptions.RequestException: If there's an issue with the HTTP request.
     """
     load_dotenv()
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        # Raise ValueError instead of just printing, consistent with the other function
         raise ValueError(
             "OPENROUTER_API_KEY not found in environment variables for stats query."
         )
@@ -750,10 +760,12 @@ def get_generation_stats_openrouter(generation_id: str) -> dict | None:
     headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
-        response = requests.get(stats_url, headers=headers)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
-        response_data = response.json()
+        # Use aiohttp for the async request
+        async with aiohttp.ClientSession() as session:
+            async with session.get(stats_url, headers=headers) as response:
+                # Raise HTTPError for bad responses (4xx or 5xx)
+                response.raise_for_status()
+                response_data = await response.json()
 
         # Check if 'data' field exists and is not None
         if "data" in response_data and response_data["data"] is not None:
@@ -788,15 +800,23 @@ def get_generation_stats_openrouter(generation_id: str) -> dict | None:
             print(f"Full response: {response_data}")
             return None  # Indicate stats could not be retrieved
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error querying OpenRouter generation stats API: {e}")
-        # Don't raise here, allow benchmark to continue but log the error
+    except aiohttp.ClientResponseError as e:
+        # Catch specific aiohttp HTTP errors
+        print(
+            f"HTTP error querying OpenRouter generation stats API: {e.status} {e.message}"
+        )
+        return None  # Indicate stats could not be retrieved
+    except aiohttp.ClientError as e:
+        # Catch other aiohttp client errors (e.g., connection issues)
+        print(f"Client error querying OpenRouter generation stats API: {e}")
         return None  # Indicate stats could not be retrieved
     except json.JSONDecodeError as e:
         print(f"Error decoding JSON response from OpenRouter stats API: {e}")
-        # Removed print(response.text) as response might be unbound if request failed earlier
+        # Consider logging response.text() if needed, but handle potential exceptions
         return None  # Indicate stats could not be retrieved
     except Exception as e:
-        print(f"An unexpected error occurred during the stats API call: {e}")
-        # Don't raise here, allow benchmark to continue but log the error
+        print(f"An unexpected error occurred during the async stats API call: {e}")
+        # Log traceback for unexpected errors
+        # import traceback
+        # traceback.print_exc()
         return None  # Indicate stats could not be retrieved
