@@ -95,21 +95,15 @@ def clone_repo_to_cache(repo_name):
         raise
 
 
-def get_repo_head_commit(repo_path):
+def get_repo_head_commit_hash(repo_path):
     """
-    Get information about the HEAD commit of a repository.
+    Get the HEAD commit hash of a repository.
 
     Args:
         repo_path: Path to the cloned repository.
 
     Returns:
-        A dictionary containing information about the HEAD commit, or None on failure.
-        The dictionary includes:
-        - 'hash': The full commit hash
-        - 'short_hash': First 7 characters of the hash
-        - 'timestamp': ISO format timestamp
-        - 'author': Author name and email
-        - 'message': Commit message (first line only)
+        The full commit hash as a string, or None on failure.
     """
     try:
         # Get commit hash
@@ -123,52 +117,15 @@ def get_repo_head_commit(repo_path):
             errors="ignore",
         )
         commit_hash = hash_result.stdout.strip()
-
-        # Get commit details
-        details_result = subprocess.run(
-            [
-                "git",
-                "show",
-                "--no-patch",
-                "--format=%h%n%ci%n%an <%ae>%n%s",
-                commit_hash,
-            ],
-            cwd=repo_path,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-
-        # Parse the details (short hash, timestamp, author, message)
-        details_lines = details_result.stdout.strip().split("\n")
-        if len(details_lines) >= 4:
-            short_hash = details_lines[0].strip()
-            timestamp = details_lines[1].strip()
-            author = details_lines[2].strip()
-            message = details_lines[3].strip()
-
-            return {
-                "hash": commit_hash,
-                "short_hash": short_hash,
-                "timestamp": timestamp,
-                "author": author,
-                "message": message,
-            }
-        else:
-            print(
-                f"\nWarning: Could not parse commit details for repository at {repo_path}"
-            )
-            return None
+        return commit_hash
     except subprocess.CalledProcessError as e:
         print(
-            f"\nWarning: Error getting HEAD commit info for repository at {repo_path}: {e}"
+            f"\nWarning: Error getting HEAD commit hash for repository at {repo_path}: {e}"
         )
         return None
     except FileNotFoundError:
         print(
-            f"\nWarning: git command not found. Unable to get HEAD commit for {repo_path}"
+            f"\nWarning: git command not found. Unable to get HEAD commit hash for {repo_path}"
         )
         return None
 
@@ -239,15 +196,13 @@ def generate_prompts_and_expected(
     stats_list = []
     files_to_process = []
 
-    # Get repository head commit information
-    print(f"Getting head commit information for {full_repo_name}...")
-    repo_head_commit = get_repo_head_commit(repo_path)
-    if repo_head_commit:
-        print(
-            f"Repository at commit: {repo_head_commit['short_hash']} - {repo_head_commit['message']}"
-        )
+    # Get repository head commit hash
+    print(f"Getting head commit hash for {full_repo_name}...")
+    head_commit_hash = get_repo_head_commit_hash(repo_path)
+    if head_commit_hash:
+        print(f"Repository at commit: {head_commit_hash}")
     else:
-        print("Could not determine repository commit information")
+        print("Could not determine repository head commit hash")
 
     # First, collect all files matching the extensions
     for root, _, files in os.walk(repo_path):
@@ -395,9 +350,7 @@ print('Hello, world!')
     metadata = {
         "repository_info": {
             "name": full_repo_name,
-            "head_commit": repo_head_commit
-            if repo_head_commit
-            else {"error": "Could not determine head commit"},
+            "head_commit_hash": head_commit_hash or "unknown",
         }
     }
 
