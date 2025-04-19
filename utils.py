@@ -4,6 +4,7 @@ import re
 import subprocess
 import tiktoken
 import openai
+import requests  # Added for querying generation stats
 from dotenv import load_dotenv
 import math
 from collections import defaultdict
@@ -594,16 +595,21 @@ def print_bucket_stats_table(buckets):
 # --- Model Interaction ---
 
 
-def get_model_response_openrouter(prompt_content: str, model_name: str) -> str:
+def get_model_response_openrouter(
+    prompt_content: str, model_name: str
+) -> tuple[str, str | None]:
     """
-    Sends a prompt to a specified model via OpenRouter and returns the response.
+    Sends a prompt to a specified model via OpenRouter and returns the response content
+    and the generation ID.
 
     Args:
         prompt_content: The full content of the prompt to send to the model.
         model_name: The identifier of the model on OpenRouter (e.g., 'openai/gpt-4o').
 
     Returns:
-        The content of the model's response message.
+        A tuple containing:
+        - The content of the model's response message (str).
+        - The generation ID (str) if available, otherwise None.
 
     Raises:
         ValueError: If the OPENROUTER_API_KEY environment variable is not set.
@@ -619,7 +625,6 @@ def get_model_response_openrouter(prompt_content: str, model_name: str) -> str:
         )
 
     # Configure the OpenAI client for OpenRouter
-    # Using the openai library >= 1.0.0
     client = openai.OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
@@ -636,20 +641,116 @@ def get_model_response_openrouter(prompt_content: str, model_name: str) -> str:
             ],
             # Optional: Add other parameters like temperature, max_tokens if needed
             # temperature=0.7,
-            # max_tokens=2000, # Example: Set a token limit if needed
+            # max_tokens=2000,
         )
-        # Ensure response structure is as expected before accessing content
+
+        response_content = ""
+        generation_id = None
+
+        # Extract content
         if completion.choices and completion.choices[0].message:
-            response_content = completion.choices[0].message.content
-            return response_content if response_content is not None else ""
+            response_content = completion.choices[0].message.content or ""
+
+        # Extract generation ID (assuming it's in the top-level response object)
+        if hasattr(completion, "id") and isinstance(completion.id, str):
+            generation_id = completion.id
         else:
-            # Handle unexpected response structure
-            print("Warning: Unexpected response structure from OpenRouter.")
-            print(f"Full response: {completion}")
-            return ""  # Return empty string or raise an error
+            print("Warning: Could not extract generation ID from OpenRouter response.")
+            print(f"Full response object: {completion}")  # Log for debugging
+
+        return response_content, generation_id
+
     except openai.APIError as e:
-        print(f"OpenRouter API error: {e}")
+        print(f"OpenRouter API error during chat completion: {e}")
         raise  # Re-raise the exception to be handled by the caller
     except Exception as e:
-        print(f"An unexpected error occurred during the API call: {e}")
+        print(f"An unexpected error occurred during the chat completion API call: {e}")
         raise  # Re-raise other potential exceptions
+
+
+def get_generation_stats_openrouter(generation_id: str) -> dict | None:
+    """
+    Queries the OpenRouter Generation Stats API for cost and token information.
+
+    Args:
+        generation_id: The ID of the generation to query (e.g., "gen-12345").
+
+    Returns:
+        A dictionary containing statistics like cost and token counts, or None if
+        the query fails or the API key is missing.
+        Example return format:
+        {
+            'cost_usd': float,
+            'prompt_tokens': int,
+            'completion_tokens': int,
+            'total_tokens': int,
+            'native_prompt_tokens': int | None,
+            'native_completion_tokens': int | None
+        }
+
+    Raises:
+        ValueError: If the OPENROUTER_API_KEY environment variable is not set.
+        requests.exceptions.RequestException: If there's an issue with the HTTP request.
+    """
+    load_dotenv()
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        # Raise ValueError instead of just printing, consistent with the other function
+        raise ValueError(
+            "OPENROUTER_API_KEY not found in environment variables for stats query."
+        )
+
+    stats_url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        response = requests.get(stats_url, headers=headers)
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+
+        response_data = response.json()
+
+        # Check if 'data' field exists and is not None
+        if "data" in response_data and response_data["data"] is not None:
+            stats_data = response_data["data"]
+            # Extract relevant fields, providing defaults or None if missing
+            cost_usd = stats_data.get("total_cost", 0.0)
+            prompt_tokens = stats_data.get("tokens_prompt", 0)
+            completion_tokens = stats_data.get("tokens_completion", 0)
+            native_prompt_tokens = stats_data.get("native_tokens_prompt")  # Can be None
+            native_completion_tokens = stats_data.get(
+                "native_tokens_completion"
+            )  # Can be None
+
+            return {
+                "cost_usd": float(cost_usd) if cost_usd is not None else 0.0,
+                "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else 0,
+                "completion_tokens": int(completion_tokens)
+                if completion_tokens is not None
+                else 0,
+                "total_tokens": (int(prompt_tokens or 0) + int(completion_tokens or 0)),
+                "native_prompt_tokens": int(native_prompt_tokens)
+                if native_prompt_tokens is not None
+                else None,
+                "native_completion_tokens": int(native_completion_tokens)
+                if native_completion_tokens is not None
+                else None,
+            }
+        else:
+            print(
+                f"Warning: 'data' field missing or null in OpenRouter stats response for ID {generation_id}."
+            )
+            print(f"Full response: {response_data}")
+            return None  # Indicate stats could not be retrieved
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error querying OpenRouter generation stats API: {e}")
+        # Don't raise here, allow benchmark to continue but log the error
+        return None  # Indicate stats could not be retrieved
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON response from OpenRouter stats API: {e}")
+        print(f"Response text: {response.text}")
+        return None  # Indicate stats could not be retrieved
+    except Exception as e:
+        print(f"An unexpected error occurred during the stats API call: {e}")
+        # Don't raise here, allow benchmark to continue but log the error
+        return None  # Indicate stats could not be retrieved
