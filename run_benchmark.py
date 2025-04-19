@@ -51,29 +51,56 @@ def find_benchmark_cases(benchmark_dir: str) -> list[str]:
     return sorted(list(prefixes))
 
 
-def check_if_already_run(
+def get_previous_run_status(
     benchmark_case_prefix: str, model: str, results_base_dir: str
-) -> bool:
-    """Checks if *any* result directory exists for this case/model, indicating it has been run."""
+) -> tuple[bool, float]:
+    """
+    Checks if a case/model has been run previously and returns its status and cost.
+
+    Returns:
+        A tuple (was_run: bool, cost: float).
+        - was_run is True if any result directory exists.
+        - cost is the cost_usd from the *latest* run's metadata, or 0.0 if
+          no run exists, metadata is missing/unreadable, or cost is not recorded.
+    """
     sanitized_model_name = sanitize_filename(model)
-    # Look for any timestamped directory within the case/model structure
     pattern = os.path.join(
         results_base_dir, benchmark_case_prefix, sanitized_model_name, "*"
     )
     potential_dirs = glob.glob(pattern)
 
-    for result_dir in potential_dirs:
-        # If we find any directory matching the pattern, it means a run was attempted.
-        # We don't need to check metadata.json or success status anymore.
-        if os.path.isdir(result_dir):
-            # Check if it looks like a timestamp directory (e.g., YYYYMMDD_HHMMSS)
-            # This is a basic check to avoid matching unrelated directories if any exist.
-            dir_name = os.path.basename(result_dir)
-            if re.match(r"\d{8}_\d{6}", dir_name):
-                return True  # Found evidence of a previous run attempt
+    latest_dir = None
+    latest_timestamp = ""
 
-    # No directory indicating a previous run attempt was found
-    return False
+    for result_dir in potential_dirs:
+        if not os.path.isdir(result_dir):
+            continue
+        dir_name = os.path.basename(result_dir)
+        # Check if it looks like a timestamp directory and find the latest
+        if re.match(r"\d{8}_\d{6}", dir_name):
+            if dir_name > latest_timestamp:
+                latest_timestamp = dir_name
+                latest_dir = result_dir
+
+    if latest_dir is None:
+        return False, 0.0  # Not run
+
+    # Found at least one run attempt, try to get cost from the latest
+    metadata_path = os.path.join(latest_dir, "metadata.json")
+    cost = 0.0
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            # Get cost, default to 0.0 if key missing or value is None/invalid
+            cost = float(metadata.get("cost_usd", 0.0) or 0.0)
+        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
+            print(
+                f"Warning: Could not read/parse metadata or cost for {latest_dir}: {e}"
+            )
+            cost = 0.0 # Treat as 0 cost if metadata is problematic
+
+    return True, cost # Was run, return cost (might be 0.0)
 
 
 async def run_single_benchmark(
@@ -304,21 +331,28 @@ async def main():
     print(f"Found {len(all_cases)} total benchmark cases.")
 
     already_run_cases = set()
-    print("Checking for existing results (any previous run attempt)...")
+    total_previous_cost = 0.0
+    print("Checking for existing results and calculating previous costs...")
     for case_prefix in all_cases:
-        # Use the renamed function
-        if check_if_already_run(case_prefix, args.model, args.results_dir):
+        was_run, cost = get_previous_run_status(
+            case_prefix, args.model, args.results_dir
+        )
+        if was_run:
             already_run_cases.add(case_prefix)
+            total_previous_cost += cost
 
     print(
-        f"{len(already_run_cases)}/{len(all_cases)} cases have already been run (attempted) for model '{args.model}'."
+        f"{len(already_run_cases)}/{len(all_cases)} cases have already been run for model '{args.model}'."
     )
+    print(f"Total cost of previously run cases: ${total_previous_cost:.6f}")
+    print("-" * 30)
+
 
     # Determine cases to run (those not in the already_run_cases set)
     cases_to_run_all = [case for case in all_cases if case not in already_run_cases]
 
     if not cases_to_run_all:
-        print("All benchmark cases for this model are already completed.")
+        print("No remaining benchmark cases to run for this model.")
         print("--- Benchmark Run Complete ---")
         return 0
 
@@ -361,10 +395,10 @@ async def main():
     # Run tasks and collect results (metadata dictionaries or exceptions)
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Process results
+    # Process results of newly run benchmarks
     success_count = 0
     failure_count = 0
-    total_cost = 0.0
+    total_new_cost = 0.0 # Cost for runs executed in this session
 
     for result in results:
         if isinstance(result, Exception):
@@ -376,7 +410,7 @@ async def main():
         elif isinstance(result, dict):
             # Got metadata back from run_single_benchmark
             # Accumulate cost regardless of success/failure, if available
-            total_cost += result.get("cost_usd", 0.0)
+            total_new_cost += result.get("cost_usd", 0.0)
 
             if result.get("success"):
                 success_count += 1
@@ -391,12 +425,15 @@ async def main():
 
     print("\n--- Benchmark Run Summary ---")
     print(f"Model: {args.model}")
-    print(f"Attempted: {len(results)} benchmarks")
-    print(f"Successful: {success_count}")
-    print(f"Failed: {failure_count}")
-    print(f"Total Cost (All Attempted Runs): ${total_cost:.6f}")
+    print(f"Attempted in this run: {len(results)} benchmarks")
+    print(f"Successful this run: {success_count}")
+    print(f"Failed this run: {failure_count}")
+    print(f"Cost of this run: ${total_new_cost:.6f}")
+    print(f"Total cost of previous runs: ${total_previous_cost:.6f}")
+    print(f"Overall total cost (previous + current): ${total_previous_cost + total_new_cost:.6f}")
     print("--- Benchmark Run Complete ---")
 
+    # Return failure if any benchmarks failed *in this run*
     return 1 if failure_count > 0 else 0
 
 
