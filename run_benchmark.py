@@ -375,9 +375,11 @@ async def main():
             failure_count += 1
         elif isinstance(result, dict):
             # Got metadata back from run_single_benchmark
+            # Accumulate cost regardless of success/failure, if available
+            total_cost += result.get("cost_usd", 0.0)
+
             if result.get("success"):
                 success_count += 1
-                total_cost += result.get("cost_usd", 0.0)
                 # Individual success/cost already printed in run_single_benchmark
             else:
                 failure_count += 1
@@ -392,7 +394,7 @@ async def main():
     print(f"Attempted: {len(results)} benchmarks")
     print(f"Successful: {success_count}")
     print(f"Failed: {failure_count}")
-    print(f"Total Cost (Successful Runs): ${total_cost:.6f}")
+    print(f"Total Cost (All Attempted Runs): ${total_cost:.6f}")
     print("--- Benchmark Run Complete ---")
 
     return 1 if failure_count > 0 else 0
