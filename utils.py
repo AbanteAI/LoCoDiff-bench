@@ -96,6 +96,34 @@ def clone_repo_to_cache(repo_name):
         raise
 
 
+def get_repo_head_commit_hash(repo_path):
+    """
+    Get the HEAD commit hash of a repository.
+
+    Args:
+        repo_path: Path to the cloned repository.
+
+    Returns:
+        The full commit hash as a string.
+
+    Raises:
+        subprocess.CalledProcessError: If git command fails.
+        FileNotFoundError: If git command is not found.
+    """
+    # Get commit hash - will raise an exception if it fails
+    hash_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    commit_hash = hash_result.stdout.strip()
+    return commit_hash
+
+
 # Global tiktoken encoder instance
 _ENCODER = None
 
@@ -157,8 +185,15 @@ def generate_prompts_and_expected(
         os.makedirs(output_dir, exist_ok=True)
 
     repo_name = os.path.basename(os.path.normpath(repo_path))
+    org_name = os.path.basename(os.path.dirname(repo_path))
+    full_repo_name = f"{org_name}/{repo_name}"
     stats_list = []
     files_to_process = []
+
+    # Get repository head commit hash
+    print(f"Getting head commit hash for {full_repo_name}...")
+    head_commit_hash = get_repo_head_commit_hash(repo_path)
+    print(f"Repository at commit: {head_commit_hash}")
 
     # First, collect all files matching the extensions
     for root, _, files in os.walk(repo_path):
@@ -303,8 +338,20 @@ print('Hello, world!')
         stats_list.append(file_stats)
 
     # After processing all files, save the metadata
+    # Create a structured metadata with clear sections
     metadata = {
-        stats["filename"]: {
+        # Repository information section
+        "repository": {
+            "name": full_repo_name,
+            "head_commit_hash": head_commit_hash,
+        },
+        # Files section to store all file entries
+        "files": {},
+    }
+
+    # Add file statistics to the files section
+    for stats in stats_list:
+        metadata["files"][stats["filename"]] = {
             "prompt_filename": stats["prompt_filename"],
             "expected_filename": stats["expected_filename"],
             "stats": {
@@ -316,8 +363,7 @@ print('Hello, world!')
                 "final_lines": stats["final_lines"],
             },
         }
-        for stats in stats_list
-    }
+
     metadata_path = os.path.join(output_dir, "metadata.json")
     try:
         with open(metadata_path, "w", encoding="utf-8") as mf:
