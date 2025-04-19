@@ -280,8 +280,8 @@ async def main():
     parser.add_argument(
         "--num-runs",
         type=int,
-        default=-1,
-        help="Maximum number of new benchmarks to run. -1 for all remaining (default: -1).",
+        default=0,
+        help="Maximum number of new benchmarks to run. Set to -1 to run all remaining. (default: 0 - just show status).",
     )
     parser.add_argument(
         "--concurrency",
@@ -297,7 +297,7 @@ async def main():
     print(f"Benchmark Directory: {args.benchmark_dir}")
     print(f"Results Base Directory: {args.results_dir}")
     print(f"Concurrency: {args.concurrency}")
-    print(f"Max New Runs: {'All' if args.num_runs == -1 else args.num_runs}")
+    print(f"Max New Runs: {'All Remaining' if args.num_runs == -1 else args.num_runs}")
     print("-" * 30)
 
     all_cases = find_benchmark_cases(args.benchmark_dir)
@@ -324,21 +324,31 @@ async def main():
         print("--- Benchmark Run Complete ---")
         return 0
 
-    # Apply limit if specified
-    if args.num_runs == -1:
+    # Determine cases to run based on limit
+    if args.num_runs == 0:
+        cases_to_run_limited = []
+        print(
+            "Running in informational mode (num-runs=0). No new benchmarks will be executed."
+        )
+    elif args.num_runs == -1:
         cases_to_run_limited = cases_to_run_all
+        print(
+            f"Preparing to run all {len(cases_to_run_limited)} remaining benchmarks..."
+        )
     else:
         cases_to_run_limited = cases_to_run_all[: args.num_runs]
         if not cases_to_run_limited:
+            # This covers cases where num_runs > 0 but no cases are left within the slice
+            print("Limit specified, but no remaining cases to run within that limit.")
+        else:
             print(
-                "Limit reached or no remaining cases within limit. No new benchmarks to run."
+                f"Preparing to run up to {args.num_runs} new benchmarks ({len(cases_to_run_limited)} available within limit)..."
             )
-            print("--- Benchmark Run Complete ---")
-            return 0
 
-    print(
-        f"Attempting to run {len(cases_to_run_limited)} new benchmarks (out of {len(cases_to_run_all)} remaining)..."
-    )
+    if not cases_to_run_limited:
+        # This handles both num_runs=0 and cases where the limit is met/exceeded
+        print("--- Benchmark Run Complete ---")
+        return 0
 
     semaphore = asyncio.Semaphore(args.concurrency)
     tasks = [
