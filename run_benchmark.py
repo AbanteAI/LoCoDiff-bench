@@ -51,10 +51,10 @@ def find_benchmark_cases(benchmark_dir: str) -> list[str]:
     return sorted(list(prefixes))
 
 
-def check_existing_success(
+def check_if_already_run(
     benchmark_case_prefix: str, model: str, results_base_dir: str
 ) -> bool:
-    """Checks if a successful result already exists for this case/model."""
+    """Checks if *any* result directory exists for this case/model, indicating it has been run."""
     sanitized_model_name = sanitize_filename(model)
     # Look for any timestamped directory within the case/model structure
     pattern = os.path.join(
@@ -63,22 +63,16 @@ def check_existing_success(
     potential_dirs = glob.glob(pattern)
 
     for result_dir in potential_dirs:
-        if not os.path.isdir(result_dir):
-            continue
-        metadata_path = os.path.join(result_dir, "metadata.json")
-        if os.path.exists(metadata_path):
-            try:
-                with open(metadata_path, "r", encoding="utf-8") as f:
-                    metadata = json.load(f)
-                if metadata.get("success") is True:
-                    # Found at least one successful run
-                    return True
-            except (json.JSONDecodeError, IOError) as e:
-                print(
-                    f"Warning: Could not read or parse existing metadata {metadata_path}: {e}"
-                )
-                continue  # Try other directories if possible
-    # No successful run found
+        # If we find any directory matching the pattern, it means a run was attempted.
+        # We don't need to check metadata.json or success status anymore.
+        if os.path.isdir(result_dir):
+            # Check if it looks like a timestamp directory (e.g., YYYYMMDD_HHMMSS)
+            # This is a basic check to avoid matching unrelated directories if any exist.
+            dir_name = os.path.basename(result_dir)
+            if re.match(r"\d{8}_\d{6}", dir_name):
+                return True  # Found evidence of a previous run attempt
+
+    # No directory indicating a previous run attempt was found
     return False
 
 
@@ -309,17 +303,19 @@ async def main():
 
     print(f"Found {len(all_cases)} total benchmark cases.")
 
-    completed_cases = set()
-    print("Checking for existing successful results...")
+    already_run_cases = set()
+    print("Checking for existing results (any previous run attempt)...")
     for case_prefix in all_cases:
-        if check_existing_success(case_prefix, args.model, args.results_dir):
-            completed_cases.add(case_prefix)
+        # Use the renamed function
+        if check_if_already_run(case_prefix, args.model, args.results_dir):
+            already_run_cases.add(case_prefix)
 
     print(
-        f"{len(completed_cases)}/{len(all_cases)} cases already successfully completed for model '{args.model}'."
+        f"{len(already_run_cases)}/{len(all_cases)} cases have already been run (attempted) for model '{args.model}'."
     )
 
-    cases_to_run_all = [case for case in all_cases if case not in completed_cases]
+    # Determine cases to run (those not in the already_run_cases set)
+    cases_to_run_all = [case for case in all_cases if case not in already_run_cases]
 
     if not cases_to_run_all:
         print("All benchmark cases for this model are already completed.")
