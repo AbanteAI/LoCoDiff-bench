@@ -355,7 +355,7 @@ print('Hello, world!')
             "head_commit_hash": head_commit_hash or "unknown",
         },
         # Files section to store all file entries
-        "files": {}
+        "files": {},
     }
 
     # Add file statistics to the files section
