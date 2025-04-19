@@ -347,16 +347,20 @@ print('Hello, world!')
         stats_list.append(file_stats)
 
     # After processing all files, save the metadata
+    # Create a structured metadata with clear sections
     metadata = {
-        "repository_info": {
+        # Repository information section
+        "repository": {
             "name": full_repo_name,
             "head_commit_hash": head_commit_hash or "unknown",
-        }
+        },
+        # Files section to store all file entries
+        "files": {}
     }
 
-    # Add file statistics to metadata
+    # Add file statistics to the files section
     for stats in stats_list:
-        metadata[stats["filename"]] = {
+        metadata["files"][stats["filename"]] = {
             "prompt_filename": stats["prompt_filename"],
             "expected_filename": stats["expected_filename"],
             "stats": {
