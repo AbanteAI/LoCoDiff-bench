@@ -98,9 +98,9 @@ def get_previous_run_status(
             print(
                 f"Warning: Could not read/parse metadata or cost for {latest_dir}: {e}"
             )
-            cost = 0.0 # Treat as 0 cost if metadata is problematic
+            cost = 0.0  # Treat as 0 cost if metadata is problematic
 
-    return True, cost # Was run, return cost (might be 0.0)
+    return True, cost  # Was run, return cost (might be 0.0)
 
 
 async def run_single_benchmark(
@@ -347,7 +347,6 @@ async def main():
     print(f"Total cost of previously run cases: ${total_previous_cost:.6f}")
     print("-" * 30)
 
-
     # Determine cases to run (those not in the already_run_cases set)
     cases_to_run_all = [case for case in all_cases if case not in already_run_cases]
 
@@ -398,7 +397,7 @@ async def main():
     # Process results of newly run benchmarks
     success_count = 0
     failure_count = 0
-    total_new_cost = 0.0 # Cost for runs executed in this session
+    total_new_cost = 0.0  # Cost for runs executed in this session
 
     for result in results:
         if isinstance(result, Exception):
@@ -410,7 +409,8 @@ async def main():
         elif isinstance(result, dict):
             # Got metadata back from run_single_benchmark
             # Accumulate cost regardless of success/failure, if available
-            total_new_cost += result.get("cost_usd", 0.0)
+            # Use 'or 0.0' to handle cases where cost_usd might be None
+            total_new_cost += result.get("cost_usd") or 0.0
 
             if result.get("success"):
                 success_count += 1
@@ -430,7 +430,9 @@ async def main():
     print(f"Failed this run: {failure_count}")
     print(f"Cost of this run: ${total_new_cost:.6f}")
     print(f"Total cost of previous runs: ${total_previous_cost:.6f}")
-    print(f"Overall total cost (previous + current): ${total_previous_cost + total_new_cost:.6f}")
+    print(
+        f"Overall total cost (previous + current): ${total_previous_cost + total_new_cost:.6f}"
+    )
     print("--- Benchmark Run Complete ---")
 
     # Return failure if any benchmarks failed *in this run*
