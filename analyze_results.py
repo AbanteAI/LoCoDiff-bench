@@ -4,13 +4,13 @@ import os
 import json
 import glob
 import re
-from collections import defaultdict
 import sys
 
 # Attempt to import pandas and matplotlib, provide guidance if missing
 try:
     import pandas as pd
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker  # Import ticker for FuncFormatter
 except ImportError as e:
     print(
         f"Error importing libraries: {e}. Please ensure pandas and matplotlib are installed."
@@ -123,9 +123,14 @@ def analyze_results(benchmark_metadata: dict, results_base_dir: str) -> dict:
             "bucket_keys": list[str] # Sorted list of bucket keys like "0-20000"
         }
     """
-    analysis = {"models": defaultdict(lambda: defaultdict(lambda: 0.0))}
+    # Initialize analysis structure explicitly
+    analysis: dict[str, Any] = {"models": {}}
     models_found_in_results = find_models_in_results(results_base_dir)
-    all_bucket_keys = sorted(benchmark_metadata["benchmark_buckets"].keys())
+    # Ensure bucket keys are sorted for consistent processing and output
+    all_bucket_keys = sorted(
+        benchmark_metadata.get("benchmark_buckets", {}).keys(),
+        key=lambda k: int(k.split("-")[0]),  # Sort numerically by lower bound
+    )
     analysis["bucket_keys"] = all_bucket_keys
 
     print(f"Found models in results directory: {models_found_in_results}")
@@ -133,7 +138,7 @@ def analyze_results(benchmark_metadata: dict, results_base_dir: str) -> dict:
 
     # Initialize structure for all models found and all defined buckets
     for model_name in models_found_in_results:
-        model_stats = {
+        analysis["models"][model_name] = {
             "total_benchmarks": 0,
             "runs_found": 0,
             "successful_runs": 0,
@@ -149,10 +154,17 @@ def analyze_results(benchmark_metadata: dict, results_base_dir: str) -> dict:
                 for key in all_bucket_keys
             },
         }
-        analysis["models"][model_name] = model_stats
 
     # Iterate through the defined benchmark structure
-    for bucket_key, benchmark_cases in benchmark_metadata["benchmark_buckets"].items():
+    defined_buckets = benchmark_metadata.get("benchmark_buckets", {})
+    if not defined_buckets:
+        print(
+            "Warning: No benchmark buckets found in metadata. Analysis might be empty."
+        )
+        # Return the initialized (empty) structure
+        return analysis
+
+    for bucket_key, benchmark_cases in defined_buckets.items():
         for case_info in benchmark_cases:
             benchmark_case_prefix = case_info["benchmark_case_prefix"]
 
@@ -279,12 +291,15 @@ def generate_plot(analysis_results: dict, output_filename: str):
     plt.xlabel("Prompt Token Bucket")
     plt.ylabel("Success Rate")
     # Format y-axis as percentage
-    plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    plt.gca().yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda y, _: f"{y:.0%}")
+    )  # Use mticker
     plt.ylim(0, 1.05)  # Extend slightly beyond 100%
     plt.xticks(x_indices, [f"{k} tk" for k in bucket_keys], rotation=45, ha="right")
     plt.legend(title="Models", bbox_to_anchor=(1.04, 1), loc="upper left")
     plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.tight_layout(rect=[0, 0, 0.85, 1])  # Adjust layout to make space for legend
+    # Use tuple for rect argument
+    plt.tight_layout(rect=(0, 0, 0.85, 1))  # Adjust layout to make space for legend
 
     # Save the plot
     try:
