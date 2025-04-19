@@ -239,22 +239,24 @@ def print_bucket_stats_table(buckets):
         range_str = f"{bucket_key[0]} - {bucket_key[1]} tokens"
 
         if count > 0:
-            avg_prompt_tokens = mean(item["prompt_tokens"] for item in items)
-            avg_expected_tokens = mean(item["expected_tokens"] for item in items)
-            avg_num_commits = mean(item["num_commits"] for item in items)
-            avg_lines_added = mean(item["lines_added"] for item in items)
-            avg_lines_deleted = mean(item["lines_deleted"] for item in items)
-            avg_final_lines = mean(item["final_lines"] for item in items)
+            # Calculate averages and round them to the nearest integer
+            avg_prompt_tokens = round(mean(item["prompt_tokens"] for item in items))
+            avg_expected_tokens = round(mean(item["expected_tokens"] for item in items))
+            avg_num_commits = round(mean(item["num_commits"] for item in items))
+            avg_lines_added = round(mean(item["lines_added"] for item in items))
+            avg_lines_deleted = round(mean(item["lines_deleted"] for item in items))
+            avg_final_lines = round(mean(item["final_lines"] for item in items))
 
+            # Format rounded averages as integers (:d)
             row = (
                 f"{range_str:<{col_widths['bucket_range']}} | "
                 f"{count:>{col_widths['count']}} | "
-                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']:.0f}} | "  # Use :.0f (integer format)
-                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']:.0f}} | "
-                f"{avg_num_commits:>{col_widths['avg_num_commits']:.0f}} | "
-                f"{avg_lines_added:>{col_widths['avg_lines_added']:.0f}} | "
-                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']:.0f}} | "
-                f"{avg_final_lines:>{col_widths['avg_final_lines']:.0f}}"
+                f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']}d} | "
+                f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']}d} | "
+                f"{avg_num_commits:>{col_widths['avg_num_commits']}d} | "
+                f"{avg_lines_added:>{col_widths['avg_lines_added']}d} | "
+                f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']}d} | "
+                f"{avg_final_lines:>{col_widths['avg_final_lines']}d}"
             )
         else:
             # Display empty buckets clearly
