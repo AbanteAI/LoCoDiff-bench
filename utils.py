@@ -95,6 +95,84 @@ def clone_repo_to_cache(repo_name):
         raise
 
 
+def get_repo_head_commit(repo_path):
+    """
+    Get information about the HEAD commit of a repository.
+
+    Args:
+        repo_path: Path to the cloned repository.
+
+    Returns:
+        A dictionary containing information about the HEAD commit, or None on failure.
+        The dictionary includes:
+        - 'hash': The full commit hash
+        - 'short_hash': First 7 characters of the hash
+        - 'timestamp': ISO format timestamp
+        - 'author': Author name and email
+        - 'message': Commit message (first line only)
+    """
+    try:
+        # Get commit hash
+        hash_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        commit_hash = hash_result.stdout.strip()
+
+        # Get commit details
+        details_result = subprocess.run(
+            [
+                "git",
+                "show",
+                "--no-patch",
+                "--format=%h%n%ci%n%an <%ae>%n%s",
+                commit_hash,
+            ],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+        # Parse the details (short hash, timestamp, author, message)
+        details_lines = details_result.stdout.strip().split("\n")
+        if len(details_lines) >= 4:
+            short_hash = details_lines[0].strip()
+            timestamp = details_lines[1].strip()
+            author = details_lines[2].strip()
+            message = details_lines[3].strip()
+
+            return {
+                "hash": commit_hash,
+                "short_hash": short_hash,
+                "timestamp": timestamp,
+                "author": author,
+                "message": message,
+            }
+        else:
+            print(
+                f"\nWarning: Could not parse commit details for repository at {repo_path}"
+            )
+            return None
+    except subprocess.CalledProcessError as e:
+        print(
+            f"\nWarning: Error getting HEAD commit info for repository at {repo_path}: {e}"
+        )
+        return None
+    except FileNotFoundError:
+        print(
+            f"\nWarning: git command not found. Unable to get HEAD commit for {repo_path}"
+        )
+        return None
+
+
 # Global tiktoken encoder instance
 _ENCODER = None
 
@@ -156,8 +234,20 @@ def generate_prompts_and_expected(
         os.makedirs(output_dir, exist_ok=True)
 
     repo_name = os.path.basename(os.path.normpath(repo_path))
+    org_name = os.path.basename(os.path.dirname(repo_path))
+    full_repo_name = f"{org_name}/{repo_name}"
     stats_list = []
     files_to_process = []
+
+    # Get repository head commit information
+    print(f"Getting head commit information for {full_repo_name}...")
+    repo_head_commit = get_repo_head_commit(repo_path)
+    if repo_head_commit:
+        print(
+            f"Repository at commit: {repo_head_commit['short_hash']} - {repo_head_commit['message']}"
+        )
+    else:
+        print("Could not determine repository commit information")
 
     # First, collect all files matching the extensions
     for root, _, files in os.walk(repo_path):
@@ -303,7 +393,17 @@ print('Hello, world!')
 
     # After processing all files, save the metadata
     metadata = {
-        stats["filename"]: {
+        "repository_info": {
+            "name": full_repo_name,
+            "head_commit": repo_head_commit
+            if repo_head_commit
+            else {"error": "Could not determine head commit"},
+        }
+    }
+
+    # Add file statistics to metadata
+    for stats in stats_list:
+        metadata[stats["filename"]] = {
             "prompt_filename": stats["prompt_filename"],
             "expected_filename": stats["expected_filename"],
             "stats": {
@@ -315,8 +415,7 @@ print('Hello, world!')
                 "final_lines": stats["final_lines"],
             },
         }
-        for stats in stats_list
-    }
+
     metadata_path = os.path.join(output_dir, "metadata.json")
     try:
         with open(metadata_path, "w", encoding="utf-8") as mf:
