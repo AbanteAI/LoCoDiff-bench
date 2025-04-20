@@ -222,10 +222,19 @@ async def run_single_benchmark(
                 if extracted_stripped == expected_stripped:
                     run_metadata["success"] = True
                 else:
+                    # Keep the error message for logging/metadata
                     run_metadata["error"] = "Output mismatch"
-                    # Optionally save diff
-                    diff_path = os.path.join(results_dir, "output.diff")
-                    try:
+                    # Success remains False
+
+                # --- Always Generate Diff File ---
+                diff_path = os.path.join(results_dir, "output.diff")
+                try:
+                    if run_metadata["success"]:
+                        # If successful, write a "no diff" message
+                        with open(diff_path, "w", encoding="utf-8") as f_diff:
+                            f_diff.write("No differences found.\n")
+                    else:
+                        # If mismatch, generate and write the actual diff
                         diff = difflib.unified_diff(
                             expected_stripped.splitlines(keepends=True),
                             extracted_stripped.splitlines(keepends=True),
@@ -235,8 +244,14 @@ async def run_single_benchmark(
                         )
                         with open(diff_path, "w", encoding="utf-8") as f_diff:
                             f_diff.writelines(diff)
-                    except Exception as diff_e:
-                        print(f"Warning: Failed to generate/save diff file: {diff_e}")
+                except Exception as diff_e:
+                    print(f"Warning: Failed to generate/save diff file: {diff_e}")
+                    # Optionally, write the error to the diff file itself
+                    try:
+                        with open(diff_path, "w", encoding="utf-8") as f_diff_err:
+                            f_diff_err.write(f"Error generating diff: {diff_e}\n")
+                    except Exception:
+                        pass  # Ignore errors writing the error message
 
         except FileNotFoundError as e:
             run_metadata["error"] = f"File Error: {e}"
