@@ -174,9 +174,26 @@ async def run_single_benchmark(
             run_metadata["expected_output_length"] = len(expected_content)
 
             # --- Call Model API (Async) ---
-            raw_model_response, generation_id = await get_model_response_openrouter(
-                prompt_content, model
-            )
+            (
+                raw_model_response,
+                generation_id,
+                api_error_message,
+            ) = await get_model_response_openrouter(prompt_content, model)
+
+            # --- Handle API Errors ---
+            if api_error_message:
+                run_metadata["error"] = api_error_message
+                run_metadata["api_error"] = True  # Flag for specific handling
+                # Print specific API error message and skip saving results
+                print(
+                    f"⚠️ API Error: {benchmark_case_prefix} - Error: {api_error_message} - Skipping results."
+                )
+                # DO NOT save metadata or other files for this run
+                # Return metadata indicating API failure
+                return run_metadata
+
+            # --- Process Successful API Response ---
+            # These steps only run if api_error_message is None
             run_metadata["raw_response_length"] = len(raw_model_response)
             run_metadata["generation_id"] = generation_id
 
@@ -253,42 +270,76 @@ async def run_single_benchmark(
                     except Exception:
                         pass  # Ignore errors writing the error message
 
+            # --- Save Metadata (only if no API error occurred earlier) ---
+            metadata_path = os.path.join(results_dir, "metadata.json")
+            try:
+                with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                    json.dump(run_metadata, f_meta, indent=4)
+            except Exception as meta_e:
+                print(
+                    f"\nWarning: Failed to save metadata.json for {benchmark_case_prefix}: {meta_e}"
+                )
+
         except FileNotFoundError as e:
             run_metadata["error"] = f"File Error: {e}"
-        except IOError as e:
-            run_metadata["error"] = f"IOError: {e}"
-        except ValueError as e:  # Catches missing API key
-            run_metadata["error"] = f"Config Error: {e}"
-        except Exception as e:  # Catch API errors or other unexpected issues
-            run_metadata["error"] = f"Runtime Error: {type(e).__name__}: {e}"
-            # Optional: Log traceback for debugging
-            # import traceback
-            # run_metadata["traceback"] = traceback.format_exc()
-        finally:
-            # --- Save Metadata ---
-            if results_dir:  # Ensure results_dir was assigned
+            # Save metadata for file errors
+            if results_dir:
                 metadata_path = os.path.join(results_dir, "metadata.json")
                 try:
                     with open(metadata_path, "w", encoding="utf-8") as f_meta:
                         json.dump(run_metadata, f_meta, indent=4)
                 except Exception as meta_e:
                     print(
-                        f"\nWarning: Failed to save metadata.json for {benchmark_case_prefix}: {meta_e}"
+                        f"\nWarning: Failed to save metadata.json after File Error for {benchmark_case_prefix}: {meta_e}"
                     )
+        except IOError as e:
+            run_metadata["error"] = f"IOError: {e}"
+            # Save metadata for IO errors
+            if results_dir:
+                metadata_path = os.path.join(results_dir, "metadata.json")
+                try:
+                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                        json.dump(run_metadata, f_meta, indent=4)
+                except Exception as meta_e:
+                    print(
+                        f"\nWarning: Failed to save metadata.json after IO Error for {benchmark_case_prefix}: {meta_e}"
+                    )
+        except ValueError as e:  # Catches missing API key from utils
+            run_metadata["error"] = f"Config Error: {e}"
+            # Don't save metadata if config error prevented API call attempt
+            print(f"Config Error for {benchmark_case_prefix}: {e} - Skipping results.")
+        except Exception as e:  # Catch other unexpected issues during processing
+            run_metadata["error"] = f"Runtime Error: {type(e).__name__}: {e}"
+            # Save metadata for runtime errors during processing
+            if results_dir:
+                metadata_path = os.path.join(results_dir, "metadata.json")
+                try:
+                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                        json.dump(run_metadata, f_meta, indent=4)
+                except Exception as meta_e:
+                    print(
+                        f"\nWarning: Failed to save metadata.json after Runtime Error for {benchmark_case_prefix}: {meta_e}"
+                    )
+            # Optional: Log traceback for debugging
+            # import traceback
+            # run_metadata["traceback"] = traceback.format_exc()
 
-        # Print result immediately after completion
-        cost_str = (
-            f"Cost: ${run_metadata.get('cost_usd', 0.0):.6f}"
-            if run_metadata.get("cost_usd") is not None
-            else "Cost: N/A"
-        )
-        if run_metadata["success"]:
-            print(f"✅ Success: {benchmark_case_prefix} - {cost_str}")
-        else:
-            error_msg = run_metadata.get("error", "Unknown error")
-            print(
-                f"❌ Failure: {benchmark_case_prefix} - Error: {error_msg} - {cost_str}"
+        # --- Print Final Status for this Case ---
+        # Check if it was an API error (already printed specific message)
+        if not run_metadata.get("api_error"):
+            cost_str = (
+                f"Cost: ${run_metadata.get('cost_usd', 0.0):.6f}"
+                if run_metadata.get("cost_usd") is not None
+                else "Cost: N/A"
             )
+            if run_metadata["success"]:
+                print(f"✅ Success: {benchmark_case_prefix} - {cost_str}")
+            else:
+                # Use the error stored in metadata (could be extraction, mismatch, file error, etc.)
+                error_msg = run_metadata.get("error", "Unknown processing error")
+                print(
+                    f"❌ Failure: {benchmark_case_prefix} - Error: {error_msg} - {cost_str}"
+                )
 
         return run_metadata
 
@@ -411,7 +462,11 @@ async def main():
 
     # Process results of newly run benchmarks
     success_count = 0
-    failure_count = 0
+    failure_count = 0  # Failures due to mismatch, extraction error, file error etc.
+    api_error_count = 0  # Failures due to API call issues (credits, rate limits etc.)
+    system_error_count = (
+        0  # Failures due to unexpected exceptions in gather/task execution
+    )
     total_new_cost = 0.0  # Cost for runs executed in this session
 
     for result in results:
@@ -420,38 +475,50 @@ async def main():
             print(
                 f"❌ System Error: An unexpected error occurred during task execution: {result}"
             )
-            failure_count += 1
+            system_error_count += 1
         elif isinstance(result, dict):
             # Got metadata back from run_single_benchmark
-            # Accumulate cost regardless of success/failure, if available
-            # Use 'or 0.0' to handle cases where cost_usd might be None
-            total_new_cost += result.get("cost_usd") or 0.0
+            # Accumulate cost only if it wasn't an API error (where cost might be irrelevant or missing)
+            # and cost is actually present
+            if not result.get("api_error") and result.get("cost_usd") is not None:
+                total_new_cost += (
+                    result.get("cost_usd") or 0.0
+                )  # Use 'or 0.0' for safety
 
-            if result.get("success"):
+            # Categorize the result
+            if result.get("api_error"):
+                api_error_count += 1
+                # Specific API error message already printed in run_single_benchmark
+            elif result.get("success"):
                 success_count += 1
                 # Individual success/cost already printed in run_single_benchmark
             else:
+                # This covers failures like mismatch, extraction, file errors, runtime errors during processing
                 failure_count += 1
                 # Individual failure/error already printed in run_single_benchmark
         else:
             # Should not happen if run_single_benchmark always returns dict
             print(f"❌ System Error: Unexpected result type from task: {type(result)}")
-            failure_count += 1
+            system_error_count += 1
 
     print("\n--- Benchmark Run Summary ---")
     print(f"Model: {args.model}")
     print(f"Attempted in this run: {len(results)} benchmarks")
-    print(f"Successful this run: {success_count}")
-    print(f"Failed this run: {failure_count}")
-    print(f"Cost of this run: ${total_new_cost:.6f}")
+    print(f"  ✅ Successful: {success_count}")
+    print(f"  ❌ Failed (Mismatch/Extraction/File Error): {failure_count}")
+    print(f"  ⚠️ API Errors (Credits/Rate Limits/etc.): {api_error_count}")
+    if system_error_count > 0:
+        print(f"  🔥 System Errors (Unexpected Task Failures): {system_error_count}")
+    print("-" * 20)
+    print(f"Cost of this run (successful/failed runs only): ${total_new_cost:.6f}")
     print(f"Total cost of previous runs: ${total_previous_cost:.6f}")
     print(
         f"Overall total cost (previous + current): ${total_previous_cost + total_new_cost:.6f}"
     )
     print("--- Benchmark Run Complete ---")
 
-    # Return failure if any benchmarks failed *in this run*
-    return 1 if failure_count > 0 else 0
+    # Return failure if any benchmarks failed (non-API/System errors) or had API/System errors in this run
+    return 1 if (failure_count + api_error_count + system_error_count) > 0 else 0
 
 
 if __name__ == "__main__":
