@@ -3,6 +3,10 @@
 # Activate the virtual environment
 source .venv/bin/activate
 
+# Verify ruff version
+echo "Ruff version in precommit:"
+ruff --version
+
 # Run formatter
 echo "Running formatter..."
 ruff format .
