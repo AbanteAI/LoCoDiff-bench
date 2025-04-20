@@ -26,16 +26,44 @@ def sanitize_filename(name):
 
 def extract_code_from_backticks(text: str) -> str | None:
     """
-    Extracts content wrapped in triple backticks, handling optional language identifiers
-    and stripping leading/trailing whitespace.
+    Extracts content between the first and the last triple backticks (```).
+    Handles optional language identifiers after the first backticks and strips
+    leading/trailing whitespace from the extracted content.
     """
-    match = re.search(r"```(?:\w+)?\s*?\n(.*?)\n?```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    else:
-        match = re.search(r"```(?:\w+)?(.*?)```", text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
+    try:
+        # Find the start of the first ``` block
+        start_outer = text.find("```")
+        if start_outer == -1:
+            return None  # No opening backticks found
+
+        # Find the end of the first ``` marker (including optional language and newline)
+        # Use regex to find the end position after ```, optional language, and optional newline
+        start_inner_match = re.search(r"```(?:\w+)?\s*?\n?", text[start_outer:])
+        if start_inner_match:
+            # Calculate the index in the original string where the actual content begins
+            start_inner = start_outer + start_inner_match.end()
+        else:
+            # Fallback if regex fails (e.g., ``` immediately followed by content without newline)
+            # Find the end of the initial ``` marker itself
+            start_inner = start_outer + 3  # Length of ```
+
+        # Find the start of the last ``` block using rfind
+        end_outer = text.rfind("```")
+
+        # Check if the last ``` was found and if it's after the first ``` marker ended
+        if end_outer == -1 or end_outer < start_inner:
+            # No closing backticks found after the opening ones,
+            # or the closing backticks are the same as the opening ones (e.g., only "```" in text)
+            return None
+
+        # Extract the content between the end of the first marker and the start of the last marker
+        extracted_content = text[start_inner:end_outer]
+
+        return extracted_content.strip()
+
+    except Exception as e:
+        # Log unexpected errors during extraction
+        print(f"Error during backtick extraction: {e}")
         return None
 
 
