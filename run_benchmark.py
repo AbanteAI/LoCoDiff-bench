@@ -463,8 +463,11 @@ async def main():
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Process results of newly run benchmarks
+    from collections import defaultdict  # Import here for clarity
+
     success_count = 0
-    failure_count = 0  # Failures due to mismatch, extraction error, file error etc.
+    # Use a dictionary to count failures by error type
+    failure_counts_by_type = defaultdict(int)
     api_error_count = 0  # Failures due to API call issues (credits, rate limits etc.)
     system_error_count = (
         0  # Failures due to unexpected exceptions in gather/task execution
@@ -496,7 +499,22 @@ async def main():
                 # Individual success/cost already printed in run_single_benchmark
             else:
                 # This covers failures like mismatch, extraction, file errors, runtime errors during processing
-                failure_count += 1
+                error_msg = result.get("error", "Unknown processing error")
+                # Simplify common error messages for better grouping
+                if "File Error:" in error_msg:
+                    error_type = "File Error"
+                elif "IOError:" in error_msg:
+                    error_type = "IO Error"
+                elif "Runtime Error:" in error_msg:
+                    error_type = "Runtime Error"
+                elif "Extraction backticks not found" in error_msg:
+                    error_type = "Extraction Error"
+                elif "Output mismatch" in error_msg:
+                    error_type = "Output Mismatch"
+                else:
+                    error_type = error_msg  # Keep less common errors as is
+
+                failure_counts_by_type[error_type] += 1
                 # Individual failure/error already printed in run_single_benchmark
         else:
             # Should not happen if run_single_benchmark always returns dict
@@ -507,7 +525,16 @@ async def main():
     print(f"Model: {args.model}")
     print(f"Attempted in this run: {len(results)} benchmarks")
     print(f"  ✅ Successful: {success_count}")
-    print(f"  ❌ Failed (Mismatch/Extraction/File Error): {failure_count}")
+    # Print detailed failure counts
+    if failure_counts_by_type:
+        print("  --- Failures by Type ---")
+        for error_type, count in sorted(failure_counts_by_type.items()):
+            print(f"    ❌ {error_type}: {count}")
+        print("  ------------------------")
+    else:
+        # Explicitly state if there were no processing failures
+        print("  ❌ Failed (Processing Errors): 0")
+
     print(f"  ⚠️ API Errors (Credits/Rate Limits/etc.): {api_error_count}")
     if system_error_count > 0:
         print(f"  🔥 System Errors (Unexpected Task Failures): {system_error_count}")
@@ -520,7 +547,8 @@ async def main():
     print("--- Benchmark Run Complete ---")
 
     # Return failure if any benchmarks failed (non-API/System errors) or had API/System errors in this run
-    return 1 if (failure_count + api_error_count + system_error_count) > 0 else 0
+    total_failures = sum(failure_counts_by_type.values())
+    return 1 if (total_failures + api_error_count + system_error_count) > 0 else 0
 
 
 if __name__ == "__main__":
