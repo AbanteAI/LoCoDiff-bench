@@ -67,9 +67,10 @@ def main():
         help="Maximum number of prompts per bucket after sampling (default: 10).",
     )
     parser.add_argument(
-        "--months-ago",
+        "--modified-within-months",
         type=int,
         default=3,
+        metavar="N",
         help="Only process files modified in the last N months (default: 3). Set to 0 or negative to disable.",
     )
 
@@ -98,9 +99,12 @@ def main():
         org_name = os.path.basename(os.path.dirname(repo_path))
         print(f"\nProcessing repository: {org_name}/{repo_name} ({repo_path})")
         try:
-            # Pass months_ago argument and receive the date filtered count
+            # Pass modified_within_months argument and receive the date filtered count
             stats_list, date_filtered_count = generate_prompts_and_expected(
-                repo_path, args.extensions, args.output_dir, args.months_ago
+                repo_path,
+                args.extensions,
+                args.output_dir,
+                args.modified_within_months,
             )
             all_stats.extend(stats_list)
             total_date_filtered_count += date_filtered_count  # Accumulate count
@@ -121,9 +125,9 @@ def main():
         return 1
 
     # Report total files filtered by date
-    if args.months_ago > 0:
+    if args.modified_within_months > 0:
         print(
-            f"\nFiltered out a total of {total_date_filtered_count} files across all repositories due to modification date constraint (older than {args.months_ago} months)."
+            f"\nFiltered out a total of {total_date_filtered_count} files across all repositories due to modification date constraint (older than {args.modified_within_months} months)."
         )
 
     # Print initial statistics table for all generated prompts (after date filtering)

@@ -154,11 +154,14 @@ def count_tokens(text):
 
 
 def generate_prompts_and_expected(
-    repo_path, extensions, output_dir="generated_prompts", months_ago=3
+    repo_path,
+    extensions,
+    output_dir="generated_prompts",
+    modified_within_months=3,
 ):
     """
     For every file in the repository at repo_path with one of the specified extensions,
-    and optionally modified within the last `months_ago` months, create two files in output_dir:
+    and optionally modified within the last `modified_within_months` months, create two files in output_dir:
       - {repo_name}_{relative_path_with_underscores}_prompt.txt containing
         a reconstruction prompt with git history.
       - {repo_name}_{relative_path_with_underscores}_expectedoutput.txt containing
@@ -170,8 +173,8 @@ def generate_prompts_and_expected(
         repo_path: Path to the cloned repository.
         extensions: List of file extensions to process.
         output_dir: Directory to save generated files.
-        months_ago: Integer, only process files modified in the last N months.
-                    If <= 0, this filter is disabled.
+        modified_within_months: Integer, only process files modified in the last N months.
+                                If <= 0, this filter is disabled.
 
     Returns:
         A tuple containing:
@@ -200,11 +203,13 @@ def generate_prompts_and_expected(
 
     # Calculate date threshold if filter is enabled
     threshold_timestamp = None
-    if months_ago > 0:
+    if modified_within_months > 0:
         # Approximate seconds per month (average)
         avg_seconds_per_month = 30.44 * 24 * 60 * 60
         current_timestamp = time.time()
-        threshold_timestamp = current_timestamp - (months_ago * avg_seconds_per_month)
+        threshold_timestamp = current_timestamp - (
+            modified_within_months * avg_seconds_per_month
+        )
         print(
             f"Date filter enabled: Processing files modified since {datetime.fromtimestamp(threshold_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
