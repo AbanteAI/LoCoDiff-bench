@@ -5,6 +5,7 @@ import subprocess
 import tiktoken
 import openai
 import aiohttp  # For async requests
+import asyncio  # For sleep
 from dotenv import load_dotenv
 import math
 from collections import defaultdict
@@ -770,65 +771,100 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
 
     stats_url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
     headers = {"Authorization": f"Bearer {api_key}"}
+    max_retries = 3
+    retry_delay_seconds = 1
 
-    try:
-        # Use aiohttp for the async request
-        async with aiohttp.ClientSession() as session:
-            async with session.get(stats_url, headers=headers) as response:
-                # Raise HTTPError for bad responses (4xx or 5xx)
-                response.raise_for_status()
-                response_data = await response.json()
+    for attempt in range(max_retries):
+        try:
+            # Use aiohttp for the async request
+            async with aiohttp.ClientSession() as session:
+                async with session.get(stats_url, headers=headers) as response:
+                    # Check for 404 specifically for retry
+                    if response.status == 404:
+                        print(
+                            f"Attempt {attempt + 1}/{max_retries}: Stats not found (404) for {generation_id}. Retrying in {retry_delay_seconds}s..."
+                        )
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay_seconds)
+                            continue  # Go to next retry iteration
+                        else:
+                            print(
+                                f"Max retries reached for {generation_id}. Giving up."
+                            )
+                            return None  # Failed after retries
 
-        # Check if 'data' field exists and is not None
-        if "data" in response_data and response_data["data"] is not None:
-            stats_data = response_data["data"]
-            # Extract relevant fields, providing defaults or None if missing
-            cost_usd = stats_data.get("total_cost", 0.0)
-            prompt_tokens = stats_data.get("tokens_prompt", 0)
-            completion_tokens = stats_data.get("tokens_completion", 0)
-            native_prompt_tokens = stats_data.get("native_tokens_prompt")  # Can be None
-            native_completion_tokens = stats_data.get(
-                "native_tokens_completion"
-            )  # Can be None
+                    # Raise HTTPError for other bad responses (4xx or 5xx, excluding 404 handled above)
+                    response.raise_for_status()
+                    response_data = await response.json()
 
-            return {
-                "cost_usd": float(cost_usd) if cost_usd is not None else 0.0,
-                "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else 0,
-                "completion_tokens": int(completion_tokens)
-                if completion_tokens is not None
-                else 0,
-                "total_tokens": (int(prompt_tokens or 0) + int(completion_tokens or 0)),
-                "native_prompt_tokens": int(native_prompt_tokens)
-                if native_prompt_tokens is not None
-                else None,
-                "native_completion_tokens": int(native_completion_tokens)
-                if native_completion_tokens is not None
-                else None,
-            }
-        else:
+            # If successful (status 200 and no exception raised), process data
+            if "data" in response_data and response_data["data"] is not None:
+                stats_data = response_data["data"]
+                # Extract relevant fields, providing defaults or None if missing
+                cost_usd = stats_data.get("total_cost", 0.0)
+                prompt_tokens = stats_data.get("tokens_prompt", 0)
+                completion_tokens = stats_data.get("tokens_completion", 0)
+                native_prompt_tokens = stats_data.get(
+                    "native_tokens_prompt"
+                )  # Can be None
+                native_completion_tokens = stats_data.get(
+                    "native_tokens_completion"
+                )  # Can be None
+
+                return {
+                    "cost_usd": float(cost_usd) if cost_usd is not None else 0.0,
+                    "prompt_tokens": int(prompt_tokens)
+                    if prompt_tokens is not None
+                    else 0,
+                    "completion_tokens": int(completion_tokens)
+                    if completion_tokens is not None
+                    else 0,
+                    "total_tokens": (
+                        int(prompt_tokens or 0) + int(completion_tokens or 0)
+                    ),
+                    "native_prompt_tokens": int(native_prompt_tokens)
+                    if native_prompt_tokens is not None
+                    else None,
+                    "native_completion_tokens": int(native_completion_tokens)
+                    if native_completion_tokens is not None
+                    else None,
+                }
+            else:
+                print(
+                    f"Warning: 'data' field missing or null in OpenRouter stats response for ID {generation_id}."
+                )
+                print(f"Full response: {response_data}")
+                return None  # Indicate stats could not be retrieved (even on success status)
+
+        except aiohttp.ClientResponseError as e:
+            # Catch non-404 HTTP errors after raise_for_status
             print(
-                f"Warning: 'data' field missing or null in OpenRouter stats response for ID {generation_id}."
+                f"HTTP error querying OpenRouter generation stats API (Attempt {attempt + 1}/{max_retries}): {e.status} {e.message}"
             )
-            print(f"Full response: {response_data}")
-            return None  # Indicate stats could not be retrieved
+            # Don't retry on non-404 errors
+            return None
+        except aiohttp.ClientError as e:
+            # Catch other aiohttp client errors (e.g., connection issues)
+            print(
+                f"Client error querying OpenRouter generation stats API (Attempt {attempt + 1}/{max_retries}): {e}"
+            )
+            # Don't retry on general client errors
+            return None
+        except json.JSONDecodeError as e:
+            print(
+                f"Error decoding JSON response from OpenRouter stats API (Attempt {attempt + 1}/{max_retries}): {e}"
+            )
+            # Don't retry on JSON errors
+            return None
+        except Exception as e:
+            print(
+                f"An unexpected error occurred during the async stats API call (Attempt {attempt + 1}/{max_retries}): {e}"
+            )
+            # Log traceback for unexpected errors
+            # import traceback
+            # traceback.print_exc()
+            # Don't retry on unexpected errors
+            return None
 
-    except aiohttp.ClientResponseError as e:
-        # Catch specific aiohttp HTTP errors
-        print(
-            f"HTTP error querying OpenRouter generation stats API: {e.status} {e.message}"
-        )
-        return None  # Indicate stats could not be retrieved
-    except aiohttp.ClientError as e:
-        # Catch other aiohttp client errors (e.g., connection issues)
-        print(f"Client error querying OpenRouter generation stats API: {e}")
-        return None  # Indicate stats could not be retrieved
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON response from OpenRouter stats API: {e}")
-        # Consider logging response.text() if needed, but handle potential exceptions
-        return None  # Indicate stats could not be retrieved
-    except Exception as e:
-        print(f"An unexpected error occurred during the async stats API call: {e}")
-        # Log traceback for unexpected errors
-        # import traceback
-        # traceback.print_exc()
-        return None  # Indicate stats could not be retrieved
+    # Should be unreachable if logic is correct, but as a fallback
+    return None
