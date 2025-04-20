@@ -2,6 +2,8 @@ import json
 import os
 import re
 import subprocess
+import time
+from datetime import datetime, timezone
 import tiktoken
 import openai
 import aiohttp  # For async requests
@@ -152,11 +154,11 @@ def count_tokens(text):
 
 
 def generate_prompts_and_expected(
-    repo_path, extensions, output_dir="generated_prompts"
+    repo_path, extensions, output_dir="generated_prompts", months_ago=3
 ):
     """
     For every file in the repository at repo_path with one of the specified extensions,
-    create two files in output_dir:
+    and optionally modified within the last `months_ago` months, create two files in output_dir:
       - {repo_name}_{relative_path_with_underscores}_prompt.txt containing
         a reconstruction prompt with git history.
       - {repo_name}_{relative_path_with_underscores}_expectedoutput.txt containing
@@ -168,11 +170,14 @@ def generate_prompts_and_expected(
         repo_path: Path to the cloned repository.
         extensions: List of file extensions to process.
         output_dir: Directory to save generated files.
+        months_ago: Integer, only process files modified in the last N months.
+                    If <= 0, this filter is disabled.
 
     Returns:
-        A list of dictionaries, where each dictionary contains statistics
-        for one processed file:
-        {
+        A tuple containing:
+        - A list of dictionaries, where each dictionary contains statistics
+          for one processed file:
+          {
             'filename': str,
             'prompt_tokens': int,
             'expected_tokens': int,
@@ -181,6 +186,7 @@ def generate_prompts_and_expected(
             'lines_deleted': int,
             'final_lines': int
         }
+        - An integer representing the count of files skipped due to the date filter.
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
@@ -190,6 +196,18 @@ def generate_prompts_and_expected(
     full_repo_name = f"{org_name}/{repo_name}"
     stats_list = []
     files_to_process = []
+    date_filtered_count = 0  # Counter for files skipped by date filter
+
+    # Calculate date threshold if filter is enabled
+    threshold_timestamp = None
+    if months_ago > 0:
+        # Approximate seconds per month (average)
+        avg_seconds_per_month = 30.44 * 24 * 60 * 60
+        current_timestamp = time.time()
+        threshold_timestamp = current_timestamp - (months_ago * avg_seconds_per_month)
+        print(
+            f"Date filter enabled: Processing files modified since {datetime.fromtimestamp(threshold_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
 
     # Get repository head commit hash
     print(f"Getting head commit hash for {full_repo_name}...")
@@ -209,6 +227,51 @@ def generate_prompts_and_expected(
 
     # Now, process the files with a progress bar
     for full_path, rel_path in tqdm(files_to_process, desc="Generating prompts"):
+        # --- Date Filter Check ---
+        if threshold_timestamp is not None:
+            try:
+                # Get the commit timestamp (Unix timestamp) of the last commit affecting the file
+                commit_time_result = subprocess.run(
+                    ["git", "log", "-1", "--format=%ct", "--", rel_path],
+                    cwd=repo_path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+                last_commit_timestamp_str = commit_time_result.stdout.strip()
+
+                # Check if we got a valid timestamp
+                if not last_commit_timestamp_str:
+                    print(
+                        f"\nWarning: Could not get commit timestamp for {rel_path}. Skipping date check."
+                    )
+                else:
+                    last_commit_timestamp = int(last_commit_timestamp_str)
+                    # Compare with the threshold
+                    if last_commit_timestamp < threshold_timestamp:
+                        date_filtered_count += 1
+                        continue  # Skip this file
+            except subprocess.CalledProcessError as e:
+                print(
+                    f"\nWarning: Error getting commit time for {rel_path}: {e}. Skipping file."
+                )
+                date_filtered_count += 1  # Count as filtered if we can't get time
+                continue
+            except ValueError as e:
+                print(
+                    f"\nWarning: Could not parse commit timestamp for {rel_path}: '{last_commit_timestamp_str}'. Skipping file. Error: {e}"
+                )
+                date_filtered_count += 1
+                continue
+            except FileNotFoundError:
+                print(
+                    "\nWarning: git command not found. Cannot perform date filtering."
+                )
+                threshold_timestamp = None  # Disable filter if git is missing
+
+        # --- Proceed with generation if not filtered ---
         safe_rel = rel_path.replace(os.sep, "_")
         prompt_fname = f"{repo_name}_{safe_rel}_prompt.txt"
         expected_fname = f"{repo_name}_{safe_rel}_expectedoutput.txt"
@@ -347,8 +410,8 @@ print('Hello, world!')
 
         stats_list.append(file_stats)
 
-    # Return the raw list of stats for all generated files before filtering/bucketing
-    return stats_list
+    # Return the list of stats and the count of files filtered by date
+    return stats_list, date_filtered_count
 
 
 def save_benchmark_metadata(output_dir, final_buckets, generation_params):

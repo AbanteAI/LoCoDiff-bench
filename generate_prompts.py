@@ -66,6 +66,12 @@ def main():
         default=10,
         help="Maximum number of prompts per bucket after sampling (default: 10).",
     )
+    parser.add_argument(
+        "--months-ago",
+        type=int,
+        default=3,
+        help="Only process files modified in the last N months (default: 3). Set to 0 or negative to disable.",
+    )
 
     args = parser.parse_args()
 
@@ -85,17 +91,22 @@ def main():
 
     all_stats = []
     generation_errors = 0
+    total_date_filtered_count = 0  # Initialize counter for date filtering
 
     for repo_path in repo_paths:
         repo_name = os.path.basename(os.path.normpath(repo_path))
         org_name = os.path.basename(os.path.dirname(repo_path))
         print(f"\nProcessing repository: {org_name}/{repo_name} ({repo_path})")
         try:
-            stats_list = generate_prompts_and_expected(
-                repo_path, args.extensions, args.output_dir
+            # Pass months_ago argument and receive the date filtered count
+            stats_list, date_filtered_count = generate_prompts_and_expected(
+                repo_path, args.extensions, args.output_dir, args.months_ago
             )
             all_stats.extend(stats_list)
-            print(f"Generated {len(stats_list)} prompts for {org_name}/{repo_name}.")
+            total_date_filtered_count += date_filtered_count  # Accumulate count
+            print(
+                f"Generated {len(stats_list)} prompts for {org_name}/{repo_name} (skipped {date_filtered_count} due to date filter)."
+            )
         except Exception as e:
             print(f"Error generating prompts for {org_name}/{repo_name}: {e}")
             generation_errors += 1
@@ -109,8 +120,14 @@ def main():
         print("\nError: No prompts were generated successfully.")
         return 1
 
-    # Print initial statistics table for all generated prompts
-    print("\n--- Initial Generation Statistics (All Repos) ---")
+    # Report total files filtered by date
+    if args.months_ago > 0:
+        print(
+            f"\nFiltered out a total of {total_date_filtered_count} files across all repositories due to modification date constraint (older than {args.months_ago} months)."
+        )
+
+    # Print initial statistics table for all generated prompts (after date filtering)
+    print("\n--- Initial Generation Statistics (All Repos, Post-Date-Filter) ---")
     print_stats_table(all_stats)
 
     # Filter, bucket, and sample the results using provided arguments
