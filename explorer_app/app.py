@@ -3,7 +3,7 @@ import os
 import json
 import glob
 import re
-from flask import Flask, render_template, abort, url_for
+from flask import Flask, render_template, abort, url_for, send_from_directory
 from markupsafe import escape
 import shutil
 import webbrowser
@@ -114,11 +114,16 @@ def get_run_details(
         "timestamp": timestamp,
         "run_dir": run_dir,
         "metadata": None,
-        "prompt_content": None,
-        "expected_content": None,
-        "raw_response": None,
-        "extracted_output": None,
-        "diff_content": None,
+        "prompt_exists": False,
+        "prompt_rel_path": None,
+        "expected_exists": False,
+        "expected_rel_path": None,
+        "raw_response_exists": False,
+        "raw_response_rel_path": None,
+        "extracted_output_exists": False,
+        "extracted_output_rel_path": None,
+        "diff_exists": False,
+        "diff_rel_path": None,
         "error": None,
     }
 
@@ -139,39 +144,40 @@ def get_run_details(
     # Load prompt and expected from benchmark_dir
     prompt_filename = f"{benchmark_case_prefix}_prompt.txt"
     expected_filename = f"{benchmark_case_prefix}_expectedoutput.txt"
-    prompt_filepath = os.path.join(benchmark_dir, prompt_filename)
-    expected_filepath = os.path.join(benchmark_dir, expected_filename)
+    # Check existence and store relative paths for prompt and expected files
+    prompt_rel_path = os.path.join(benchmark_dir, prompt_filename)
+    expected_rel_path = os.path.join(benchmark_dir, expected_filename)
 
-    try:
-        with open(prompt_filepath, "r", encoding="utf-8") as f:
-            details["prompt_content"] = f.read()
-    except IOError as e:
-        details["error"] = details.get("error", "") + f" Error loading prompt file: {e}"
-
-    try:
-        with open(expected_filepath, "r", encoding="utf-8") as f:
-            details["expected_content"] = f.read()
-    except IOError as e:
+    if os.path.exists(prompt_rel_path):
+        details["prompt_exists"] = True
+        details["prompt_rel_path"] = prompt_rel_path
+    else:
         details["error"] = (
-            details.get("error", "") + f" Error loading expected output file: {e}"
+            details.get("error", "") + f" Prompt file not found: {prompt_rel_path}"
         )
 
-    # Load files from run_dir
-    def read_run_file(filename):
-        filepath = os.path.join(run_dir, filename)
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    return f.read()
-            except IOError as e:
-                details["error"] = (
-                    details.get("error", "") + f" Error loading {filename}: {e}"
-                )
-        return None  # Or indicate file not found?
+    if os.path.exists(expected_rel_path):
+        details["expected_exists"] = True
+        details["expected_rel_path"] = expected_rel_path
+    else:
+        details["error"] = (
+            details.get("error", "")
+            + f" Expected output file not found: {expected_rel_path}"
+        )
 
-    details["raw_response"] = read_run_file("raw_response.txt")
-    details["extracted_output"] = read_run_file("extracted_output.txt")
-    details["diff_content"] = read_run_file("output.diff")
+    # Check existence and store relative paths for files in run_dir
+    def check_run_file(filename, exists_key, path_key):
+        rel_path = os.path.join(run_dir, filename)
+        if os.path.exists(rel_path):
+            details[exists_key] = True
+            details[path_key] = rel_path
+        # No error message here, as missing files might be expected (e.g., no diff on success)
+
+    check_run_file("raw_response.txt", "raw_response_exists", "raw_response_rel_path")
+    check_run_file(
+        "extracted_output.txt", "extracted_output_exists", "extracted_output_rel_path"
+    )
+    check_run_file("output.diff", "diff_exists", "diff_rel_path")
 
     return details
 
@@ -341,6 +347,75 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 #         return send_from_directory(os.path.dirname(safe_path), os.path.basename(safe_path))
 #     except FileNotFoundError:
 #         abort(404)
+
+
+@app.route("/files/<path:filepath>")
+def serve_file(filepath):
+    """Serves files securely from allowed directories."""
+    # Basic sanitization (Flask's path converter helps, but extra checks are good)
+    if ".." in filepath or filepath.startswith("/"):
+        abort(403, "Invalid file path.")
+
+    # Define allowed base directories relative to app root
+    allowed_dirs_rel = [app.config["BENCHMARK_DIR"], app.config["RESULTS_BASE_DIR"]]
+    # Get the absolute path to the repository root directory
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    allowed_dirs_abs = [
+        os.path.abspath(os.path.join(repo_root, d)) for d in allowed_dirs_rel
+    ]
+
+    # Construct the absolute path requested by the user, relative to repo root
+    requested_path_abs = os.path.abspath(os.path.join(repo_root, filepath))
+
+    # Security Check: Ensure the requested path is within one of the allowed directories
+    is_allowed = False
+    serving_directory = None
+    filename = None
+    for allowed_dir in allowed_dirs_abs:
+        # Check if the requested path starts with the allowed directory path + separator
+        # This ensures we don't match partial directory names
+        # Use os.path.normcase for case-insensitive comparison on relevant systems
+        if os.path.normcase(requested_path_abs).startswith(
+            os.path.normcase(allowed_dir + os.sep)
+        ):
+            is_allowed = True
+            serving_directory = allowed_dir
+            # Calculate filename relative to the serving directory
+            filename = os.path.relpath(requested_path_abs, allowed_dir)
+            # Double-check filename doesn't try to escape upwards (should be prevented by startswith check)
+            if ".." in filename or filename.startswith(os.sep):
+                is_allowed = False  # Abort if relpath calculation seems suspicious
+                break
+            break  # Found the allowed directory
+
+    if not is_allowed or serving_directory is None or filename is None:
+        abort(
+            403,
+            "Access denied: File is outside allowed directories or path calculation failed.",
+        )
+
+    # Determine mimetype (simple check for text files)
+    mimetype = (
+        "text/plain"
+        if filepath.endswith(
+            (".txt", ".diff", ".py", ".js", ".html", ".css", ".md", ".log")
+        )
+        else None
+    )
+
+    try:
+        # Use send_from_directory for safer serving
+        # It requires the directory and the filename relative to that directory
+        # print(f"Serving file: directory='{serving_directory}', filename='{filename}'") # Debugging
+        return send_from_directory(
+            serving_directory, filename, mimetype=mimetype, as_attachment=False
+        )
+    except FileNotFoundError:
+        abort(404, "File not found.")
+    except Exception as e:
+        print(f"Error serving file {filepath}: {e}")
+        abort(500, "Internal server error while serving file.")
 
 
 def open_browser(host, port):
