@@ -715,16 +715,15 @@ async def get_model_response_openrouter(
         generation_id = None
 
         # Check for API-level errors returned in the response body (e.g., credit limits)
-        # Based on the example error, the structure might be directly in the completion object
-        # when the API call itself returns a 200 but contains an error payload.
-        if hasattr(completion, "error") and completion.error:
-            error_detail = completion.error
-            if isinstance(error_detail, dict):
-                error_message = error_detail.get(
+        # Use getattr for safer access to potentially dynamic attributes
+        error_payload = getattr(completion, "error", None)
+        if error_payload:
+            if isinstance(error_payload, dict):
+                error_message = error_payload.get(
                     "message", "Unknown API error structure in response."
                 )
             else:
-                error_message = str(error_detail)
+                error_message = str(error_payload)
             print(
                 f"OpenRouter API reported an error in the response body: {error_message}"
             )
@@ -747,13 +746,16 @@ async def get_model_response_openrouter(
 
     except openai.APIError as e:
         # This catches errors where the API call itself failed (e.g., 4xx/5xx status codes)
-        error_message = f"OpenRouter API Error: {e.status_code} - {e.message}"
+        # Use getattr for status_code and body as they might not be statically typed
+        status_code = getattr(e, "status_code", "Unknown")
+        error_message = f"OpenRouter API Error: {status_code} - {e.message}"
         print(error_message)
         # Attempt to extract more detail if available in the body
-        if e.body and isinstance(e.body, dict):
-            detail = e.body.get("error", {}).get("message")
+        body = getattr(e, "body", None)
+        if body and isinstance(body, dict):
+            detail = body.get("error", {}).get("message")
             if detail:
-                error_message = f"OpenRouter API Error: {e.status_code} - {detail}"
+                error_message = f"OpenRouter API Error: {status_code} - {detail}"
         return None, None, error_message
     except Exception as e:
         error_message = f"Unexpected Error during API call: {type(e).__name__}: {e}"

@@ -194,6 +194,8 @@ async def run_single_benchmark(
 
             # --- Process Successful API Response ---
             # These steps only run if api_error_message is None
+            # Add assertion to satisfy type checker after the early return for API errors
+            assert raw_model_response is not None
             run_metadata["raw_response_length"] = len(raw_model_response)
             run_metadata["generation_id"] = generation_id
 
