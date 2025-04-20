@@ -6,6 +6,8 @@ import re
 from flask import Flask, render_template, abort, url_for
 from markupsafe import escape
 import shutil
+import webbrowser
+import threading
 
 # --- Configuration ---
 # Assuming the app is run from the root of the repository
@@ -341,8 +343,28 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 #         abort(404)
 
 
+def open_browser(host, port):
+    """Opens the browser to the specified host and port."""
+    # Use 127.0.0.1 for the browser URL even if hosting on 0.0.0.0
+    url_host = "127.0.0.1" if host == "0.0.0.0" else host
+    webbrowser.open_new_tab(f"http://{url_host}:{port}")
+
+
 if __name__ == "__main__":
+    # Configuration for running directly
+    HOST = "127.0.0.1"  # Default to localhost for security unless specified
+    PORT = 5001
+    DEBUG = True
+
     # Ensure plot is available before starting
     copy_plot_to_static()
-    # Add host='0.0.0.0' to make accessible on network
-    app.run(debug=True, host="0.0.0.0")
+
+    # Open browser tab shortly after starting the server
+    # Use a timer to avoid race condition where browser opens before server is ready
+    if DEBUG:  # Only open browser automatically in debug mode
+        threading.Timer(1, lambda: open_browser(HOST, PORT)).start()
+
+    # Run the Flask app
+    # Note: Running with host='0.0.0.0' makes it accessible on the network
+    # Change HOST above if network access is desired by default when running directly.
+    app.run(debug=DEBUG, host=HOST, port=PORT)
