@@ -718,15 +718,18 @@ async def get_model_response_openrouter(
         # Use getattr for safer access to potentially dynamic attributes
         error_payload = getattr(completion, "error", None)
         if error_payload:
-            if isinstance(error_payload, dict):
-                error_message = error_payload.get(
-                    "message", "Unknown API error structure in response."
-                )
-            else:
-                error_message = str(error_payload)
-            print(
-                f"OpenRouter API reported an error in the response body: {error_message}"
-            )
+            # Try to serialize the full error payload for more detail
+            try:
+                if isinstance(error_payload, dict):
+                    error_details = json.dumps(error_payload)
+                else:
+                    error_details = str(error_payload)
+                error_message = f"Provider error in response body: {error_details}"
+            except Exception as serialize_err:
+                # Fallback if serialization fails
+                error_message = f"Provider error in response body (serialization failed: {serialize_err}): {str(error_payload)}"
+
+            print(f"OpenRouter API reported an error: {error_message}")
             return None, None, error_message
 
         # Extract content if successful and no error in body
@@ -748,15 +751,36 @@ async def get_model_response_openrouter(
         # This catches errors where the API call itself failed (e.g., 4xx/5xx status codes)
         # Use getattr for status_code and body as they might not be statically typed
         status_code = getattr(e, "status_code", "Unknown")
-        error_message = f"OpenRouter API Error: {status_code} - {e.message}"
-        print(error_message)
-        # Attempt to extract more detail if available in the body
+        base_error_message = f"OpenRouter API Error: Status {status_code} - {e.message}"
+        detailed_error_message = base_error_message  # Start with base message
+
+        # Attempt to extract more detail from the body
         body = getattr(e, "body", None)
-        if body and isinstance(body, dict):
-            detail = body.get("error", {}).get("message")
-            if detail:
-                error_message = f"OpenRouter API Error: {status_code} - {detail}"
-        return None, None, error_message
+        if body:
+            try:
+                if isinstance(body, dict):
+                    # Try to get nested message first
+                    nested_message = body.get("error", {}).get("message")
+                    if nested_message and nested_message != e.message:
+                        detailed_error_message = (
+                            f"{base_error_message} | Detail: {nested_message}"
+                        )
+                    # Include full body if it might be useful and isn't just repeating the message
+                    body_str = json.dumps(body)
+                    if body_str not in detailed_error_message:  # Avoid redundancy
+                        detailed_error_message += f" | Body: {body_str}"
+                else:
+                    # If body is not a dict, include its string representation if informative
+                    body_str = str(body)
+                    if body_str and body_str not in detailed_error_message:
+                        detailed_error_message += f" | Body: {body_str}"
+            except Exception as serialize_err:
+                detailed_error_message += (
+                    f" (Failed to serialize body: {serialize_err})"
+                )
+
+        print(detailed_error_message)  # Print the most detailed message obtained
+        return None, None, detailed_error_message  # Return the detailed message
     except Exception as e:
         error_message = f"Unexpected Error during API call: {type(e).__name__}: {e}"
         print(error_message)
