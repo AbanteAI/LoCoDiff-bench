@@ -234,7 +234,7 @@ def generate_prompts_and_expected(
     for full_path, rel_path in tqdm(files_to_process, desc="Generating prompts"):
         # --- Date Filter Check ---
         if threshold_timestamp is not None:
-            last_commit_timestamp_str = "" # Initialize to ensure it's bound
+            last_commit_timestamp_str = ""  # Initialize to ensure it's bound
             try:
                 # Get the commit timestamp (Unix timestamp) of the last commit affecting the file
                 commit_time_result = subprocess.run(
