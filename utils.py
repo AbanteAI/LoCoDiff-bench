@@ -806,9 +806,10 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
             'prompt_tokens': int,
             'completion_tokens': int,
             'total_tokens': int,
-            'native_prompt_tokens': int | None,
-            'native_completion_tokens': int | None
-        }
+                    'native_prompt_tokens': int | None,
+                    'native_completion_tokens': int | None,
+                    'native_finish_reason': str | None
+                }
 
     Raises:
         ValueError: If the OPENROUTER_API_KEY environment variable is not set.
@@ -861,6 +862,9 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
                 native_completion_tokens = stats_data.get(
                     "native_tokens_completion"
                 )  # Can be None
+                native_finish_reason = stats_data.get(
+                    "native_finish_reason"
+                )  # Can be None
 
                 return {
                     "cost_usd": float(cost_usd) if cost_usd is not None else 0.0,
@@ -878,6 +882,9 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
                     else None,
                     "native_completion_tokens": int(native_completion_tokens)
                     if native_completion_tokens is not None
+                    else None,
+                    "native_finish_reason": str(native_finish_reason)
+                    if native_finish_reason is not None
                     else None,
                 }
             else:

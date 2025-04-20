@@ -167,6 +167,7 @@ async def run_single_benchmark(
             "total_tokens": None,
             "native_prompt_tokens": None,
             "native_completion_tokens": None,
+            "native_finish_reason": None,  # Added this line
             "stats_error": None,
         }
 
