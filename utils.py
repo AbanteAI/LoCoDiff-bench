@@ -677,10 +677,9 @@ def _get_async_openai_client():
 
 async def get_model_response_openrouter(
     prompt_content: str, model_name: str
-) -> tuple[str, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """
-    Sends a prompt to a specified model via OpenRouter asynchronously and returns
-    the response content and the generation ID.
+    Sends a prompt to a specified model via OpenRouter asynchronously.
 
     Args:
         prompt_content: The full content of the prompt to send to the model.
@@ -688,14 +687,15 @@ async def get_model_response_openrouter(
 
     Returns:
         A tuple containing:
-        - The content of the model's response message (str).
-        - The generation ID (str) if available, otherwise None.
+        - The content of the model's response message (str) if successful, else None.
+        - The generation ID (str) if available, else None.
+        - An error message (str) if an API error occurred, else None.
 
     Raises:
-        ValueError: If the OPENROUTER_API_KEY environment variable is not set.
-        openai.APIError: If there's an issue communicating with the OpenRouter API.
+        ValueError: If the OPENROUTER_API_KEY environment variable is not set (raised by _get_async_openai_client).
     """
     client = _get_async_openai_client()
+    error_message = None
 
     try:
         completion = await client.chat.completions.create(
@@ -714,7 +714,25 @@ async def get_model_response_openrouter(
         response_content = ""
         generation_id = None
 
-        # Extract content
+        # Check for API-level errors returned in the response body (e.g., credit limits)
+        # Use getattr for safer access to potentially dynamic attributes
+        error_payload = getattr(completion, "error", None)
+        if error_payload:
+            # Try to serialize the full error payload for more detail
+            try:
+                if isinstance(error_payload, dict):
+                    error_details = json.dumps(error_payload)
+                else:
+                    error_details = str(error_payload)
+                error_message = f"Provider error in response body: {error_details}"
+            except Exception as serialize_err:
+                # Fallback if serialization fails
+                error_message = f"Provider error in response body (serialization failed: {serialize_err}): {str(error_payload)}"
+
+            print(f"OpenRouter API reported an error: {error_message}")
+            return None, None, error_message
+
+        # Extract content if successful and no error in body
         if completion.choices and completion.choices[0].message:
             response_content = completion.choices[0].message.content or ""
 
@@ -727,16 +745,49 @@ async def get_model_response_openrouter(
                 f"Warning: Could not extract generation ID from OpenRouter response object: {completion}"
             )
 
-        return response_content, generation_id
+        return response_content, generation_id, None  # Success
 
     except openai.APIError as e:
-        print(f"OpenRouter API error during async chat completion: {e}")
-        raise
+        # This catches errors where the API call itself failed (e.g., 4xx/5xx status codes)
+        # Use getattr for status_code and body as they might not be statically typed
+        status_code = getattr(e, "status_code", "Unknown")
+        base_error_message = f"OpenRouter API Error: Status {status_code} - {e.message}"
+        detailed_error_message = base_error_message  # Start with base message
+
+        # Attempt to extract more detail from the body
+        body = getattr(e, "body", None)
+        if body:
+            try:
+                if isinstance(body, dict):
+                    # Try to get nested message first
+                    nested_message = body.get("error", {}).get("message")
+                    if nested_message and nested_message != e.message:
+                        detailed_error_message = (
+                            f"{base_error_message} | Detail: {nested_message}"
+                        )
+                    # Include full body if it might be useful and isn't just repeating the message
+                    body_str = json.dumps(body)
+                    if body_str not in detailed_error_message:  # Avoid redundancy
+                        detailed_error_message += f" | Body: {body_str}"
+                else:
+                    # If body is not a dict, include its string representation if informative
+                    body_str = str(body)
+                    if body_str and body_str not in detailed_error_message:
+                        detailed_error_message += f" | Body: {body_str}"
+            except Exception as serialize_err:
+                detailed_error_message += (
+                    f" (Failed to serialize body: {serialize_err})"
+                )
+
+        print(detailed_error_message)  # Print the most detailed message obtained
+        return None, None, detailed_error_message  # Return the detailed message
     except Exception as e:
-        print(
-            f"An unexpected error occurred during the async chat completion API call: {e}"
-        )
-        raise
+        error_message = f"Unexpected Error during API call: {type(e).__name__}: {e}"
+        print(error_message)
+        # Log traceback for unexpected errors
+        # import traceback
+        # traceback.print_exc()
+        return None, None, error_message
 
 
 async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
