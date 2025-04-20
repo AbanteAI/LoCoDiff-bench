@@ -142,10 +142,11 @@ async def run_single_benchmark(
             "stats_error": None,
         }
 
-        results_dir = None  # Define results_dir outside try block for finally
+        results_dir = None  # Define results_dir path string early
 
         try:
-            # --- Setup Results Directory ---
+            # --- Define Results Directory Path ---
+            # Directory creation is deferred until after successful API call
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             sanitized_model_name = sanitize_filename(model)
             results_dir = os.path.join(
@@ -154,10 +155,9 @@ async def run_single_benchmark(
                 sanitized_model_name,
                 timestamp_str,
             )
-            # Use pathlib for potentially deeper paths and easier creation
-            Path(results_dir).mkdir(parents=True, exist_ok=True)
-            run_metadata["results_dir"] = results_dir
-            # print(f"Results for {benchmark_case_prefix} will be saved to: {results_dir}") # Less verbose
+            run_metadata["results_dir_path_planned"] = (
+                results_dir  # Store planned path for metadata
+            )
 
             # --- Read Input Files ---
             if not os.path.exists(prompt_filepath):
@@ -214,6 +214,13 @@ async def run_single_benchmark(
                 run_metadata["stats_error"] = (
                     "No generation ID received from chat completion"
                 )
+
+            # --- Create Results Directory (only after successful API call) ---
+            # Use pathlib for potentially deeper paths and easier creation
+            Path(results_dir).mkdir(parents=True, exist_ok=True)
+            run_metadata["results_dir"] = (
+                results_dir  # Update metadata with actual created dir
+            )
 
             # --- Save Raw Response ---
             raw_response_path = os.path.join(results_dir, "raw_response.txt")
@@ -272,56 +279,58 @@ async def run_single_benchmark(
                     except Exception:
                         pass  # Ignore errors writing the error message
 
-            # --- Save Metadata (only if no API error occurred earlier) ---
-            metadata_path = os.path.join(results_dir, "metadata.json")
-            try:
-                with open(metadata_path, "w", encoding="utf-8") as f_meta:
-                    json.dump(run_metadata, f_meta, indent=4)
-            except Exception as meta_e:
-                print(
-                    f"\nWarning: Failed to save metadata.json for {benchmark_case_prefix}: {meta_e}"
-                )
+            # --- Save Metadata (only if no API error occurred and directory was created) ---
+            if results_dir and os.path.exists(
+                results_dir
+            ):  # Check if dir was actually created
+                metadata_path = os.path.join(results_dir, "metadata.json")
+                try:
+                    # Remove the temporary planned path key before saving
+                    run_metadata.pop("results_dir_path_planned", None)
+                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                        json.dump(run_metadata, f_meta, indent=4)
+                except Exception as meta_e:
+                    print(
+                        f"\nWarning: Failed to save metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
+                    )
+            else:
+                # This case should only be hit if an API error occurred earlier,
+                # preventing directory creation. We already printed the API error message.
+                pass
 
         except FileNotFoundError as e:
             run_metadata["error"] = f"File Error: {e}"
-            # Save metadata for file errors
-            if results_dir:
-                metadata_path = os.path.join(results_dir, "metadata.json")
-                try:
-                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
-                        json.dump(run_metadata, f_meta, indent=4)
-                except Exception as meta_e:
-                    print(
-                        f"\nWarning: Failed to save metadata.json after File Error for {benchmark_case_prefix}: {meta_e}"
-                    )
+            # Don't attempt to save metadata here as the results dir likely wasn't created
+            print(f"File Error for {benchmark_case_prefix}: {e} - Skipping results.")
+
         except IOError as e:
             run_metadata["error"] = f"IOError: {e}"
-            # Save metadata for IO errors
-            if results_dir:
-                metadata_path = os.path.join(results_dir, "metadata.json")
-                try:
-                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
-                        json.dump(run_metadata, f_meta, indent=4)
-                except Exception as meta_e:
-                    print(
-                        f"\nWarning: Failed to save metadata.json after IO Error for {benchmark_case_prefix}: {meta_e}"
-                    )
+            # Don't attempt to save metadata here
+            print(f"IO Error for {benchmark_case_prefix}: {e} - Skipping results.")
+
         except ValueError as e:  # Catches missing API key from utils
             run_metadata["error"] = f"Config Error: {e}"
             # Don't save metadata if config error prevented API call attempt
             print(f"Config Error for {benchmark_case_prefix}: {e} - Skipping results.")
         except Exception as e:  # Catch other unexpected issues during processing
             run_metadata["error"] = f"Runtime Error: {type(e).__name__}: {e}"
-            # Save metadata for runtime errors during processing
-            if results_dir:
+            # Attempt to save metadata only if the directory was created before the error
+            if results_dir and os.path.exists(results_dir):
                 metadata_path = os.path.join(results_dir, "metadata.json")
                 try:
+                    # Remove the temporary planned path key before saving
+                    run_metadata.pop("results_dir_path_planned", None)
                     with open(metadata_path, "w", encoding="utf-8") as f_meta:
                         json.dump(run_metadata, f_meta, indent=4)
                 except Exception as meta_e:
                     print(
-                        f"\nWarning: Failed to save metadata.json after Runtime Error for {benchmark_case_prefix}: {meta_e}"
+                        f"\nWarning: Failed to save metadata.json after Runtime Error for {benchmark_case_prefix} in {results_dir}: {meta_e}"
                     )
+            else:
+                print(
+                    f"Runtime Error for {benchmark_case_prefix}: {e} - Skipping results (directory not created)."
+                )
+
             # Optional: Log traceback for debugging
             # import traceback
             # run_metadata["traceback"] = traceback.format_exc()
