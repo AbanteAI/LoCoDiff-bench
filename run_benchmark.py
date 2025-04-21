@@ -50,14 +50,21 @@ def extract_code_from_backticks(text: str) -> str | None:
         # Find the start of the last ``` block using rfind
         end_outer = text.rfind("```")
 
+        # Find the start of the last ``` block using rfind
+        end_outer = text.rfind("```")
+
         # Check if the last ``` was found and if it's after the first ``` marker ended
         if end_outer == -1 or end_outer < start_inner:
-            # No closing backticks found after the opening ones,
-            # or the closing backticks are the same as the opening ones (e.g., only "```" in text)
-            return None
-
-        # Extract the content between the end of the first marker and the start of the last marker
-        extracted_content = text[start_inner:end_outer]
+            # No closing backticks found, or they are invalid.
+            # Be generous: extract from the start marker to the end of the string.
+            print(
+                "Warning: Closing backticks not found or invalid. Extracting from start marker to end."
+            )
+            extracted_content = text[start_inner:]
+        else:
+            # Both opening and closing backticks are valid
+            # Extract the content between the end of the first marker and the start of the last marker
+            extracted_content = text[start_inner:end_outer]
 
         return extracted_content.strip()
 

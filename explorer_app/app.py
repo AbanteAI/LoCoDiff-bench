@@ -489,7 +489,8 @@ if __name__ == "__main__":
 
     # Open browser tab shortly after starting the server
     # Use a timer to avoid race condition where browser opens before server is ready
-    if DEBUG:  # Only open browser automatically in debug mode
+    # Check WERKZEUG_RUN_MAIN to prevent the reloader from opening a second tab
+    if DEBUG and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         threading.Timer(1, lambda: open_browser(HOST, PORT)).start()
 
     # Run the Flask app
