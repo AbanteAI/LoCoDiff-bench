@@ -49,16 +49,10 @@ def main():
     )
     # Add arguments for filtering/bucketing/sampling parameters
     parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=100000,
-        help="Maximum prompt tokens allowed (default: 100000).",
-    )
-    parser.add_argument(
-        "--bucket-size",
-        type=int,
-        default=20000,
-        help="Size of token buckets for sampling (default: 20000).",
+        "--buckets",
+        type=str,
+        default="0,20,40,60,80,100",  # Default buckets up to 100k
+        help='Comma-separated list of bucket boundaries in thousands of tokens (e.g., "0,10,20,40,80"). Defines buckets [0k-10k), [10k-20k), [20k-40k), [40k-80k).',
     )
     parser.add_argument(
         "--max-per-bucket",
@@ -80,6 +74,28 @@ def main():
     print(f"Processing extensions: {args.extensions}")
     print(f"Looking for repositories in: {args.cache_dir}")
     print(f"Outputting prompts to: {args.output_dir}")
+
+    # --- Parse and validate bucket boundaries ---
+    try:
+        bucket_boundaries_k = [int(b.strip()) for b in args.buckets.split(",")]
+        if len(bucket_boundaries_k) < 2:
+            raise ValueError(
+                "Must specify at least two bucket boundaries (e.g., '0,100')."
+            )
+        if not all(
+            bucket_boundaries_k[i] < bucket_boundaries_k[i + 1]
+            for i in range(len(bucket_boundaries_k) - 1)
+        ):
+            raise ValueError("Bucket boundaries must be strictly increasing.")
+        if bucket_boundaries_k[0] < 0:
+            raise ValueError("Bucket boundaries cannot be negative.")
+        # Convert k-tokens to actual token counts
+        bucket_boundaries = [b * 1000 for b in bucket_boundaries_k]
+        print(f"Using bucket boundaries (tokens): {bucket_boundaries}")
+    except ValueError as e:
+        print(f"Error parsing --buckets argument '{args.buckets}': {e}")
+        return 1
+    # --- End bucket parsing ---
 
     repo_paths = find_repo_dirs(args.cache_dir)
 
@@ -138,8 +154,7 @@ def main():
     final_buckets = filter_bucket_sample_stats(
         all_stats,
         args.output_dir,
-        max_tokens=args.max_tokens,
-        bucket_size=args.bucket_size,
+        bucket_boundaries=bucket_boundaries,  # Pass the parsed list of token boundaries
         max_per_bucket=args.max_per_bucket,
     )
 
@@ -151,9 +166,9 @@ def main():
         "extensions": args.extensions,
         "cache_dir": args.cache_dir,
         "output_dir": args.output_dir,
-        "max_tokens": args.max_tokens,
-        "bucket_size": args.bucket_size,
+        "buckets": args.buckets,  # Store the original string argument
         "max_per_bucket": args.max_per_bucket,
+        "modified_within_months": args.modified_within_months,  # Also store this parameter
     }
     save_benchmark_metadata(args.output_dir, final_buckets, generation_params)
 
