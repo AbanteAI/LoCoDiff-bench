@@ -9,7 +9,6 @@ import openai
 import aiohttp  # For async requests
 import asyncio  # For sleep
 from dotenv import load_dotenv
-import math
 from collections import defaultdict
 from statistics import mean
 import random
@@ -540,7 +539,9 @@ def filter_bucket_sample_stats(
     if bucket_boundaries[0] < 0:
         raise ValueError("Bucket boundaries cannot be negative.")
 
-    max_tokens = bucket_boundaries[-1]  # The highest boundary defines the max tokens allowed
+    max_tokens = bucket_boundaries[
+        -1
+    ]  # The highest boundary defines the max tokens allowed
 
     print(
         f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {max_per_bucket}) ---"
@@ -673,15 +674,6 @@ def filter_bucket_sample_stats(
     print("Filtering, bucketing, and sampling complete.")
     # Return the final buckets containing the stats of the kept prompts
     return final_buckets
-                        f"Warning: Expected file not found for deletion during sampling: {expected_file}"
-                    )
-
-            final_buckets[bucket_key] = items_to_keep
-        else:
-            # Keep all items if count is within limit
-            final_buckets[bucket_key] = items
-            if items:  # Only print if bucket wasn't empty
-                print(f"  Bucket {bucket_key}: Kept all {len(items)} items.")
 
     print(f"Removed {total_sampled_out} prompts during sampling.")
     print("Filtering, bucketing, and sampling complete.")
