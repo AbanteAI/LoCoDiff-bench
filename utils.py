@@ -513,35 +513,111 @@ def print_stats_table(stats_list):
 
 
 def filter_bucket_sample_stats(
-    stats_list, output_dir, max_tokens=100000, bucket_size=20000, max_per_bucket=10
+    stats_list, output_dir, bucket_boundaries, max_per_bucket=10
 ):
     """
-    Filters stats, assigns them to buckets, samples buckets, and deletes discarded files.
+    Filters stats based on the highest bucket boundary, assigns them to buckets defined by the boundaries,
+    samples buckets, and deletes discarded files.
 
     Args:
         stats_list: List of dictionaries containing statistics for each file.
         output_dir: Directory where prompt and expected files are stored.
-        max_tokens: Maximum prompt tokens allowed.
-        bucket_size: Size of each token bucket.
+        bucket_boundaries: A list of integers representing the token boundaries for buckets
+                           (e.g., [0, 10000, 20000, 40000, 80000]). Must be sorted and contain at least two elements.
         max_per_bucket: Maximum number of items allowed per bucket after sampling.
 
     Returns:
         A dictionary where keys are bucket range tuples (min_token, max_token)
         and values are lists of stats dictionaries belonging to that bucket after filtering and sampling.
     """
+    if not bucket_boundaries or len(bucket_boundaries) < 2:
+        raise ValueError("bucket_boundaries must contain at least two elements.")
+    if not all(bucket_boundaries[i] < bucket_boundaries[i+1] for i in range(len(bucket_boundaries)-1)):
+         raise ValueError("bucket_boundaries must be strictly increasing.")
+    if bucket_boundaries[0] < 0:
+        raise ValueError("Bucket boundaries cannot be negative.")
+
+    max_tokens = bucket_boundaries[-1] # The highest boundary defines the max tokens allowed
+
     print(
         f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {max_per_bucket}) ---"
     )
     filtered_stats = []
     deleted_count = 0
 
-    # 1. Filter by max_tokens and delete corresponding files
+    # 1. Filter by max_tokens (highest boundary) and delete corresponding files
     print(f"Filtering prompts with more than {max_tokens} tokens...")
     for stats in stats_list:
-        if stats["prompt_tokens"] <= max_tokens:
-            filtered_stats.append(stats)
-        else:
+        # Filter prompts strictly greater than the max boundary, or exactly zero if the first boundary is > 0
+        if stats["prompt_tokens"] > max_tokens or (bucket_boundaries[0] > 0 and stats["prompt_tokens"] == 0):
             prompt_file = os.path.join(output_dir, stats["prompt_filename"])
+            expected_file = os.path.join(output_dir, stats["expected_filename"])
+            try:
+                os.remove(prompt_file)
+            except FileNotFoundError:
+                print(f"Warning: Prompt file not found for deletion: {prompt_file}")
+            try:
+                os.remove(expected_file)
+            except FileNotFoundError:
+                print(f"Warning: Expected file not found for deletion: {expected_file}")
+            deleted_count += 1
+        else:
+             # Keep prompts within the overall range [min_boundary, max_boundary]
+             # Note: We handle the lower bound during bucketing.
+             filtered_stats.append(stats)
+
+    print(f"Filtered out {deleted_count} prompts exceeding token limit or below minimum boundary.")
+
+    # 2. Bucket the filtered stats
+    print("Assigning remaining prompts to buckets...")
+    buckets = defaultdict(list)
+    # Define bucket ranges directly from the boundaries list
+    bucket_ranges = []
+    for i in range(len(bucket_boundaries) - 1):
+        min_tk = bucket_boundaries[i]
+        max_tk = bucket_boundaries[i+1]
+        # Buckets are defined as [min_tk, max_tk) except for the first bucket which includes 0 if min_tk is 0.
+        # However, the logic below handles assignment correctly.
+        # The key will represent the range (inclusive min, exclusive max for display/logic).
+        # Let's adjust the range slightly for assignment logic:
+        # Bucket 1: [min_b[0], min_b[1])
+        # Bucket 2: [min_b[1], min_b[2])
+        # ...
+        bucket_key = (min_tk, max_tk)
+        buckets[bucket_key] = [] # Initialize empty list
+        bucket_ranges.append(bucket_key)
+
+    for stats in filtered_stats:
+        tokens = stats["prompt_tokens"]
+        assigned = False
+        for min_tk, max_tk in bucket_ranges:
+            # Assign if tokens are within the bucket range [min_tk, max_tk)
+            # Special case: if min_tk is 0, include 0 tokens.
+            if (tokens >= min_tk and tokens < max_tk) or (min_tk == 0 and tokens == 0):
+                 # Check if it's the last bucket, include the max boundary value
+                 if max_tk == max_tokens and tokens == max_tk:
+                     buckets[(min_tk, max_tk)].append(stats)
+                     assigned = True
+                     break
+                 elif tokens < max_tk: # Standard case
+                     buckets[(min_tk, max_tk)].append(stats)
+                     assigned = True
+                     break
+        # This check is mostly for debugging, should not happen with valid boundaries
+        if not assigned and tokens == max_tokens:
+             # Handle the edge case where a prompt has exactly max_tokens
+             # It should belong to the last bucket
+             last_bucket_key = bucket_ranges[-1]
+             if last_bucket_key[1] == max_tokens:
+                 buckets[last_bucket_key].append(stats)
+                 assigned = True
+
+        if not assigned:
+             print(f"Warning: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}")
+
+
+    # 3. Sample buckets exceeding max_per_bucket and delete corresponding files
+    print(f"Sampling buckets to have at most {max_per_bucket} prompts each...")
             expected_file = os.path.join(output_dir, stats["expected_filename"])
             try:
                 os.remove(prompt_file)
@@ -557,35 +633,6 @@ def filter_bucket_sample_stats(
     print(f"Filtered out {deleted_count} prompts exceeding token limit.")
 
     # 2. Bucket the filtered stats
-    print("Assigning remaining prompts to buckets...")
-    num_buckets = math.ceil(max_tokens / bucket_size)
-    buckets = defaultdict(list)
-    bucket_ranges = {}  # Store range tuple for printing
-
-    for i in range(num_buckets):
-        min_tk = i * bucket_size + (
-            1 if i > 0 else 0
-        )  # Start from 1 for non-zero buckets
-        max_tk = (i + 1) * bucket_size
-        # Ensure the last bucket goes exactly up to max_tokens
-        if max_tk > max_tokens:
-            max_tk = max_tokens
-        bucket_key = (min_tk, max_tk)
-        buckets[bucket_key] = []  # Initialize empty list
-        bucket_ranges[i] = bucket_key  # Map index to range for lookup
-
-    for stats in filtered_stats:
-        tokens = stats["prompt_tokens"]
-        # Find the correct bucket index
-        bucket_index = (tokens - 1) // bucket_size if tokens > 0 else 0
-        # Ensure index is within bounds (handles edge case of exactly max_tokens)
-        bucket_index = min(bucket_index, num_buckets - 1)
-
-        bucket_key = bucket_ranges[bucket_index]
-        buckets[bucket_key].append(stats)
-
-    # 3. Sample buckets exceeding max_per_bucket and delete corresponding files
-    print(f"Sampling buckets to have at most {max_per_bucket} prompts each...")
     final_buckets = {}
     total_sampled_out = 0
     for bucket_key, items in buckets.items():
