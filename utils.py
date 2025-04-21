@@ -532,12 +532,15 @@ def filter_bucket_sample_stats(
     """
     if not bucket_boundaries or len(bucket_boundaries) < 2:
         raise ValueError("bucket_boundaries must contain at least two elements.")
-    if not all(bucket_boundaries[i] < bucket_boundaries[i+1] for i in range(len(bucket_boundaries)-1)):
-         raise ValueError("bucket_boundaries must be strictly increasing.")
+    if not all(
+        bucket_boundaries[i] < bucket_boundaries[i + 1]
+        for i in range(len(bucket_boundaries) - 1)
+    ):
+        raise ValueError("bucket_boundaries must be strictly increasing.")
     if bucket_boundaries[0] < 0:
         raise ValueError("Bucket boundaries cannot be negative.")
 
-    max_tokens = bucket_boundaries[-1] # The highest boundary defines the max tokens allowed
+    max_tokens = bucket_boundaries[-1]  # The highest boundary defines the max tokens allowed
 
     print(
         f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {max_per_bucket}) ---"
@@ -549,7 +552,9 @@ def filter_bucket_sample_stats(
     print(f"Filtering prompts with more than {max_tokens} tokens...")
     for stats in stats_list:
         # Filter prompts strictly greater than the max boundary, or exactly zero if the first boundary is > 0
-        if stats["prompt_tokens"] > max_tokens or (bucket_boundaries[0] > 0 and stats["prompt_tokens"] == 0):
+        if stats["prompt_tokens"] > max_tokens or (
+            bucket_boundaries[0] > 0 and stats["prompt_tokens"] == 0
+        ):
             prompt_file = os.path.join(output_dir, stats["prompt_filename"])
             expected_file = os.path.join(output_dir, stats["expected_filename"])
             try:
@@ -562,11 +567,13 @@ def filter_bucket_sample_stats(
                 print(f"Warning: Expected file not found for deletion: {expected_file}")
             deleted_count += 1
         else:
-             # Keep prompts within the overall range [min_boundary, max_boundary]
-             # Note: We handle the lower bound during bucketing.
-             filtered_stats.append(stats)
+            # Keep prompts within the overall range [min_boundary, max_boundary]
+            # Note: We handle the lower bound during bucketing.
+            filtered_stats.append(stats)
 
-    print(f"Filtered out {deleted_count} prompts exceeding token limit or below minimum boundary.")
+    print(
+        f"Filtered out {deleted_count} prompts exceeding token limit or below minimum boundary."
+    )
 
     # 2. Bucket the filtered stats
     print("Assigning remaining prompts to buckets...")
@@ -575,16 +582,9 @@ def filter_bucket_sample_stats(
     bucket_ranges = []
     for i in range(len(bucket_boundaries) - 1):
         min_tk = bucket_boundaries[i]
-        max_tk = bucket_boundaries[i+1]
-        # Buckets are defined as [min_tk, max_tk) except for the first bucket which includes 0 if min_tk is 0.
-        # However, the logic below handles assignment correctly.
-        # The key will represent the range (inclusive min, exclusive max for display/logic).
-        # Let's adjust the range slightly for assignment logic:
-        # Bucket 1: [min_b[0], min_b[1])
-        # Bucket 2: [min_b[1], min_b[2])
-        # ...
+        max_tk = bucket_boundaries[i + 1]
         bucket_key = (min_tk, max_tk)
-        buckets[bucket_key] = [] # Initialize empty list
+        buckets[bucket_key] = []  # Initialize empty list
         bucket_ranges.append(bucket_key)
 
     for stats in filtered_stats:
@@ -593,71 +593,49 @@ def filter_bucket_sample_stats(
         for min_tk, max_tk in bucket_ranges:
             # Assign if tokens are within the bucket range [min_tk, max_tk)
             # Special case: if min_tk is 0, include 0 tokens.
-            if (tokens >= min_tk and tokens < max_tk) or (min_tk == 0 and tokens == 0):
-                 # Check if it's the last bucket, include the max boundary value
-                 if max_tk == max_tokens and tokens == max_tk:
-                     buckets[(min_tk, max_tk)].append(stats)
-                     assigned = True
-                     break
-                 elif tokens < max_tk: # Standard case
-                     buckets[(min_tk, max_tk)].append(stats)
-                     assigned = True
-                     break
-        # This check is mostly for debugging, should not happen with valid boundaries
-        if not assigned and tokens == max_tokens:
-             # Handle the edge case where a prompt has exactly max_tokens
-             # It should belong to the last bucket
-             last_bucket_key = bucket_ranges[-1]
-             if last_bucket_key[1] == max_tokens:
-                 buckets[last_bucket_key].append(stats)
-                 assigned = True
+            # Also include the upper boundary max_tk if it's the very last boundary
+            is_last_bucket = max_tk == max_tokens
+            in_range = (tokens >= min_tk and tokens < max_tk) or (
+                min_tk == 0 and tokens == 0
+            )
+            # Include the max_tokens value in the last bucket
+            if is_last_bucket and tokens == max_tk:
+                in_range = True
+
+            if in_range:
+                buckets[(min_tk, max_tk)].append(stats)
+                assigned = True
+                break
 
         if not assigned:
-             print(f"Warning: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}")
-
+            # This should ideally not happen if filtering and bucketing logic is correct
+            print(
+                f"Warning: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}"
+            )
 
     # 3. Sample buckets exceeding max_per_bucket and delete corresponding files
     print(f"Sampling buckets to have at most {max_per_bucket} prompts each...")
-            expected_file = os.path.join(output_dir, stats["expected_filename"])
-            try:
-                os.remove(prompt_file)
-                # print(f"Deleted {prompt_file}")
-            except FileNotFoundError:
-                print(f"Warning: Prompt file not found for deletion: {prompt_file}")
-            try:
-                os.remove(expected_file)
-                # print(f"Deleted {expected_file}")
-            except FileNotFoundError:
-                print(f"Warning: Expected file not found for deletion: {expected_file}")
-            deleted_count += 1
-    print(f"Filtered out {deleted_count} prompts exceeding token limit.")
-
-    # 2. Bucket the filtered stats
     final_buckets = {}
     total_sampled_out = 0
+    # Iterate through the buckets created in step 2
     for bucket_key, items in buckets.items():
         if len(items) > max_per_bucket:
-            # Targeted sampling: Instead of pure random sampling, select items closest to
-            # randomly chosen target token counts within the bucket range. This aims to
-            # create a sample whose average token count is closer to the midpoint of the
-            # bucket, counteracting potential skew towards lower token counts.
+            # Targeted sampling logic
             min_tk, max_tk = bucket_key
             items_to_keep = []
             available_items = list(items)  # Copy to modify
 
             for _ in range(max_per_bucket):
-                if (
-                    not available_items
-                ):  # Should not happen if len(items) > max_per_bucket
+                if not available_items:
                     break
+                # Select item closest to a random target within the bucket range
                 target_token_count = random.uniform(min_tk, max_tk)
-                # Find item in available_items closest to target_token_count
                 closest_item = min(
                     available_items,
                     key=lambda item: abs(item["prompt_tokens"] - target_token_count),
                 )
                 items_to_keep.append(closest_item)
-                available_items.remove(closest_item)  # Remove selected item
+                available_items.remove(closest_item)
 
             # Items remaining in available_items are discarded
             items_to_discard = available_items
@@ -666,6 +644,7 @@ def filter_bucket_sample_stats(
             )
             total_sampled_out += len(items_to_discard)
 
+            # Delete files for discarded items
             for stats in items_to_discard:
                 prompt_file = os.path.join(output_dir, stats["prompt_filename"])
                 expected_file = os.path.join(output_dir, stats["expected_filename"])
@@ -679,6 +658,21 @@ def filter_bucket_sample_stats(
                     os.remove(expected_file)
                 except FileNotFoundError:
                     print(
+                        f"Warning: Expected file not found for deletion during sampling: {expected_file}"
+                    )
+
+            # Store the kept items for this bucket
+            final_buckets[bucket_key] = items_to_keep
+        else:
+            # Keep all items if count is within limit
+            final_buckets[bucket_key] = items
+            if items:  # Only print if bucket wasn't empty
+                print(f"  Bucket {bucket_key}: Kept all {len(items)} items.")
+
+    print(f"Removed {total_sampled_out} prompts during sampling.")
+    print("Filtering, bucketing, and sampling complete.")
+    # Return the final buckets containing the stats of the kept prompts
+    return final_buckets
                         f"Warning: Expected file not found for deletion during sampling: {expected_file}"
                     )
 
