@@ -20,6 +20,26 @@ except ImportError as e:
     sys.exit(1)
 
 
+# --- Helper Functions ---
+
+
+def format_bucket_key(key_str: str) -> str:
+    """Formats a bucket key string 'min-max' into 'min/1k-max/1k k'."""
+    try:
+        min_val, max_val = map(int, key_str.split("-"))
+        # Format as thousands, using 'k' suffix
+        min_k = min_val // 1000
+        max_k = max_val // 1000
+        # Handle the 0 case specifically if needed, but simple division works
+        return f"{min_k}-{max_k}k"
+    except ValueError:
+        # Handle cases where splitting or conversion fails (e.g., unexpected key format)
+        return key_str  # Return original key if formatting fails
+
+
+# --- Core Logic ---
+
+
 def load_benchmark_metadata(benchmark_dir: str) -> dict | None:
     """Loads the benchmark structure metadata from metadata.json."""
     metadata_path = os.path.join(benchmark_dir, "metadata.json")
@@ -241,7 +261,9 @@ def print_summary_tables(analysis_results: dict):
 
     print("\n--- Per-Bucket Success Rate (%) ---")
     bucket_keys = analysis_results["bucket_keys"]
-    bucket_data = {"Bucket": [f"{k} tk" for k in bucket_keys]}  # Shorten bucket label
+    # Format bucket keys using the helper function and update header
+    formatted_keys = [format_bucket_key(k) for k in bucket_keys]
+    bucket_data = {"Bucket (k tk)": formatted_keys}  # Updated header
 
     for model_name, stats in analysis_results["models"].items():
         rates = []
@@ -270,6 +292,8 @@ def generate_plot(analysis_results: dict, output_filename: str):
     # Use bucket midpoints for plotting x-axis? Or just indices? Indices are simpler.
     # Let's use indices for simplicity, label ticks with bucket ranges.
     x_indices = range(len(bucket_keys))
+    # Format bucket keys for tick labels
+    formatted_bucket_labels = [format_bucket_key(k) for k in bucket_keys]
 
     plt.figure(figsize=(12, 7))
 
@@ -297,18 +321,30 @@ def generate_plot(analysis_results: dict, output_filename: str):
 
     # Formatting the plot
     plt.title("Benchmark Success Rate per Prompt Token Bucket")
-    plt.xlabel("Prompt Token Bucket")
+    plt.xlabel("Prompt Token Bucket (k tk)")  # Updated x-axis label
     plt.ylabel("Success Rate")
     # Format y-axis as percentage
     plt.gca().yaxis.set_major_formatter(
         mticker.FuncFormatter(lambda y, _: f"{y:.0%}")
     )  # Use mticker
     plt.ylim(0, 1.05)  # Extend slightly beyond 100%
-    plt.xticks(x_indices, [f"{k} tk" for k in bucket_keys], rotation=45, ha="right")
+    # Use formatted labels for x-ticks
+    plt.xticks(x_indices, formatted_bucket_labels, rotation=45, ha="right")
     plt.legend(title="Models", bbox_to_anchor=(1.04, 1), loc="upper left")
     plt.grid(axis="y", linestyle="--", alpha=0.7)
     # Use tuple for rect argument
     plt.tight_layout(rect=(0, 0, 0.85, 1))  # Adjust layout to make space for legend
+
+    # Ensure the output directory exists
+    output_dir = os.path.dirname(output_filename)
+    if output_dir and not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"Created directory for plot: {output_dir}")
+        except OSError as e:
+            print(f"Error creating directory {output_dir}: {e}")
+            # Optionally decide if you want to proceed or exit
+            # For now, we'll let savefig handle the potential error if dir creation failed
 
     # Save the plot
     try:
@@ -327,7 +363,8 @@ def main():
     )
     default_benchmark_dir = "generated_prompts"
     default_results_dir = "benchmark_results"
-    default_plot_file = "benchmark_success_rate.png"
+    # Default plot location changed to be inside results dir
+    default_plot_file = os.path.join(default_results_dir, "benchmark_success_rate.png")
 
     parser.add_argument(
         "--benchmark-dir",
@@ -342,7 +379,7 @@ def main():
     parser.add_argument(
         "--plot-file",
         default=default_plot_file,
-        help=f"Filename to save the generated plot (default: '{default_plot_file}').",
+        help=f"Filename to save the generated plot (default: '{default_plot_file}'). Directory will be created if it doesn't exist.",
     )
     parser.add_argument(
         "--no-plot",
