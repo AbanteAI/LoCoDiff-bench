@@ -67,6 +67,13 @@ def main():
         metavar="N",
         help="Only process files modified in the last N months (default: 3). Set to 0 or negative to disable.",
     )
+    parser.add_argument(
+        "--max-expected-tokens",
+        type=int,
+        default=12000,
+        metavar="T",
+        help="Maximum number of tokens allowed in the expected output file (default: 12000). Set to 0 or negative to disable.",
+    )
 
     args = parser.parse_args()
 
@@ -109,23 +116,35 @@ def main():
     all_stats = []
     generation_errors = 0
     total_date_filtered_count = 0  # Initialize counter for date filtering
+    total_expected_token_filtered_count = (
+        0  # Initialize counter for expected token filtering
+    )
 
     for repo_path in repo_paths:
         repo_name = os.path.basename(os.path.normpath(repo_path))
         org_name = os.path.basename(os.path.dirname(repo_path))
         print(f"\nProcessing repository: {org_name}/{repo_name} ({repo_path})")
         try:
-            # Pass modified_within_months argument and receive the date filtered count
-            stats_list, date_filtered_count = generate_prompts_and_expected(
+            # Pass modified_within_months and max_expected_tokens arguments
+            # Receive both date and expected token filtered counts
+            (
+                stats_list,
+                date_filtered_count,
+                expected_token_filtered_count,
+            ) = generate_prompts_and_expected(
                 repo_path,
                 args.extensions,
                 args.output_dir,
                 args.modified_within_months,
+                args.max_expected_tokens,  # Pass the new argument
             )
             all_stats.extend(stats_list)
-            total_date_filtered_count += date_filtered_count  # Accumulate count
+            total_date_filtered_count += date_filtered_count  # Accumulate date count
+            total_expected_token_filtered_count += (
+                expected_token_filtered_count  # Accumulate token count
+            )
             print(
-                f"Generated {len(stats_list)} prompts for {org_name}/{repo_name} (skipped {date_filtered_count} due to date filter)."
+                f"Generated {len(stats_list)} prompts for {org_name}/{repo_name} (skipped {date_filtered_count} by date, {expected_token_filtered_count} by expected tokens)."
             )
         except Exception as e:
             print(f"Error generating prompts for {org_name}/{repo_name}: {e}")
@@ -145,9 +164,14 @@ def main():
         print(
             f"\nFiltered out a total of {total_date_filtered_count} files across all repositories due to modification date constraint (older than {args.modified_within_months} months)."
         )
+    # Report total files filtered by expected token count
+    if args.max_expected_tokens > 0:
+        print(
+            f"\nFiltered out a total of {total_expected_token_filtered_count} files across all repositories due to expected output token constraint (more than {args.max_expected_tokens} tokens)."
+        )
 
-    # Print initial statistics table for all generated prompts (after date filtering)
-    print("\n--- Initial Generation Statistics (All Repos, Post-Date-Filter) ---")
+    # Print initial statistics table for all generated prompts (after all filtering)
+    print("\n--- Initial Generation Statistics (All Repos, Post-Filtering) ---")
     print_stats_table(all_stats)
 
     # Filter, bucket, and sample the results using provided arguments
@@ -168,7 +192,8 @@ def main():
         "output_dir": args.output_dir,
         "buckets": args.buckets,  # Store the original string argument
         "max_per_bucket": args.max_per_bucket,
-        "modified_within_months": args.modified_within_months,  # Also store this parameter
+        "modified_within_months": args.modified_within_months,
+        "max_expected_tokens": args.max_expected_tokens,  # Store the new parameter
     }
     save_benchmark_metadata(args.output_dir, final_buckets, generation_params)
 
