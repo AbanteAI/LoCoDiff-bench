@@ -157,6 +157,7 @@ def generate_prompts_and_expected(
     extensions,
     output_dir="generated_prompts",
     modified_within_months=3,
+    max_expected_tokens=12000,  # Add new parameter with default
 ):
     """
     For every file in the repository at repo_path with one of the specified extensions,
@@ -199,6 +200,9 @@ def generate_prompts_and_expected(
     stats_list = []
     files_to_process = []
     date_filtered_count = 0  # Counter for files skipped by date filter
+    expected_token_filtered_count = (
+        0  # Counter for files skipped by expected token limit
+    )
 
     # Calculate date threshold if filter is enabled
     threshold_timestamp = None
@@ -276,7 +280,23 @@ def generate_prompts_and_expected(
                 )
                 threshold_timestamp = None  # Disable filter if git is missing
 
-        # --- Proceed with generation if not filtered ---
+        # --- Proceed with generation if not filtered by date ---
+
+        # --- Read final content first to check expected token count ---
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
+                final_content = original.read()
+        except Exception as e:
+            print(f"\nWarning: Error reading file {full_path}: {e}. Skipping.")
+            continue  # Skip if we can't even read the file
+
+        # --- Expected Token Filter Check ---
+        expected_tokens = count_tokens(final_content)
+        if max_expected_tokens > 0 and expected_tokens > max_expected_tokens:
+            expected_token_filtered_count += 1
+            continue  # Skip this file
+
+        # --- Proceed with prompt generation if not filtered by expected tokens ---
         safe_rel = rel_path.replace(os.sep, "_")
         prompt_fname = f"{repo_name}_{safe_rel}_prompt.txt"
         expected_fname = f"{repo_name}_{safe_rel}_expectedoutput.txt"
@@ -339,16 +359,13 @@ print('Hello, world!')
         with open(prompt_path, "w", encoding="utf-8") as pf:
             pf.write(prompt_content)
 
-        # 3. Read final content (Let it raise errors if file cannot be read)
-        with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
-            final_content = original.read()
-
+        # 3. Write final content (already read and token count checked)
         with open(expected_path, "w", encoding="utf-8") as ef:
             ef.write(final_content)
 
-        # 4. Calculate statistics
+        # 4. Calculate statistics (expected_tokens already calculated)
         prompt_tokens = count_tokens(prompt_content)
-        expected_tokens = count_tokens(final_content)
+        # expected_tokens = count_tokens(final_content) # Already done above
         final_lines = len(final_content.splitlines())
 
         # Count commits
@@ -415,8 +432,8 @@ print('Hello, world!')
 
         stats_list.append(file_stats)
 
-    # Return the list of stats and the count of files filtered by date
-    return stats_list, date_filtered_count
+    # Return the list of stats and the counts of files filtered by date and expected tokens
+    return stats_list, date_filtered_count, expected_token_filtered_count
 
 
 def save_benchmark_metadata(output_dir, final_buckets, generation_params):
