@@ -3,6 +3,8 @@ import os
 import json
 import glob
 import re
+import subprocess  # Added for running analysis script
+import sys  # Added to get current python executable
 from flask import Flask, render_template, abort, url_for, send_from_directory
 from markupsafe import escape
 import shutil
@@ -13,9 +15,13 @@ import threading
 # Assuming the app is run from the root of the repository
 BENCHMARK_DIR = "generated_prompts"
 RESULTS_BASE_DIR = "benchmark_results"
-PLOT_FILENAME = "benchmark_success_rate.png"  # Original plot location
+# Plot is now generated inside the results directory by analyze_results.py
+PLOT_FILENAME = os.path.join(RESULTS_BASE_DIR, "benchmark_success_rate.png")
 STATIC_DIR = "explorer_app/static"
-PLOT_STATIC_PATH = os.path.join(STATIC_DIR, PLOT_FILENAME)
+# The destination path in static dir keeps the original simple name for the URL
+PLOT_STATIC_DEST_FILENAME = "benchmark_success_rate.png"
+PLOT_STATIC_PATH = os.path.join(STATIC_DIR, PLOT_STATIC_DEST_FILENAME)
+
 
 # --- Flask App Initialization ---
 app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -187,19 +193,23 @@ def copy_plot_to_static():
     if not os.path.exists(STATIC_DIR):
         os.makedirs(STATIC_DIR, exist_ok=True)
 
+    # PLOT_FILENAME now points to the source location (e.g., benchmark_results/...)
+    # PLOT_STATIC_PATH points to the destination in the static folder
     if os.path.exists(PLOT_FILENAME):
         try:
             shutil.copy2(PLOT_FILENAME, PLOT_STATIC_PATH)  # copy2 preserves metadata
-            print(f"Copied {PLOT_FILENAME} to {PLOT_STATIC_PATH}")
+            print(f"Copied plot from {PLOT_FILENAME} to {PLOT_STATIC_PATH}")
             return True
         except Exception as e:
-            print(f"Error copying plot file: {e}")
+            print(
+                f"Error copying plot file from {PLOT_FILENAME} to {PLOT_STATIC_PATH}: {e}"
+            )
             return False
     else:
         print(
-            f"Warning: Plot file {PLOT_FILENAME} not found. Cannot copy to static dir."
+            f"Warning: Source plot file {PLOT_FILENAME} not found. Cannot copy to static dir."
         )
-        # Check if it already exists in static dir from a previous run
+        # Check if the destination plot already exists in static dir from a previous run
         return os.path.exists(PLOT_STATIC_PATH)
 
 
@@ -212,7 +222,10 @@ def index():
     benchmark_metadata = load_benchmark_metadata(app.config["BENCHMARK_DIR"])
     models = find_models_in_results(app.config["RESULTS_BASE_DIR"])
     plot_exists = copy_plot_to_static()  # Ensure plot is in static dir for serving
-    plot_url = url_for("static", filename=PLOT_FILENAME) if plot_exists else None
+    # Use the destination filename for the URL
+    plot_url = (
+        url_for("static", filename=PLOT_STATIC_DEST_FILENAME) if plot_exists else None
+    )
 
     # Basic stats (can be expanded)
     total_cases = 0
@@ -431,7 +444,47 @@ if __name__ == "__main__":
     PORT = 5001
     DEBUG = True
 
-    # Ensure plot is available before starting
+    # --- Run Analysis Script ---
+    print("\n--- Running analyze_results.py to update plot ---")
+    try:
+        # Run the script using the python executable from the current environment
+        # Pass necessary arguments if defaults are not sufficient (using defaults here)
+        # Capture output and errors
+        analysis_process = subprocess.run(
+            [sys.executable, "analyze_results.py"],  # Use sys.executable
+            check=False,  # Don't throw exception on non-zero exit code
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        # Print stdout and stderr
+        if analysis_process.stdout:
+            print("Analysis Script Output:\n", analysis_process.stdout)
+        if analysis_process.stderr:
+            print(
+                "Analysis Script Error Output:\n",
+                analysis_process.stderr,
+                file=sys.stderr,
+            )
+
+        if analysis_process.returncode != 0:
+            print(
+                f"Warning: analyze_results.py exited with code {analysis_process.returncode}",
+                file=sys.stderr,
+            )
+        else:
+            print("analyze_results.py completed successfully.")
+
+    except FileNotFoundError:
+        print(
+            "Error: analyze_results.py not found. Make sure you are in the repository root.",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"Error running analyze_results.py: {e}", file=sys.stderr)
+    print("--- Finished running analyze_results.py ---\n")
+
+    # Ensure plot is available in static dir after potentially running analysis
     copy_plot_to_static()
 
     # Open browser tab shortly after starting the server
