@@ -75,39 +75,161 @@ from collections import defaultdict
 from statistics import mean
 import random
 from tqdm import tqdm
-from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict, Any
+from dataclasses import dataclass, field, asdict
+from typing import List, Tuple, Dict, Any, Optional
+from pathlib import Path
 
 
-# --- Helper Functions ---
+# --- Git Helper Class ---
 
 
-def get_repo_head_commit_hash(repo_path):
-    """
-    Get the HEAD commit hash of a repository.
+class GitRepo:
+    """Encapsulates Git subprocess logic and caches expensive calls."""
 
-    Args:
-        repo_path: Path to the cloned repository.
+    def __init__(self, repo_path: str | Path):
+        self.repo_path = Path(repo_path)
+        if not (self.repo_path / ".git").is_dir():
+            raise FileNotFoundError(f"Not a git repository: {self.repo_path}")
 
-    Returns:
-        The full commit hash as a string.
+        self._head_hash: Optional[str] = None
+        self._commit_times: Dict[str, int] = {}
+        self._numstats: Dict[str, Tuple[int, int]] = {}
+        # History is likely too large to cache effectively in memory for many files
 
-    Raises:
-        subprocess.CalledProcessError: If git command fails.
-        FileNotFoundError: If git command is not found.
-    """
-    # Get commit hash - will raise an exception if it fails
-    hash_result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_path,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
-    commit_hash = hash_result.stdout.strip()
-    return commit_hash
+    def _run_git_command(
+        self, args: List[str], check: bool = True
+    ) -> subprocess.CompletedProcess:
+        """Helper to run git commands in the repository context."""
+        try:
+            return subprocess.run(
+                ["git"] + args,
+                cwd=self.repo_path,
+                check=check,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",  # Keep ignoring errors for robustness with diverse repos
+            )
+        except FileNotFoundError:
+            print(
+                "\nError: 'git' command not found. Please ensure Git is installed and in your PATH."
+            )
+            raise  # Re-raise the exception after printing the message
+
+    @property
+    def head_hash(self) -> str:
+        """Get the HEAD commit hash, caching the result."""
+        if self._head_hash is None:
+            try:
+                result = self._run_git_command(["rev-parse", "HEAD"])
+                self._head_hash = result.stdout.strip()
+            except subprocess.CalledProcessError as e:
+                print(f"Error getting HEAD hash for {self.repo_path}: {e}")
+                raise  # Propagate error
+        if (
+            not self._head_hash
+        ):  # Check if empty after potential error or if git returned nothing
+            raise ValueError(f"Could not determine HEAD hash for {self.repo_path}")
+        return self._head_hash
+
+    def file_last_commit_time(self, rel_path: str) -> Optional[int]:
+        """Get the Unix timestamp of the last commit affecting the file, caching the result."""
+        if rel_path not in self._commit_times:
+            try:
+                result = self._run_git_command(
+                    ["log", "-1", "--format=%ct", "--", rel_path]
+                )
+                timestamp_str = result.stdout.strip()
+                if timestamp_str:
+                    self._commit_times[rel_path] = int(timestamp_str)
+                else:
+                    # Handle case where file might be new or untracked by log
+                    print(
+                        f"\nWarning: Could not get commit timestamp for {rel_path}. Assuming recent."
+                    )
+                    self._commit_times[rel_path] = int(
+                        time.time()
+                    )  # Default to now? Or None? Let's use None.
+                    return None
+
+            except subprocess.CalledProcessError as e:
+                print(
+                    f"\nWarning: Error getting commit time for {rel_path}: {e}. Skipping date check."
+                )
+                self._commit_times[
+                    rel_path
+                ] = -1  # Use sentinel value for error? Or None? Let's use None.
+                return None
+            except ValueError as e:
+                print(
+                    f"\nWarning: Could not parse commit timestamp for {rel_path}: '{timestamp_str}'. Error: {e}"
+                )
+                self._commit_times[
+                    rel_path
+                ] = -1  # Use sentinel value for error? Or None? Let's use None.
+                return None
+
+        # Return cached value, handling the sentinel if we used one (now using None)
+        return self._commit_times.get(rel_path)
+
+    def file_history(self, rel_path: str) -> str:
+        """Get the git log history with diffs for the file."""
+        try:
+            # No caching for history as it can be large
+            result = self._run_git_command(
+                [
+                    "log",
+                    "-p",
+                    "--cc",  # Show combined diff for merge commits
+                    "--topo-order",
+                    "--reverse",
+                    "--",
+                    rel_path,
+                ]
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            print(f"\nWarning: Error getting git history for {rel_path}: {e}")
+            return f"Error retrieving git history: {e}\n"  # Return error message in history
+
+    def file_numstat(self, rel_path: str) -> Tuple[int, int]:
+        """Get total lines added/deleted for the file across its history, caching the result."""
+        if rel_path not in self._numstats:
+            lines_added = 0
+            lines_deleted = 0
+            try:
+                result = self._run_git_command(
+                    [
+                        "log",
+                        "--format=format:",  # Only show numstat
+                        "--numstat",
+                        "--",
+                        rel_path,
+                    ]
+                )
+                for line in result.stdout.splitlines():
+                    if not line.strip():
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) == 3:
+                        added_str, deleted_str, _ = parts
+                        # Handle binary files marked with '-'
+                        if added_str != "-":
+                            lines_added += int(added_str)
+                        if deleted_str != "-":
+                            lines_deleted += int(deleted_str)
+                self._numstats[rel_path] = (lines_added, lines_deleted)
+            except subprocess.CalledProcessError as e:
+                print(f"\nWarning: Error getting numstat for {rel_path}: {e}")
+                self._numstats[rel_path] = (0, 0)  # Cache error state as (0, 0)
+            except ValueError as e:
+                print(f"\nWarning: Error parsing numstat output for {rel_path}: {e}")
+                self._numstats[rel_path] = (0, 0)  # Cache error state as (0, 0)
+
+        return self._numstats[rel_path]
+
+
+# --- Configuration Dataclass ---
 
 
 @dataclass(frozen=True)
@@ -123,6 +245,11 @@ class Config:
     modified_within_months: int
     max_expected_tokens: int
     encoder: tiktoken.Encoding  # Encoder instance is now required
+    # Add GitRepo instance, initialized later
+    # Using default_factory to avoid issues with mutable defaults in dataclasses
+    git_repo: Optional[GitRepo] = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
 
 def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
@@ -184,6 +311,29 @@ def generate_prompts_and_expected(
     if not os.path.exists(cfg.output_dir):
         os.makedirs(cfg.output_dir, exist_ok=True)
 
+    # --- Initialize GitRepo Helper ---
+    try:
+        # Use the GitRepo instance from the config if provided, otherwise create one
+        # This allows for potential future reuse across multiple calls if needed
+        if cfg.git_repo is None:
+            # This modification assumes Config is mutable or recreated per repo
+            # If Config is truly frozen and shared, this approach needs rethinking.
+            # For now, let's assume we can assign it here.
+            # A cleaner way might be to pass the repo object explicitly, not via Config.
+            # TODO: Revisit Config immutability vs. holding the GitRepo instance.
+            # Let's create it directly here instead of modifying Config.
+            repo = GitRepo(repo_path)
+        else:
+            repo = cfg.git_repo  # Use existing repo object from config
+
+        head_commit_hash = repo.head_hash  # Get hash via property
+        print(f"Repository at commit: {head_commit_hash}")
+    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as e:
+        print(f"Error initializing GitRepo or getting head hash for {repo_path}: {e}")
+        # Return empty results and zero counts if Git setup fails
+        return [], 0, 0
+    # --- End GitRepo Initialization ---
+
     repo_name = os.path.basename(os.path.normpath(repo_path))
     org_name = os.path.basename(os.path.dirname(repo_path))
     full_repo_name = f"{org_name}/{repo_name}"
@@ -207,11 +357,6 @@ def generate_prompts_and_expected(
             f"Date filter enabled: Processing files modified since {datetime.fromtimestamp(threshold_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
 
-    # Get repository head commit hash
-    print(f"Getting head commit hash for {full_repo_name}...")
-    head_commit_hash = get_repo_head_commit_hash(repo_path)
-    print(f"Repository at commit: {head_commit_hash}")
-
     # First, collect all files matching the extensions
     for root, _, files in os.walk(repo_path):
         # Skip .git directory
@@ -220,62 +365,36 @@ def generate_prompts_and_expected(
         for filename in files:
             if any(filename.endswith(ext) for ext in cfg.extensions):
                 full_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(full_path, repo_path)
-                files_to_process.append((full_path, rel_path))
+                # Use Path objects for easier handling
+                rel_path_obj = Path(os.path.relpath(full_path, repo_path))
+                # Store Path object and string version for compatibility
+                files_to_process.append((Path(full_path), str(rel_path_obj)))
 
     # Now, process the files with a progress bar
-    for full_path, rel_path in tqdm(files_to_process, desc="Generating prompts"):
+    for full_path, rel_path in tqdm(
+        files_to_process, desc=f"Generating prompts for {full_repo_name}"
+    ):
         # --- Date Filter Check ---
         if threshold_timestamp is not None:
-            last_commit_timestamp_str = ""  # Initialize to ensure it's bound
-            try:
-                # Get the commit timestamp (Unix timestamp) of the last commit affecting the file
-                commit_time_result = subprocess.run(
-                    ["git", "log", "-1", "--format=%ct", "--", rel_path],
-                    cwd=repo_path,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="ignore",
-                )
-                last_commit_timestamp_str = commit_time_result.stdout.strip()
+            # Use GitRepo method to get timestamp (handles caching and errors)
+            last_commit_timestamp = repo.file_last_commit_time(rel_path)
 
-                # Check if we got a valid timestamp
-                if not last_commit_timestamp_str:
-                    print(
-                        f"\nWarning: Could not get commit timestamp for {rel_path}. Skipping date check."
-                    )
-                else:
-                    last_commit_timestamp = int(last_commit_timestamp_str)
-                    # Compare with the threshold
-                    if last_commit_timestamp < threshold_timestamp:
-                        date_filtered_count += 1
-                        continue  # Skip this file
-            except subprocess.CalledProcessError as e:
-                print(
-                    f"\nWarning: Error getting commit time for {rel_path}: {e}. Skipping file."
-                )
-                date_filtered_count += 1  # Count as filtered if we can't get time
-                continue
-            except ValueError as e:
-                print(
-                    f"\nWarning: Could not parse commit timestamp for {rel_path}: '{last_commit_timestamp_str}'. Skipping file. Error: {e}"
-                )
+            if last_commit_timestamp is None:
+                # Error occurred or timestamp couldn't be determined by GitRepo method
+                # Warning message already printed by the method.
+                # Decide how to handle: skip or proceed? Let's skip.
                 date_filtered_count += 1
                 continue
-            except FileNotFoundError:
-                print(
-                    "\nWarning: git command not found. Cannot perform date filtering."
-                )
-                threshold_timestamp = None  # Disable filter if git is missing
+            elif last_commit_timestamp < threshold_timestamp:
+                date_filtered_count += 1
+                continue  # Skip this file
 
         # --- Proceed with generation if not filtered by date ---
 
         # --- Read final content first to check expected token count ---
         try:
-            with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
-                final_content = original.read()
+            # Use Path object for reading
+            final_content = full_path.read_text(encoding="utf-8", errors="ignore")
         except Exception as e:
             print(f"\nWarning: Error reading file {full_path}: {e}. Skipping.")
             continue  # Skip if we can't even read the file
@@ -289,39 +408,16 @@ def generate_prompts_and_expected(
             continue  # Skip this file
 
         # --- Proceed with prompt generation if not filtered by expected tokens ---
-        safe_rel = rel_path.replace(os.sep, "_")
+        safe_rel = rel_path.replace(
+            os.sep, "_"
+        )  # Keep using string rel_path here for filename
         prompt_fname = f"{repo_name}_{safe_rel}_prompt.txt"
         expected_fname = f"{repo_name}_{safe_rel}_expectedoutput.txt"
         prompt_path = os.path.join(cfg.output_dir, prompt_fname)
         expected_path = os.path.join(cfg.output_dir, expected_fname)
 
-        # 1. Get git history with diffs for the prompt
-        try:
-            history_result = subprocess.run(
-                [
-                    "git",
-                    "log",
-                    "-p",
-                    "--cc",  # Show combined diff for merge commits
-                    "--topo-order",
-                    "--reverse",
-                    "--",
-                    rel_path,
-                ],
-                cwd=repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",  # Ignore decoding errors
-            )
-            git_history = history_result.stdout
-        except subprocess.CalledProcessError as e:
-            print(f"\nWarning: Error getting git history for {rel_path}: {e}")
-            git_history = f"Error retrieving git history: {e}\n"
-        except FileNotFoundError:
-            print("\nWarning: git command not found. Skipping history generation.")
-            git_history = "git command not found.\n"
+        # 1. Get git history using GitRepo method
+        git_history = repo.file_history(rel_path)  # Use string rel_path
 
         # 2. Construct prompt content using Markdown structure
         prompt_content = f"""\
@@ -359,52 +455,17 @@ print('Hello, world!')
         prompt_tokens = count_tokens(
             prompt_content, cfg.encoder
         )  # Pass encoder from config
-        # expected_tokens = count_tokens(final_content, cfg.encoder) # Already done above
         final_lines = len(final_content.splitlines())
 
-        # Count commits
+        # Count commits (still need history string for this)
         num_commits = len(re.findall(r"^commit ", git_history, re.MULTILINE))
 
-        # Get lines added/deleted using git log --numstat
-        lines_added = 0
-        lines_deleted = 0
-        try:
-            numstat_result = subprocess.run(
-                [
-                    "git",
-                    "log",
-                    "--format=format:",  # Only show numstat
-                    "--numstat",
-                    "--",
-                    rel_path,
-                ],
-                cwd=repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-            )
-            for line in numstat_result.stdout.splitlines():
-                if not line.strip():
-                    continue
-                parts = line.split("\t")
-                if len(parts) == 3:
-                    # Handle binary files marked with '-'
-                    added = parts[0]
-                    deleted = parts[1]
-                    if added != "-":
-                        lines_added += int(added)
-                    if deleted != "-":
-                        lines_deleted += int(deleted)
-        except subprocess.CalledProcessError as e:
-            print(f"\nWarning: Error getting numstat for {rel_path}: {e}")
-        except FileNotFoundError:
-            print("\nWarning: git command not found. Skipping numstat calculation.")
+        # Get lines added/deleted using GitRepo method
+        lines_added, lines_deleted = repo.file_numstat(rel_path)  # Use string rel_path
 
         # 5. Store stats
         file_stats = {
-            "filename": rel_path,
+            "filename": rel_path,  # Store the string relative path
             "prompt_tokens": prompt_tokens,
             "expected_tokens": expected_tokens,
             "num_commits": num_commits,
@@ -414,7 +475,7 @@ print('Hello, world!')
         }
         # Include generated filenames and repo info in the stats for metadata/analysis
         file_stats["repo_name"] = full_repo_name
-        file_stats["repo_commit_hash"] = head_commit_hash
+        file_stats["repo_commit_hash"] = head_commit_hash  # Use hash obtained earlier
         file_stats["prompt_filename"] = prompt_fname
         file_stats["expected_filename"] = expected_fname
         # Generate a unique prefix for this benchmark case
@@ -727,9 +788,11 @@ def save_benchmark_metadata(
         cfg: The configuration object containing output_dir and other parameters.
     """
     # Create generation_params dict from Config, excluding derived fields if needed
-    # Using asdict and then removing the derived list of boundaries
+    # Using asdict and then removing the derived list of boundaries and other non-serializable fields
     generation_params = asdict(cfg)
     generation_params.pop("bucket_boundaries", None)  # Remove the list, keep the string
+    generation_params.pop("encoder", None)  # Remove non-serializable encoder
+    generation_params.pop("git_repo", None)  # Remove non-serializable GitRepo instance
 
     metadata = {
         "generation_parameters": generation_params,
@@ -864,8 +927,11 @@ def main():
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
         encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
+        git_repo=None,  # Initialize git_repo as None in Config
     )
-    print(f"Configuration loaded: {cfg}")
+    # Note: We are not putting the GitRepo instance into the shared Config object anymore.
+    # It will be created per-repository inside generate_prompts_and_expected.
+    print(f"Configuration loaded (excluding GitRepo): {cfg}")
     # --- End Config creation ---
 
     repo_paths = find_repo_dirs(cfg.cache_dir)
