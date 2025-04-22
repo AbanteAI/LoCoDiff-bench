@@ -446,13 +446,14 @@ if __name__ == "__main__":
 
     # --- Run Analysis Script ---
     print("\n--- Running analyze_results.py to update plot ---")
+    # Define path before try block to ensure it's bound in except blocks
+    analysis_script_path = os.path.join(
+        "results_explorer", "analyze_results.py"
+    )  # Updated path
     try:
         # Run the script using the python executable from the current environment
         # Pass necessary arguments if defaults are not sufficient (using defaults here)
         # Capture output and errors
-        analysis_script_path = os.path.join(
-            "results_explorer", "analyze_results.py"
-        )  # Updated path
         analysis_process = subprocess.run(
             [sys.executable, analysis_script_path],  # Use updated path
             check=False,  # Don't throw exception on non-zero exit code
