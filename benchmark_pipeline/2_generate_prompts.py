@@ -1,4 +1,66 @@
 #!/usr/bin/env python3
+"""
+Generates benchmark prompts and expected outputs from cloned repositories.
+
+Purpose:
+  This script iterates through specified files (matching given extensions) within
+  repositories located in the 'cached-repos/' directory. For each eligible file,
+  it generates two corresponding files in the 'generated_prompts/' directory:
+    1. A prompt file (*_prompt.txt): Contains instructions and the full git log
+       history (with diffs) for the original file. The model's task is to
+       reconstruct the file's final state based on this history.
+    2. An expected output file (*_expectedoutput.txt): Contains the exact final
+       content of the original file. This serves as the ground truth for scoring.
+
+  The script applies filters based on file modification date and the token count
+  of the expected output. It then buckets the generated prompts based on their
+  token count, samples prompts within each bucket to meet a specified maximum,
+  and saves metadata about the final benchmark set.
+
+Arguments:
+  --extensions, -e (required): List of file extensions to process (e.g., '.py' '.js').
+  --cache-dir (optional): Path to the directory containing cached repositories
+                          (default: 'cached-repos').
+  --output-dir (optional): Directory to save generated prompt/expected files
+                           (default: 'generated_prompts').
+  --buckets (optional): Comma-separated list of bucket boundaries in thousands
+                        of prompt tokens (e.g., "0,20,40,80,100"). Defines the
+                        token ranges for grouping prompts. (default: "0,20,40,60,80,100").
+                        The highest value also acts as a maximum token filter.
+  --max-per-bucket (optional): Maximum number of prompts to keep per bucket after
+                               sampling (default: 10).
+  --modified-within-months (optional): Only process files last modified within the
+                                       specified number of months (default: 3).
+                                       Set <= 0 to disable.
+  --max-expected-tokens (optional): Skip files whose final content (expected output)
+                                    exceeds this token count (default: 12000).
+                                    Set <= 0 to disable.
+
+Inputs:
+  - Repositories cloned by `1_clone_repos.py` located in the `cache-dir`
+    (default: 'cached-repos/'). Expects standard git repository structure within.
+  - Command-line arguments specifying extensions, directories, and filtering/bucketing parameters.
+
+Outputs:
+  - Creates the `output-dir` (default: 'generated_prompts/') if it doesn't exist.
+  - Populates `output-dir` with pairs of files for each processed source file:
+    - `repo_path_prompt.txt`: Contains the reconstruction prompt (filename format uses repo name and sanitized relative path).
+    - `repo_path_expectedoutput.txt`: Contains the ground truth file content (filename format uses repo name and sanitized relative path).
+  - Creates `output-dir/metadata.json`: Contains metadata about the generation
+    parameters and the final set of benchmark cases organized by bucket.
+  - Prints statistics about the generation process, filtering, and final bucket distribution to the console.
+
+File Modifications:
+  - Creates the `output-dir` if it doesn't exist.
+  - Creates `*_prompt.txt` files within `output-dir`.
+  - Creates `*_expectedoutput.txt` files within `output-dir`.
+  - Creates or overwrites `metadata.json` within `output-dir`.
+  - Deletes prompt/expected file pairs from `output-dir` that are filtered out due
+    to token limits (prompt token > max bucket boundary, or expected token > max_expected_tokens)
+    or removed during the sampling process (`max-per-bucket`).
+  - Does *not* modify files within the `cache-dir`.
+"""
+
 import argparse
 import os
 import sys
