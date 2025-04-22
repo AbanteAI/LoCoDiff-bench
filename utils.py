@@ -867,40 +867,173 @@ async def get_model_response_openrouter(
         return response_content, generation_id, None  # Success
 
     except openai.APIError as e:
-        # This catches errors where the API call itself failed (e.g., 4xx/5xx status codes)
-        # Use getattr for status_code and body as they might not be statically typed
-        status_code = getattr(e, "status_code", "Unknown")
-        base_error_message = f"OpenRouter API Error: Status {status_code} - {e.message}"
-        detailed_error_message = base_error_message  # Start with base message
-
-        # Attempt to extract more detail from the body
+        # --- Context Length Retry Logic ---
+        status_code = getattr(e, "status_code", None)
         body = getattr(e, "body", None)
+        should_retry = False
+        new_max_tokens = None
+        context_limit_error_message = ""  # Store the specific error message for logging
+
+        if status_code == 400 and body:
+            try:
+                error_message_text = ""
+                # Attempt to parse the body to find the specific error message
+                if isinstance(body, dict):
+                    error_message_text = body.get("error", {}).get("message", "")
+                    # Check the specific structure from the issue example (nested in raw JSON string)
+                    if (
+                        not error_message_text
+                        and "metadata" in body
+                        and "raw" in body["metadata"]
+                    ):
+                        raw_data_str = body["metadata"]["raw"]
+                        if isinstance(raw_data_str, str):
+                            try:
+                                raw_data = json.loads(raw_data_str)
+                                error_message_text = raw_data.get("error", {}).get(
+                                    "message", ""
+                                )
+                            except json.JSONDecodeError:
+                                error_message_text = (
+                                    raw_data_str  # Fallback if raw isn't JSON
+                                )
+                elif isinstance(body, str):
+                    error_message_text = body  # Body might just be the error string
+
+                # Search for the context limit pattern
+                if error_message_text:
+                    context_limit_pattern = r"input length(?: and `max_tokens`)? exceed(?:s)? context limit: (\d+) \+ (\d+) > (\d+)"
+                    match = re.search(context_limit_pattern, error_message_text)
+                    if match:
+                        input_len = int(match.group(1))
+                        # current_max_tokens = int(match.group(2)) # Y value - not directly used for calculation
+                        context_limit = int(match.group(3))
+                        context_limit_error_message = match.group(
+                            0
+                        )  # Store the matched error string
+
+                        calculated_max = context_limit - input_len
+                        calculated_max -= 20  # Apply safety buffer
+
+                        if calculated_max > 0:
+                            should_retry = True
+                            new_max_tokens = calculated_max
+                            print(
+                                f"⚠️ Warning: Context limit exceeded ({context_limit_error_message}) for model {model_name}. Retrying with max_tokens={new_max_tokens}..."
+                            )
+                        else:
+                            print(
+                                f"⚠️ Warning: Context limit exceeded ({context_limit_error_message}) for model {model_name}, but calculated new max_tokens ({calculated_max}) is too small. Cannot retry."
+                            )
+
+            except Exception as parse_err:
+                # Ignore parsing errors, just proceed with original error handling
+                print(
+                    f"Debug: Error parsing APIError body for retry logic: {parse_err}"
+                )
+                pass  # Fall through to original error handling below
+
+        # --- Perform Retry if Applicable ---
+        if should_retry and new_max_tokens is not None:
+            try:
+                print(f"Attempting retry with max_tokens={new_max_tokens}...")
+                retry_completion = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt_content}],
+                    max_tokens=new_max_tokens,  # Apply the new limit
+                )
+
+                # Process successful retry response
+                retry_response_content = ""
+                retry_generation_id = None
+                retry_error_payload = getattr(retry_completion, "error", None)
+
+                if retry_error_payload:
+                    # Handle error within the retry response body
+                    try:
+                        retry_error_details = (
+                            json.dumps(retry_error_payload)
+                            if isinstance(retry_error_payload, dict)
+                            else str(retry_error_payload)
+                        )
+                        retry_error_message = f"Retry failed: Provider error in retry response body: {retry_error_details}"
+                    except Exception as serialize_err:
+                        retry_error_message = f"Retry failed: Provider error in retry response body (serialization failed: {serialize_err}): {str(retry_error_payload)}"
+                    print(retry_error_message)
+                    return None, None, retry_error_message  # Return failure from retry
+
+                if retry_completion.choices and retry_completion.choices[0].message:
+                    retry_response_content = (
+                        retry_completion.choices[0].message.content or ""
+                    )
+                if hasattr(retry_completion, "id") and isinstance(
+                    retry_completion.id, str
+                ):
+                    retry_generation_id = retry_completion.id
+                else:
+                    print(
+                        f"Warning: Could not extract generation ID from retry response: {retry_completion}"
+                    )
+
+                print(
+                    f"✅ Retry successful for model {model_name} with max_tokens={new_max_tokens}."
+                )
+                return (
+                    retry_response_content,
+                    retry_generation_id,
+                    None,
+                )  # Return success from retry
+
+            except openai.APIError as retry_e:
+                # Handle API errors during the retry attempt
+                retry_status_code = getattr(retry_e, "status_code", "Unknown")
+                retry_error_message = f"Retry failed: OpenRouter API Error on retry: Status {retry_status_code} - {retry_e.message}"
+                # Optionally add body details from retry_e
+                retry_body = getattr(retry_e, "body", None)
+                if retry_body:
+                    try:
+                        retry_body_str = (
+                            json.dumps(retry_body)
+                            if isinstance(retry_body, dict)
+                            else str(retry_body)
+                        )
+                        retry_error_message += f" | Body: {retry_body_str}"
+                    except Exception:
+                        pass  # Ignore serialization errors for body
+                print(retry_error_message)
+                return None, None, retry_error_message  # Return failure from retry
+            except Exception as retry_e:
+                # Handle other unexpected errors during retry
+                retry_error_message = f"Retry failed: Unexpected Error during retry API call: {type(retry_e).__name__}: {retry_e}"
+                print(retry_error_message)
+                return None, None, retry_error_message  # Return failure from retry
+
+        # --- Original Error Handling (if no retry was attempted or retry failed) ---
+        # This part runs if should_retry is False or if the retry block returned an error
+        base_error_message = f"OpenRouter API Error: Status {status_code} - {e.message}"
+        detailed_error_message = base_error_message
+
+        # Add context limit message if it was extracted
+        if context_limit_error_message:
+            detailed_error_message += f" | Detail: {context_limit_error_message}"
+
+        # Attempt to extract more detail from the original body (if not already included)
         if body:
             try:
-                if isinstance(body, dict):
-                    # Try to get nested message first
-                    nested_message = body.get("error", {}).get("message")
-                    if nested_message and nested_message != e.message:
-                        detailed_error_message = (
-                            f"{base_error_message} | Detail: {nested_message}"
-                        )
-                    # Include full body if it might be useful and isn't just repeating the message
-                    body_str = json.dumps(body)
-                    if body_str not in detailed_error_message:  # Avoid redundancy
-                        detailed_error_message += f" | Body: {body_str}"
-                else:
-                    # If body is not a dict, include its string representation if informative
-                    body_str = str(body)
-                    if body_str and body_str not in detailed_error_message:
-                        detailed_error_message += f" | Body: {body_str}"
+                body_str = json.dumps(body) if isinstance(body, dict) else str(body)
+                # Add body if it provides more info than the base message and context limit message
+                if body_str not in detailed_error_message:
+                    detailed_error_message += f" | Body: {body_str}"
             except Exception as serialize_err:
                 detailed_error_message += (
                     f" (Failed to serialize body: {serialize_err})"
                 )
 
-        print(detailed_error_message)  # Print the most detailed message obtained
-        return None, None, detailed_error_message  # Return the detailed message
+        print(detailed_error_message)  # Print the detailed original error message
+        return None, None, detailed_error_message  # Return the original detailed error
+
     except Exception as e:
+        # Catch-all for non-APIError exceptions during the initial call attempt
         error_message = f"Unexpected Error during API call: {type(e).__name__}: {e}"
         print(error_message)
         # Log traceback for unexpected errors
