@@ -834,22 +834,80 @@ async def get_model_response_openrouter(
         generation_id = None
 
         # Check for API-level errors returned in the response body (e.g., credit limits)
-        # Use getattr for safer access to potentially dynamic attributes
         error_payload = getattr(completion, "error", None)
         if error_payload:
-            # Try to serialize the full error payload for more detail
+            base_error_message = "Provider error in response body"
+            detailed_error_message = base_error_message
+
             try:
                 if isinstance(error_payload, dict):
-                    error_details = json.dumps(error_payload)
-                else:
-                    error_details = str(error_payload)
-                error_message = f"Provider error in response body: {error_details}"
-            except Exception as serialize_err:
-                # Fallback if serialization fails
-                error_message = f"Provider error in response body (serialization failed: {serialize_err}): {str(error_payload)}"
+                    # Try to extract nested message, code, and metadata
+                    nested_message = error_payload.get("message")  # Top-level message
+                    nested_code = error_payload.get("code")  # Top-level code
+                    metadata = error_payload.get("metadata", {})
+                    raw_metadata = (
+                        metadata.get("raw") if isinstance(metadata, dict) else None
+                    )
+                    provider_name = (
+                        metadata.get("provider_name")
+                        if isinstance(metadata, dict)
+                        else None
+                    )
 
-            print(f"OpenRouter API reported an error: {error_message}")
-            return None, None, error_message
+                    # Build a more detailed message string
+                    details = []
+                    if nested_message and nested_message != base_error_message:
+                        details.append(f"Message: '{nested_message}'")
+                    if nested_code:
+                        details.append(f"Code: {nested_code}")
+                    if provider_name:
+                        details.append(f"Provider: {provider_name}")
+                    if raw_metadata:
+                        # Check if raw metadata adds info beyond just the code/message
+                        raw_metadata_str = str(raw_metadata)
+                        if (
+                            str(nested_code) not in raw_metadata_str
+                            or (
+                                nested_message
+                                and nested_message not in raw_metadata_str
+                            )
+                            or len(raw_metadata_str) > 30
+                        ):  # Heuristic check
+                            details.append(f"Raw Metadata: '{raw_metadata_str}'")
+
+                    if details:
+                        detailed_error_message += f" ({', '.join(details)})"
+
+                    # Append the full payload JSON if it might contain more context not captured above
+                    try:
+                        payload_str = json.dumps(error_payload)
+                        # Add payload if it's not trivially represented by the details extracted
+                        if (
+                            payload_str not in detailed_error_message
+                            and len(payload_str) > 20
+                        ):  # Avoid adding empty or simple payloads
+                            detailed_error_message += f" | Full Payload: {payload_str}"
+                    except Exception:
+                        detailed_error_message += (
+                            " | Full Payload: (Serialization Failed)"
+                        )
+
+                else:
+                    # If not a dict, just convert to string
+                    detailed_error_message += f": {str(error_payload)}"
+
+            except Exception as format_err:
+                # Fallback if formatting fails
+                try:
+                    # Try to get at least the string representation of the original payload
+                    payload_str_fallback = str(error_payload)
+                except Exception:
+                    payload_str_fallback = "(Error getting payload string)"
+                detailed_error_message = f"{base_error_message} (Formatting Error: {format_err}): {payload_str_fallback}"
+
+            print(f"OpenRouter API reported an error: {detailed_error_message}")
+            # Return the detailed message
+            return None, None, detailed_error_message
 
         # Extract content if successful and no error in body
         if completion.choices and completion.choices[0].message:
@@ -868,39 +926,63 @@ async def get_model_response_openrouter(
 
     except openai.APIError as e:
         # This catches errors where the API call itself failed (e.g., 4xx/5xx status codes)
-        # Use getattr for status_code and body as they might not be statically typed
         status_code = getattr(e, "status_code", "Unknown")
+        # Start with the basic error message from the exception
         base_error_message = f"OpenRouter API Error: Status {status_code} - {e.message}"
-        detailed_error_message = base_error_message  # Start with base message
+        detailed_error_message = base_error_message
 
-        # Attempt to extract more detail from the body
+        # Attempt to extract more detail from the exception's body attribute
         body = getattr(e, "body", None)
         if body:
+            body_details = []
             try:
                 if isinstance(body, dict):
-                    # Try to get nested message first
-                    nested_message = body.get("error", {}).get("message")
+                    # Try to get nested error details
+                    error_dict = body.get("error", {})
+                    nested_message = error_dict.get("message")
+                    nested_type = error_dict.get("type")
+                    nested_param = error_dict.get("param")
+                    nested_code = error_dict.get("code")
+
+                    # Add details if they provide more info than the base message
                     if nested_message and nested_message != e.message:
-                        detailed_error_message = (
-                            f"{base_error_message} | Detail: {nested_message}"
-                        )
-                    # Include full body if it might be useful and isn't just repeating the message
-                    body_str = json.dumps(body)
-                    if body_str not in detailed_error_message:  # Avoid redundancy
-                        detailed_error_message += f" | Body: {body_str}"
+                        body_details.append(f"Nested Msg: '{nested_message}'")
+                    if nested_type:
+                        body_details.append(f"Type: {nested_type}")
+                    if nested_param:
+                        body_details.append(f"Param: {nested_param}")
+                    if nested_code:
+                        body_details.append(f"Code: {nested_code}")
+
+                    # Append the full body JSON if it seems complex or wasn't fully parsed
+                    try:
+                        body_str = json.dumps(body)
+                        # Add if it's not just repeating the base message or simple details
+                        if (
+                            body_str not in detailed_error_message
+                            and len(body_str) > len(e.message) + 20
+                        ):
+                            body_details.append(f"Full Body: {body_str}")
+                    except Exception:
+                        body_details.append("Full Body: (Serialization Failed)")
+
                 else:
                     # If body is not a dict, include its string representation if informative
                     body_str = str(body)
                     if body_str and body_str not in detailed_error_message:
-                        detailed_error_message += f" | Body: {body_str}"
-            except Exception as serialize_err:
-                detailed_error_message += (
-                    f" (Failed to serialize body: {serialize_err})"
-                )
+                        body_details.append(f"Body: {body_str}")
+
+            except Exception as parse_err:
+                body_details.append(f"(Error parsing body: {parse_err})")
+
+            if body_details:
+                detailed_error_message += f" | Details: ({'; '.join(body_details)})"
 
         print(detailed_error_message)  # Print the most detailed message obtained
         return None, None, detailed_error_message  # Return the detailed message
+
     except Exception as e:
+        # Catch other unexpected errors during the API call process
         error_message = f"Unexpected Error during API call: {type(e).__name__}: {e}"
         print(error_message)
         # Log traceback for unexpected errors
