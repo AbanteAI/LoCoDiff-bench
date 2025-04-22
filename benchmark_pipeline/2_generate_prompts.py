@@ -75,8 +75,8 @@ from collections import defaultdict
 from statistics import mean
 import random
 from tqdm import tqdm
-from dataclasses import dataclass, asdict, field  # Import field
-from typing import List, Tuple, Dict, Any  # Added for type hinting
+from dataclasses import dataclass, asdict, field
+from typing import List, Tuple, Dict, Any
 
 
 # --- Helper Functions ---
@@ -110,18 +110,6 @@ def get_repo_head_commit_hash(repo_path):
     return commit_hash
 
 
-# Global tiktoken encoder instance (kept for now, but Config could manage it)
-_ENCODER = None
-
-
-def get_encoder():
-    """Initializes and returns the tiktoken encoder."""
-    global _ENCODER
-    if _ENCODER is None:
-        _ENCODER = tiktoken.get_encoding("cl100k_base")
-    return _ENCODER
-
-
 @dataclass(frozen=True)
 class Config:
     """Configuration settings for the prompt generation script."""
@@ -134,25 +122,20 @@ class Config:
     max_per_bucket: int
     modified_within_months: int
     max_expected_tokens: int
-    # Add default value for encoder using field factory
-    encoder: tiktoken.Encoding = field(
-        default_factory=get_encoder, init=False, repr=False
-    )
+    encoder: tiktoken.Encoding # Encoder instance is now required
 
 
-def count_tokens(text: str, encoder: tiktoken.Encoding | None = None) -> int:
+def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
     """
-    Counts the number of tokens in a given text using the cl100k_base encoder.
+    Counts the number of tokens in a given text using the provided encoder.
 
     Args:
         text: The string to count tokens for.
-        encoder: Optional tiktoken encoder instance. If None, uses the global one.
+        encoder: The tiktoken encoder instance to use.
 
     Returns:
         The number of tokens in the text.
     """
-    if encoder is None:
-        encoder = get_encoder()  # Fallback to global if not provided
     return len(encoder.encode(text))
 
 
@@ -880,6 +863,7 @@ def main():
         max_per_bucket=args.max_per_bucket,
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
+        encoder=tiktoken.get_encoding("cl100k_base") # Initialize encoder here
     )
     print(f"Configuration loaded: {cfg}")
     # --- End Config creation ---
