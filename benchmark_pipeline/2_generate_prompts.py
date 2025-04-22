@@ -82,7 +82,7 @@ from typing import List, Tuple, Dict, Any
 # --- Helper Functions ---
 
 
-def get_repo_head_commit_hash(repo_path):
+def get_repo_head_commit_hash(repo_path: str) -> str:
     """
     Get the HEAD commit hash of a repository.
 
@@ -96,7 +96,6 @@ def get_repo_head_commit_hash(repo_path):
         subprocess.CalledProcessError: If git command fails.
         FileNotFoundError: If git command is not found.
     """
-    # Get commit hash - will raise an exception if it fails
     hash_result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo_path,
@@ -106,8 +105,7 @@ def get_repo_head_commit_hash(repo_path):
         encoding="utf-8",
         errors="ignore",
     )
-    commit_hash = hash_result.stdout.strip()
-    return commit_hash
+    return hash_result.stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -139,192 +137,160 @@ def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
     return len(encoder.encode(text))
 
 
-# --- Core Generation Logic ---
-
-
-def generate_prompts_and_expected(
-    repo_path: str, cfg: Config
-) -> Tuple[List[Dict[str, Any]], int, int]:
+def _run_git_command(
+    args: List[str], repo_path: str, description: str
+) -> Tuple[str | None, str | None]:
     """
-    For every file in the repository at repo_path matching extensions in cfg,
-    and optionally modified within cfg.modified_within_months, create two files in cfg.output_dir:
-      - {repo_name}_{relative_path_with_underscores}_prompt.txt containing
-        a reconstruction prompt with git history.
-      - {repo_name}_{relative_path_with_underscores}_expectedoutput.txt containing
-        the file's final content.
-
-    Also calculates statistics about the generated prompts and files.
+    Runs a git command and handles common errors.
 
     Args:
-        repo_path: Path to the cloned repository.
-        cfg: The configuration object containing settings like extensions, output_dir,
-             modified_within_months, and max_expected_tokens.
+        args: List of arguments for the git command (e.g., ["log", "-1", "--format=%ct"]).
+        repo_path: Path to the repository.
+        description: Description of the action for error messages (e.g., "commit time").
 
     Returns:
-        A tuple containing:
-        - A list of dictionaries, where each dictionary contains statistics
-          for one processed file:
-          {
-            'filename': str,
-            'prompt_tokens': int,
-            'expected_tokens': int,
-            'num_commits': int,
-            'lines_added': int,
-            'lines_deleted': int,
-            'final_lines': int,
-            'repo_name': str,
-            'repo_commit_hash': str,
-            'prompt_filename': str,
-            'expected_filename': str,
-            'benchmark_case_prefix': str
-          }
-        - An integer representing the count of files skipped due to the date filter.
-        - An integer representing the count of files skipped due to the expected token limit.
+        A tuple (stdout: str | None, error_message: str | None).
+        stdout is None if an error occurs.
+        error_message is None if the command succeeds.
     """
-    if not os.path.exists(cfg.output_dir):
-        os.makedirs(cfg.output_dir, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        return result.stdout, None
+    except subprocess.CalledProcessError as e:
+        return None, f"Error getting {description}: {e}"
+    except FileNotFoundError:
+        return None, "git command not found"
 
-    repo_name = os.path.basename(os.path.normpath(repo_path))
-    org_name = os.path.basename(os.path.dirname(repo_path))
-    full_repo_name = f"{org_name}/{repo_name}"
-    stats_list = []
-    files_to_process = []
-    date_filtered_count = 0  # Counter for files skipped by date filter
-    expected_token_filtered_count = (
-        0  # Counter for files skipped by expected token limit
+
+def _is_file_recently_modified(
+    rel_path: str, repo_path: str, threshold_timestamp: float | None
+) -> Tuple[bool, bool]:
+    """
+    Checks if a file was modified after the threshold timestamp.
+
+    Args:
+        rel_path: Relative path of the file within the repository.
+        repo_path: Path to the repository.
+        threshold_timestamp: The minimum modification timestamp (Unix epoch). If None, always returns True.
+
+    Returns:
+        A tuple (is_recent: bool, error_occurred: bool).
+        is_recent is True if the file is recent enough or if the check is disabled/fails safely.
+        error_occurred is True if there was an issue getting the timestamp.
+    """
+    if threshold_timestamp is None:
+        return True, False  # Date filter disabled
+
+    stdout, error = _run_git_command(
+        ["log", "-1", "--format=%ct", "--", rel_path], repo_path, "commit time"
     )
 
-    # Calculate date threshold if filter is enabled
-    threshold_timestamp = None
-    if cfg.modified_within_months > 0:
-        # Approximate seconds per month (average)
-        avg_seconds_per_month = 30.44 * 24 * 60 * 60
-        current_timestamp = time.time()
-        threshold_timestamp = current_timestamp - (
-            cfg.modified_within_months * avg_seconds_per_month
-        )
+    if error:
+        print(f"\nWarning: {error} for {rel_path}. Skipping date check.")
+        # Treat as recent if we can't get the time, but flag error
+        return True, True
+    if not stdout:
         print(
-            f"Date filter enabled: Processing files modified since {datetime.fromtimestamp(threshold_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            f"\nWarning: Could not get commit timestamp for {rel_path}. Skipping date check."
         )
+        return True, True  # Treat as recent, flag error
 
-    # Get repository head commit hash
-    print(f"Getting head commit hash for {full_repo_name}...")
-    head_commit_hash = get_repo_head_commit_hash(repo_path)
-    print(f"Repository at commit: {head_commit_hash}")
+    try:
+        last_commit_timestamp = int(stdout.strip())
+        return last_commit_timestamp >= threshold_timestamp, False
+    except ValueError as e:
+        print(
+            f"\nWarning: Could not parse commit timestamp for {rel_path}: '{stdout.strip()}'. Skipping file. Error: {e}"
+        )
+        return False, True  # Treat as not recent, flag error
 
-    # First, collect all files matching the extensions
-    for root, _, files in os.walk(repo_path):
-        # Skip .git directory
-        if ".git" in root.split(os.sep):
+
+def _get_git_history(rel_path: str, repo_path: str) -> str:
+    """Gets the full git log history with patches for a file."""
+    stdout, error = _run_git_command(
+        ["log", "-p", "--cc", "--topo-order", "--reverse", "--", rel_path],
+        repo_path,
+        "git history",
+    )
+    if error:
+        print(f"\nWarning: {error} for {rel_path}")
+        return f"Error retrieving git history: {error}\n"
+    return stdout or ""  # Return empty string if stdout is None
+
+
+def _get_git_numstat(rel_path: str, repo_path: str) -> Tuple[int, int]:
+    """Gets the total lines added and deleted for a file from git history."""
+    lines_added = 0
+    lines_deleted = 0
+    stdout, error = _run_git_command(
+        ["log", "--format=format:", "--numstat", "--", rel_path],
+        repo_path,
+        "numstat",
+    )
+
+    if error:
+        print(f"\nWarning: {error} for {rel_path}")
+        return lines_added, lines_deleted
+    if not stdout:
+        return lines_added, lines_deleted  # No stats found
+
+    for line in stdout.splitlines():
+        if not line.strip():
             continue
-        for filename in files:
-            if any(filename.endswith(ext) for ext in cfg.extensions):
-                full_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(full_path, repo_path)
-                files_to_process.append((full_path, rel_path))
-
-    # Now, process the files with a progress bar
-    for full_path, rel_path in tqdm(files_to_process, desc="Generating prompts"):
-        # --- Date Filter Check ---
-        if threshold_timestamp is not None:
-            last_commit_timestamp_str = ""  # Initialize to ensure it's bound
-            try:
-                # Get the commit timestamp (Unix timestamp) of the last commit affecting the file
-                commit_time_result = subprocess.run(
-                    ["git", "log", "-1", "--format=%ct", "--", rel_path],
-                    cwd=repo_path,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="ignore",
-                )
-                last_commit_timestamp_str = commit_time_result.stdout.strip()
-
-                # Check if we got a valid timestamp
-                if not last_commit_timestamp_str:
+        parts = line.split("\t")
+        if len(parts) == 3:
+            added_str, deleted_str, _ = parts
+            if added_str != "-":
+                try:
+                    lines_added += int(added_str)
+                except ValueError:
                     print(
-                        f"\nWarning: Could not get commit timestamp for {rel_path}. Skipping date check."
+                        f"\nWarning: Could not parse added lines '{added_str}' in numstat for {rel_path}"
                     )
-                else:
-                    last_commit_timestamp = int(last_commit_timestamp_str)
-                    # Compare with the threshold
-                    if last_commit_timestamp < threshold_timestamp:
-                        date_filtered_count += 1
-                        continue  # Skip this file
-            except subprocess.CalledProcessError as e:
-                print(
-                    f"\nWarning: Error getting commit time for {rel_path}: {e}. Skipping file."
-                )
-                date_filtered_count += 1  # Count as filtered if we can't get time
-                continue
-            except ValueError as e:
-                print(
-                    f"\nWarning: Could not parse commit timestamp for {rel_path}: '{last_commit_timestamp_str}'. Skipping file. Error: {e}"
-                )
-                date_filtered_count += 1
-                continue
-            except FileNotFoundError:
-                print(
-                    "\nWarning: git command not found. Cannot perform date filtering."
-                )
-                threshold_timestamp = None  # Disable filter if git is missing
+            if deleted_str != "-":
+                try:
+                    lines_deleted += int(deleted_str)
+                except ValueError:
+                    print(
+                        f"\nWarning: Could not parse deleted lines '{deleted_str}' in numstat for {rel_path}"
+                    )
 
-        # --- Proceed with generation if not filtered by date ---
+    return lines_added, lines_deleted
 
-        # --- Read final content first to check expected token count ---
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
-                final_content = original.read()
-        except Exception as e:
-            print(f"\nWarning: Error reading file {full_path}: {e}. Skipping.")
-            continue  # Skip if we can't even read the file
 
-        # --- Expected Token Filter Check ---
-        expected_tokens = count_tokens(
-            final_content, cfg.encoder
-        )  # Pass encoder from config
-        if cfg.max_expected_tokens > 0 and expected_tokens > cfg.max_expected_tokens:
-            expected_token_filtered_count += 1
-            continue  # Skip this file
+def _write_output_files(
+    prompt_path: str,
+    expected_path: str,
+    prompt_content: str,
+    final_content: str,
+):
+    """Writes the prompt and expected output content to their respective files."""
+    try:
+        with open(prompt_path, "w", encoding="utf-8") as pf:
+            pf.write(prompt_content)
+    except IOError as e:
+        print(f"\nError writing prompt file {prompt_path}: {e}")
+        raise  # Re-raise to stop processing this file
 
-        # --- Proceed with prompt generation if not filtered by expected tokens ---
-        safe_rel = rel_path.replace(os.sep, "_")
-        prompt_fname = f"{repo_name}_{safe_rel}_prompt.txt"
-        expected_fname = f"{repo_name}_{safe_rel}_expectedoutput.txt"
-        prompt_path = os.path.join(cfg.output_dir, prompt_fname)
-        expected_path = os.path.join(cfg.output_dir, expected_fname)
+    try:
+        with open(expected_path, "w", encoding="utf-8") as ef:
+            ef.write(final_content)
+    except IOError as e:
+        print(f"\nError writing expected output file {expected_path}: {e}")
+        raise  # Re-raise to stop processing this file
 
-        # 1. Get git history with diffs for the prompt
-        try:
-            history_result = subprocess.run(
-                [
-                    "git",
-                    "log",
-                    "-p",
-                    "--cc",  # Show combined diff for merge commits
-                    "--topo-order",
-                    "--reverse",
-                    "--",
-                    rel_path,
-                ],
-                cwd=repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",  # Ignore decoding errors
-            )
-            git_history = history_result.stdout
-        except subprocess.CalledProcessError as e:
-            print(f"\nWarning: Error getting git history for {rel_path}: {e}")
-            git_history = f"Error retrieving git history: {e}\n"
-        except FileNotFoundError:
-            print("\nWarning: git command not found. Skipping history generation.")
-            git_history = "git command not found.\n"
 
-        # 2. Construct prompt content using Markdown structure
-        prompt_content = f"""\
+def _build_prompt_content(rel_path: str, git_history: str) -> str:
+    """Constructs the prompt content using the git history."""
+    return f"""\
 # Instructions
 
 You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
@@ -348,61 +314,147 @@ print('Hello, world!')
 
 {git_history}
 """
-        with open(prompt_path, "w", encoding="utf-8") as pf:
-            pf.write(prompt_content)
 
-        # 3. Write final content (already read and token count checked)
-        with open(expected_path, "w", encoding="utf-8") as ef:
-            ef.write(final_content)
 
-        # 4. Calculate statistics (expected_tokens already calculated)
-        prompt_tokens = count_tokens(
-            prompt_content, cfg.encoder
-        )  # Pass encoder from config
-        # expected_tokens = count_tokens(final_content, cfg.encoder) # Already done above
-        final_lines = len(final_content.splitlines())
+# --- Core Generation Logic ---
 
-        # Count commits
-        num_commits = len(re.findall(r"^commit ", git_history, re.MULTILINE))
 
-        # Get lines added/deleted using git log --numstat
-        lines_added = 0
-        lines_deleted = 0
+def generate_prompts_and_expected(
+    repo_path: str, cfg: Config
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    Generates prompts and expected outputs for eligible files in a repository.
+
+    Iterates through files matching specified extensions, applies date and token
+    filters, fetches git history, calculates stats, and writes output files.
+
+    Args:
+        repo_path: Path to the cloned repository.
+        cfg: Configuration object.
+
+    Returns:
+        Tuple: (stats_list, date_filtered_count, expected_token_filtered_count)
+            - stats_list: List of dictionaries with statistics for each generated case.
+            - date_filtered_count: Number of files skipped due to modification date.
+            - expected_token_filtered_count: Number of files skipped due to expected token limit.
+    """
+    if not os.path.exists(cfg.output_dir):
+        os.makedirs(cfg.output_dir, exist_ok=True)
+
+    repo_name = os.path.basename(os.path.normpath(repo_path))
+    org_name = os.path.basename(os.path.dirname(repo_path))
+    full_repo_name = f"{org_name}/{repo_name}"
+    stats_list = []
+    files_to_process = []
+    date_filtered_count = 0
+    expected_token_filtered_count = 0
+    git_command_errors = 0  # Track errors during git operations
+
+    # --- Calculate Date Threshold ---
+    threshold_timestamp = None
+    if cfg.modified_within_months > 0:
+        avg_seconds_per_month = 30.44 * 24 * 60 * 60
+        threshold_timestamp = time.time() - (
+            cfg.modified_within_months * avg_seconds_per_month
+        )
+        print(
+            f"Date filter enabled: Processing files modified since {datetime.fromtimestamp(threshold_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    # --- Get Repo Info ---
+    print(f"Getting head commit hash for {full_repo_name}...")
+    head_commit_hash = get_repo_head_commit_hash(
+        repo_path
+    )  # Assuming this helper is fine as is
+    print(f"Repository at commit: {head_commit_hash}")
+
+    # --- Collect Files ---
+    print("Collecting files matching extensions...")
+    for root, _, files in os.walk(repo_path):
+        if ".git" in root.split(os.sep):
+            continue
+        for filename in files:
+            if any(filename.endswith(ext) for ext in cfg.extensions):
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, repo_path)
+                files_to_process.append((full_path, rel_path))
+    print(f"Found {len(files_to_process)} files to potentially process.")
+
+    # --- Process Files ---
+    for full_path, rel_path in tqdm(
+        files_to_process, desc=f"Generating prompts for {full_repo_name}"
+    ):
+        # 1. Date Filter Check
+        is_recent, date_check_error = _is_file_recently_modified(
+            rel_path, repo_path, threshold_timestamp
+        )
+        if date_check_error and threshold_timestamp is not None:
+            # Count as filtered if error occurred during check (and filter is enabled)
+            # The function prints warnings, so we just count here.
+            git_command_errors += 1
+            # Decide whether to skip or proceed if timestamp couldn't be determined.
+            # Current logic in _is_file_recently_modified proceeds but flags error.
+            # Let's change to skip if error occurred during date check.
+            print(f"\nSkipping {rel_path} due to error during date check.")
+            date_filtered_count += 1
+            continue
+        if not is_recent:
+            date_filtered_count += 1
+            continue
+
+        # 2. Read Final Content & Expected Token Filter Check
         try:
-            numstat_result = subprocess.run(
-                [
-                    "git",
-                    "log",
-                    "--format=format:",  # Only show numstat
-                    "--numstat",
-                    "--",
-                    rel_path,
-                ],
-                cwd=repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-            )
-            for line in numstat_result.stdout.splitlines():
-                if not line.strip():
-                    continue
-                parts = line.split("\t")
-                if len(parts) == 3:
-                    # Handle binary files marked with '-'
-                    added = parts[0]
-                    deleted = parts[1]
-                    if added != "-":
-                        lines_added += int(added)
-                    if deleted != "-":
-                        lines_deleted += int(deleted)
-        except subprocess.CalledProcessError as e:
-            print(f"\nWarning: Error getting numstat for {rel_path}: {e}")
-        except FileNotFoundError:
-            print("\nWarning: git command not found. Skipping numstat calculation.")
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
+                final_content = original.read()
+        except Exception as e:
+            print(f"\nWarning: Error reading file {full_path}: {e}. Skipping.")
+            continue
 
-        # 5. Store stats
+        expected_tokens = count_tokens(final_content, cfg.encoder)
+        if cfg.max_expected_tokens > 0 and expected_tokens > cfg.max_expected_tokens:
+            expected_token_filtered_count += 1
+            continue
+
+        # 3. Prepare Filenames and Paths
+        safe_rel = rel_path.replace(os.sep, "_")
+        repo_file_prefix = (
+            f"{repo_name}_{safe_rel}"  # Used for filenames and benchmark prefix
+        )
+        prompt_fname = f"{repo_file_prefix}_prompt.txt"
+        expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
+        prompt_path = os.path.join(cfg.output_dir, prompt_fname)
+        expected_path = os.path.join(cfg.output_dir, expected_fname)
+
+        # 4. Get Git History
+        git_history = _get_git_history(rel_path, repo_path)
+        if "Error retrieving git history" in git_history:
+            git_command_errors += 1
+            # Decide if we should continue without history or skip. Let's continue for now.
+
+        # 5. Construct and Write Prompt File
+        prompt_content = _build_prompt_content(rel_path, git_history)
+        try:
+            _write_output_files(
+                prompt_path, expected_path, prompt_content, final_content
+            )
+        except IOError:
+            # Error already printed by _write_output_files, just skip stats calculation
+            continue
+
+        # 6. Calculate Statistics
+        prompt_tokens = count_tokens(prompt_content, cfg.encoder)
+        final_lines = len(final_content.splitlines())
+        num_commits = len(re.findall(r"^commit ", git_history, re.MULTILINE))
+        lines_added, lines_deleted = _get_git_numstat(rel_path, repo_path)
+        if (
+            lines_added == 0
+            and lines_deleted == 0
+            and "Error getting numstat" in locals().get("error", "")
+        ):
+            # Check if numstat failed specifically
+            git_command_errors += 1
+
+        # 7. Store Stats
         file_stats = {
             "filename": rel_path,
             "prompt_tokens": prompt_tokens,
@@ -411,22 +463,19 @@ print('Hello, world!')
             "lines_added": lines_added,
             "lines_deleted": lines_deleted,
             "final_lines": final_lines,
+            "repo_name": full_repo_name,
+            "repo_commit_hash": head_commit_hash,
+            "prompt_filename": prompt_fname,
+            "expected_filename": expected_fname,
+            "benchmark_case_prefix": repo_file_prefix,  # Use the prefix generated earlier
         }
-        # Include generated filenames and repo info in the stats for metadata/analysis
-        file_stats["repo_name"] = full_repo_name
-        file_stats["repo_commit_hash"] = head_commit_hash
-        file_stats["prompt_filename"] = prompt_fname
-        file_stats["expected_filename"] = expected_fname
-        # Generate a unique prefix for this benchmark case
-        # Format: {repo_name}_{relative_path_with_underscores}
-        # Example: celery_celery_app___init__.py
-        # This MUST match the prefix derived from filenames by run_benchmark.py
-        benchmark_case_prefix = f"{repo_name}_{safe_rel}"
-        file_stats["benchmark_case_prefix"] = benchmark_case_prefix
-
         stats_list.append(file_stats)
 
-    # Return the list of stats and the counts of files filtered by date and expected tokens
+    if git_command_errors > 0:
+        print(
+            f"\nWarning: Encountered {git_command_errors} errors during git operations for {full_repo_name}."
+        )
+
     return stats_list, date_filtered_count, expected_token_filtered_count
 
 
