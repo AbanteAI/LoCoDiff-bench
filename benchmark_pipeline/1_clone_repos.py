@@ -1,4 +1,38 @@
 #!/usr/bin/env python3
+"""
+Clones specified GitHub repositories into a local cache directory.
+
+Purpose:
+  This script takes a list of GitHub repository identifiers (either 'org/repo'
+  or full HTTPS URLs) and clones them into a structured directory named
+  'cached-repos'. It checks if a repository already exists in the cache
+  and skips cloning if it does, printing a message instead.
+
+Arguments:
+  --repos, -r (required): One or more GitHub repository identifiers separated
+                          by spaces.
+                          Example: python 1_clone_repos.py -r org1/repoA https://github.com/org2/repoB
+
+Inputs:
+  - Command-line arguments specifying the repositories to clone.
+  - Does not depend on outputs from previous scripts in the pipeline.
+
+Outputs:
+  - Creates the 'cached-repos/' directory in the current working directory
+    if it doesn't already exist.
+  - Clones each specified repository into a subdirectory structure within
+    'cached-repos/'. The structure is 'cached-repos/<organization>/<repository_name>/'.
+    Example: Cloning 'AbanteAI/mentat' results in 'cached-repos/AbanteAI/mentat/'.
+
+File Modifications:
+  - Creates the 'cached-repos/' directory.
+  - Creates subdirectories within 'cached-repos/' for each organization and repository.
+  - Populates these directories with the cloned repository files via 'git clone'.
+  - Does *not* modify any files outside the 'cached-repos/' directory.
+  - Does *not* modify existing cloned repositories if they are already present
+    (e.g., it does not pull updates).
+"""
+
 import argparse
 import sys
 import os
