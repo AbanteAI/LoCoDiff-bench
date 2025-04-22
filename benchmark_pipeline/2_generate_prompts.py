@@ -143,7 +143,7 @@ class Config:
     )
 
 
-def count_tokens(text: str, encoder: tiktoken.Encoding = None) -> int:
+def count_tokens(text: str, encoder: tiktoken.Encoding | None = None) -> int:
     """
     Counts the number of tokens in a given text using the cl100k_base encoder.
 
