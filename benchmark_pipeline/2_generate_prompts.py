@@ -614,38 +614,14 @@ def sample_prompts_from_buckets(
     for bucket_key in sorted_bucket_keys:
         items = buckets[bucket_key]
         if len(items) > cfg.max_per_bucket:
-            # --- Targeted Sampling Logic ---
-            # This logic aims to select prompts that are somewhat evenly distributed
-            # within the token range of the bucket, rather than purely random selection.
-            min_tk, max_tk = bucket_key
-            items_to_keep = []
-            available_items = list(items)  # Create a mutable copy
-
-            for _ in range(cfg.max_per_bucket):
-                if not available_items:
-                    break  # Should not happen if len(items) > max_per_bucket initially
-
-                # 1. Choose a random target token count within the bucket's range.
-                target_token_count = random.uniform(min_tk, max_tk)
-
-                # 2. Find the available prompt that is closest to this target token count.
-                closest_item = min(
-                    available_items,
-                    key=lambda item: abs(item["prompt_tokens"] - target_token_count),
-                )
-
-                # 3. Select this closest prompt and remove it from the available pool.
-                items_to_keep.append(closest_item)
-                available_items.remove(closest_item)
-            # --- End Targeted Sampling ---
-
-            # Items remaining in available_items are the ones sampled out.
-            items_sampled_out_count = len(available_items)
+            # --- Random Sampling Logic ---
+            # Randomly select prompts to keep if the bucket exceeds the maximum size.
+            items_to_keep = random.sample(items, cfg.max_per_bucket)
+            items_sampled_out_count = len(items) - len(items_to_keep)
             total_sampled_out += items_sampled_out_count
             print(
-                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {cfg.max_per_bucket} (removed {items_sampled_out_count}, targeted sampling)."
+                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {cfg.max_per_bucket} (removed {items_sampled_out_count}, random sampling)."
             )
-
             # Store the kept items for this bucket
             final_sampled_buckets[bucket_key] = items_to_keep
         else:
