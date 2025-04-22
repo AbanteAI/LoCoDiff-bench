@@ -135,6 +135,7 @@ class GitRepo:
     def file_last_commit_time(self, rel_path: str) -> Optional[int]:
         """Get the Unix timestamp of the last commit affecting the file, caching the result."""
         if rel_path not in self._commit_times:
+            timestamp_str = ""  # Initialize timestamp_str to ensure it's always bound
             try:
                 result = self._run_git_command(
                     ["log", "-1", "--format=%ct", "--", rel_path]
