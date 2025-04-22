@@ -79,27 +79,6 @@ from dataclasses import dataclass, asdict, field  # Import field
 from typing import List, Tuple, Dict, Any  # Added for type hinting
 
 
-# --- Configuration Dataclass ---
-
-
-@dataclass(frozen=True)
-class Config:
-    """Configuration settings for the prompt generation script."""
-
-    extensions: List[str]
-    cache_dir: str
-    output_dir: str
-    buckets_str: str  # Original comma-separated string for metadata
-    bucket_boundaries: List[int]  # Processed list of token boundaries
-    max_per_bucket: int
-    modified_within_months: int
-    max_expected_tokens: int
-    # Add default value for encoder using field factory
-    encoder: tiktoken.Encoding = field(
-        default_factory=get_encoder, init=False, repr=False
-    )
-
-
 # --- Helper Functions ---
 
 
@@ -141,6 +120,27 @@ def get_encoder():
     if _ENCODER is None:
         _ENCODER = tiktoken.get_encoding("cl100k_base")
     return _ENCODER
+
+
+# --- Configuration Dataclass ---
+
+
+@dataclass(frozen=True)
+class Config:
+    """Configuration settings for the prompt generation script."""
+
+    extensions: List[str]
+    cache_dir: str
+    output_dir: str
+    buckets_str: str  # Original comma-separated string for metadata
+    bucket_boundaries: List[int]  # Processed list of token boundaries
+    max_per_bucket: int
+    modified_within_months: int
+    max_expected_tokens: int
+    # Add default value for encoder using field factory
+    encoder: tiktoken.Encoding = field(
+        default_factory=get_encoder, init=False, repr=False
+    )
 
 
 def count_tokens(text: str, encoder: tiktoken.Encoding = None) -> int:
