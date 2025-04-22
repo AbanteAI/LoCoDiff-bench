@@ -430,10 +430,10 @@ print('Hello, world!')
     return stats_list, date_filtered_count, expected_token_filtered_count
 
 
-# --- Statistics and Filtering Functions ---
+# --- Statistics, Filtering, Bucketing, Sampling, and Deletion Functions ---
 
 
-def print_stats_table(stats_list):
+def print_stats_table(stats_list: List[Dict[str, Any]]):
     """Prints a formatted table of the collected statistics."""
     if not stats_list:
         print("No statistics generated.")
@@ -481,93 +481,89 @@ def print_stats_table(stats_list):
         print(row)
 
 
-def filter_bucket_sample_stats(
+def filter_prompts(
     stats_list: List[Dict[str, Any]], cfg: Config
-) -> Dict[Tuple[int, int], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Filters stats based on the highest bucket boundary, assigns them to buckets defined by the boundaries,
-    samples buckets, and deletes discarded files.
+    Filters the list of generated prompt statistics based on token limits.
 
     Args:
-        stats_list: List of dictionaries containing statistics for each file.
-        cfg: The configuration object containing output_dir, bucket_boundaries, and max_per_bucket.
+        stats_list: The initial list of statistics for all generated prompts.
+        cfg: The configuration object containing bucket_boundaries.
 
     Returns:
-        A dictionary where keys are bucket range tuples (min_token, max_token)
-        and values are lists of stats dictionaries belonging to that bucket after filtering and sampling.
+        A tuple containing:
+        - A list of statistics dictionaries for prompts that pass the filter.
+        - The count of prompts that were filtered out.
     """
-    bucket_boundaries = cfg.bucket_boundaries  # Use boundaries from config
+    bucket_boundaries = cfg.bucket_boundaries
     if not bucket_boundaries or len(bucket_boundaries) < 2:
         raise ValueError("Config bucket_boundaries must contain at least two elements.")
-    if not all(
-        bucket_boundaries[i] < bucket_boundaries[i + 1]
-        for i in range(len(bucket_boundaries) - 1)
-    ):
-        raise ValueError("Config bucket_boundaries must be strictly increasing.")
-    if bucket_boundaries[0] < 0:
-        raise ValueError("Config bucket boundaries cannot be negative.")
+    max_tokens = bucket_boundaries[-1]  # Highest boundary is the max prompt tokens
 
-    max_tokens = bucket_boundaries[
-        -1
-    ]  # The highest boundary defines the max tokens allowed
+    print(f"\n--- Filtering Prompts (Max Prompt Tokens: {max_tokens}) ---")
+    kept_stats = []
+    filtered_count = 0
 
-    print(
-        f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {cfg.max_per_bucket}) ---"
-    )
-    filtered_stats = []
-    deleted_count = 0
-
-    # 1. Filter by max_tokens (highest boundary) and delete corresponding files
-    print(f"Filtering prompts with more than {max_tokens} tokens...")
     for stats in stats_list:
-        # Filter prompts strictly greater than the max boundary, or exactly zero if the first boundary is > 0
+        # Filter prompts strictly greater than the max boundary,
+        # or exactly zero if the first boundary is > 0 (meaning 0 is excluded).
         if stats["prompt_tokens"] > max_tokens or (
             bucket_boundaries[0] > 0 and stats["prompt_tokens"] == 0
         ):
-            prompt_file = os.path.join(cfg.output_dir, stats["prompt_filename"])
-            expected_file = os.path.join(cfg.output_dir, stats["expected_filename"])
-            try:
-                os.remove(prompt_file)
-            except FileNotFoundError:
-                print(f"Warning: Prompt file not found for deletion: {prompt_file}")
-            try:
-                os.remove(expected_file)
-            except FileNotFoundError:
-                print(f"Warning: Expected file not found for deletion: {expected_file}")
-            deleted_count += 1
+            filtered_count += 1
         else:
             # Keep prompts within the overall range [min_boundary, max_boundary]
-            # Note: We handle the lower bound during bucketing.
-            filtered_stats.append(stats)
+            # Note: The lower bound check happens implicitly during bucketing.
+            kept_stats.append(stats)
 
     print(
-        f"Filtered out {deleted_count} prompts exceeding token limit or below minimum boundary."
+        f"Filtered out {filtered_count} prompts exceeding token limit ({max_tokens}) or below minimum boundary ({bucket_boundaries[0]})."
     )
+    return kept_stats, filtered_count
 
-    # 2. Bucket the filtered stats
-    print("Assigning remaining prompts to buckets...")
+
+def assign_prompts_to_buckets(
+    stats_list: List[Dict[str, Any]], cfg: Config
+) -> Dict[Tuple[int, int], List[Dict[str, Any]]]:
+    """
+    Assigns filtered prompt statistics to buckets based on prompt token count.
+
+    Args:
+        stats_list: List of statistics dictionaries (already filtered).
+        cfg: The configuration object containing bucket_boundaries.
+
+    Returns:
+        A dictionary where keys are bucket range tuples (min_token, max_token)
+        and values are lists of stats dictionaries belonging to that bucket.
+    """
+    bucket_boundaries = cfg.bucket_boundaries
+    max_tokens = bucket_boundaries[-1]
+
+    print("\n--- Assigning Prompts to Buckets ---")
     buckets = defaultdict(list)
-    # Define bucket ranges directly from the boundaries list
+    # Define bucket ranges and initialize dictionary
     bucket_ranges = []
     for i in range(len(bucket_boundaries) - 1):
         min_tk = bucket_boundaries[i]
         max_tk = bucket_boundaries[i + 1]
         bucket_key = (min_tk, max_tk)
-        buckets[bucket_key] = []  # Initialize empty list
+        buckets[bucket_key] = []  # Initialize empty list for each defined bucket
         bucket_ranges.append(bucket_key)
 
-    for stats in filtered_stats:
+    unassigned_count = 0
+    for stats in stats_list:
         tokens = stats["prompt_tokens"]
         assigned = False
         for min_tk, max_tk in bucket_ranges:
-            # Assign if tokens are within the bucket range [min_tk, max_tk)
-            # Special case: if min_tk is 0, include 0 tokens.
-            # Also include the upper boundary max_tk if it's the very last boundary
+            # Check if token count falls within the bucket range [min_tk, max_tk).
+            # Special case: Include 0 tokens if min_tk is 0.
+            # Special case: Include the upper boundary max_tk if it's the very last boundary.
             is_last_bucket = max_tk == max_tokens
             in_range = (tokens >= min_tk and tokens < max_tk) or (
                 min_tk == 0 and tokens == 0
             )
-            # Include the max_tokens value in the last bucket
+            # Include the max_tokens value itself in the last bucket
             if is_last_bucket and tokens == max_tk:
                 in_range = True
 
@@ -581,67 +577,146 @@ def filter_bucket_sample_stats(
             print(
                 f"Warning: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}"
             )
+            unassigned_count += 1
 
-    # 3. Sample buckets exceeding max_per_bucket and delete corresponding files
-    print(f"Sampling buckets to have at most {cfg.max_per_bucket} prompts each...")
-    final_buckets = {}
-    total_sampled_out = 0
-    # Iterate through the buckets created in step 2
+    if unassigned_count > 0:
+        print(f"Warning: {unassigned_count} prompts could not be assigned to a bucket.")
+
+    # Print summary of bucket assignments
     for bucket_key, items in buckets.items():
+        print(f"  Bucket {bucket_key}: Assigned {len(items)} prompts.")
+
+    return buckets
+
+
+def sample_prompts_from_buckets(
+    buckets: Dict[Tuple[int, int], List[Dict[str, Any]]], cfg: Config
+) -> Tuple[Dict[Tuple[int, int], List[Dict[str, Any]]], int]:
+    """
+    Samples prompts within each bucket to meet the max_per_bucket limit.
+
+    Args:
+        buckets: Dictionary mapping bucket ranges to lists of prompt stats.
+        cfg: The configuration object containing max_per_bucket.
+
+    Returns:
+        A tuple containing:
+        - A dictionary containing the final sampled buckets.
+        - The total number of prompts sampled out (discarded).
+    """
+    print(f"\n--- Sampling Buckets (Max per Bucket: {cfg.max_per_bucket}) ---")
+    final_sampled_buckets = {}
+    total_sampled_out = 0
+
+    # Iterate through the buckets, ensuring consistent order for logging
+    sorted_bucket_keys = sorted(buckets.keys(), key=lambda x: x[0])
+
+    for bucket_key in sorted_bucket_keys:
+        items = buckets[bucket_key]
         if len(items) > cfg.max_per_bucket:
-            # Targeted sampling logic
+            # --- Targeted Sampling Logic ---
+            # This logic aims to select prompts that are somewhat evenly distributed
+            # within the token range of the bucket, rather than purely random selection.
             min_tk, max_tk = bucket_key
             items_to_keep = []
-            available_items = list(items)  # Copy to modify
+            available_items = list(items)  # Create a mutable copy
 
             for _ in range(cfg.max_per_bucket):
                 if not available_items:
-                    break
-                # Select item closest to a random target within the bucket range
+                    break  # Should not happen if len(items) > max_per_bucket initially
+
+                # 1. Choose a random target token count within the bucket's range.
                 target_token_count = random.uniform(min_tk, max_tk)
+
+                # 2. Find the available prompt that is closest to this target token count.
                 closest_item = min(
                     available_items,
                     key=lambda item: abs(item["prompt_tokens"] - target_token_count),
                 )
+
+                # 3. Select this closest prompt and remove it from the available pool.
                 items_to_keep.append(closest_item)
                 available_items.remove(closest_item)
+            # --- End Targeted Sampling ---
 
-            # Items remaining in available_items are discarded
-            items_to_discard = available_items
+            # Items remaining in available_items are the ones sampled out.
+            items_sampled_out_count = len(available_items)
+            total_sampled_out += items_sampled_out_count
             print(
-                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {cfg.max_per_bucket} (targeted sampling)."
+                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {cfg.max_per_bucket} (removed {items_sampled_out_count}, targeted sampling)."
             )
-            total_sampled_out += len(items_to_discard)
-
-            # Delete files for discarded items
-            for stats in items_to_discard:
-                prompt_file = os.path.join(cfg.output_dir, stats["prompt_filename"])
-                expected_file = os.path.join(cfg.output_dir, stats["expected_filename"])
-                try:
-                    os.remove(prompt_file)
-                except FileNotFoundError:
-                    print(
-                        f"Warning: Prompt file not found for deletion during sampling: {prompt_file}"
-                    )
-                try:
-                    os.remove(expected_file)
-                except FileNotFoundError:
-                    print(
-                        f"Warning: Expected file not found for deletion during sampling: {expected_file}"
-                    )
 
             # Store the kept items for this bucket
-            final_buckets[bucket_key] = items_to_keep
+            final_sampled_buckets[bucket_key] = items_to_keep
         else:
             # Keep all items if count is within limit
-            final_buckets[bucket_key] = items
+            final_sampled_buckets[bucket_key] = items
             if items:  # Only print if bucket wasn't empty
-                print(f"  Bucket {bucket_key}: Kept all {len(items)} items.")
+                print(
+                    f"  Bucket {bucket_key}: Kept all {len(items)} items (within limit)."
+                )
 
-    print(f"Removed {total_sampled_out} prompts during sampling.")
-    print("Filtering, bucketing, and sampling complete.")
-    # Return the final buckets containing the stats of the kept prompts
-    return final_buckets
+    print(f"\nTotal prompts removed during sampling: {total_sampled_out}")
+    return final_sampled_buckets, total_sampled_out
+
+
+def delete_discarded_files(
+    all_generated_prefixes: set[str],
+    kept_prefixes: set[str],
+    output_dir: str,
+):
+    """
+    Deletes the prompt and expected output files for benchmarks that were discarded.
+
+    Args:
+        all_generated_prefixes: A set of all benchmark case prefixes initially generated.
+        kept_prefixes: A set of benchmark case prefixes remaining after filtering/sampling.
+        output_dir: The directory where the generated files are stored.
+    """
+    discarded_prefixes = all_generated_prefixes - kept_prefixes
+    deleted_files_count = 0
+
+    print(
+        f"\n--- Deleting Files for Discarded Benchmarks ({len(discarded_prefixes)} sets) ---"
+    )
+
+    if not discarded_prefixes:
+        print("No files to delete.")
+        return
+
+    for prefix in tqdm(discarded_prefixes, desc="Deleting files"):
+        prompt_filename = f"{prefix}_prompt.txt"
+        expected_filename = f"{prefix}_expectedoutput.txt"
+        prompt_file_path = os.path.join(output_dir, prompt_filename)
+        expected_file_path = os.path.join(output_dir, expected_filename)
+
+        deleted_pair = False
+        try:
+            if os.path.exists(prompt_file_path):
+                os.remove(prompt_file_path)
+                deleted_pair = True
+            else:
+                print(
+                    f"Warning: Prompt file not found for deletion: {prompt_file_path}"
+                )
+        except OSError as e:
+            print(f"Error deleting prompt file {prompt_file_path}: {e}")
+
+        try:
+            if os.path.exists(expected_file_path):
+                os.remove(expected_file_path)
+                deleted_pair = True
+            else:
+                print(
+                    f"Warning: Expected output file not found for deletion: {expected_file_path}"
+                )
+        except OSError as e:
+            print(f"Error deleting expected output file {expected_file_path}: {e}")
+
+        if deleted_pair:
+            deleted_files_count += 1  # Count pairs deleted
+
+    print(f"Deleted {deleted_files_count} pairs of prompt/expected files.")
 
 
 def print_bucket_stats_table(buckets):
@@ -927,18 +1002,38 @@ def main():
             f"\nFiltered out a total of {total_expected_token_filtered_count} files across all repositories due to expected output token constraint (more than {cfg.max_expected_tokens} tokens)."
         )
 
-    # Print initial statistics table for all generated prompts (after all filtering)
-    print("\n--- Initial Generation Statistics (All Repos, Post-Filtering) ---")
+    # --- Post-Generation Processing ---
+
+    # Get prefixes of all generated files for later cleanup
+    all_generated_prefixes = {stats["benchmark_case_prefix"] for stats in all_stats}
+
+    # Print initial statistics table for all generated prompts (before filtering/sampling)
+    print("\n--- Initial Generation Statistics (All Repos, Pre-Filtering/Sampling) ---")
     print_stats_table(all_stats)
 
-    # Filter, bucket, and sample the results using the config object
-    final_buckets = filter_bucket_sample_stats(all_stats, cfg)  # Pass cfg object
+    # 1. Filter prompts by token limits
+    filtered_stats, _ = filter_prompts(all_stats, cfg)
 
-    # Print statistics for the final buckets
+    # 2. Assign filtered prompts to buckets
+    buckets = assign_prompts_to_buckets(filtered_stats, cfg)
+
+    # 3. Sample prompts from buckets
+    final_buckets, _ = sample_prompts_from_buckets(buckets, cfg)
+
+    # Print statistics for the final selected buckets
     print_bucket_stats_table(final_buckets)
 
-    # Save the final benchmark structure metadata using the config object
-    save_benchmark_metadata(final_buckets, cfg)  # Pass cfg object
+    # 4. Determine which files were kept vs discarded
+    kept_prefixes = set()
+    for bucket_key, stats_list in final_buckets.items():
+        for stats in stats_list:
+            kept_prefixes.add(stats["benchmark_case_prefix"])
+
+    # 5. Delete files for discarded benchmarks
+    delete_discarded_files(all_generated_prefixes, kept_prefixes, cfg.output_dir)
+
+    # 6. Save the final benchmark structure metadata using the config object
+    save_benchmark_metadata(final_buckets, cfg)
 
     print("\nBenchmark prompt generation and processing complete.")
     return 0
