@@ -17,7 +17,7 @@ BENCHMARK_DIR = "generated_prompts"
 RESULTS_BASE_DIR = "benchmark_results"
 # Plot is now generated inside the results directory by analyze_results.py
 PLOT_FILENAME = os.path.join(RESULTS_BASE_DIR, "benchmark_success_rate.png")
-STATIC_DIR = "explorer_app/static"
+STATIC_DIR = "results_explorer/static"  # Updated directory name
 # The destination path in static dir keeps the original simple name for the URL
 PLOT_STATIC_DEST_FILENAME = "benchmark_success_rate.png"
 PLOT_STATIC_PATH = os.path.join(STATIC_DIR, PLOT_STATIC_DEST_FILENAME)
@@ -446,12 +446,16 @@ if __name__ == "__main__":
 
     # --- Run Analysis Script ---
     print("\n--- Running analyze_results.py to update plot ---")
+    # Define path before try block to ensure it's bound in except blocks
+    analysis_script_path = os.path.join(
+        "results_explorer", "analyze_results.py"
+    )  # Updated path
     try:
         # Run the script using the python executable from the current environment
         # Pass necessary arguments if defaults are not sufficient (using defaults here)
         # Capture output and errors
         analysis_process = subprocess.run(
-            [sys.executable, "analyze_results.py"],  # Use sys.executable
+            [sys.executable, analysis_script_path],  # Use updated path
             check=False,  # Don't throw exception on non-zero exit code
             capture_output=True,
             text=True,
@@ -477,11 +481,14 @@ if __name__ == "__main__":
 
     except FileNotFoundError:
         print(
-            "Error: analyze_results.py not found. Make sure you are in the repository root.",
+            f"Error: Analysis script not found at '{analysis_script_path}'. Make sure you are in the repository root.",  # Updated error message
             file=sys.stderr,
         )
     except Exception as e:
-        print(f"Error running analyze_results.py: {e}", file=sys.stderr)
+        print(
+            f"Error running analysis script '{analysis_script_path}': {e}",
+            file=sys.stderr,
+        )  # Updated error message
     print("--- Finished running analyze_results.py ---\n")
 
     # Ensure plot is available in static dir after potentially running analysis
