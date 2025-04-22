@@ -75,7 +75,7 @@ from collections import defaultdict
 from statistics import mean
 import random
 from tqdm import tqdm
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any
 
 
@@ -122,7 +122,7 @@ class Config:
     max_per_bucket: int
     modified_within_months: int
     max_expected_tokens: int
-    encoder: tiktoken.Encoding # Encoder instance is now required
+    encoder: tiktoken.Encoding  # Encoder instance is now required
 
 
 def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
@@ -863,7 +863,7 @@ def main():
         max_per_bucket=args.max_per_bucket,
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
-        encoder=tiktoken.get_encoding("cl100k_base") # Initialize encoder here
+        encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
     )
     print(f"Configuration loaded: {cfg}")
     # --- End Config creation ---
