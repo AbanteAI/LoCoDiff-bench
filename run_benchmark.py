@@ -14,7 +14,7 @@ import aiohttp  # For async requests
 from dotenv import load_dotenv
 
 
-# --- Model Interaction (Moved from utils.py) ---
+# --- Model Interaction ---
 
 # Global async client instance
 _ASYNC_CLIENT = None
@@ -623,7 +623,7 @@ async def run_single_benchmark(
             # Don't attempt to save metadata here
             print(f"IO Error for {benchmark_case_prefix}: {e} - Skipping results.")
 
-        except ValueError as e:  # Catches missing API key from utils
+        except ValueError as e:  # Catches missing API key
             run_metadata["error"] = f"Config Error: {e}"
             # Don't save metadata if config error prevented API call attempt
             print(f"Config Error for {benchmark_case_prefix}: {e} - Skipping results.")

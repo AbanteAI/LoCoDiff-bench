@@ -15,7 +15,7 @@ import random
 from tqdm import tqdm
 
 
-# --- Helper Functions (Moved from utils.py) ---
+# --- Helper Functions ---
 
 
 def get_repo_head_commit_hash(repo_path):
@@ -72,7 +72,7 @@ def count_tokens(text):
     return len(encoder.encode(text))
 
 
-# --- Core Generation Logic (Moved from utils.py) ---
+# --- Core Generation Logic ---
 
 
 def generate_prompts_and_expected(
@@ -367,7 +367,7 @@ print('Hello, world!')
     return stats_list, date_filtered_count, expected_token_filtered_count
 
 
-# --- Statistics and Filtering Functions (Moved from utils.py) ---
+# --- Statistics and Filtering Functions ---
 
 
 def print_stats_table(stats_list):
