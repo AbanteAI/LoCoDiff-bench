@@ -122,9 +122,6 @@ def get_encoder():
     return _ENCODER
 
 
-# --- Configuration Dataclass ---
-
-
 @dataclass(frozen=True)
 class Config:
     """Configuration settings for the prompt generation script."""
