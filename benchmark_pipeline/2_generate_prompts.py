@@ -75,6 +75,8 @@ from collections import defaultdict
 from statistics import mean
 import random
 from tqdm import tqdm
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Any
 
 
 # --- Helper Functions ---
@@ -108,29 +110,32 @@ def get_repo_head_commit_hash(repo_path):
     return commit_hash
 
 
-# Global tiktoken encoder instance
-_ENCODER = None
+@dataclass(frozen=True)
+class Config:
+    """Configuration settings for the prompt generation script."""
+
+    extensions: List[str]
+    cache_dir: str
+    output_dir: str
+    buckets_str: str  # Original comma-separated string for metadata
+    bucket_boundaries: List[int]  # Processed list of token boundaries
+    max_per_bucket: int
+    modified_within_months: int
+    max_expected_tokens: int
+    encoder: tiktoken.Encoding  # Encoder instance is now required
 
 
-def get_encoder():
-    """Initializes and returns the tiktoken encoder."""
-    global _ENCODER
-    if _ENCODER is None:
-        _ENCODER = tiktoken.get_encoding("cl100k_base")
-    return _ENCODER
-
-
-def count_tokens(text):
+def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
     """
-    Counts the number of tokens in a given text using the cl100k_base encoder.
+    Counts the number of tokens in a given text using the provided encoder.
 
     Args:
         text: The string to count tokens for.
+        encoder: The tiktoken encoder instance to use.
 
     Returns:
         The number of tokens in the text.
     """
-    encoder = get_encoder()
     return len(encoder.encode(text))
 
 
@@ -138,15 +143,11 @@ def count_tokens(text):
 
 
 def generate_prompts_and_expected(
-    repo_path,
-    extensions,
-    output_dir="generated_prompts",
-    modified_within_months=3,
-    max_expected_tokens=12000,  # Add new parameter with default
-):
+    repo_path: str, cfg: Config
+) -> Tuple[List[Dict[str, Any]], int, int]:
     """
-    For every file in the repository at repo_path with one of the specified extensions,
-    and optionally modified within the last `modified_within_months` months, create two files in output_dir:
+    For every file in the repository at repo_path matching extensions in cfg,
+    and optionally modified within cfg.modified_within_months, create two files in cfg.output_dir:
       - {repo_name}_{relative_path_with_underscores}_prompt.txt containing
         a reconstruction prompt with git history.
       - {repo_name}_{relative_path_with_underscores}_expectedoutput.txt containing
@@ -156,12 +157,8 @@ def generate_prompts_and_expected(
 
     Args:
         repo_path: Path to the cloned repository.
-        extensions: List of file extensions to process.
-        output_dir: Directory to save generated files.
-        modified_within_months: Integer, only process files modified in the last N months.
-                                If <= 0, this filter is disabled.
-        max_expected_tokens: Integer, maximum number of tokens allowed in the expected output file.
-                             If <= 0, this filter is disabled.
+        cfg: The configuration object containing settings like extensions, output_dir,
+             modified_within_months, and max_expected_tokens.
 
     Returns:
         A tuple containing:
@@ -184,8 +181,8 @@ def generate_prompts_and_expected(
         - An integer representing the count of files skipped due to the date filter.
         - An integer representing the count of files skipped due to the expected token limit.
     """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+    if not os.path.exists(cfg.output_dir):
+        os.makedirs(cfg.output_dir, exist_ok=True)
 
     repo_name = os.path.basename(os.path.normpath(repo_path))
     org_name = os.path.basename(os.path.dirname(repo_path))
@@ -199,12 +196,12 @@ def generate_prompts_and_expected(
 
     # Calculate date threshold if filter is enabled
     threshold_timestamp = None
-    if modified_within_months > 0:
+    if cfg.modified_within_months > 0:
         # Approximate seconds per month (average)
         avg_seconds_per_month = 30.44 * 24 * 60 * 60
         current_timestamp = time.time()
         threshold_timestamp = current_timestamp - (
-            modified_within_months * avg_seconds_per_month
+            cfg.modified_within_months * avg_seconds_per_month
         )
         print(
             f"Date filter enabled: Processing files modified since {datetime.fromtimestamp(threshold_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
@@ -221,7 +218,7 @@ def generate_prompts_and_expected(
         if ".git" in root.split(os.sep):
             continue
         for filename in files:
-            if any(filename.endswith(ext) for ext in extensions):
+            if any(filename.endswith(ext) for ext in cfg.extensions):
                 full_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(full_path, repo_path)
                 files_to_process.append((full_path, rel_path))
@@ -284,8 +281,10 @@ def generate_prompts_and_expected(
             continue  # Skip if we can't even read the file
 
         # --- Expected Token Filter Check ---
-        expected_tokens = count_tokens(final_content)
-        if max_expected_tokens > 0 and expected_tokens > max_expected_tokens:
+        expected_tokens = count_tokens(
+            final_content, cfg.encoder
+        )  # Pass encoder from config
+        if cfg.max_expected_tokens > 0 and expected_tokens > cfg.max_expected_tokens:
             expected_token_filtered_count += 1
             continue  # Skip this file
 
@@ -293,8 +292,8 @@ def generate_prompts_and_expected(
         safe_rel = rel_path.replace(os.sep, "_")
         prompt_fname = f"{repo_name}_{safe_rel}_prompt.txt"
         expected_fname = f"{repo_name}_{safe_rel}_expectedoutput.txt"
-        prompt_path = os.path.join(output_dir, prompt_fname)
-        expected_path = os.path.join(output_dir, expected_fname)
+        prompt_path = os.path.join(cfg.output_dir, prompt_fname)
+        expected_path = os.path.join(cfg.output_dir, expected_fname)
 
         # 1. Get git history with diffs for the prompt
         try:
@@ -357,8 +356,10 @@ print('Hello, world!')
             ef.write(final_content)
 
         # 4. Calculate statistics (expected_tokens already calculated)
-        prompt_tokens = count_tokens(prompt_content)
-        # expected_tokens = count_tokens(final_content) # Already done above
+        prompt_tokens = count_tokens(
+            prompt_content, cfg.encoder
+        )  # Pass encoder from config
+        # expected_tokens = count_tokens(final_content, cfg.encoder) # Already done above
         final_lines = len(final_content.splitlines())
 
         # Count commits
@@ -481,39 +482,37 @@ def print_stats_table(stats_list):
 
 
 def filter_bucket_sample_stats(
-    stats_list, output_dir, bucket_boundaries, max_per_bucket=10
-):
+    stats_list: List[Dict[str, Any]], cfg: Config
+) -> Dict[Tuple[int, int], List[Dict[str, Any]]]:
     """
     Filters stats based on the highest bucket boundary, assigns them to buckets defined by the boundaries,
     samples buckets, and deletes discarded files.
 
     Args:
         stats_list: List of dictionaries containing statistics for each file.
-        output_dir: Directory where prompt and expected files are stored.
-        bucket_boundaries: A list of integers representing the token boundaries for buckets
-                           (e.g., [0, 10000, 20000, 40000, 80000]). Must be sorted and contain at least two elements.
-        max_per_bucket: Maximum number of items allowed per bucket after sampling.
+        cfg: The configuration object containing output_dir, bucket_boundaries, and max_per_bucket.
 
     Returns:
         A dictionary where keys are bucket range tuples (min_token, max_token)
         and values are lists of stats dictionaries belonging to that bucket after filtering and sampling.
     """
+    bucket_boundaries = cfg.bucket_boundaries  # Use boundaries from config
     if not bucket_boundaries or len(bucket_boundaries) < 2:
-        raise ValueError("bucket_boundaries must contain at least two elements.")
+        raise ValueError("Config bucket_boundaries must contain at least two elements.")
     if not all(
         bucket_boundaries[i] < bucket_boundaries[i + 1]
         for i in range(len(bucket_boundaries) - 1)
     ):
-        raise ValueError("bucket_boundaries must be strictly increasing.")
+        raise ValueError("Config bucket_boundaries must be strictly increasing.")
     if bucket_boundaries[0] < 0:
-        raise ValueError("Bucket boundaries cannot be negative.")
+        raise ValueError("Config bucket boundaries cannot be negative.")
 
     max_tokens = bucket_boundaries[
         -1
     ]  # The highest boundary defines the max tokens allowed
 
     print(
-        f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {max_per_bucket}) ---"
+        f"\n--- Filtering, Bucketing, and Sampling (Max Tokens: {max_tokens}, Max per Bucket: {cfg.max_per_bucket}) ---"
     )
     filtered_stats = []
     deleted_count = 0
@@ -525,8 +524,8 @@ def filter_bucket_sample_stats(
         if stats["prompt_tokens"] > max_tokens or (
             bucket_boundaries[0] > 0 and stats["prompt_tokens"] == 0
         ):
-            prompt_file = os.path.join(output_dir, stats["prompt_filename"])
-            expected_file = os.path.join(output_dir, stats["expected_filename"])
+            prompt_file = os.path.join(cfg.output_dir, stats["prompt_filename"])
+            expected_file = os.path.join(cfg.output_dir, stats["expected_filename"])
             try:
                 os.remove(prompt_file)
             except FileNotFoundError:
@@ -584,18 +583,18 @@ def filter_bucket_sample_stats(
             )
 
     # 3. Sample buckets exceeding max_per_bucket and delete corresponding files
-    print(f"Sampling buckets to have at most {max_per_bucket} prompts each...")
+    print(f"Sampling buckets to have at most {cfg.max_per_bucket} prompts each...")
     final_buckets = {}
     total_sampled_out = 0
     # Iterate through the buckets created in step 2
     for bucket_key, items in buckets.items():
-        if len(items) > max_per_bucket:
+        if len(items) > cfg.max_per_bucket:
             # Targeted sampling logic
             min_tk, max_tk = bucket_key
             items_to_keep = []
             available_items = list(items)  # Copy to modify
 
-            for _ in range(max_per_bucket):
+            for _ in range(cfg.max_per_bucket):
                 if not available_items:
                     break
                 # Select item closest to a random target within the bucket range
@@ -610,14 +609,14 @@ def filter_bucket_sample_stats(
             # Items remaining in available_items are discarded
             items_to_discard = available_items
             print(
-                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {max_per_bucket} (targeted sampling)."
+                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {cfg.max_per_bucket} (targeted sampling)."
             )
             total_sampled_out += len(items_to_discard)
 
             # Delete files for discarded items
             for stats in items_to_discard:
-                prompt_file = os.path.join(output_dir, stats["prompt_filename"])
-                expected_file = os.path.join(output_dir, stats["expected_filename"])
+                prompt_file = os.path.join(cfg.output_dir, stats["prompt_filename"])
+                expected_file = os.path.join(cfg.output_dir, stats["expected_filename"])
                 try:
                     os.remove(prompt_file)
                 except FileNotFoundError:
@@ -717,15 +716,21 @@ def print_bucket_stats_table(buckets):
     print(f"Total prompts in final set: {total_count}")
 
 
-def save_benchmark_metadata(output_dir, final_buckets, generation_params):
+def save_benchmark_metadata(
+    final_buckets: Dict[Tuple[int, int], List[Dict[str, Any]]], cfg: Config
+):
     """
     Saves the final benchmark structure and generation parameters to metadata.json.
 
     Args:
-        output_dir: The directory where prompts are saved.
         final_buckets: Dictionary mapping bucket ranges to lists of kept prompt stats.
-        generation_params: Dictionary of parameters used for generation/filtering.
+        cfg: The configuration object containing output_dir and other parameters.
     """
+    # Create generation_params dict from Config, excluding derived fields if needed
+    # Using asdict and then removing the derived list of boundaries
+    generation_params = asdict(cfg)
+    generation_params.pop("bucket_boundaries", None)  # Remove the list, keep the string
+
     metadata = {
         "generation_parameters": generation_params,
         "benchmark_buckets": {},
@@ -749,7 +754,7 @@ def save_benchmark_metadata(output_dir, final_buckets, generation_params):
                 for stats in stats_list
             ]
 
-    metadata_path = os.path.join(output_dir, "metadata.json")
+    metadata_path = os.path.join(cfg.output_dir, "metadata.json")
     try:
         with open(metadata_path, "w", encoding="utf-8") as mf:
             json.dump(metadata, mf, indent=4)
@@ -825,9 +830,6 @@ def main():
     args = parser.parse_args()
 
     print("--- Starting Prompt Generation ---")
-    print(f"Processing extensions: {args.extensions}")
-    print(f"Looking for repositories in: {args.cache_dir}")
-    print(f"Outputting prompts to: {args.output_dir}")
 
     # --- Parse and validate bucket boundaries ---
     try:
@@ -851,10 +853,25 @@ def main():
         return 1
     # --- End bucket parsing ---
 
-    repo_paths = find_repo_dirs(args.cache_dir)
+    # --- Create Config object ---
+    cfg = Config(
+        extensions=args.extensions,
+        cache_dir=args.cache_dir,
+        output_dir=args.output_dir,
+        buckets_str=args.buckets,  # Store original string
+        bucket_boundaries=bucket_boundaries,  # Store processed list
+        max_per_bucket=args.max_per_bucket,
+        modified_within_months=args.modified_within_months,
+        max_expected_tokens=args.max_expected_tokens,
+        encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
+    )
+    print(f"Configuration loaded: {cfg}")
+    # --- End Config creation ---
+
+    repo_paths = find_repo_dirs(cfg.cache_dir)
 
     if not repo_paths:
-        print(f"Error: No valid repository directories found in {args.cache_dir}")
+        print(f"Error: No valid repository directories found in {cfg.cache_dir}")
         print("Please run the clone_repos.py script first.")
         return 1
 
@@ -872,19 +889,12 @@ def main():
         org_name = os.path.basename(os.path.dirname(repo_path))
         print(f"\nProcessing repository: {org_name}/{repo_name} ({repo_path})")
         try:
-            # Pass modified_within_months and max_expected_tokens arguments
-            # Receive both date and expected token filtered counts
+            # Pass the config object
             (
                 stats_list,
                 date_filtered_count,
                 expected_token_filtered_count,
-            ) = generate_prompts_and_expected(
-                repo_path,
-                args.extensions,
-                args.output_dir,
-                args.modified_within_months,
-                args.max_expected_tokens,  # Pass the new argument
-            )
+            ) = generate_prompts_and_expected(repo_path, cfg)  # Pass cfg object
             all_stats.extend(stats_list)
             total_date_filtered_count += date_filtered_count  # Accumulate date count
             total_expected_token_filtered_count += (
@@ -907,42 +917,28 @@ def main():
         return 1
 
     # Report total files filtered by date
-    if args.modified_within_months > 0:
+    if cfg.modified_within_months > 0:
         print(
-            f"\nFiltered out a total of {total_date_filtered_count} files across all repositories due to modification date constraint (older than {args.modified_within_months} months)."
+            f"\nFiltered out a total of {total_date_filtered_count} files across all repositories due to modification date constraint (older than {cfg.modified_within_months} months)."
         )
     # Report total files filtered by expected token count
-    if args.max_expected_tokens > 0:
+    if cfg.max_expected_tokens > 0:
         print(
-            f"\nFiltered out a total of {total_expected_token_filtered_count} files across all repositories due to expected output token constraint (more than {args.max_expected_tokens} tokens)."
+            f"\nFiltered out a total of {total_expected_token_filtered_count} files across all repositories due to expected output token constraint (more than {cfg.max_expected_tokens} tokens)."
         )
 
     # Print initial statistics table for all generated prompts (after all filtering)
     print("\n--- Initial Generation Statistics (All Repos, Post-Filtering) ---")
     print_stats_table(all_stats)
 
-    # Filter, bucket, and sample the results using provided arguments
-    final_buckets = filter_bucket_sample_stats(
-        all_stats,
-        args.output_dir,
-        bucket_boundaries=bucket_boundaries,  # Pass the parsed list of token boundaries
-        max_per_bucket=args.max_per_bucket,
-    )
+    # Filter, bucket, and sample the results using the config object
+    final_buckets = filter_bucket_sample_stats(all_stats, cfg)  # Pass cfg object
 
     # Print statistics for the final buckets
     print_bucket_stats_table(final_buckets)
 
-    # Save the final benchmark structure metadata
-    generation_params = {
-        "extensions": args.extensions,
-        "cache_dir": args.cache_dir,
-        "output_dir": args.output_dir,
-        "buckets": args.buckets,  # Store the original string argument
-        "max_per_bucket": args.max_per_bucket,
-        "modified_within_months": args.modified_within_months,
-        "max_expected_tokens": args.max_expected_tokens,  # Store the new parameter
-    }
-    save_benchmark_metadata(args.output_dir, final_buckets, generation_params)
+    # Save the final benchmark structure metadata using the config object
+    save_benchmark_metadata(final_buckets, cfg)  # Pass cfg object
 
     print("\nBenchmark prompt generation and processing complete.")
     return 0
