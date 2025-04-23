@@ -696,48 +696,7 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 #         abort(404)
 
 
-@app.route("/api/plot-data")
-def get_plot_data():
-    """Returns the plot data as JSON for the chart."""
-    analysis_results = current_app.config.get("ANALYSIS_RESULTS")
-
-    if not analysis_results or not analysis_results.get("models"):
-        return {"error": "No analysis results available"}, 404
-
-    # Prepare data for Chart.js format
-    bucket_labels = analysis_results.get("formatted_bucket_keys", [])
-    datasets = []
-
-    # Sort models for consistent coloring
-    models = sorted(list(analysis_results["models"].keys()))
-
-    for model_name in models:
-        model_stats = analysis_results["models"][model_name]
-        success_rates = []
-
-        for bucket_key in analysis_results["bucket_keys"]:
-            bucket_stats = model_stats["buckets"][bucket_key]
-            rate = (
-                bucket_stats["success_rate"] if bucket_stats["runs_found"] > 0 else None
-            )
-            success_rates.append(rate)
-
-        # Format the cost for the label
-        total_cost = model_stats.get("total_cost_usd", 0.0)
-
-        datasets.append(
-            {
-                "label": f"{model_name} (${total_cost:.2f})",
-                "data": success_rates,
-                "borderWidth": 2,
-                "tension": 0.1,  # Slight curve for nicer appearance
-                "fill": False,
-            }
-        )
-
-# --- Removed Orphaned Function Body ---
-# The body of the old /api/plot-data function was here and has been removed.
-# --- End Removed Orphaned Function Body ---
+# Removed the entire orphaned get_plot_data function and its route decorator.
 
 
 @app.route("/api/sliding-plot-data")
