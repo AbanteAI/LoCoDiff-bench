@@ -59,7 +59,8 @@ import json
 import glob
 import re
 import sys
-from typing import Any  # Add this import
+from typing import Any, Dict, Optional, Tuple, List
+from collections import defaultdict
 
 # Attempt to import pandas and matplotlib, provide guidance if missing
 try:
@@ -91,116 +92,110 @@ def format_bucket_key(key_str: str) -> str:
         return key_str  # Return original key if formatting fails
 
 
+def load_json_file(filepath: str) -> Optional[Dict[str, Any]]:
+    """Loads a JSON file, returning None on error."""
+    if not os.path.exists(filepath):
+        # print(f"Warning: File not found: {filepath}") # Optional: less verbose
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Error reading or parsing JSON file {filepath}: {e}")
+        return None
+
+
 # --- Core Logic ---
 
 
-def load_benchmark_metadata(benchmark_dir: str) -> dict | None:
-    """Loads the benchmark structure metadata from metadata.json."""
-    metadata_path = os.path.join(benchmark_dir, "metadata.json")
-    if not os.path.exists(metadata_path):
-        print(f"Error: Benchmark metadata file not found at {metadata_path}")
-        print("Please run generate_prompts.py first.")
-        return None
-    try:
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-        return metadata
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"Error reading or parsing benchmark metadata file {metadata_path}: {e}")
-        return None
-
-
-def find_models_in_results(results_base_dir: str) -> list[str]:
-    """Finds all unique model names present in the results directory structure."""
-    models = set()
-    # Pattern: results_base_dir / * (benchmark_case) / * (model_name) / * (timestamp)
-    pattern = os.path.join(results_base_dir, "*", "*")
-    potential_model_dirs = glob.glob(pattern)
-    for path in potential_model_dirs:
-        if os.path.isdir(path):
-            # The model name is the basename of this directory
-            model_name = os.path.basename(path)
-            # Basic check: avoid adding timestamp dirs if structure is unexpected
-            if not re.match(r"\d{8}_\d{6}", model_name):
-                models.add(model_name)
-    return sorted(list(models))
-
-
-def find_latest_result_dir(
-    benchmark_case_prefix: str, model_name: str, results_base_dir: str
-) -> str | None:
-    """Finds the path to the latest timestamped result directory for a given case and model."""
-    pattern = os.path.join(
-        results_base_dir, benchmark_case_prefix, model_name, "*"
-    )  # Match any timestamp dir
-    potential_dirs = glob.glob(pattern)
-    latest_dir = None
-    latest_timestamp = ""
-
-    for result_dir in potential_dirs:
-        if not os.path.isdir(result_dir):
-            continue
-        dir_name = os.path.basename(result_dir)
-        # Check if it looks like a timestamp directory
-        if re.match(r"\d{8}_\d{6}", dir_name):
-            if dir_name > latest_timestamp:
-                latest_timestamp = dir_name
-                latest_dir = result_dir
-
-    return latest_dir
-
-
-def load_result_metadata(result_dir: str) -> dict | None:
-    """Loads the metadata.json from a specific result directory."""
-    metadata_path = os.path.join(result_dir, "metadata.json")
-    if not os.path.exists(metadata_path):
-        # This might happen if a run failed very early
-        # print(f"Warning: Result metadata not found in {result_dir}")
-        return None
-    try:
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-        return metadata
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"Warning: Error reading result metadata from {metadata_path}: {e}")
-        return None
-
-
-def analyze_results(benchmark_metadata: dict, results_base_dir: str) -> dict:
+def scan_results_directory(
+    results_base_dir: str,
+) -> Tuple[List[str], Dict[str, Dict[str, Optional[Dict[str, Any]]]]]:
     """
-    Analyzes benchmark results by comparing benchmark structure with found results.
+    Scans the results directory to find all models and their latest run metadata for each benchmark case.
 
     Args:
-        benchmark_metadata: Loaded metadata from generated_prompts/metadata.json.
         results_base_dir: Path to the benchmark_results directory.
 
     Returns:
+        A tuple containing:
+        - A sorted list of unique model names found.
+        - A dictionary mapping model_name -> benchmark_case_prefix -> latest_run_metadata (or None if not found/error).
+          Example: {"openai_gpt-4o": {"case1_prefix": {...metadata...}, "case2_prefix": None}, ...}
+    """
+    print(f"Scanning results directory: {results_base_dir}...")
+    # Structure: {model_name: {case_prefix: (latest_timestamp, metadata_path)}}
+    latest_runs: Dict[str, Dict[str, Tuple[str, str]]] = defaultdict(
+        lambda: defaultdict(lambda: ("", ""))
+    )
+    models = set()
+
+    # Pattern: results_base_dir / * (benchmark_case) / * (model_name) / * (timestamp) / metadata.json
+    pattern = os.path.join(results_base_dir, "*", "*", "*", "metadata.json")
+    metadata_files = glob.glob(pattern)
+
+    for metadata_path in metadata_files:
+        try:
+            parts = metadata_path.split(os.sep)
+            # Ensure path structure is as expected before accessing indices
+            if len(parts) >= 4:
+                timestamp = parts[-2]
+                model_name = parts[-3]
+                benchmark_case_prefix = parts[-4]
+
+                # Validate timestamp format
+                if not re.match(r"\d{8}_\d{6}", timestamp):
+                    continue  # Skip if the directory name isn't a valid timestamp
+
+                models.add(model_name)
+
+                # Check if this timestamp is later than the one currently stored
+                current_latest_ts, _ = latest_runs[model_name][benchmark_case_prefix]
+                if timestamp > current_latest_ts:
+                    latest_runs[model_name][benchmark_case_prefix] = (
+                        timestamp,
+                        metadata_path,
+                    )
+            else:
+                # Handle unexpected path structure if necessary
+                # print(f"Warning: Skipping unexpected path structure: {metadata_path}")
+                pass
+
+        except IndexError:
+            # Handle cases where splitting the path doesn't yield enough parts
+            # print(f"Warning: Could not parse path components for: {metadata_path}")
+            pass
+
+    # Now load the metadata for the latest runs identified
+    results_data: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = defaultdict(dict)
+    for model_name, cases in latest_runs.items():
+        for case_prefix, (_, metadata_path) in cases.items():
+            results_data[model_name][case_prefix] = load_json_file(metadata_path)
+
+    sorted_models = sorted(list(models))
+    print(f"Scan complete. Found {len(sorted_models)} models.")
+    return sorted_models, results_data
+
+
+def analyze_results(
+    benchmark_metadata: dict,
+    models_found: List[str],
+    results_data: Dict[str, Dict[str, Optional[Dict[str, Any]]]],
+) -> dict:
+    """
+    Analyzes benchmark results using pre-scanned data.
+
+    Args:
+        benchmark_metadata: Loaded metadata from generated_prompts/metadata.json.
+        models_found: List of model names found during the scan.
+        results_data: Dictionary mapping model -> case -> latest metadata (or None).
+
+    Returns:
         A dictionary containing aggregated analysis results per model and per bucket.
-        Structure:
-        {
-            "models": {
-                "model_name": {
-                    "total_benchmarks": int, # Total benchmarks defined for this model
-                    "runs_found": int,
-                    "successful_runs": int,
-                    "total_cost_usd": float,
-                    "success_rate": float, # 0.0 to 1.0
-                    "buckets": {
-                        "bucket_key_str": {
-                            "total_in_bucket": int,
-                            "runs_found": int,
-                            "successful_runs": int,
-                            "success_rate": float
-                        }, ...
-                    }
-                }, ...
-            },
-            "bucket_keys": list[str] # Sorted list of bucket keys like "0-20000"
-        }
+        (Structure is the same as the previous version).
     """
     # Initialize analysis structure explicitly
     analysis: dict[str, Any] = {"models": {}}
-    models_found_in_results = find_models_in_results(results_base_dir)
     # Ensure bucket keys are sorted for consistent processing and output
     all_bucket_keys = sorted(
         benchmark_metadata.get("benchmark_buckets", {}).keys(),
@@ -208,11 +203,11 @@ def analyze_results(benchmark_metadata: dict, results_base_dir: str) -> dict:
     )
     analysis["bucket_keys"] = all_bucket_keys
 
-    print(f"Found models in results directory: {models_found_in_results}")
-    print(f"Analyzing {len(all_bucket_keys)} buckets defined in benchmark metadata.")
+    print(f"Analyzing results for models: {models_found}")
+    print(f"Using {len(all_bucket_keys)} buckets defined in benchmark metadata.")
 
     # Initialize structure for all models found and all defined buckets
-    for model_name in models_found_in_results:
+    for model_name in models_found:
         analysis["models"][model_name] = {
             "total_benchmarks": 0,
             "runs_found": 0,
@@ -236,44 +231,42 @@ def analyze_results(benchmark_metadata: dict, results_base_dir: str) -> dict:
         print(
             "Warning: No benchmark buckets found in metadata. Analysis might be empty."
         )
-        # Return the initialized (empty) structure
-        return analysis
+        return analysis  # Return the initialized (empty) structure
 
     for bucket_key, benchmark_cases in defined_buckets.items():
         for case_info in benchmark_cases:
             benchmark_case_prefix = case_info["benchmark_case_prefix"]
 
             # Update total counts for each model
-            for model_name in models_found_in_results:
+            for model_name in models_found:
                 analysis["models"][model_name]["total_benchmarks"] += 1
                 analysis["models"][model_name]["buckets"][bucket_key][
                     "total_in_bucket"
                 ] += 1
 
-                # Find the latest result for this specific case and model
-                latest_result_dir = find_latest_result_dir(
-                    benchmark_case_prefix, model_name, results_base_dir
+                # Get the pre-loaded result metadata for this case and model
+                result_meta = results_data.get(model_name, {}).get(
+                    benchmark_case_prefix
                 )
 
-                if latest_result_dir:
-                    result_meta = load_result_metadata(latest_result_dir)
-                    if result_meta:
-                        # Increment found counts
-                        analysis["models"][model_name]["runs_found"] += 1
+                # Check if a result was found and metadata loaded successfully
+                if result_meta is not None:
+                    # Increment found counts
+                    analysis["models"][model_name]["runs_found"] += 1
+                    analysis["models"][model_name]["buckets"][bucket_key][
+                        "runs_found"
+                    ] += 1
+
+                    # Check success
+                    if result_meta.get("success", False):
+                        analysis["models"][model_name]["successful_runs"] += 1
                         analysis["models"][model_name]["buckets"][bucket_key][
-                            "runs_found"
+                            "successful_runs"
                         ] += 1
 
-                        # Check success
-                        if result_meta.get("success", False):
-                            analysis["models"][model_name]["successful_runs"] += 1
-                            analysis["models"][model_name]["buckets"][bucket_key][
-                                "successful_runs"
-                            ] += 1
-
-                        # Accumulate cost
-                        cost = result_meta.get("cost_usd", 0.0) or 0.0  # Handle None
-                        analysis["models"][model_name]["total_cost_usd"] += float(cost)
+                    # Accumulate cost
+                    cost = result_meta.get("cost_usd", 0.0) or 0.0  # Handle None
+                    analysis["models"][model_name]["total_cost_usd"] += float(cost)
 
     # Calculate success rates
     for model_name, model_stats in analysis["models"].items():
@@ -294,7 +287,11 @@ def print_summary_tables(analysis_results: dict):
     """Prints formatted summary tables to the console."""
     print("\n--- Overall Model Performance Summary ---")
     models_data = []
-    for model_name, stats in analysis_results["models"].items():
+    # Sort models alphabetically for consistent table order
+    sorted_model_names = sorted(analysis_results["models"].keys())
+
+    for model_name in sorted_model_names:
+        stats = analysis_results["models"][model_name]
         models_data.append(
             {
                 "Model": model_name,
@@ -319,7 +316,8 @@ def print_summary_tables(analysis_results: dict):
     formatted_keys = [format_bucket_key(k) for k in bucket_keys]
     bucket_data = {"Bucket (k tk)": formatted_keys}  # Updated header
 
-    for model_name, stats in analysis_results["models"].items():
+    for model_name in sorted_model_names:  # Use sorted names here too
+        stats = analysis_results["models"][model_name]
         rates = []
         for key in bucket_keys:
             bucket_stats = stats["buckets"][key]
@@ -341,7 +339,8 @@ def print_summary_tables(analysis_results: dict):
 def generate_plot(analysis_results: dict, output_filename: str):
     """Generates and saves a plot of per-bucket success rates."""
     print(f"\nGenerating plot and saving to {output_filename}...")
-    models = list(analysis_results["models"].keys())
+    # Sort models alphabetically for consistent plot order/colors
+    models = sorted(list(analysis_results["models"].keys()))
     bucket_keys = analysis_results["bucket_keys"]
     # Use bucket midpoints for plotting x-axis? Or just indices? Indices are simpler.
     # Let's use indices for simplicity, label ticks with bucket ranges.
@@ -454,20 +453,35 @@ def main():
         print("Plot generation disabled.")
 
     # 1. Load Benchmark Metadata
-    benchmark_metadata = load_benchmark_metadata(args.benchmark_dir)
+    benchmark_metadata_path = os.path.join(args.benchmark_dir, "metadata.json")
+    benchmark_metadata = load_json_file(benchmark_metadata_path)
     if benchmark_metadata is None:
+        print(
+            f"Error: Benchmark metadata file not found or invalid at {benchmark_metadata_path}"
+        )
+        print("Please run generate_prompts.py first.")
         return 1  # Error loading metadata
 
-    # 2. Analyze Results
-    analysis = analyze_results(benchmark_metadata, args.results_dir)
+    # 2. Scan Results Directory
+    models_found, results_data = scan_results_directory(args.results_dir)
+    if not models_found:
+        print(
+            "Warning: No models found in the results directory. No analysis to perform."
+        )
+        # Still print empty tables for consistency? Or exit? Let's exit.
+        print("\n--- Benchmark Analysis Complete (No Results Found) ---")
+        return 0
 
-    # 3. Print Summary Tables
+    # 3. Analyze Results using scanned data
+    analysis = analyze_results(benchmark_metadata, models_found, results_data)
+
+    # 4. Print Summary Tables
     print_summary_tables(analysis)
 
-    # 4. Generate Plot (if not disabled)
+    # 5. Generate Plot (if not disabled)
     if not args.no_plot:
         if not analysis["models"]:
-            print("\nSkipping plot generation as no model results were found.")
+            print("\nSkipping plot generation as no model results were analyzed.")
         else:
             generate_plot(analysis, args.plot_file)
 
