@@ -75,17 +75,20 @@ File Modifications:
 """
 
 import argparse
-import os
-import sys
-import difflib
-import json
-import re
 import asyncio
+import difflib
 import glob
-from pathlib import Path
+import json
+import os
+import re
+import sys
+from collections import defaultdict
 from datetime import datetime, timezone
-import openai
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 import aiohttp  # For async requests
+import openai
 from dotenv import load_dotenv
 
 
@@ -369,7 +372,7 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
 # --- Benchmark Logic ---
 
 
-def sanitize_filename(name):
+def sanitize_filename(name: str) -> str:
     """Removes characters that are problematic for filenames/paths."""
     # Replace slashes with underscores
     name = name.replace(os.path.sep, "_").replace("/", "_")
@@ -440,31 +443,28 @@ def find_benchmark_cases(benchmark_dir: str) -> list[str]:
     return sorted(list(prefixes))
 
 
-def get_previous_run_status(
-    benchmark_case_prefix: str, model: str, results_base_dir: str
-) -> tuple[bool, float]:
+def get_latest_run_cost(
+    benchmark_case_prefix: str, model_name: str, results_base_dir: Path
+) -> float:
     """
-    Checks if a case/model has been run previously and returns its status and cost.
+    Finds the latest run for a case/model and returns its cost.
 
     Returns:
-        A tuple (was_run: bool, cost: float).
-        - was_run is True if any result directory exists.
-        - cost is the cost_usd from the *latest* run's metadata, or 0.0 if
-          no run exists, metadata is missing/unreadable, or cost is not recorded.
+        The cost_usd from the latest run's metadata, or 0.0 if no run exists,
+        metadata is missing/unreadable, or cost is not recorded.
     """
-    sanitized_model_name = sanitize_filename(model)
-    pattern = os.path.join(
-        results_base_dir, benchmark_case_prefix, sanitized_model_name, "*"
-    )
-    potential_dirs = glob.glob(pattern)
+    sanitized_model_name = sanitize_filename(model_name)
+    # Use Path object methods for globbing
+    pattern = f"{benchmark_case_prefix}/{sanitized_model_name}/*"
+    potential_dirs = list(results_base_dir.glob(pattern))
 
-    latest_dir = None
+    latest_dir: Optional[Path] = None
     latest_timestamp = ""
 
     for result_dir in potential_dirs:
-        if not os.path.isdir(result_dir):
+        if not result_dir.is_dir():
             continue
-        dir_name = os.path.basename(result_dir)
+        dir_name = result_dir.name
         # Check if it looks like a timestamp directory and find the latest
         if re.match(r"\d{8}_\d{6}", dir_name):
             if dir_name > latest_timestamp:
@@ -472,12 +472,12 @@ def get_previous_run_status(
                 latest_dir = result_dir
 
     if latest_dir is None:
-        return False, 0.0  # Not run
+        return 0.0  # Not run or no valid timestamp dirs found
 
     # Found at least one run attempt, try to get cost from the latest
-    metadata_path = os.path.join(latest_dir, "metadata.json")
+    metadata_path = latest_dir / "metadata.json"
     cost = 0.0
-    if os.path.exists(metadata_path):
+    if metadata_path.exists():
         try:
             with open(metadata_path, "r", encoding="utf-8") as f:
                 metadata = json.load(f)
@@ -489,34 +489,46 @@ def get_previous_run_status(
             )
             cost = 0.0  # Treat as 0 cost if metadata is problematic
 
-    return True, cost  # Was run, return cost (might be 0.0)
+    return cost
+
+
+def _save_text_file(filepath: Path, content: str):
+    """Helper to save text content to a file."""
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(content, encoding="utf-8")
+    except IOError as e:
+        print(f"Warning: Failed to write file {filepath}: {e}")
+        # Decide if this should re-raise or just warn
 
 
 async def run_single_benchmark(
     benchmark_case_prefix: str,
     model: str,
-    benchmark_dir: str,
-    results_base_dir: str,
+    benchmark_dir: Path,
+    results_base_dir: Path,
     semaphore: asyncio.Semaphore,
-) -> dict:
+) -> Dict[str, Any]:
     """Runs a single benchmark case asynchronously."""
     async with semaphore:
         prompt_filename = f"{benchmark_case_prefix}_prompt.txt"
         expected_filename = f"{benchmark_case_prefix}_expectedoutput.txt"
-        prompt_filepath = os.path.join(benchmark_dir, prompt_filename)
-        expected_filepath = os.path.join(benchmark_dir, expected_filename)
+        prompt_filepath = benchmark_dir / prompt_filename
+        expected_filepath = benchmark_dir / expected_filename
 
         print(f"Starting benchmark: {benchmark_case_prefix} with model {model}")
 
-        run_metadata = {
+        # Initialize metadata with Path objects converted to strings for JSON later
+        run_metadata: Dict[str, Any] = {
             "model": model,
             "benchmark_case": benchmark_case_prefix,
-            "benchmark_dir": benchmark_dir,
-            "prompt_file": prompt_filepath,
-            "expected_file": expected_filepath,
+            "benchmark_dir": str(benchmark_dir),
+            "prompt_file": str(prompt_filepath),
+            "expected_file": str(expected_filepath),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "success": False,
             "error": None,
+            "api_error": False,  # Explicitly track API vs processing errors
             "raw_response_length": 0,
             "extracted_output_length": None,
             "expected_output_length": 0,
@@ -528,71 +540,66 @@ async def run_single_benchmark(
             "total_tokens": None,
             "native_prompt_tokens": None,
             "native_completion_tokens": None,
-            "native_finish_reason": None,  # Added this line
+            "native_finish_reason": None,
             "stats_error": None,
         }
 
-        results_dir = None  # Define results_dir path string early
+        results_dir: Optional[Path] = None
+        raw_model_response: Optional[str] = None
+        generation_id: Optional[str] = None
+        api_error_message: Optional[str] = None
+        extracted_content: Optional[str] = None
 
         try:
-            # --- Define Results Directory Path ---
-            # Directory creation is deferred until after successful API call
+            # --- 1. Define Results Directory Path ---
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             sanitized_model_name = sanitize_filename(model)
-            results_dir = os.path.join(
-                results_base_dir,
-                benchmark_case_prefix,
-                sanitized_model_name,
-                timestamp_str,
+            results_dir = (
+                results_base_dir
+                / benchmark_case_prefix
+                / sanitized_model_name
+                / timestamp_str
             )
-            run_metadata["results_dir_path_planned"] = (
-                results_dir  # Store planned path for metadata
-            )
+            # Store planned path as string for metadata, actual creation deferred
+            run_metadata["results_dir_path_planned"] = str(results_dir)
 
-            # --- Read Input Files ---
-            if not os.path.exists(prompt_filepath):
+            # --- 2. Read Input Files ---
+            if not prompt_filepath.is_file():
                 raise FileNotFoundError(f"Prompt file not found: {prompt_filepath}")
-            with open(prompt_filepath, "r", encoding="utf-8") as f_prompt:
-                prompt_content = f_prompt.read()
+            prompt_content = prompt_filepath.read_text(encoding="utf-8")
 
-            if not os.path.exists(expected_filepath):
+            if not expected_filepath.is_file():
                 raise FileNotFoundError(
                     f"Expected output file not found: {expected_filepath}"
                 )
-            with open(expected_filepath, "r", encoding="utf-8") as f_expected:
-                expected_content = f_expected.read()
+            expected_content = expected_filepath.read_text(encoding="utf-8")
             run_metadata["expected_output_length"] = len(expected_content)
 
-            # --- Call Model API (Async) ---
+            # --- 3. Call Model API (Async) ---
             (
                 raw_model_response,
                 generation_id,
                 api_error_message,
             ) = await get_model_response_openrouter(prompt_content, model)
 
-            # --- Handle API Errors ---
+            # --- 4. Handle API Errors ---
             if api_error_message:
                 run_metadata["error"] = api_error_message
-                run_metadata["api_error"] = True  # Flag for specific handling
-                # Print specific API error message and skip saving results
+                run_metadata["api_error"] = True
                 print(
                     f"⚠️ API Error: {benchmark_case_prefix} - Error: {api_error_message} - Skipping results."
                 )
-                # DO NOT save metadata or other files for this run
-                # Return metadata indicating API failure
+                # Return early, do not save any files or metadata for API errors
                 return run_metadata
 
-            # --- Process Successful API Response ---
-            # These steps only run if api_error_message is None
-            # Add assertion to satisfy type checker after the early return for API errors
-            assert raw_model_response is not None
+            # --- 5. Process Successful API Response ---
+            assert raw_model_response is not None  # Should be true if no API error
             run_metadata["raw_response_length"] = len(raw_model_response)
             run_metadata["generation_id"] = generation_id
 
-            # --- Get Generation Stats (Async) ---
+            # --- 6. Get Generation Stats (Async) ---
             if generation_id:
-                # Add a small delay as stats might not be immediately available
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)  # Delay for stats availability
                 stats = await get_generation_stats_openrouter(generation_id)
                 if stats:
                     run_metadata.update(stats)
@@ -605,129 +612,92 @@ async def run_single_benchmark(
                     "No generation ID received from chat completion"
                 )
 
-            # --- Create Results Directory (only after successful API call) ---
-            # Use pathlib for potentially deeper paths and easier creation
-            Path(results_dir).mkdir(parents=True, exist_ok=True)
-            run_metadata["results_dir"] = (
-                results_dir  # Update metadata with actual created dir
-            )
+            # --- 7. Create Results Directory (Now that API call succeeded) ---
+            assert results_dir is not None  # Should be defined if we got here
+            results_dir.mkdir(parents=True, exist_ok=True)
+            run_metadata["results_dir"] = str(
+                results_dir
+            )  # Update metadata with actual dir path
 
-            # --- Save Raw Response ---
-            raw_response_path = os.path.join(results_dir, "raw_response.txt")
-            with open(raw_response_path, "w", encoding="utf-8") as f_raw:
-                f_raw.write(raw_model_response)
+            # --- 8. Save Raw Response ---
+            _save_text_file(results_dir / "raw_response.txt", raw_model_response)
 
-            # --- Extract Content ---
+            # --- 9. Extract Content ---
             extracted_content = extract_code_from_backticks(raw_model_response)
 
             if extracted_content is None:
                 run_metadata["error"] = "Extraction backticks not found"
-                # Keep success=False
             else:
                 run_metadata["extracted_output_length"] = len(extracted_content)
-                extracted_output_path = os.path.join(
-                    results_dir, "extracted_output.txt"
-                )
-                with open(extracted_output_path, "w", encoding="utf-8") as f_ext:
-                    f_ext.write(extracted_content)
+                _save_text_file(results_dir / "extracted_output.txt", extracted_content)
 
-                # --- Compare Extracted vs Expected ---
+                # --- 10. Compare Extracted vs Expected ---
                 extracted_stripped = extracted_content.strip()
                 expected_stripped = expected_content.strip()
 
                 if extracted_stripped == expected_stripped:
                     run_metadata["success"] = True
                 else:
-                    # Keep the error message for logging/metadata
                     run_metadata["error"] = "Output mismatch"
-                    # Success remains False
 
-                # --- Always Generate Diff File ---
-                diff_path = os.path.join(results_dir, "output.diff")
+                # --- 11. Generate and Save Diff File ---
+                diff_path = results_dir / "output.diff"
                 try:
                     if run_metadata["success"]:
-                        # If successful, write a "no diff" message
-                        with open(diff_path, "w", encoding="utf-8") as f_diff:
-                            f_diff.write("No differences found.\n")
+                        diff_content = "No differences found.\n"
                     else:
-                        # If mismatch, generate and write the actual diff
-                        diff = difflib.unified_diff(
+                        diff_lines = difflib.unified_diff(
                             expected_stripped.splitlines(keepends=True),
                             extracted_stripped.splitlines(keepends=True),
                             fromfile=f"{expected_filename} (expected)",
                             tofile=f"{benchmark_case_prefix}_extracted.txt (actual)",
                             lineterm="",
                         )
-                        with open(diff_path, "w", encoding="utf-8") as f_diff:
-                            f_diff.writelines(diff)
+                        diff_content = "".join(diff_lines)
+                    _save_text_file(diff_path, diff_content)
                 except Exception as diff_e:
                     print(f"Warning: Failed to generate/save diff file: {diff_e}")
-                    # Optionally, write the error to the diff file itself
+                    # Optionally save the error to the diff file
                     try:
-                        with open(diff_path, "w", encoding="utf-8") as f_diff_err:
-                            f_diff_err.write(f"Error generating diff: {diff_e}\n")
+                        _save_text_file(diff_path, f"Error generating diff: {diff_e}\n")
                     except Exception:
                         pass  # Ignore errors writing the error message
 
-            # --- Save Metadata (only if no API error occurred and directory was created) ---
-            if results_dir and os.path.exists(
-                results_dir
-            ):  # Check if dir was actually created
-                metadata_path = os.path.join(results_dir, "metadata.json")
-                try:
-                    # Remove the temporary planned path key before saving
-                    run_metadata.pop("results_dir_path_planned", None)
-                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
-                        json.dump(run_metadata, f_meta, indent=4)
-                except Exception as meta_e:
-                    print(
-                        f"\nWarning: Failed to save metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
-                    )
-            else:
-                # This case should only be hit if an API error occurred earlier,
-                # preventing directory creation. We already printed the API error message.
-                pass
-
         except FileNotFoundError as e:
             run_metadata["error"] = f"File Error: {e}"
-            # Don't attempt to save metadata here as the results dir likely wasn't created
             print(f"File Error for {benchmark_case_prefix}: {e} - Skipping results.")
-
         except IOError as e:
             run_metadata["error"] = f"IOError: {e}"
-            # Don't attempt to save metadata here
             print(f"IO Error for {benchmark_case_prefix}: {e} - Skipping results.")
-
-        except ValueError as e:  # Catches missing API key
+        except ValueError as e:  # Catches missing API key via _get_async_openai_client
             run_metadata["error"] = f"Config Error: {e}"
-            # Don't save metadata if config error prevented API call attempt
+            run_metadata["api_error"] = True  # Treat config errors like API errors
             print(f"Config Error for {benchmark_case_prefix}: {e} - Skipping results.")
-        except Exception as e:  # Catch other unexpected issues during processing
+        except Exception as e:  # Catch other unexpected issues
             run_metadata["error"] = f"Runtime Error: {type(e).__name__}: {e}"
-            # Attempt to save metadata only if the directory was created before the error
-            if results_dir and os.path.exists(results_dir):
-                metadata_path = os.path.join(results_dir, "metadata.json")
-                try:
-                    # Remove the temporary planned path key before saving
-                    run_metadata.pop("results_dir_path_planned", None)
-                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
-                        json.dump(run_metadata, f_meta, indent=4)
-                except Exception as meta_e:
-                    print(
-                        f"\nWarning: Failed to save metadata.json after Runtime Error for {benchmark_case_prefix} in {results_dir}: {meta_e}"
-                    )
-            else:
-                print(
-                    f"Runtime Error for {benchmark_case_prefix}: {e} - Skipping results (directory not created)."
-                )
-
-            # Optional: Log traceback for debugging
-            # import traceback
+            print(
+                f"Runtime Error for {benchmark_case_prefix}: {e} - Attempting to save partial results if possible."
+            )
+            # import traceback # Uncomment for debugging
             # run_metadata["traceback"] = traceback.format_exc()
 
-        # --- Print Final Status for this Case ---
-        # Check if it was an API error (already printed specific message)
-        if not run_metadata.get("api_error"):
+        # --- 12. Save Final Metadata (if results dir was created) ---
+        # This runs outside the main try block's success path to capture errors,
+        # but only saves if the API call didn't fail initially and the dir exists.
+        if results_dir and results_dir.exists() and not run_metadata["api_error"]:
+            metadata_path = results_dir / "metadata.json"
+            try:
+                # Remove the temporary planned path key before saving
+                run_metadata.pop("results_dir_path_planned", None)
+                with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                    json.dump(run_metadata, f_meta, indent=4)
+            except Exception as meta_e:
+                print(
+                    f"\nWarning: Failed to save final metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
+                )
+
+        # --- 13. Print Final Status for this Case ---
+        if not run_metadata["api_error"]:
             cost_str = (
                 f"Cost: ${run_metadata.get('cost_usd', 0.0):.6f}"
                 if run_metadata.get("cost_usd") is not None
@@ -736,7 +706,6 @@ async def run_single_benchmark(
             if run_metadata["success"]:
                 print(f"✅ Success: {benchmark_case_prefix} - {cost_str}")
             else:
-                # Use the error stored in metadata (could be extraction, mismatch, file error, etc.)
                 error_msg = run_metadata.get("error", "Unknown processing error")
                 print(
                     f"❌ Failure: {benchmark_case_prefix} - Error: {error_msg} - {cost_str}"
@@ -749,8 +718,8 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Run benchmark cases against a model using OpenRouter, checking for existing results and running concurrently."
     )
-    default_benchmark_dir = "generated_prompts"
-    default_results_dir = "benchmark_results"
+    default_benchmark_dir = Path("generated_prompts")
+    default_results_dir = Path("benchmark_results")
 
     parser.add_argument(
         "--model",
@@ -759,11 +728,13 @@ async def main():
     )
     parser.add_argument(
         "--benchmark-dir",
+        type=Path,
         default=default_benchmark_dir,
         help=f"Directory containing the benchmark prompt/expected files (default: '{default_benchmark_dir}').",
     )
     parser.add_argument(
         "--results-dir",
+        type=Path,
         default=default_results_dir,
         help=f"Base directory to save results (default: '{default_results_dir}').",
     )
@@ -790,9 +761,13 @@ async def main():
     print(f"Max New Runs: {'All Remaining' if args.num_runs == -1 else args.num_runs}")
     print("-" * 30)
 
-    all_cases = find_benchmark_cases(args.benchmark_dir)
+    # Convert Path object to string for find_benchmark_cases if needed
+    benchmark_dir_str = str(args.benchmark_dir)
+    # results_dir_str is no longer needed as get_latest_run_cost takes Path
+
+    all_cases = find_benchmark_cases(benchmark_dir_str)
     if not all_cases:
-        print(f"Error: No benchmark cases found in '{args.benchmark_dir}'.")
+        print(f"Error: No benchmark cases found in '{benchmark_dir_str}'.")
         return 1
 
     print(f"Found {len(all_cases)} total benchmark cases.")
@@ -801,11 +776,34 @@ async def main():
     total_previous_cost = 0.0
     print("Checking for existing results and calculating previous costs...")
     for case_prefix in all_cases:
-        was_run, cost = get_previous_run_status(
-            case_prefix, args.model, args.results_dir
-        )
-        if was_run:
+        # Check cost of the latest run for this case/model pair
+        cost = get_latest_run_cost(case_prefix, args.model, args.results_dir)
+        # If cost > 0, it implies a run exists (or at least metadata with cost was found)
+        # We consider it "already run" if we found a cost, even if it was 0.0 but metadata existed.
+        # A more robust check might involve checking if the latest_dir was found by the helper.
+        # For simplicity, we'll assume finding any cost means it was run.
+        # A dedicated function returning (bool, float) might be clearer.
+        # Let's refine: get_latest_run_cost returns 0.0 if no run dir found.
+        # We need a way to know if *any* run exists. Let's modify the helper slightly.
+
+        # Re-checking logic: Find *if* a latest run exists first.
+        sanitized_model_name = sanitize_filename(args.model)
+        pattern = f"{case_prefix}/{sanitized_model_name}/*"
+        potential_dirs = list(args.results_dir.glob(pattern))
+        latest_dir_found = False
+        latest_timestamp = ""
+        for result_dir in potential_dirs:
+            if result_dir.is_dir() and re.match(r"\d{8}_\d{6}", result_dir.name):
+                if result_dir.name > latest_timestamp:
+                    latest_timestamp = result_dir.name
+                    latest_dir_found = (
+                        True  # Mark that we found at least one valid run dir
+                    )
+
+        if latest_dir_found:
             already_run_cases.add(case_prefix)
+            # Now get the cost specifically from the latest run (if metadata exists)
+            cost = get_latest_run_cost(case_prefix, args.model, args.results_dir)
             total_previous_cost += cost
 
     print(
@@ -836,7 +834,6 @@ async def main():
     else:
         cases_to_run_limited = cases_to_run_all[: args.num_runs]
         if not cases_to_run_limited:
-            # This covers cases where num_runs > 0 but no cases are left within the slice
             print("Limit specified, but no remaining cases to run within that limit.")
         else:
             print(
@@ -844,7 +841,6 @@ async def main():
             )
 
     if not cases_to_run_limited:
-        # This handles both num_runs=0 and cases where the limit is met/exceeded
         print("--- Benchmark Run Complete ---")
         return 0
 
@@ -852,54 +848,45 @@ async def main():
     tasks = [
         asyncio.create_task(
             run_single_benchmark(
-                case, args.model, args.benchmark_dir, args.results_dir, semaphore
+                case,
+                args.model,
+                args.benchmark_dir,  # Pass Path object
+                args.results_dir,  # Pass Path object
+                semaphore,
             )
         )
         for case in cases_to_run_limited
     ]
 
-    # Run tasks and collect results (metadata dictionaries or exceptions)
+    # Run tasks and collect results
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Process results of newly run benchmarks
-    from collections import defaultdict  # Import here for clarity
-
+    # Process results
     success_count = 0
-    # Use a dictionary to count failures by error type
     failure_counts_by_type = defaultdict(int)
-    api_error_count = 0  # Failures due to API call issues (credits, rate limits etc.)
-    system_error_count = (
-        0  # Failures due to unexpected exceptions in gather/task execution
-    )
-    total_new_cost = 0.0  # Cost for runs executed in this session
+    api_error_count = 0
+    system_error_count = 0
+    total_new_cost = 0.0
 
     for result in results:
         if isinstance(result, Exception):
-            # Exception occurred within run_single_benchmark or gather itself
             print(
                 f"❌ System Error: An unexpected error occurred during task execution: {result}"
             )
             system_error_count += 1
         elif isinstance(result, dict):
-            # Got metadata back from run_single_benchmark
-            # Accumulate cost only if it wasn't an API error (where cost might be irrelevant or missing)
-            # and cost is actually present
+            # Accumulate cost only if not an API error and cost is present
             if not result.get("api_error") and result.get("cost_usd") is not None:
-                total_new_cost += (
-                    result.get("cost_usd") or 0.0
-                )  # Use 'or 0.0' for safety
+                total_new_cost += float(result.get("cost_usd", 0.0))
 
-            # Categorize the result
+            # Categorize result
             if result.get("api_error"):
                 api_error_count += 1
-                # Specific API error message already printed in run_single_benchmark
             elif result.get("success"):
                 success_count += 1
-                # Individual success/cost already printed in run_single_benchmark
             else:
-                # This covers failures like mismatch, extraction, file errors, runtime errors during processing
                 error_msg = result.get("error", "Unknown processing error")
-                # Simplify common error messages for better grouping
+                # Simplify error messages for grouping
                 if "File Error:" in error_msg:
                     error_type = "File Error"
                 elif "IOError:" in error_msg:
@@ -911,30 +898,25 @@ async def main():
                 elif "Output mismatch" in error_msg:
                     error_type = "Output Mismatch"
                 else:
-                    error_type = error_msg  # Keep less common errors as is
-
+                    error_type = error_msg
                 failure_counts_by_type[error_type] += 1
-                # Individual failure/error already printed in run_single_benchmark
         else:
-            # Should not happen if run_single_benchmark always returns dict
             print(f"❌ System Error: Unexpected result type from task: {type(result)}")
             system_error_count += 1
 
+    # Print Summary
     print("\n--- Benchmark Run Summary ---")
     print(f"Model: {args.model}")
     print(f"Attempted in this run: {len(results)} benchmarks")
     print(f"  ✅ Successful: {success_count}")
-    # Print detailed failure counts
     if failure_counts_by_type:
         print("  --- Failures by Type ---")
         for error_type, count in sorted(failure_counts_by_type.items()):
             print(f"    ❌ {error_type}: {count}")
         print("  ------------------------")
     else:
-        # Explicitly state if there were no processing failures
         print("  ❌ Failed (Processing Errors): 0")
-
-    print(f"  ⚠️ API Errors (Credits/Rate Limits/etc.): {api_error_count}")
+    print(f"  ⚠️ API Errors (Config/Credits/Rate Limits/etc.): {api_error_count}")
     if system_error_count > 0:
         print(f"  🔥 System Errors (Unexpected Task Failures): {system_error_count}")
     print("-" * 20)
@@ -945,12 +927,11 @@ async def main():
     )
     print("--- Benchmark Run Complete ---")
 
-    # Return failure if any benchmarks failed (non-API/System errors) or had API/System errors in this run
+    # Determine exit code
     total_failures = sum(failure_counts_by_type.values())
     return 1 if (total_failures + api_error_count + system_error_count) > 0 else 0
 
 
 if __name__ == "__main__":
-    # Run the async main function
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
