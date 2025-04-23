@@ -1054,6 +1054,16 @@ def main():
     # 6. Save the final benchmark structure metadata to the output directory
     save_benchmark_metadata(final_buckets, cfg)
 
+    # 7. Clean up temporary directory
+    print(f"\nCleaning up temporary directory: {cfg.temp_dir}")
+    if os.path.exists(cfg.temp_dir):
+        try:
+            shutil.rmtree(cfg.temp_dir)
+            print(f"Successfully removed temporary directory: {cfg.temp_dir}")
+        except OSError as e:
+            print(f"Warning: Failed to remove temporary directory {cfg.temp_dir}: {e}")
+            print("You may need to manually delete this directory.")
+
     print("\nBenchmark prompt generation and processing complete.")
     return 0
 
