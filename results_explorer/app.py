@@ -19,7 +19,16 @@ from typing import Any, Dict, Optional, Tuple, List
 from collections import defaultdict
 
 # Attempt to import pandas and matplotlib, provide guidance if missing
-# Imports for analysis/plotting moved into run_analysis_and_plotting
+try:
+    import pandas as pd  # noqa: F401
+    import matplotlib.pyplot as plt  # noqa: F401
+    import matplotlib.ticker as mticker  # noqa: F401
+except ImportError as e:
+    print(
+        f"Error importing libraries: {e}. Please ensure pandas and matplotlib are installed."
+    )
+    print("You may need to run: pip install pandas matplotlib")
+    sys.exit(1)
 
 
 # --- Configuration ---
@@ -673,19 +682,7 @@ def open_browser(host, port):
 
 def run_analysis_and_plotting():
     """Performs analysis and generates plot, storing results in app.config."""
-    # Import heavy libraries only when needed
-    try:
-        import pandas as pd
-        import matplotlib.pyplot as plt
-        import matplotlib.ticker as mticker
-    except ImportError as e:
-        print(f"Error importing analysis/plotting libraries: {e}", file=sys.stderr)
-        print("Please ensure pandas and matplotlib are installed.", file=sys.stderr)
-        print("You may need to run: pip install pandas matplotlib", file=sys.stderr)
-        # Set analysis results to None and skip plotting
-        with app.app_context():
-            current_app.config["ANALYSIS_RESULTS"] = None
-        return  # Exit the function early
+    # Imports are now at top level
 
     # Use app context to access config
     with app.app_context():
