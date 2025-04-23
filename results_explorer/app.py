@@ -753,6 +753,7 @@ def get_sliding_plot_data():
     sliding_data = analysis_results["sliding_window"]
     # Labels are the window centers in k tokens
     labels = [f"{k}k" for k in sliding_data.get("window_centers_k", [])]
+    # Removed unused bucket_labels assignment
     datasets = []
 
     # Sort models for consistent coloring
