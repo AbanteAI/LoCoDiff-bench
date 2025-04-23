@@ -591,14 +591,18 @@ def model_results(model_name):
     runs_by_bucket = {}
     if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
         # Use bucket keys from analysis results if available, otherwise from metadata
-        bucket_keys = (
-            analysis_results.get("bucket_keys")
-            if analysis_results
-            else sorted(
+        bucket_keys = None
+        if analysis_results:
+            bucket_keys = analysis_results.get("bucket_keys")
+
+        # If bucket_keys is None (not set in analysis_results or analysis_results is None),
+        # fall back to sorting the bucket keys from benchmark_metadata
+        if bucket_keys is None:
+            bucket_keys = sorted(
                 benchmark_metadata["benchmark_buckets"].keys(),
                 key=lambda k: int(k.split("-")[0]),
             )
-        )
+
         for bucket_key in bucket_keys:
             runs_by_bucket[bucket_key] = []
 
