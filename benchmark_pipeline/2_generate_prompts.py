@@ -115,6 +115,7 @@ class Config:
     extensions: List[str]
     cache_dir: str
     output_dir: str
+    temp_dir: str  # Added temporary directory
     buckets_str: str  # Original comma-separated string for metadata
     bucket_boundaries: List[int]  # Processed list of token boundaries
     max_per_bucket: int
@@ -137,158 +138,133 @@ def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
     return len(encoder.encode(text))
 
 
-def _run_git_command(
-    args: List[str], repo_path: str, description: str
-) -> Tuple[str | None, str | None]:
+def run_git_command(args: List[str], repo_path: str, description: str) -> str:
     """
-    Runs a git command and handles common errors.
+    Runs a git command and raises exception on error.
 
     Args:
         args: List of arguments for the git command (e.g., ["log", "-1", "--format=%ct"]).
         repo_path: Path to the repository.
-        description: Description of the action for error messages (e.g., "commit time").
+        description: Description of the action for error messages.
 
     Returns:
-        A tuple (stdout: str | None, error_message: str | None).
-        stdout is None if an error occurs.
-        error_message is None if the command succeeds.
+        The stdout of the command.
+
+    Raises:
+        subprocess.CalledProcessError: If the git command fails.
+        FileNotFoundError: If the git command is not found.
     """
-    try:
-        result = subprocess.run(
-            ["git"] + args,
-            cwd=repo_path,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-        return result.stdout, None
-    except subprocess.CalledProcessError as e:
-        return None, f"Error getting {description}: {e}"
-    except FileNotFoundError:
-        return None, "git command not found"
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    return result.stdout
 
 
-def _is_file_recently_modified(
+def is_file_recently_modified(
     rel_path: str, repo_path: str, threshold_timestamp: float | None
-) -> Tuple[bool, bool]:
+) -> bool:
     """
     Checks if a file was modified after the threshold timestamp.
 
     Args:
         rel_path: Relative path of the file within the repository.
         repo_path: Path to the repository.
-        threshold_timestamp: The minimum modification timestamp (Unix epoch). If None, always returns True.
+        threshold_timestamp: The minimum modification timestamp (Unix epoch).
 
     Returns:
-        A tuple (is_recent: bool, error_occurred: bool).
-        is_recent is True if the file is recent enough or if the check is disabled/fails safely.
-        error_occurred is True if there was an issue getting the timestamp.
+        True if the file is recent enough or if the check is disabled.
+
+    Raises:
+        ValueError: If there are issues getting or parsing the commit timestamp.
     """
     if threshold_timestamp is None:
-        return True, False  # Date filter disabled
-
-    stdout, error = _run_git_command(
-        ["log", "-1", "--format=%ct", "--", rel_path], repo_path, "commit time"
-    )
-
-    if error:
-        print(f"\nWarning: {error} for {rel_path}. Skipping date check.")
-        # Treat as recent if we can't get the time, but flag error
-        return True, True
-    if not stdout:
-        print(
-            f"\nWarning: Could not get commit timestamp for {rel_path}. Skipping date check."
-        )
-        return True, True  # Treat as recent, flag error
+        return True  # Date filter disabled
 
     try:
-        last_commit_timestamp = int(stdout.strip())
-        return last_commit_timestamp >= threshold_timestamp, False
-    except ValueError as e:
-        print(
-            f"\nWarning: Could not parse commit timestamp for {rel_path}: '{stdout.strip()}'. Skipping file. Error: {e}"
+        stdout = run_git_command(
+            ["log", "-1", "--format=%ct", "--", rel_path], repo_path, "commit time"
         )
-        return False, True  # Treat as not recent, flag error
+
+        if not stdout.strip():
+            raise ValueError(f"No commit timestamp returned for {rel_path}")
+
+        last_commit_timestamp = int(stdout.strip())
+        return last_commit_timestamp >= threshold_timestamp
+
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"Git command failed for {rel_path}: {e}")
+    except ValueError as e:
+        raise ValueError(f"Failed to parse commit timestamp for {rel_path}: {e}")
 
 
-def _get_git_history(rel_path: str, repo_path: str) -> str:
+def get_git_history(rel_path: str, repo_path: str) -> str:
     """Gets the full git log history with patches for a file."""
-    stdout, error = _run_git_command(
-        ["log", "-p", "--cc", "--topo-order", "--reverse", "--", rel_path],
-        repo_path,
-        "git history",
-    )
-    if error:
-        print(f"\nWarning: {error} for {rel_path}")
-        return f"Error retrieving git history: {error}\n"
-    return stdout or ""  # Return empty string if stdout is None
+    try:
+        return run_git_command(
+            ["log", "-p", "--cc", "--topo-order", "--reverse", "--", rel_path],
+            repo_path,
+            "git history",
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Failed to get git history for {rel_path}: {e}")
 
 
-def _get_git_numstat(rel_path: str, repo_path: str) -> Tuple[int, int]:
+def get_git_numstat(rel_path: str, repo_path: str) -> Tuple[int, int]:
     """Gets the total lines added and deleted for a file from git history."""
     lines_added = 0
     lines_deleted = 0
-    stdout, error = _run_git_command(
-        ["log", "--format=format:", "--numstat", "--", rel_path],
-        repo_path,
-        "numstat",
-    )
 
-    if error:
-        print(f"\nWarning: {error} for {rel_path}")
-        return lines_added, lines_deleted
-    if not stdout:
-        return lines_added, lines_deleted  # No stats found
+    try:
+        stdout = run_git_command(
+            ["log", "--format=format:", "--numstat", "--", rel_path],
+            repo_path,
+            "numstat",
+        )
 
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) == 3:
-            added_str, deleted_str, _ = parts
-            if added_str != "-":
-                try:
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+
+            parts = line.split("\t")
+            if len(parts) == 3:
+                added_str, deleted_str, _ = parts
+                if added_str != "-":
                     lines_added += int(added_str)
-                except ValueError:
-                    print(
-                        f"\nWarning: Could not parse added lines '{added_str}' in numstat for {rel_path}"
-                    )
-            if deleted_str != "-":
-                try:
+                if deleted_str != "-":
                     lines_deleted += int(deleted_str)
-                except ValueError:
-                    print(
-                        f"\nWarning: Could not parse deleted lines '{deleted_str}' in numstat for {rel_path}"
-                    )
 
-    return lines_added, lines_deleted
+        return lines_added, lines_deleted
+
+    except (subprocess.CalledProcessError, ValueError) as e:
+        # If we can't get numstat, return 0/0 rather than crashing
+        print(f"\nWarning: Failed to get numstat for {rel_path}: {e}")
+        return 0, 0
 
 
-def _write_output_files(
+def write_output_files(
     prompt_path: str,
     expected_path: str,
     prompt_content: str,
     final_content: str,
 ):
     """Writes the prompt and expected output content to their respective files."""
-    try:
-        with open(prompt_path, "w", encoding="utf-8") as pf:
-            pf.write(prompt_content)
-    except IOError as e:
-        print(f"\nError writing prompt file {prompt_path}: {e}")
-        raise  # Re-raise to stop processing this file
+    os.makedirs(os.path.dirname(prompt_path), exist_ok=True)
+    os.makedirs(os.path.dirname(expected_path), exist_ok=True)
 
-    try:
-        with open(expected_path, "w", encoding="utf-8") as ef:
-            ef.write(final_content)
-    except IOError as e:
-        print(f"\nError writing expected output file {expected_path}: {e}")
-        raise  # Re-raise to stop processing this file
+    with open(prompt_path, "w", encoding="utf-8") as pf:
+        pf.write(prompt_content)
+
+    with open(expected_path, "w", encoding="utf-8") as ef:
+        ef.write(final_content)
 
 
-def _build_prompt_content(rel_path: str, git_history: str) -> str:
+def build_prompt_content(rel_path: str, git_history: str) -> str:
     """Constructs the prompt content using the git history."""
     return f"""\
 # Instructions
@@ -326,7 +302,8 @@ def generate_prompts_and_expected(
     Generates prompts and expected outputs for eligible files in a repository.
 
     Iterates through files matching specified extensions, applies date and token
-    filters, fetches git history, calculates stats, and writes output files.
+    filters, fetches git history, calculates stats, and writes output files to
+    the temporary directory.
 
     Args:
         repo_path: Path to the cloned repository.
@@ -338,8 +315,9 @@ def generate_prompts_and_expected(
             - date_filtered_count: Number of files skipped due to modification date.
             - expected_token_filtered_count: Number of files skipped due to expected token limit.
     """
-    if not os.path.exists(cfg.output_dir):
-        os.makedirs(cfg.output_dir, exist_ok=True)
+    # Ensure temporary directory exists
+    if not os.path.exists(cfg.temp_dir):
+        os.makedirs(cfg.temp_dir, exist_ok=True)
 
     repo_name = os.path.basename(os.path.normpath(repo_path))
     org_name = os.path.basename(os.path.dirname(repo_path))
@@ -348,7 +326,6 @@ def generate_prompts_and_expected(
     files_to_process = []
     date_filtered_count = 0
     expected_token_filtered_count = 0
-    git_command_errors = 0  # Track errors during git operations
 
     # --- Calculate Date Threshold ---
     threshold_timestamp = None
@@ -363,9 +340,7 @@ def generate_prompts_and_expected(
 
     # --- Get Repo Info ---
     print(f"Getting head commit hash for {full_repo_name}...")
-    head_commit_hash = get_repo_head_commit_hash(
-        repo_path
-    )  # Assuming this helper is fine as is
+    head_commit_hash = get_repo_head_commit_hash(repo_path)
     print(f"Repository at commit: {head_commit_hash}")
 
     # --- Collect Files ---
@@ -385,20 +360,12 @@ def generate_prompts_and_expected(
         files_to_process, desc=f"Generating prompts for {full_repo_name}"
     ):
         # 1. Date Filter Check
-        is_recent, date_check_error = _is_file_recently_modified(
-            rel_path, repo_path, threshold_timestamp
-        )
-        if date_check_error and threshold_timestamp is not None:
-            # Count as filtered if error occurred during check (and filter is enabled)
-            # The function prints warnings, so we just count here.
-            git_command_errors += 1
-            # Decide whether to skip or proceed if timestamp couldn't be determined.
-            # Current logic in _is_file_recently_modified proceeds but flags error.
-            # Let's change to skip if error occurred during date check.
-            print(f"\nSkipping {rel_path} due to error during date check.")
-            date_filtered_count += 1
-            continue
-        if not is_recent:
+        try:
+            if not is_file_recently_modified(rel_path, repo_path, threshold_timestamp):
+                date_filtered_count += 1
+                continue
+        except ValueError as e:
+            print(f"\nSkipping {rel_path}: {e}")
             date_filtered_count += 1
             continue
 
@@ -407,7 +374,7 @@ def generate_prompts_and_expected(
             with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
                 final_content = original.read()
         except Exception as e:
-            print(f"\nWarning: Error reading file {full_path}: {e}. Skipping.")
+            print(f"\nSkipping {rel_path}: Error reading file: {e}")
             continue
 
         expected_tokens = count_tokens(final_content, cfg.encoder)
@@ -415,44 +382,38 @@ def generate_prompts_and_expected(
             expected_token_filtered_count += 1
             continue
 
-        # 3. Prepare Filenames and Paths
+        # 3. Prepare Filenames and Paths (write to temporary directory)
         safe_rel = rel_path.replace(os.sep, "_")
-        repo_file_prefix = (
-            f"{repo_name}_{safe_rel}"  # Used for filenames and benchmark prefix
-        )
+        repo_file_prefix = f"{repo_name}_{safe_rel}"
         prompt_fname = f"{repo_file_prefix}_prompt.txt"
         expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
-        prompt_path = os.path.join(cfg.output_dir, prompt_fname)
-        expected_path = os.path.join(cfg.output_dir, expected_fname)
+
+        # Write to temp directory instead of output directory
+        prompt_path = os.path.join(cfg.temp_dir, prompt_fname)
+        expected_path = os.path.join(cfg.temp_dir, expected_fname)
 
         # 4. Get Git History
-        git_history = _get_git_history(rel_path, repo_path)
-        if "Error retrieving git history" in git_history:
-            git_command_errors += 1
-            # Decide if we should continue without history or skip. Let's continue for now.
+        try:
+            git_history = get_git_history(rel_path, repo_path)
+        except RuntimeError as e:
+            print(f"\n{e}")
+            continue
 
         # 5. Construct and Write Prompt File
-        prompt_content = _build_prompt_content(rel_path, git_history)
+        prompt_content = build_prompt_content(rel_path, git_history)
         try:
-            _write_output_files(
+            write_output_files(
                 prompt_path, expected_path, prompt_content, final_content
             )
-        except IOError:
-            # Error already printed by _write_output_files, just skip stats calculation
+        except Exception as e:
+            print(f"\nError writing output files for {rel_path}: {e}")
             continue
 
         # 6. Calculate Statistics
         prompt_tokens = count_tokens(prompt_content, cfg.encoder)
         final_lines = len(final_content.splitlines())
         num_commits = len(re.findall(r"^commit ", git_history, re.MULTILINE))
-        lines_added, lines_deleted = _get_git_numstat(rel_path, repo_path)
-        if (
-            lines_added == 0
-            and lines_deleted == 0
-            and "Error getting numstat" in locals().get("error", "")
-        ):
-            # Check if numstat failed specifically
-            git_command_errors += 1
+        lines_added, lines_deleted = get_git_numstat(rel_path, repo_path)
 
         # 7. Store Stats
         file_stats = {
@@ -467,14 +428,9 @@ def generate_prompts_and_expected(
             "repo_commit_hash": head_commit_hash,
             "prompt_filename": prompt_fname,
             "expected_filename": expected_fname,
-            "benchmark_case_prefix": repo_file_prefix,  # Use the prefix generated earlier
+            "benchmark_case_prefix": repo_file_prefix,
         }
         stats_list.append(file_stats)
-
-    if git_command_errors > 0:
-        print(
-            f"\nWarning: Encountered {git_command_errors} errors during git operations for {full_repo_name}."
-        )
 
     return stats_list, date_filtered_count, expected_token_filtered_count
 
@@ -709,63 +665,63 @@ def sample_prompts_from_buckets(
     return final_sampled_buckets, total_sampled_out
 
 
-def delete_discarded_files(
-    all_generated_prefixes: set[str],
+def copy_selected_files(
     kept_prefixes: set[str],
+    temp_dir: str,
     output_dir: str,
 ):
     """
-    Deletes the prompt and expected output files for benchmarks that were discarded.
+    Copies selected prompt and expected output files from temporary directory to output directory.
 
     Args:
-        all_generated_prefixes: A set of all benchmark case prefixes initially generated.
-        kept_prefixes: A set of benchmark case prefixes remaining after filtering/sampling.
-        output_dir: The directory where the generated files are stored.
+        kept_prefixes: A set of benchmark case prefixes to copy.
+        temp_dir: The source directory containing temporary files.
+        output_dir: The destination directory to copy selected files to.
     """
-    discarded_prefixes = all_generated_prefixes - kept_prefixes
-    deleted_files_count = 0
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    copied_files_count = 0
+    error_count = 0
 
     print(
-        f"\n--- Deleting Files for Discarded Benchmarks ({len(discarded_prefixes)} sets) ---"
+        f"\n--- Copying {len(kept_prefixes)} Selected Benchmark Files to Final Location ---"
     )
 
-    if not discarded_prefixes:
-        print("No files to delete.")
+    if not kept_prefixes:
+        print("No files to copy.")
         return
 
-    for prefix in tqdm(discarded_prefixes, desc="Deleting files"):
+    for prefix in tqdm(kept_prefixes, desc="Copying files"):
         prompt_filename = f"{prefix}_prompt.txt"
         expected_filename = f"{prefix}_expectedoutput.txt"
-        prompt_file_path = os.path.join(output_dir, prompt_filename)
-        expected_file_path = os.path.join(output_dir, expected_filename)
 
-        deleted_pair = False
+        source_prompt_path = os.path.join(temp_dir, prompt_filename)
+        source_expected_path = os.path.join(temp_dir, expected_filename)
+
+        dest_prompt_path = os.path.join(output_dir, prompt_filename)
+        dest_expected_path = os.path.join(output_dir, expected_filename)
+
+        # Skip if source files don't exist
+        if not os.path.exists(source_prompt_path) or not os.path.exists(
+            source_expected_path
+        ):
+            print(f"Warning: Source files missing for prefix {prefix}")
+            error_count += 1
+            continue
+
+        # Copy the files
         try:
-            if os.path.exists(prompt_file_path):
-                os.remove(prompt_file_path)
-                deleted_pair = True
-            else:
-                print(
-                    f"Warning: Prompt file not found for deletion: {prompt_file_path}"
-                )
+            shutil.copy2(source_prompt_path, dest_prompt_path)
+            shutil.copy2(source_expected_path, dest_expected_path)
+            copied_files_count += 1
         except OSError as e:
-            print(f"Error deleting prompt file {prompt_file_path}: {e}")
+            print(f"Error copying files for prefix {prefix}: {e}")
+            error_count += 1
 
-        try:
-            if os.path.exists(expected_file_path):
-                os.remove(expected_file_path)
-                deleted_pair = True
-            else:
-                print(
-                    f"Warning: Expected output file not found for deletion: {expected_file_path}"
-                )
-        except OSError as e:
-            print(f"Error deleting expected output file {expected_file_path}: {e}")
-
-        if deleted_pair:
-            deleted_files_count += 1  # Count pairs deleted
-
-    print(f"Deleted {deleted_files_count} pairs of prompt/expected files.")
+    print(f"Successfully copied {copied_files_count} pairs of prompt/expected files.")
+    if error_count > 0:
+        print(f"Encountered errors with {error_count} benchmark sets.")
 
 
 def print_bucket_stats_table(buckets):
@@ -923,6 +879,11 @@ def main():
         default="generated_prompts",
         help="Directory to save generated prompt/expected files (default: 'generated_prompts').",
     )
+    parser.add_argument(
+        "--temp-dir",
+        default="generated_prompts_temp",
+        help="Directory for storing temporarily generated files (default: 'generated_prompts_temp').",
+    )
     # Add arguments for filtering/bucketing/sampling parameters
     parser.add_argument(
         "--buckets",
@@ -982,6 +943,7 @@ def main():
         extensions=args.extensions,
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
+        temp_dir=args.temp_dir,  # Add temp_dir
         buckets_str=args.buckets,  # Store original string
         bucket_boundaries=bucket_boundaries,  # Store processed list
         max_per_bucket=args.max_per_bucket,
@@ -1053,9 +1015,6 @@ def main():
 
     # --- Post-Generation Processing ---
 
-    # Get prefixes of all generated files for later cleanup
-    all_generated_prefixes = {stats["benchmark_case_prefix"] for stats in all_stats}
-
     # Print initial statistics table for all generated prompts (before filtering/sampling)
     print("\n--- Initial Generation Statistics (All Repos, Pre-Filtering/Sampling) ---")
     print_stats_table(all_stats)
@@ -1072,16 +1031,16 @@ def main():
     # Print statistics for the final selected buckets
     print_bucket_stats_table(final_buckets)
 
-    # 4. Determine which files were kept vs discarded
+    # 4. Determine which files were kept after sampling and filtering
     kept_prefixes = set()
     for bucket_key, stats_list in final_buckets.items():
         for stats in stats_list:
             kept_prefixes.add(stats["benchmark_case_prefix"])
 
-    # 5. Delete files for discarded benchmarks
-    delete_discarded_files(all_generated_prefixes, kept_prefixes, cfg.output_dir)
+    # 5. Copy selected files from temp directory to output directory
+    copy_selected_files(kept_prefixes, cfg.temp_dir, cfg.output_dir)
 
-    # 6. Save the final benchmark structure metadata using the config object
+    # 6. Save the final benchmark structure metadata to the output directory
     save_benchmark_metadata(final_buckets, cfg)
 
     print("\nBenchmark prompt generation and processing complete.")
