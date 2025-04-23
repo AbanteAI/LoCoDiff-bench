@@ -738,6 +738,7 @@ def _get_latest_run_info(
 ) -> tuple[Path | None, float]:
     """
     Finds the latest run directory for a case/model and returns its path and cost.
+    # Helper function for checking existing results.
 
     Returns:
         A tuple containing:
