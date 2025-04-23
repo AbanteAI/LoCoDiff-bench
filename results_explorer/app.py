@@ -19,16 +19,7 @@ from typing import Any, Dict, Optional, Tuple, List
 from collections import defaultdict
 
 # Attempt to import pandas and matplotlib, provide guidance if missing
-try:
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker  # Import ticker for FuncFormatter
-except ImportError as e:
-    print(
-        f"Error importing libraries: {e}. Please ensure pandas and matplotlib are installed."
-    )
-    print("You may need to run: pip install pandas matplotlib")
-    sys.exit(1)
+# Imports for analysis/plotting moved into run_analysis_and_plotting
 
 
 # --- Configuration ---
@@ -96,10 +87,7 @@ def load_benchmark_metadata(benchmark_dir):
         return None
 
 
-def load_benchmark_metadata(benchmark_dir):
-    """Loads the benchmark structure metadata from metadata.json."""
-    metadata_path = os.path.join(benchmark_dir, "metadata.json")
-    return load_json_file(metadata_path)
+# Removed duplicate definition of load_benchmark_metadata here
 
 
 def scan_results_directory(
@@ -685,6 +673,20 @@ def open_browser(host, port):
 
 def run_analysis_and_plotting():
     """Performs analysis and generates plot, storing results in app.config."""
+    # Import heavy libraries only when needed
+    try:
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+    except ImportError as e:
+        print(f"Error importing analysis/plotting libraries: {e}", file=sys.stderr)
+        print("Please ensure pandas and matplotlib are installed.", file=sys.stderr)
+        print("You may need to run: pip install pandas matplotlib", file=sys.stderr)
+        # Set analysis results to None and skip plotting
+        with app.app_context():
+            current_app.config["ANALYSIS_RESULTS"] = None
+        return  # Exit the function early
+
     # Use app context to access config
     with app.app_context():
         print("\n--- Running Analysis and Plotting ---")
