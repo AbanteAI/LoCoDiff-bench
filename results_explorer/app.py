@@ -752,12 +752,16 @@ def get_sliding_plot_data():
         success_rates = []
         wilson_lower_bounds = []  # Initialize list for lower bounds
         wilson_upper_bounds = []  # Initialize list for upper bounds
+        totals_in_window = []  # Initialize list for total counts
+        successes_in_window = []  # Initialize list for success counts
 
         for center in window_centers:
             stats = model_sliding_stats.get(center, {})
             success_rates.append(stats.get("rate"))  # Append rate (can be None)
             wilson_lower_bounds.append(stats.get("wilson_lower"))  # Append lower bound
             wilson_upper_bounds.append(stats.get("wilson_upper"))  # Append upper bound
+            totals_in_window.append(stats.get("total"))  # Append total count
+            successes_in_window.append(stats.get("successful"))  # Append success count
 
         # Get overall cost for the label from the main analysis part
         total_cost = (
@@ -772,6 +776,8 @@ def get_sliding_plot_data():
                 "data": success_rates,
                 "wilson_lower": wilson_lower_bounds,  # Add lower bounds to dataset
                 "wilson_upper": wilson_upper_bounds,  # Add upper bounds to dataset
+                "totals": totals_in_window,  # Add total counts to dataset
+                "successes": successes_in_window,  # Add success counts to dataset
                 "borderWidth": 2,
                 "tension": 0.1,
                 "fill": False,
