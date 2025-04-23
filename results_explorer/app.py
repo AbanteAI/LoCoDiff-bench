@@ -8,7 +8,6 @@ from flask import (
     Flask,
     render_template,
     abort,
-    url_for,
     send_from_directory,
     current_app,
 )
@@ -18,39 +17,26 @@ import threading
 from typing import Any, Dict, Optional, Tuple, List
 from collections import defaultdict
 
-# Attempt to import pandas and matplotlib, provide guidance if missing
+# pandas is still useful for analysis but we no longer need matplotlib
 try:
     import pandas as pd  # noqa: F401
-    import matplotlib.pyplot as plt  # noqa: F401
-    import matplotlib.ticker as mticker  # noqa: F401
 except ImportError as e:
-    print(
-        f"Error importing libraries: {e}. Please ensure pandas and matplotlib are installed."
-    )
-    print("You may need to run: pip install pandas matplotlib")
-    sys.exit(1)
+    print(f"Error importing pandas: {e}. Please ensure it's installed.")
+    print("You may need to run: pip install pandas")
+    # Not exiting as pandas is not strictly required for basic functionality
 
 
 # --- Configuration ---
 # Assuming the app is run from the root of the repository
 BENCHMARK_DIR = "generated_prompts"
 RESULTS_BASE_DIR = "benchmark_results"
-# Plot is now generated inside the results directory by analyze_results.py
-PLOT_FILENAME = os.path.join(RESULTS_BASE_DIR, "benchmark_success_rate.png")
 STATIC_DIR = "results_explorer/static"  # Updated directory name
-# The destination path in static dir keeps the original simple name for the URL
-PLOT_STATIC_DEST_FILENAME = "benchmark_success_rate.png"
-PLOT_STATIC_PATH = os.path.join(STATIC_DIR, PLOT_STATIC_DEST_FILENAME)
-
 
 # --- Flask App Initialization ---
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config["BENCHMARK_DIR"] = BENCHMARK_DIR
 app.config["RESULTS_BASE_DIR"] = RESULTS_BASE_DIR
 app.config["STATIC_DIR"] = STATIC_DIR
-# Add plot path to config for easy access in templates/routes
-app.config["PLOT_STATIC_PATH"] = PLOT_STATIC_PATH
-app.config["PLOT_STATIC_DEST_FILENAME"] = PLOT_STATIC_DEST_FILENAME
 # Placeholder for analysis results calculated at startup
 app.config["ANALYSIS_RESULTS"] = None
 
@@ -234,68 +220,7 @@ def analyze_results(
     return analysis
 
 
-def generate_plot(analysis_results: dict, output_filename: str):
-    """
-    Generates and saves a plot of per-bucket success rates.
-    (Directly from analyze_results.py, saves to specified path)
-    """
-    print(f"\nGenerating plot and saving to {output_filename}...")
-    if not analysis_results or not analysis_results.get("models"):
-        print("No analysis results found to generate plot.")
-        return False  # Indicate failure
-
-    models = sorted(list(analysis_results["models"].keys()))
-    bucket_keys = analysis_results["bucket_keys"]
-    formatted_bucket_labels = analysis_results["formatted_bucket_keys"]
-    x_indices = range(len(bucket_keys))
-
-    plt.figure(figsize=(12, 7))
-
-    for model_name in models:
-        success_rates = []
-        for key in bucket_keys:
-            rate = analysis_results["models"][model_name]["buckets"][key][
-                "success_rate"
-            ]
-            runs_found = analysis_results["models"][model_name]["buckets"][key][
-                "runs_found"
-            ]
-            success_rates.append(rate if runs_found > 0 else float("nan"))
-
-        total_cost = analysis_results["models"][model_name].get("total_cost_usd", 0.0)
-        legend_label = f"{model_name} (${total_cost:.2f})"
-        plt.plot(
-            x_indices, success_rates, marker="o", linestyle="-", label=legend_label
-        )
-
-    plt.title("Benchmark Success Rate per Prompt Token Bucket")
-    plt.xlabel("Prompt Token Bucket (k tk)")
-    plt.ylabel("Success Rate")
-    plt.gca().yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:.0%}"))
-    plt.ylim(0, 1.05)
-    plt.xticks(x_indices, formatted_bucket_labels, rotation=45, ha="right")
-    plt.legend(title="Models", bbox_to_anchor=(1.04, 1), loc="upper left")
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.tight_layout(rect=(0, 0, 0.85, 1))
-
-    output_dir = os.path.dirname(output_filename)
-    if output_dir and not os.path.exists(output_dir):
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            print(f"Created directory for plot: {output_dir}")
-        except OSError as e:
-            print(f"Error creating directory {output_dir}: {e}")
-            return False  # Indicate failure
-
-    try:
-        plt.savefig(output_filename, dpi=300, bbox_inches="tight")
-        plt.close()  # Close the figure to free memory
-        print(f"Plot saved successfully to {output_filename}")
-        return True  # Indicate success
-    except Exception as e:
-        print(f"Error saving plot to {output_filename}: {e}")
-        plt.close()  # Close the figure even if saving failed
-        return False  # Indicate failure
+# Plot generation function has been removed in favor of the client-side Chart.js visualization
 
 
 def find_models_in_results(results_base_dir):
@@ -444,7 +369,7 @@ def get_run_details(
 
 @app.route("/")
 def index():
-    """Index page: Shows overall summary, models, and plot."""
+    """Index page: Shows overall summary, models, and dynamic chart."""
     benchmark_metadata = load_benchmark_metadata(current_app.config["BENCHMARK_DIR"])
     # Retrieve pre-calculated analysis results and models found
     analysis_results = current_app.config.get("ANALYSIS_RESULTS")
@@ -452,13 +377,6 @@ def index():
         sorted(list(analysis_results["models"].keys()))
         if analysis_results and analysis_results.get("models")
         else []
-    )
-
-    plot_exists = os.path.exists(current_app.config["PLOT_STATIC_PATH"])
-    plot_url = (
-        url_for("static", filename=current_app.config["PLOT_STATIC_DEST_FILENAME"])
-        if plot_exists
-        else None
     )
 
     total_cases = 0
@@ -470,7 +388,6 @@ def index():
         "index.html",
         models=models,
         total_cases=total_cases,
-        plot_url=plot_url,
         benchmark_metadata=benchmark_metadata,
         analysis_results=analysis_results,  # Pass full analysis results
     )
@@ -601,6 +518,48 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 #         abort(404)
 
 
+@app.route("/api/plot-data")
+def get_plot_data():
+    """Returns the plot data as JSON for the chart."""
+    analysis_results = current_app.config.get("ANALYSIS_RESULTS")
+
+    if not analysis_results or not analysis_results.get("models"):
+        return {"error": "No analysis results available"}, 404
+
+    # Prepare data for Chart.js format
+    bucket_labels = analysis_results.get("formatted_bucket_keys", [])
+    datasets = []
+
+    # Sort models for consistent coloring
+    models = sorted(list(analysis_results["models"].keys()))
+
+    for model_name in models:
+        model_stats = analysis_results["models"][model_name]
+        success_rates = []
+
+        for bucket_key in analysis_results["bucket_keys"]:
+            bucket_stats = model_stats["buckets"][bucket_key]
+            rate = (
+                bucket_stats["success_rate"] if bucket_stats["runs_found"] > 0 else None
+            )
+            success_rates.append(rate)
+
+        # Format the cost for the label
+        total_cost = model_stats.get("total_cost_usd", 0.0)
+
+        datasets.append(
+            {
+                "label": f"{model_name} (${total_cost:.2f})",
+                "data": success_rates,
+                "borderWidth": 2,
+                "tension": 0.1,  # Slight curve for nicer appearance
+                "fill": False,
+            }
+        )
+
+    return {"labels": bucket_labels, "datasets": datasets}
+
+
 @app.route("/files/<path:filepath>")
 def serve_file(filepath):
     """Serves files securely from allowed directories."""
@@ -680,13 +639,11 @@ def open_browser(host, port):
 # --- Analysis and Plotting Execution (at startup) ---
 
 
-def run_analysis_and_plotting():
-    """Performs analysis and generates plot, storing results in app.config."""
-    # Imports are now at top level
-
+def run_data_analysis():
+    """Performs benchmark results analysis, storing results in app.config."""
     # Use app context to access config
     with app.app_context():
-        print("\n--- Running Analysis and Plotting ---")
+        print("\n--- Running Benchmark Data Analysis ---")
         benchmark_metadata = load_benchmark_metadata(
             current_app.config["BENCHMARK_DIR"]
         )
@@ -711,8 +668,6 @@ def run_analysis_and_plotting():
                 "bucket_keys": [],
                 "formatted_bucket_keys": [],
             }
-            # Attempt to generate an empty plot? Or just skip? Skip for now.
-            print("Skipping plot generation as no models were found.")
             return
 
         analysis_results = analyze_results(
@@ -720,11 +675,7 @@ def run_analysis_and_plotting():
         )
         current_app.config["ANALYSIS_RESULTS"] = analysis_results  # Store results
 
-        # Generate plot directly into static directory
-        plot_output_path = current_app.config["PLOT_STATIC_PATH"]
-        generate_plot(analysis_results, plot_output_path)
-
-        print("--- Finished Analysis and Plotting ---\n")
+        print("--- Finished Data Analysis ---\n")
 
 
 if __name__ == "__main__":
@@ -733,10 +684,10 @@ if __name__ == "__main__":
     PORT = 5001
     DEBUG = True  # Flask debug mode
 
-    # Run analysis and plotting before starting the server
+    # Run data analysis before starting the server
     # This happens only once when the main process starts (not in reloader subprocess)
     if not DEBUG or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        run_analysis_and_plotting()
+        run_data_analysis()
 
     # Open browser tab shortly after starting the server
     if not DEBUG or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
