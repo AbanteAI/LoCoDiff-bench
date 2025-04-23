@@ -580,13 +580,14 @@ def assign_prompts_to_buckets(
 
         if not assigned:
             # This should ideally not happen if filtering and bucketing logic is correct
-            print(
-                f"Warning: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}"
+            # This should ideally not happen if filtering and bucketing logic is correct
+            raise ValueError(
+                f"Error: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}"
             )
-            unassigned_count += 1
+            # unassigned_count += 1 # Unreachable after raise
 
-    if unassigned_count > 0:
-        print(f"Warning: {unassigned_count} prompts could not be assigned to a bucket.")
+    # if unassigned_count > 0: # Unreachable after raise
+    #     print(f"Warning: {unassigned_count} prompts could not be assigned to a bucket.")
 
     # Print summary of bucket assignments
     for bucket_key, items in buckets.items():
@@ -707,9 +708,12 @@ def copy_selected_files(
         if not os.path.exists(source_prompt_path) or not os.path.exists(
             source_expected_path
         ):
-            print(f"Warning: Source files missing for prefix {prefix}")
-            error_count += 1
-            continue
+            # This indicates an inconsistency between kept prefixes and generated files
+            raise FileNotFoundError(
+                f"Error: Source files missing for prefix {prefix}. Expected prompt: {source_prompt_path}, Expected output: {source_expected_path}"
+            )
+            # error_count += 1 # Unreachable
+            # continue
 
         # Copy the files
         try:
@@ -717,12 +721,13 @@ def copy_selected_files(
             shutil.copy2(source_expected_path, dest_expected_path)
             copied_files_count += 1
         except OSError as e:
-            print(f"Error copying files for prefix {prefix}: {e}")
-            error_count += 1
+            # Raise the error instead of just printing and counting
+            raise OSError(f"Error copying files for prefix {prefix}: {e}") from e
+            # error_count += 1 # Unreachable
 
     print(f"Successfully copied {copied_files_count} pairs of prompt/expected files.")
-    if error_count > 0:
-        print(f"Encountered errors with {error_count} benchmark sets.")
+    # if error_count > 0: # Error count logic removed as errors are now raised
+    #     print(f"Encountered errors with {error_count} benchmark sets.")
 
 
 def print_bucket_stats_table(buckets):
@@ -807,9 +812,10 @@ def save_benchmark_metadata(
         final_buckets: Dictionary mapping bucket ranges to lists of kept prompt stats.
         cfg: The configuration object containing output_dir and other parameters.
     """
-    # Create generation_params dict from Config, excluding derived fields if needed
-    # Using asdict and then removing the derived list of boundaries
+    # Create generation_params dict from Config, excluding non-serializable fields
     generation_params = asdict(cfg)
+    # Remove fields that are not JSON serializable or derived
+    generation_params.pop("encoder", None)
     generation_params.pop("bucket_boundaries", None)  # Remove the list, keep the string
 
     metadata = {
@@ -840,8 +846,14 @@ def save_benchmark_metadata(
         with open(metadata_path, "w", encoding="utf-8") as mf:
             json.dump(metadata, mf, indent=4)
         print(f"\nSaved final benchmark structure metadata to {metadata_path}")
-    except Exception as e:
-        print(f"\nWarning: Failed to save metadata to {metadata_path}: {e}")
+    except (
+        IOError,
+        TypeError,
+    ) as e:  # Catch specific errors related to writing/serialization
+        # Raise error instead of printing warning
+        raise RuntimeError(
+            f"Error: Failed to save metadata to {metadata_path}: {e}"
+        ) from e
 
 
 # --- Main Script Logic ---

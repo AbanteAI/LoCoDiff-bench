@@ -498,7 +498,8 @@ def _save_text_file(filepath: Path, content: str):
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content, encoding="utf-8")
     except IOError as e:
-        print(f"Warning: Failed to write file {filepath}: {e}")
+        # Raise the error instead of just printing a warning
+        raise IOError(f"Failed to write file {filepath}: {e}") from e
         # Decide if this should re-raise or just warn
 
 
@@ -654,14 +655,22 @@ async def run_single_benchmark(
                             lineterm="",
                         )
                         diff_content = "".join(diff_lines)
+                    # _save_text_file will raise IOError on failure
                     _save_text_file(diff_path, diff_content)
-                except Exception as diff_e:
-                    print(f"Warning: Failed to generate/save diff file: {diff_e}")
-                    # Optionally save the error to the diff file
+                except IOError as diff_io_e:
+                    # Re-raise file saving errors as RuntimeError for clarity in summary
+                    raise RuntimeError(
+                        f"Failed to save diff file {diff_path}: {diff_io_e}"
+                    ) from diff_io_e
+                except Exception as diff_gen_e:
+                    # Handle errors during diff *generation* (not saving)
+                    error_msg = f"Error generating diff: {diff_gen_e}"
+                    print(f"Warning: {error_msg}")
+                    # Attempt to save the error message to the diff file, ignore failure
                     try:
-                        _save_text_file(diff_path, f"Error generating diff: {diff_e}\n")
-                    except Exception:
-                        pass  # Ignore errors writing the error message
+                        _save_text_file(diff_path, f"{error_msg}\n")
+                    except IOError:
+                        pass  # Ignore error saving the error message itself
 
         except FileNotFoundError as e:
             run_metadata["error"] = f"File Error: {e}"
@@ -691,10 +700,18 @@ async def run_single_benchmark(
                 run_metadata.pop("results_dir_path_planned", None)
                 with open(metadata_path, "w", encoding="utf-8") as f_meta:
                     json.dump(run_metadata, f_meta, indent=4)
-            except Exception as meta_e:
-                print(
-                    f"\nWarning: Failed to save final metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
-                )
+            except (
+                IOError,
+                TypeError,
+            ) as meta_e:  # Catch specific file write/serialization errors
+                # Raise error instead of just printing warning
+                raise RuntimeError(
+                    f"Failed to save final metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
+                ) from meta_e
+            except Exception as meta_e:  # Catch other potential errors during save
+                raise RuntimeError(
+                    f"Unexpected error saving final metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
+                ) from meta_e
 
         # --- 13. Print Final Status for this Case ---
         if not run_metadata["api_error"]:

@@ -396,7 +396,8 @@ def generate_plot(analysis_results: dict, output_filename: str):
             os.makedirs(output_dir, exist_ok=True)
             print(f"Created directory for plot: {output_dir}")
         except OSError as e:
-            print(f"Error creating directory {output_dir}: {e}")
+            # Raise error instead of just printing
+            raise OSError(f"Error creating directory {output_dir}: {e}") from e
             # Optionally decide if you want to proceed or exit
             # For now, we'll let savefig handle the potential error if dir creation failed
 
@@ -405,7 +406,8 @@ def generate_plot(analysis_results: dict, output_filename: str):
         plt.savefig(output_filename, dpi=300, bbox_inches="tight")
         print(f"Plot saved successfully to {output_filename}")
     except Exception as e:
-        print(f"Error saving plot: {e}")
+        # Raise error instead of just printing
+        raise RuntimeError(f"Error saving plot to {output_filename}: {e}") from e
 
     # Optionally display the plot
     # plt.show()
