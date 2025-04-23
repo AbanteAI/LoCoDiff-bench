@@ -4,6 +4,7 @@ import json
 import glob
 import re
 import sys
+import math  # Added for Wilson score calculation
 from flask import (
     Flask,
     render_template,
@@ -259,7 +260,13 @@ def analyze_results(
         # Initialize structure for each model
         for model_name in models_found:
             analysis["sliding_window"]["models"][model_name] = {
-                center: {"total": 0, "successful": 0, "rate": None}
+                center: {
+                    "total": 0,
+                    "successful": 0,
+                    "rate": None,
+                    "wilson_lower": None,
+                    "wilson_upper": None,
+                }
                 for center in window_centers
             }
 
@@ -306,10 +313,75 @@ def analyze_results(
                     window_stats["rate"] = (
                         window_stats["successful"] / window_stats["total"]
                     )
+                    # Calculate Wilson interval
+                    lower, upper = calculate_wilson_interval(
+                        window_stats["successful"], window_stats["total"]
+                    )
+                    window_stats["wilson_lower"] = lower
+                    window_stats["wilson_upper"] = upper
+                else:
+                    # Ensure bounds are None if total is 0
+                    window_stats["wilson_lower"] = None
+                    window_stats["wilson_upper"] = None
+
         print("Sliding window analysis complete.")
     # --- End Sliding Window Analysis ---
 
     return analysis
+
+
+# --- Wilson Score Interval Calculation ---
+def calculate_wilson_interval(
+    successes: int, total: int, confidence: float = 0.95
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Calculates the Wilson score interval for a binomial proportion.
+
+    Args:
+        successes: Number of successful outcomes.
+        total: Total number of trials.
+        confidence: The desired confidence level (e.g., 0.95 for 95%).
+
+    Returns:
+        A tuple containing (lower_bound, upper_bound), or (None, None) if total is 0.
+    """
+    if total == 0:
+        return None, None
+
+    # Calculate z-score for the given confidence level (approximation for common levels)
+    # For simplicity, we'll hardcode z for 95% confidence.
+    # For other levels, use: from scipy.stats import norm; z = norm.ppf(1 - (1 - confidence) / 2)
+    if confidence == 0.95:
+        z = 1.96
+    elif confidence == 0.99:
+        z = 2.576
+    elif confidence == 0.90:
+        z = 1.645
+    else:
+        # Fallback or raise error for unsupported confidence levels
+        # Using 95% as default if confidence is not recognized
+        print(
+            f"Warning: Unsupported confidence level {confidence}. Using z=1.96 (95%)."
+        )
+        z = 1.96  # Default to 95%
+
+    p_hat = successes / total
+    z2 = z * z
+    n = total
+
+    center = (p_hat + z2 / (2 * n)) / (1 + z2 / n)
+    margin = (z / (1 + z2 / n)) * math.sqrt(
+        (p_hat * (1 - p_hat) / n) + (z2 / (4 * n * n))
+    )
+
+    lower = center - margin
+    upper = center + margin
+
+    # Ensure bounds are within [0, 1]
+    lower = max(0.0, lower)
+    upper = min(1.0, upper)
+
+    return lower, upper
 
 
 # Plot generation function has been removed in favor of the client-side Chart.js visualization
@@ -678,10 +750,14 @@ def get_sliding_plot_data():
     for model_name in models:
         model_sliding_stats = sliding_data["models"][model_name]
         success_rates = []
+        wilson_lower_bounds = []  # Initialize list for lower bounds
+        wilson_upper_bounds = []  # Initialize list for upper bounds
 
         for center in window_centers:
-            rate = model_sliding_stats.get(center, {}).get("rate")
-            success_rates.append(rate)  # Append rate (can be None)
+            stats = model_sliding_stats.get(center, {})
+            success_rates.append(stats.get("rate"))  # Append rate (can be None)
+            wilson_lower_bounds.append(stats.get("wilson_lower"))  # Append lower bound
+            wilson_upper_bounds.append(stats.get("wilson_upper"))  # Append upper bound
 
         # Get overall cost for the label from the main analysis part
         total_cost = (
@@ -694,6 +770,8 @@ def get_sliding_plot_data():
             {
                 "label": f"{model_name} (${total_cost:.2f})",
                 "data": success_rates,
+                "wilson_lower": wilson_lower_bounds,  # Add lower bounds to dataset
+                "wilson_upper": wilson_upper_bounds,  # Add upper bounds to dataset
                 "borderWidth": 2,
                 "tension": 0.1,
                 "fill": False,
