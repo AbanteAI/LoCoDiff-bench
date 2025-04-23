@@ -489,18 +489,17 @@ def get_latest_run_cost(
             )
             cost = 0.0  # Treat as 0 cost if metadata is problematic
 
-    return cost
+    return 0.0  # Return 0.0 if no valid run or metadata found
 
 
 def _save_text_file(filepath: Path, content: str):
-    """Helper to save text content to a file."""
+    """Helper to save text content to a file, creating parent dirs."""
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content, encoding="utf-8")
     except IOError as e:
-        # Raise the error instead of just printing a warning
+        # Raise the error to be caught by the caller
         raise IOError(f"Failed to write file {filepath}: {e}") from e
-        # Decide if this should re-raise or just warn
 
 
 async def run_single_benchmark(
@@ -510,7 +509,9 @@ async def run_single_benchmark(
     results_base_dir: Path,
     semaphore: asyncio.Semaphore,
 ) -> Dict[str, Any]:
-    """Runs a single benchmark case asynchronously."""
+    """
+    Runs a single benchmark case asynchronously, handling errors and saving metadata.
+    """
     async with semaphore:
         prompt_filename = f"{benchmark_case_prefix}_prompt.txt"
         expected_filename = f"{benchmark_case_prefix}_expectedoutput.txt"
@@ -519,7 +520,7 @@ async def run_single_benchmark(
 
         print(f"Starting benchmark: {benchmark_case_prefix} with model {model}")
 
-        # Initialize metadata with Path objects converted to strings for JSON later
+        # Initialize metadata - will be updated throughout the process
         run_metadata: Dict[str, Any] = {
             "model": model,
             "benchmark_case": benchmark_case_prefix,
@@ -529,7 +530,7 @@ async def run_single_benchmark(
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "success": False,
             "error": None,
-            "api_error": False,  # Explicitly track API vs processing errors
+            "api_error": False,
             "raw_response_length": 0,
             "extracted_output_length": None,
             "expected_output_length": 0,
@@ -546,10 +547,7 @@ async def run_single_benchmark(
         }
 
         results_dir: Optional[Path] = None
-        raw_model_response: Optional[str] = None
-        generation_id: Optional[str] = None
-        api_error_message: Optional[str] = None
-        extracted_content: Optional[str] = None
+        save_results = True  # Flag to control saving results/metadata
 
         try:
             # --- 1. Define Results Directory Path ---
@@ -561,8 +559,7 @@ async def run_single_benchmark(
                 / sanitized_model_name
                 / timestamp_str
             )
-            # Store planned path as string for metadata, actual creation deferred
-            run_metadata["results_dir_path_planned"] = str(results_dir)
+            run_metadata["results_dir_planned"] = str(results_dir)
 
             # --- 2. Read Input Files ---
             if not prompt_filepath.is_file():
@@ -585,16 +582,18 @@ async def run_single_benchmark(
 
             # --- 4. Handle API Errors ---
             if api_error_message:
+                # Record API error but prevent saving results/metadata
                 run_metadata["error"] = api_error_message
                 run_metadata["api_error"] = True
+                save_results = False
                 print(
-                    f"⚠️ API Error: {benchmark_case_prefix} - Error: {api_error_message} - Skipping results."
+                    f"⚠️ API Error: {benchmark_case_prefix} - Error: {api_error_message} - Skipping results saving."
                 )
-                # Return early, do not save any files or metadata for API errors
-                return run_metadata
+                # No need to raise, error is recorded, finally block won't save
+                return run_metadata  # Return early as no results will be saved
 
             # --- 5. Process Successful API Response ---
-            assert raw_model_response is not None  # Should be true if no API error
+            assert raw_model_response is not None
             run_metadata["raw_response_length"] = len(raw_model_response)
             run_metadata["generation_id"] = generation_id
 
@@ -613,21 +612,19 @@ async def run_single_benchmark(
                     "No generation ID received from chat completion"
                 )
 
-            # --- 7. Create Results Directory (Now that API call succeeded) ---
-            assert results_dir is not None  # Should be defined if we got here
+            # --- 7. Create Results Directory (Only if API call succeeded) ---
+            assert results_dir is not None
             results_dir.mkdir(parents=True, exist_ok=True)
-            run_metadata["results_dir"] = str(
-                results_dir
-            )  # Update metadata with actual dir path
+            run_metadata["results_dir"] = str(results_dir)  # Record actual path
 
             # --- 8. Save Raw Response ---
             _save_text_file(results_dir / "raw_response.txt", raw_model_response)
 
             # --- 9. Extract Content ---
             extracted_content = extract_code_from_backticks(raw_model_response)
-
             if extracted_content is None:
                 run_metadata["error"] = "Extraction backticks not found"
+                # Continue to save metadata and diff (which will show full expected)
             else:
                 run_metadata["extracted_output_length"] = len(extracted_content)
                 _save_text_file(results_dir / "extracted_output.txt", extracted_content)
@@ -635,100 +632,155 @@ async def run_single_benchmark(
                 # --- 10. Compare Extracted vs Expected ---
                 extracted_stripped = extracted_content.strip()
                 expected_stripped = expected_content.strip()
-
                 if extracted_stripped == expected_stripped:
                     run_metadata["success"] = True
                 else:
-                    run_metadata["error"] = "Output mismatch"
+                    # Only set error if not already set by extraction failure
+                    if run_metadata["error"] is None:
+                        run_metadata["error"] = "Output mismatch"
 
-                # --- 11. Generate and Save Diff File ---
-                diff_path = results_dir / "output.diff"
-                try:
-                    if run_metadata["success"]:
-                        diff_content = "No differences found.\n"
-                    else:
-                        diff_lines = difflib.unified_diff(
-                            expected_stripped.splitlines(keepends=True),
-                            extracted_stripped.splitlines(keepends=True),
-                            fromfile=f"{expected_filename} (expected)",
-                            tofile=f"{benchmark_case_prefix}_extracted.txt (actual)",
-                            lineterm="",
-                        )
-                        diff_content = "".join(diff_lines)
-                    # _save_text_file will raise IOError on failure
-                    _save_text_file(diff_path, diff_content)
-                except IOError as diff_io_e:
-                    # Re-raise file saving errors as RuntimeError for clarity in summary
-                    raise RuntimeError(
-                        f"Failed to save diff file {diff_path}: {diff_io_e}"
-                    ) from diff_io_e
-                except Exception as diff_gen_e:
-                    # Handle errors during diff *generation* (not saving)
-                    error_msg = f"Error generating diff: {diff_gen_e}"
-                    print(f"Warning: {error_msg}")
-                    # Attempt to save the error message to the diff file, ignore failure
-                    try:
-                        _save_text_file(diff_path, f"{error_msg}\n")
-                    except IOError:
-                        pass  # Ignore error saving the error message itself
+            # --- 11. Generate and Save Diff File ---
+            # Always generate diff, even if extraction failed (diff against empty string)
+            diff_path = results_dir / "output.diff"
+            extracted_for_diff = (extracted_content or "").strip()  # Use empty if None
+            expected_for_diff = expected_content.strip()
 
+            if run_metadata["success"]:
+                diff_content = "No differences found.\n"
+            else:
+                diff_lines = difflib.unified_diff(
+                    expected_for_diff.splitlines(keepends=True),
+                    extracted_for_diff.splitlines(keepends=True),
+                    fromfile=f"{expected_filename} (expected)",
+                    tofile=f"{benchmark_case_prefix}_extracted.txt (actual)",
+                    lineterm="",
+                )
+                diff_content = "".join(diff_lines)
+                if (
+                    not diff_content
+                ):  # Handle case where both are empty or identical after strip
+                    diff_content = (
+                        "No differences found (after stripping whitespace).\n"
+                    )
+
+            _save_text_file(diff_path, diff_content)  # Will raise IOError on failure
+
+        # --- Error Handling for Processing Steps ---
         except FileNotFoundError as e:
             run_metadata["error"] = f"File Error: {e}"
-            print(f"File Error for {benchmark_case_prefix}: {e} - Skipping results.")
-        except IOError as e:
+            save_results = False  # Don't save metadata if input files missing
+            print(
+                f"File Error for {benchmark_case_prefix}: {e} - Skipping results saving."
+            )
+        except IOError as e:  # Catch file writing errors from _save_text_file
             run_metadata["error"] = f"IOError: {e}"
-            print(f"IO Error for {benchmark_case_prefix}: {e} - Skipping results.")
-        except ValueError as e:  # Catches missing API key via _get_async_openai_client
+            # Allow metadata saving if results_dir exists, but log the error
+            print(
+                f"IO Error for {benchmark_case_prefix}: {e} - Attempting to save metadata."
+            )
+        except ValueError as e:  # Catches missing API key
             run_metadata["error"] = f"Config Error: {e}"
-            run_metadata["api_error"] = True  # Treat config errors like API errors
-            print(f"Config Error for {benchmark_case_prefix}: {e} - Skipping results.")
-        except Exception as e:  # Catch other unexpected issues
+            run_metadata["api_error"] = True
+            save_results = False
+            print(
+                f"Config Error for {benchmark_case_prefix}: {e} - Skipping results saving."
+            )
+        except Exception as e:  # Catch unexpected errors during processing
             run_metadata["error"] = f"Runtime Error: {type(e).__name__}: {e}"
             print(
-                f"Runtime Error for {benchmark_case_prefix}: {e} - Attempting to save partial results if possible."
+                f"Runtime Error for {benchmark_case_prefix}: {e} - Attempting to save metadata."
             )
             # import traceback # Uncomment for debugging
             # run_metadata["traceback"] = traceback.format_exc()
 
-        # --- 12. Save Final Metadata (if results dir was created) ---
-        # This runs outside the main try block's success path to capture errors,
-        # but only saves if the API call didn't fail initially and the dir exists.
-        if results_dir and results_dir.exists() and not run_metadata["api_error"]:
-            metadata_path = results_dir / "metadata.json"
-            try:
-                # Remove the temporary planned path key before saving
-                run_metadata.pop("results_dir_path_planned", None)
-                with open(metadata_path, "w", encoding="utf-8") as f_meta:
-                    json.dump(run_metadata, f_meta, indent=4)
-            except (
-                IOError,
-                TypeError,
-            ) as meta_e:  # Catch specific file write/serialization errors
-                # Raise error instead of just printing warning
-                raise RuntimeError(
-                    f"Failed to save final metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
-                ) from meta_e
-            except Exception as meta_e:  # Catch other potential errors during save
-                raise RuntimeError(
-                    f"Unexpected error saving final metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
-                ) from meta_e
+        # --- Final Actions: Save Metadata and Print Status ---
+        finally:
+            # Save metadata only if results dir exists and saving is enabled
+            if save_results and results_dir and results_dir.exists():
+                metadata_path = results_dir / "metadata.json"
+                try:
+                    run_metadata.pop(
+                        "results_dir_planned", None
+                    )  # Clean up planned path
+                    with open(metadata_path, "w", encoding="utf-8") as f_meta:
+                        json.dump(run_metadata, f_meta, indent=4)
+                except (IOError, TypeError) as meta_e:
+                    print(
+                        f"❌ Critical Error: Failed to save metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
+                    )
+                    # Optionally re-raise or handle more gracefully
+                    # For now, just print error, the run_metadata dict is still returned
+                except Exception as meta_e:
+                    print(
+                        f"❌ Critical Error: Unexpected error saving metadata.json for {benchmark_case_prefix} in {results_dir}: {meta_e}"
+                    )
 
-        # --- 13. Print Final Status for this Case ---
-        if not run_metadata["api_error"]:
-            cost_str = (
-                f"Cost: ${run_metadata.get('cost_usd', 0.0):.6f}"
-                if run_metadata.get("cost_usd") is not None
-                else "Cost: N/A"
-            )
-            if run_metadata["success"]:
-                print(f"✅ Success: {benchmark_case_prefix} - {cost_str}")
-            else:
-                error_msg = run_metadata.get("error", "Unknown processing error")
-                print(
-                    f"❌ Failure: {benchmark_case_prefix} - Error: {error_msg} - {cost_str}"
+            # Print final status for this case (unless it was an API error handled earlier)
+            if not run_metadata.get("api_error", False):
+                cost_str = (
+                    f"Cost: ${run_metadata.get('cost_usd', 0.0):.6f}"
+                    if run_metadata.get("cost_usd") is not None
+                    else "Cost: N/A"
                 )
+                if run_metadata["success"]:
+                    print(f"✅ Success: {benchmark_case_prefix} - {cost_str}")
+                else:
+                    error_msg = run_metadata.get("error", "Unknown processing error")
+                    print(
+                        f"❌ Failure: {benchmark_case_prefix} - Error: {error_msg} - {cost_str}"
+                    )
 
-        return run_metadata
+            return run_metadata  # Return the final metadata dictionary
+
+
+def _get_latest_run_info(
+    benchmark_case_prefix: str, model_name: str, results_base_dir: Path
+) -> tuple[Path | None, float]:
+    """
+    Finds the latest run directory for a case/model and returns its path and cost.
+
+    Returns:
+        A tuple containing:
+        - The Path object for the latest run directory, or None if no run exists.
+        - The cost_usd from the latest run's metadata (float), or 0.0 if no run,
+          metadata is missing/unreadable, or cost is not recorded.
+    """
+    sanitized_model_name = sanitize_filename(model_name)
+    pattern = f"{benchmark_case_prefix}/{sanitized_model_name}/*"
+    potential_dirs = list(results_base_dir.glob(pattern))
+
+    latest_dir: Optional[Path] = None
+    latest_timestamp = ""
+
+    for result_dir in potential_dirs:
+        if not result_dir.is_dir():
+            continue
+        dir_name = result_dir.name
+        # Check if it looks like a timestamp directory and find the latest
+        if re.match(r"\d{8}_\d{6}", dir_name):
+            if dir_name > latest_timestamp:
+                latest_timestamp = dir_name
+                latest_dir = result_dir
+
+    if latest_dir is None:
+        return None, 0.0  # No run found
+
+    # Found a latest run, try to get cost
+    metadata_path = latest_dir / "metadata.json"
+    cost = 0.0
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            # Get cost, default to 0.0 if key missing or value is None/invalid
+            cost = float(metadata.get("cost_usd", 0.0) or 0.0)
+        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
+            print(
+                f"Warning: Could not read/parse metadata or cost for {latest_dir}: {e}"
+            )
+            cost = 0.0  # Treat as 0 cost if metadata is problematic
+
+    return latest_dir, cost
 
 
 async def main():
@@ -778,10 +830,7 @@ async def main():
     print(f"Max New Runs: {'All Remaining' if args.num_runs == -1 else args.num_runs}")
     print("-" * 30)
 
-    # Convert Path object to string for find_benchmark_cases if needed
     benchmark_dir_str = str(args.benchmark_dir)
-    # results_dir_str is no longer needed as get_latest_run_cost takes Path
-
     all_cases = find_benchmark_cases(benchmark_dir_str)
     if not all_cases:
         print(f"Error: No benchmark cases found in '{benchmark_dir_str}'.")
@@ -793,34 +842,12 @@ async def main():
     total_previous_cost = 0.0
     print("Checking for existing results and calculating previous costs...")
     for case_prefix in all_cases:
-        # Check cost of the latest run for this case/model pair
-        cost = get_latest_run_cost(case_prefix, args.model, args.results_dir)
-        # If cost > 0, it implies a run exists (or at least metadata with cost was found)
-        # We consider it "already run" if we found a cost, even if it was 0.0 but metadata existed.
-        # A more robust check might involve checking if the latest_dir was found by the helper.
-        # For simplicity, we'll assume finding any cost means it was run.
-        # A dedicated function returning (bool, float) might be clearer.
-        # Let's refine: get_latest_run_cost returns 0.0 if no run dir found.
-        # We need a way to know if *any* run exists. Let's modify the helper slightly.
-
-        # Re-checking logic: Find *if* a latest run exists first.
-        sanitized_model_name = sanitize_filename(args.model)
-        pattern = f"{case_prefix}/{sanitized_model_name}/*"
-        potential_dirs = list(args.results_dir.glob(pattern))
-        latest_dir_found = False
-        latest_timestamp = ""
-        for result_dir in potential_dirs:
-            if result_dir.is_dir() and re.match(r"\d{8}_\d{6}", result_dir.name):
-                if result_dir.name > latest_timestamp:
-                    latest_timestamp = result_dir.name
-                    latest_dir_found = (
-                        True  # Mark that we found at least one valid run dir
-                    )
-
-        if latest_dir_found:
+        # Use the helper function to find the latest run and its cost
+        latest_run_dir, cost = _get_latest_run_info(
+            case_prefix, args.model, args.results_dir
+        )
+        if latest_run_dir is not None:  # Check if a run directory was found
             already_run_cases.add(case_prefix)
-            # Now get the cost specifically from the latest run (if metadata exists)
-            cost = get_latest_run_cost(case_prefix, args.model, args.results_dir)
             total_previous_cost += cost
 
     print(
