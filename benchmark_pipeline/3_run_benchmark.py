@@ -778,7 +778,7 @@ def _get_latest_run_info(
             print(
                 f"Warning: Could not read/parse metadata or cost for {latest_dir}: {e}"
             )
-            cost = 0.0  # Treat as 0 cost if metadata is problematic
+            # cost remains 0.0 as initialized before the try block
 
     return latest_dir, cost
 
