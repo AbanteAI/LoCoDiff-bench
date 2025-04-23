@@ -143,82 +143,96 @@ def analyze_results(
     (Directly from analyze_results.py)
     """
     analysis: dict[str, Any] = {"models": {}}
-    all_bucket_keys = sorted(
-        benchmark_metadata.get("benchmark_buckets", {}).keys(),
-        key=lambda k: int(k.split("-")[0]),
-    )
-    analysis["bucket_keys"] = all_bucket_keys
-    analysis["formatted_bucket_keys"] = [
-        format_bucket_key(k) for k in all_bucket_keys
-    ]  # Add formatted keys
+    # Removed bucket key initialization and formatting as bucket analysis is removed
 
     print(f"Analyzing results for models: {models_found}")
-    print(f"Using {len(all_bucket_keys)} buckets defined in benchmark metadata.")
+    # Removed bucket count print statement
 
+    # Initialize basic model structure for overall stats
     for model_name in models_found:
         analysis["models"][model_name] = {
-            "total_benchmarks": 0,
+            "total_benchmarks": 0,  # Will count all cases encountered
             "runs_found": 0,
             "successful_runs": 0,
             "total_cost_usd": 0.0,
             "success_rate": 0.0,
-            "buckets": {
-                key: {
-                    "total_in_bucket": 0,
-                    "runs_found": 0,
-                    "successful_runs": 0,
-                    "success_rate": 0.0,
-                }
-                for key in all_bucket_keys
-            },
+            # "buckets" structure removed
         }
 
     defined_buckets = benchmark_metadata.get("benchmark_buckets", {})
     if not defined_buckets:
-        print("Warning: No benchmark buckets found in metadata.")
-        return analysis
+        print(
+            "Warning: No benchmark buckets found in metadata. Cannot perform analysis."
+        )
+        # If no buckets, we can't get case info for sliding window either
+        analysis["sliding_window"] = None  # Ensure sliding window is None
+        return analysis  # Return early
 
-    for bucket_key, benchmark_cases in defined_buckets.items():
-        for case_info in benchmark_cases:
-            benchmark_case_prefix = case_info["benchmark_case_prefix"]
+    # Iterate through cases primarily to get overall stats and case list for sliding window
+    all_cases_info = []
+    for _bucket_key, benchmark_cases in defined_buckets.items():
+        all_cases_info.extend(benchmark_cases)  # Collect all case info
 
-            for model_name in models_found:
+    print(f"Found {len(all_cases_info)} total benchmark cases defined in metadata.")
+
+    # Use a set to count unique benchmark cases processed per model to avoid overcounting total_benchmarks
+    processed_cases_per_model = defaultdict(set)
+
+    for case_info in all_cases_info:
+        benchmark_case_prefix = case_info["benchmark_case_prefix"]
+        for model_name in models_found:
+            # Increment total benchmark count only if this case hasn't been counted for this model yet
+            if benchmark_case_prefix not in processed_cases_per_model[model_name]:
                 analysis["models"][model_name]["total_benchmarks"] += 1
-                analysis["models"][model_name]["buckets"][bucket_key][
-                    "total_in_bucket"
-                ] += 1
+                processed_cases_per_model[model_name].add(benchmark_case_prefix)
 
-                result_meta = results_data.get(model_name, {}).get(
-                    benchmark_case_prefix
-                )
+            result_meta = results_data.get(model_name, {}).get(benchmark_case_prefix)
 
-                if result_meta is not None:
-                    analysis["models"][model_name]["runs_found"] += 1
-                    analysis["models"][model_name]["buckets"][bucket_key][
-                        "runs_found"
-                    ] += 1
+            # Aggregate run stats only once per actual run result found
+            if (
+                result_meta is not None
+                and benchmark_case_prefix in processed_cases_per_model[model_name]
+            ):
+                # Check if we already processed this specific run for overall stats
+                # This check might be redundant if results_data only contains latest runs, but safer
+                # We need a way to ensure we only count cost/success once per model/case pair if multiple runs exist
+                # Assuming results_data *only* contains the latest run, this block is fine.
+                # If results_data could contain multiple runs, this logic needs refinement.
+                # For now, assume results_data is pre-filtered to latest runs.
 
-                    if result_meta.get("success", False):
-                        analysis["models"][model_name]["successful_runs"] += 1
-                        analysis["models"][model_name]["buckets"][bucket_key][
-                            "successful_runs"
-                        ] += 1
+                # Count runs found, successful runs, and cost based on the (latest) result_meta
+                # This part seems okay assuming results_data has latest runs only.
+                # Let's refine the counting logic slightly. We should count runs_found etc. outside the
+                # processed_cases check, as those relate to actual runs, not just defined cases.
 
-                    cost = result_meta.get("cost_usd", 0.0) or 0.0
-                    analysis["models"][model_name]["total_cost_usd"] += float(cost)
+                pass  # Defer run counting until after the loop for clarity
 
+    # Recalculate runs_found, successful_runs, and cost by iterating through the actual results_data
+    # This ensures we count based on actual runs, not just defined cases.
+    for model_name in models_found:
+        model_results = results_data.get(model_name, {})
+        analysis["models"][model_name]["runs_found"] = len(
+            model_results
+        )  # Count actual runs found
+        analysis["models"][model_name]["successful_runs"] = 0
+        analysis["models"][model_name]["total_cost_usd"] = 0.0
+        for case_prefix, result_meta in model_results.items():
+            if result_meta is not None:
+                if result_meta.get("success", False):
+                    analysis["models"][model_name]["successful_runs"] += 1
+                cost = result_meta.get("cost_usd", 0.0) or 0.0
+                analysis["models"][model_name]["total_cost_usd"] += float(cost)
+
+    # Calculate overall success rates based on actual runs found
     for model_name, model_stats in analysis["models"].items():
         if model_stats["runs_found"] > 0:
             model_stats["success_rate"] = (
                 model_stats["successful_runs"] / model_stats["runs_found"]
             )
-        for bucket_key, bucket_stats in model_stats["buckets"].items():
-            if bucket_stats["runs_found"] > 0:
-                bucket_stats["success_rate"] = (
-                    bucket_stats["successful_runs"] / bucket_stats["runs_found"]
-                )
+        # Bucket rate calculation removed
 
     # --- Sliding Window Analysis ---
+    # Uses all_cases_info collected above
     print("Starting sliding window analysis...")
     max_token_limit = 0
     try:
@@ -721,7 +735,7 @@ def get_plot_data():
             }
         )
 
-    return {"labels": bucket_labels, "datasets": datasets}
+    # Removed original /api/plot-data endpoint
 
 
 @app.route("/api/sliding-plot-data")
