@@ -876,9 +876,9 @@ def main():
     parser.add_argument(
         "--extensions",
         "-e",
-        nargs="+",
+        type=str,
         required=True,
-        help="File extensions to process (include the dot), e.g., .py .txt",
+        help="Comma-separated list of file extensions to process (include the dot), e.g., .py,.txt,.js",
     )
     parser.add_argument(
         "--cache-dir",
@@ -950,8 +950,11 @@ def main():
     # --- End bucket parsing ---
 
     # --- Create Config object ---
+    # Parse extensions from comma-separated string to list
+    extension_list = [ext.strip() for ext in args.extensions.split(",")]
+
     cfg = Config(
-        extensions=args.extensions,
+        extensions=extension_list,
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
         temp_dir=args.temp_dir,  # Add temp_dir
