@@ -217,6 +217,83 @@ def analyze_results(
                     bucket_stats["successful_runs"] / bucket_stats["runs_found"]
                 )
 
+    # --- Sliding Window Analysis ---
+    print("Starting sliding window analysis...")
+    max_token_limit = 0
+    if benchmark_metadata and benchmark_metadata.get("generation_parameters", {}).get(
+        "bucket_boundaries", []
+    ):
+        max_token_limit = benchmark_metadata["generation_parameters"][
+            "bucket_boundaries"
+        ][-1]
+
+    if max_token_limit < 5000:
+        print(
+            f"Warning: Max token limit ({max_token_limit}) is less than 5000. Skipping sliding window analysis."
+        )
+        analysis["sliding_window"] = None
+    else:
+        # Define x-axis points (centers of the sliding windows)
+        window_centers = list(range(5000, max_token_limit + 1, 1000))
+        window_radius = 5000
+        analysis["sliding_window"] = {
+            "window_centers_k": [c // 1000 for c in window_centers],
+            "models": {},
+        }
+
+        # Initialize structure for each model
+        for model_name in models_found:
+            analysis["sliding_window"]["models"][model_name] = {
+                center: {"total": 0, "successful": 0, "rate": None}
+                for center in window_centers
+            }
+
+        # Iterate through all benchmark cases
+        all_cases_info = []
+        for _bucket_key, cases in defined_buckets.items():
+            all_cases_info.extend(cases)
+
+        print(
+            f"Processing {len(all_cases_info)} total benchmark cases for sliding window..."
+        )
+        for case_info in all_cases_info:
+            benchmark_case_prefix = case_info["benchmark_case_prefix"]
+            prompt_tokens = case_info.get("prompt_tokens")
+
+            if prompt_tokens is None:
+                print(
+                    f"Warning: Missing prompt_tokens for case {benchmark_case_prefix}. Skipping for sliding window."
+                )
+                continue
+
+            for model_name in models_found:
+                result_meta = results_data.get(model_name, {}).get(
+                    benchmark_case_prefix
+                )
+                if result_meta is not None:
+                    is_success = result_meta.get("success", False)
+
+                    # Check which windows this case falls into
+                    for center in window_centers:
+                        if abs(prompt_tokens - center) <= window_radius:
+                            window_stats = analysis["sliding_window"]["models"][
+                                model_name
+                            ][center]
+                            window_stats["total"] += 1
+                            if is_success:
+                                window_stats["successful"] += 1
+
+        # Calculate rates
+        for model_name in models_found:
+            for center in window_centers:
+                window_stats = analysis["sliding_window"]["models"][model_name][center]
+                if window_stats["total"] > 0:
+                    window_stats["rate"] = (
+                        window_stats["successful"] / window_stats["total"]
+                    )
+        print("Sliding window analysis complete.")
+    # --- End Sliding Window Analysis ---
+
     return analysis
 
 
@@ -558,6 +635,58 @@ def get_plot_data():
         )
 
     return {"labels": bucket_labels, "datasets": datasets}
+
+
+@app.route("/api/sliding-plot-data")
+def get_sliding_plot_data():
+    """Returns the sliding window plot data as JSON for the chart."""
+    analysis_results = current_app.config.get("ANALYSIS_RESULTS")
+
+    if (
+        not analysis_results
+        or not analysis_results.get("sliding_window")
+        or not analysis_results["sliding_window"].get("models")
+    ):
+        return {"error": "No sliding window analysis results available"}, 404
+
+    sliding_data = analysis_results["sliding_window"]
+    # Labels are the window centers in k tokens
+    labels = [f"{k}k" for k in sliding_data.get("window_centers_k", [])]
+    datasets = []
+
+    # Sort models for consistent coloring
+    models = sorted(list(sliding_data["models"].keys()))
+    window_centers = [
+        c * 1000 for c in sliding_data.get("window_centers_k", [])
+    ]  # Get original centers
+
+    for model_name in models:
+        model_sliding_stats = sliding_data["models"][model_name]
+        success_rates = []
+
+        for center in window_centers:
+            rate = model_sliding_stats.get(center, {}).get("rate")
+            success_rates.append(rate)  # Append rate (can be None)
+
+        # Get overall cost for the label from the main analysis part
+        total_cost = (
+            analysis_results.get("models", {})
+            .get(model_name, {})
+            .get("total_cost_usd", 0.0)
+        )
+
+        datasets.append(
+            {
+                "label": f"{model_name} (${total_cost:.2f})",
+                "data": success_rates,
+                "borderWidth": 2,
+                "tension": 0.1,
+                "fill": False,
+                "spanGaps": True,  # Connect lines even if there are null data points
+            }
+        )
+
+    return {"labels": labels, "datasets": datasets}
 
 
 @app.route("/files/<path:filepath>")
