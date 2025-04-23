@@ -220,12 +220,27 @@ def analyze_results(
     # --- Sliding Window Analysis ---
     print("Starting sliding window analysis...")
     max_token_limit = 0
-    if benchmark_metadata and benchmark_metadata.get("generation_parameters", {}).get(
-        "bucket_boundaries", []
-    ):
-        max_token_limit = benchmark_metadata["generation_parameters"][
-            "bucket_boundaries"
-        ][-1]
+    try:
+        if benchmark_metadata and "generation_parameters" in benchmark_metadata:
+            gen_params = benchmark_metadata["generation_parameters"]
+            if "buckets_str" in gen_params:
+                buckets_k_str = gen_params["buckets_str"]
+                # Parse the string "0,20,40,..." into a list of integers
+                bucket_boundaries_k = [
+                    int(b.strip()) for b in buckets_k_str.split(",") if b.strip()
+                ]
+                if bucket_boundaries_k:
+                    # Get the max k-token value and convert to actual token count
+                    max_token_limit = max(bucket_boundaries_k) * 1000
+                else:
+                    print("Warning: Parsed bucket boundaries string is empty.")
+            else:
+                print("Warning: 'buckets_str' not found in generation_parameters.")
+        else:
+            print("Warning: 'generation_parameters' not found in benchmark_metadata.")
+    except (ValueError, TypeError, AttributeError) as e:
+        print(f"Error parsing bucket boundaries for sliding window: {e}")
+        max_token_limit = 0  # Ensure it defaults to 0 on error
 
     if max_token_limit < 5000:
         print(
