@@ -4,6 +4,7 @@ import json
 import glob
 import re
 import sys
+import math  # Added for Wilson score calculation
 from flask import (
     Flask,
     render_template,
@@ -142,82 +143,259 @@ def analyze_results(
     (Directly from analyze_results.py)
     """
     analysis: dict[str, Any] = {"models": {}}
-    all_bucket_keys = sorted(
-        benchmark_metadata.get("benchmark_buckets", {}).keys(),
-        key=lambda k: int(k.split("-")[0]),
-    )
-    analysis["bucket_keys"] = all_bucket_keys
-    analysis["formatted_bucket_keys"] = [
-        format_bucket_key(k) for k in all_bucket_keys
-    ]  # Add formatted keys
+    # Removed bucket key initialization and formatting as bucket analysis is removed
 
     print(f"Analyzing results for models: {models_found}")
-    print(f"Using {len(all_bucket_keys)} buckets defined in benchmark metadata.")
+    # Removed bucket count print statement
 
+    # Initialize basic model structure for overall stats
     for model_name in models_found:
         analysis["models"][model_name] = {
-            "total_benchmarks": 0,
+            "total_benchmarks": 0,  # Will count all cases encountered
             "runs_found": 0,
             "successful_runs": 0,
             "total_cost_usd": 0.0,
             "success_rate": 0.0,
-            "buckets": {
-                key: {
-                    "total_in_bucket": 0,
-                    "runs_found": 0,
-                    "successful_runs": 0,
-                    "success_rate": 0.0,
-                }
-                for key in all_bucket_keys
-            },
+            # "buckets" structure removed
         }
 
     defined_buckets = benchmark_metadata.get("benchmark_buckets", {})
     if not defined_buckets:
-        print("Warning: No benchmark buckets found in metadata.")
-        return analysis
+        print(
+            "Warning: No benchmark buckets found in metadata. Cannot perform analysis."
+        )
+        # If no buckets, we can't get case info for sliding window either
+        analysis["sliding_window"] = None  # Ensure sliding window is None
+        return analysis  # Return early
 
-    for bucket_key, benchmark_cases in defined_buckets.items():
-        for case_info in benchmark_cases:
-            benchmark_case_prefix = case_info["benchmark_case_prefix"]
+    # Iterate through cases primarily to get overall stats and case list for sliding window
+    all_cases_info = []
+    for _bucket_key, benchmark_cases in defined_buckets.items():
+        all_cases_info.extend(benchmark_cases)  # Collect all case info
 
-            for model_name in models_found:
+    print(f"Found {len(all_cases_info)} total benchmark cases defined in metadata.")
+
+    # Use a set to count unique benchmark cases processed per model to avoid overcounting total_benchmarks
+    processed_cases_per_model = defaultdict(set)
+
+    for case_info in all_cases_info:
+        benchmark_case_prefix = case_info["benchmark_case_prefix"]
+        for model_name in models_found:
+            # Increment total benchmark count only if this case hasn't been counted for this model yet
+            if benchmark_case_prefix not in processed_cases_per_model[model_name]:
                 analysis["models"][model_name]["total_benchmarks"] += 1
-                analysis["models"][model_name]["buckets"][bucket_key][
-                    "total_in_bucket"
-                ] += 1
+                processed_cases_per_model[model_name].add(benchmark_case_prefix)
 
-                result_meta = results_data.get(model_name, {}).get(
-                    benchmark_case_prefix
-                )
+            result_meta = results_data.get(model_name, {}).get(benchmark_case_prefix)
 
-                if result_meta is not None:
-                    analysis["models"][model_name]["runs_found"] += 1
-                    analysis["models"][model_name]["buckets"][bucket_key][
-                        "runs_found"
-                    ] += 1
+            # Aggregate run stats only once per actual run result found
+            if (
+                result_meta is not None
+                and benchmark_case_prefix in processed_cases_per_model[model_name]
+            ):
+                # Check if we already processed this specific run for overall stats
+                # This check might be redundant if results_data only contains latest runs, but safer
+                # We need a way to ensure we only count cost/success once per model/case pair if multiple runs exist
+                # Assuming results_data *only* contains the latest run, this block is fine.
+                # If results_data could contain multiple runs, this logic needs refinement.
+                # For now, assume results_data is pre-filtered to latest runs.
 
-                    if result_meta.get("success", False):
-                        analysis["models"][model_name]["successful_runs"] += 1
-                        analysis["models"][model_name]["buckets"][bucket_key][
-                            "successful_runs"
-                        ] += 1
+                # Count runs found, successful runs, and cost based on the (latest) result_meta
+                # This part seems okay assuming results_data has latest runs only.
+                # Let's refine the counting logic slightly. We should count runs_found etc. outside the
+                # processed_cases check, as those relate to actual runs, not just defined cases.
 
-                    cost = result_meta.get("cost_usd", 0.0) or 0.0
-                    analysis["models"][model_name]["total_cost_usd"] += float(cost)
+                pass  # Defer run counting until after the loop for clarity
 
+    # Recalculate runs_found, successful_runs, and cost by iterating through the actual results_data
+    # This ensures we count based on actual runs, not just defined cases.
+    for model_name in models_found:
+        model_results = results_data.get(model_name, {})
+        analysis["models"][model_name]["runs_found"] = len(
+            model_results
+        )  # Count actual runs found
+        analysis["models"][model_name]["successful_runs"] = 0
+        analysis["models"][model_name]["total_cost_usd"] = 0.0
+        for case_prefix, result_meta in model_results.items():
+            if result_meta is not None:
+                if result_meta.get("success", False):
+                    analysis["models"][model_name]["successful_runs"] += 1
+                cost = result_meta.get("cost_usd", 0.0) or 0.0
+                analysis["models"][model_name]["total_cost_usd"] += float(cost)
+
+    # Calculate overall success rates based on actual runs found
     for model_name, model_stats in analysis["models"].items():
         if model_stats["runs_found"] > 0:
             model_stats["success_rate"] = (
                 model_stats["successful_runs"] / model_stats["runs_found"]
             )
-        for bucket_key, bucket_stats in model_stats["buckets"].items():
-            if bucket_stats["runs_found"] > 0:
-                bucket_stats["success_rate"] = (
-                    bucket_stats["successful_runs"] / bucket_stats["runs_found"]
+        # Bucket rate calculation removed
+
+    # --- Sliding Window Analysis ---
+    # Uses all_cases_info collected above
+    print("Starting sliding window analysis...")
+    max_token_limit = 0
+    try:
+        if benchmark_metadata and "generation_parameters" in benchmark_metadata:
+            gen_params = benchmark_metadata["generation_parameters"]
+            if "buckets_str" in gen_params:
+                buckets_k_str = gen_params["buckets_str"]
+                # Parse the string "0,20,40,..." into a list of integers
+                bucket_boundaries_k = [
+                    int(b.strip()) for b in buckets_k_str.split(",") if b.strip()
+                ]
+                if bucket_boundaries_k:
+                    # Get the max k-token value and convert to actual token count
+                    max_token_limit = max(bucket_boundaries_k) * 1000
+                else:
+                    print("Warning: Parsed bucket boundaries string is empty.")
+            else:
+                print("Warning: 'buckets_str' not found in generation_parameters.")
+        else:
+            print("Warning: 'generation_parameters' not found in benchmark_metadata.")
+    except (ValueError, TypeError, AttributeError) as e:
+        print(f"Error parsing bucket boundaries for sliding window: {e}")
+        max_token_limit = 0  # Ensure it defaults to 0 on error
+
+    if max_token_limit < 5000:
+        print(
+            f"Warning: Max token limit ({max_token_limit}) is less than 5000. Skipping sliding window analysis."
+        )
+        analysis["sliding_window"] = None
+    else:
+        # Define x-axis points (centers of the sliding windows)
+        window_centers = list(range(5000, max_token_limit + 1, 1000))
+        window_radius = 5000
+        analysis["sliding_window"] = {
+            "window_centers_k": [c // 1000 for c in window_centers],
+            "models": {},
+        }
+
+        # Initialize structure for each model
+        for model_name in models_found:
+            analysis["sliding_window"]["models"][model_name] = {
+                center: {
+                    "total": 0,
+                    "successful": 0,
+                    "rate": None,
+                    "wilson_lower": None,
+                    "wilson_upper": None,
+                }
+                for center in window_centers
+            }
+
+        # Iterate through all benchmark cases
+        all_cases_info = []
+        for _bucket_key, cases in defined_buckets.items():
+            all_cases_info.extend(cases)
+
+        print(
+            f"Processing {len(all_cases_info)} total benchmark cases for sliding window..."
+        )
+        for case_info in all_cases_info:
+            benchmark_case_prefix = case_info["benchmark_case_prefix"]
+            prompt_tokens = case_info.get("prompt_tokens")
+
+            if prompt_tokens is None:
+                print(
+                    f"Warning: Missing prompt_tokens for case {benchmark_case_prefix}. Skipping for sliding window."
                 )
+                continue
+
+            for model_name in models_found:
+                result_meta = results_data.get(model_name, {}).get(
+                    benchmark_case_prefix
+                )
+                if result_meta is not None:
+                    is_success = result_meta.get("success", False)
+
+                    # Check which windows this case falls into
+                    for center in window_centers:
+                        if abs(prompt_tokens - center) <= window_radius:
+                            window_stats = analysis["sliding_window"]["models"][
+                                model_name
+                            ][center]
+                            window_stats["total"] += 1
+                            if is_success:
+                                window_stats["successful"] += 1
+
+        # Calculate rates
+        for model_name in models_found:
+            for center in window_centers:
+                window_stats = analysis["sliding_window"]["models"][model_name][center]
+                if window_stats["total"] > 0:
+                    window_stats["rate"] = (
+                        window_stats["successful"] / window_stats["total"]
+                    )
+                    # Calculate Wilson interval
+                    lower, upper = calculate_wilson_interval(
+                        window_stats["successful"], window_stats["total"]
+                    )
+                    window_stats["wilson_lower"] = lower
+                    window_stats["wilson_upper"] = upper
+                else:
+                    # Ensure bounds are None if total is 0
+                    window_stats["wilson_lower"] = None
+                    window_stats["wilson_upper"] = None
+
+        print("Sliding window analysis complete.")
+    # --- End Sliding Window Analysis ---
 
     return analysis
+
+
+# --- Wilson Score Interval Calculation ---
+def calculate_wilson_interval(
+    successes: int, total: int, confidence: float = 0.95
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Calculates the Wilson score interval for a binomial proportion.
+
+    Args:
+        successes: Number of successful outcomes.
+        total: Total number of trials.
+        confidence: The desired confidence level (e.g., 0.95 for 95%).
+
+    Returns:
+        A tuple containing (lower_bound, upper_bound), or (None, None) if total is 0.
+    """
+    if total == 0:
+        return None, None
+
+    # Calculate z-score for the given confidence level (approximation for common levels)
+    # For simplicity, we'll hardcode z for 95% confidence.
+    # For other levels, use: from scipy.stats import norm; z = norm.ppf(1 - (1 - confidence) / 2)
+    if confidence == 0.95:
+        z = 1.96
+    elif confidence == 0.99:
+        z = 2.576
+    elif confidence == 0.90:
+        z = 1.645
+    else:
+        # Fallback or raise error for unsupported confidence levels
+        # Using 95% as default if confidence is not recognized
+        print(
+            f"Warning: Unsupported confidence level {confidence}. Using z=1.96 (95%)."
+        )
+        z = 1.96  # Default to 95%
+
+    p_hat = successes / total
+    z2 = z * z
+    n = total
+
+    center = (p_hat + z2 / (2 * n)) / (1 + z2 / n)
+    margin = (z / (1 + z2 / n)) * math.sqrt(
+        (p_hat * (1 - p_hat) / n) + (z2 / (4 * n * n))
+    )
+
+    lower = center - margin
+    upper = center + margin
+
+    # Ensure bounds are within [0, 1]
+    lower = max(0.0, lower)
+    upper = min(1.0, upper)
+
+    return lower, upper
 
 
 # Plot generation function has been removed in favor of the client-side Chart.js visualization
@@ -518,46 +696,72 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 #         abort(404)
 
 
-@app.route("/api/plot-data")
-def get_plot_data():
-    """Returns the plot data as JSON for the chart."""
+# Removed the entire orphaned get_plot_data function and its route decorator.
+
+
+@app.route("/api/sliding-plot-data")
+def get_sliding_plot_data():
+    """Returns the sliding window plot data as JSON for the chart."""
     analysis_results = current_app.config.get("ANALYSIS_RESULTS")
 
-    if not analysis_results or not analysis_results.get("models"):
-        return {"error": "No analysis results available"}, 404
+    if (
+        not analysis_results
+        or not analysis_results.get("sliding_window")
+        or not analysis_results["sliding_window"].get("models")
+    ):
+        return {"error": "No sliding window analysis results available"}, 404
 
-    # Prepare data for Chart.js format
-    bucket_labels = analysis_results.get("formatted_bucket_keys", [])
+    sliding_data = analysis_results["sliding_window"]
+    # Labels are the window centers in k tokens
+    labels = [f"{k}k" for k in sliding_data.get("window_centers_k", [])]
+    # Removed unused bucket_labels assignment (this comment might be redundant now)
     datasets = []
 
     # Sort models for consistent coloring
-    models = sorted(list(analysis_results["models"].keys()))
+    models = sorted(list(sliding_data["models"].keys()))
+    window_centers = [
+        c * 1000 for c in sliding_data.get("window_centers_k", [])
+    ]  # Get original centers
 
     for model_name in models:
-        model_stats = analysis_results["models"][model_name]
+        model_sliding_stats = sliding_data["models"][model_name]
         success_rates = []
+        wilson_lower_bounds = []  # Initialize list for lower bounds
+        wilson_upper_bounds = []  # Initialize list for upper bounds
+        totals_in_window = []  # Initialize list for total counts
+        successes_in_window = []  # Initialize list for success counts
 
-        for bucket_key in analysis_results["bucket_keys"]:
-            bucket_stats = model_stats["buckets"][bucket_key]
-            rate = (
-                bucket_stats["success_rate"] if bucket_stats["runs_found"] > 0 else None
-            )
-            success_rates.append(rate)
+        for center in window_centers:
+            stats = model_sliding_stats.get(center, {})
+            success_rates.append(stats.get("rate"))  # Append rate (can be None)
+            wilson_lower_bounds.append(stats.get("wilson_lower"))  # Append lower bound
+            wilson_upper_bounds.append(stats.get("wilson_upper"))  # Append upper bound
+            totals_in_window.append(stats.get("total"))  # Append total count
+            successes_in_window.append(stats.get("successful"))  # Append success count
 
-        # Format the cost for the label
-        total_cost = model_stats.get("total_cost_usd", 0.0)
+        # Get overall cost for the label from the main analysis part
+        total_cost = (
+            analysis_results.get("models", {})
+            .get(model_name, {})
+            .get("total_cost_usd", 0.0)
+        )
 
         datasets.append(
             {
                 "label": f"{model_name} (${total_cost:.2f})",
                 "data": success_rates,
+                "wilson_lower": wilson_lower_bounds,  # Add lower bounds to dataset
+                "wilson_upper": wilson_upper_bounds,  # Add upper bounds to dataset
+                "totals": totals_in_window,  # Add total counts to dataset
+                "successes": successes_in_window,  # Add success counts to dataset
                 "borderWidth": 2,
-                "tension": 0.1,  # Slight curve for nicer appearance
+                "tension": 0.1,
                 "fill": False,
+                "spanGaps": True,  # Connect lines even if there are null data points
             }
         )
 
-    return {"labels": bucket_labels, "datasets": datasets}
+    return {"labels": labels, "datasets": datasets}
 
 
 @app.route("/files/<path:filepath>")
