@@ -767,20 +767,21 @@ def _get_latest_run_info(
 
     # Found a latest run, try to get cost
     metadata_path = latest_dir / "metadata.json"
-    cost = 0.0
     if metadata_path.exists():
         try:
             with open(metadata_path, "r", encoding="utf-8") as f:
                 metadata = json.load(f)
             # Get cost, default to 0.0 if key missing or value is None/invalid
             cost = float(metadata.get("cost_usd", 0.0) or 0.0)
+            return latest_dir, cost # Return cost derived from metadata
         except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
             print(
                 f"Warning: Could not read/parse metadata or cost for {latest_dir}: {e}"
             )
-            # cost remains 0.0 as initialized before the try block
-
-    return latest_dir, cost
+            return latest_dir, 0.0 # Return 0.0 cost if metadata parsing failed
+    else:
+        # Metadata file doesn't exist
+        return latest_dir, 0.0 # Return 0.0 cost if no metadata file
 
 
 async def main():
