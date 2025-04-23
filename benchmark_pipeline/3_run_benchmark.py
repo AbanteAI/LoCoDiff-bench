@@ -443,55 +443,6 @@ def find_benchmark_cases(benchmark_dir: str) -> list[str]:
     return sorted(list(prefixes))
 
 
-def get_latest_run_cost(
-    benchmark_case_prefix: str, model_name: str, results_base_dir: Path
-) -> float:
-    """
-    Finds the latest run for a case/model and returns its cost.
-
-    Returns:
-        The cost_usd from the latest run's metadata, or 0.0 if no run exists,
-        metadata is missing/unreadable, or cost is not recorded.
-    """
-    sanitized_model_name = sanitize_filename(model_name)
-    # Use Path object methods for globbing
-    pattern = f"{benchmark_case_prefix}/{sanitized_model_name}/*"
-    potential_dirs = list(results_base_dir.glob(pattern))
-
-    latest_dir: Optional[Path] = None
-    latest_timestamp = ""
-
-    for result_dir in potential_dirs:
-        if not result_dir.is_dir():
-            continue
-        dir_name = result_dir.name
-        # Check if it looks like a timestamp directory and find the latest
-        if re.match(r"\d{8}_\d{6}", dir_name):
-            if dir_name > latest_timestamp:
-                latest_timestamp = dir_name
-                latest_dir = result_dir
-
-    if latest_dir is None:
-        return 0.0  # Not run or no valid timestamp dirs found
-
-    # Found at least one run attempt, try to get cost from the latest
-    metadata_path = latest_dir / "metadata.json"
-    cost = 0.0
-    if metadata_path.exists():
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            # Get cost, default to 0.0 if key missing or value is None/invalid
-            cost = float(metadata.get("cost_usd", 0.0) or 0.0)
-        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
-            print(
-                f"Warning: Could not read/parse metadata or cost for {latest_dir}: {e}"
-            )
-            cost = 0.0  # Treat as 0 cost if metadata is problematic
-
-    return 0.0  # Return 0.0 if no valid run or metadata found
-
-
 def _save_text_file(filepath: Path, content: str):
     """Helper to save text content to a file, creating parent dirs."""
     try:
