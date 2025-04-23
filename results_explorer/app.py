@@ -735,7 +735,9 @@ def get_plot_data():
             }
         )
 
-    # Removed original /api/plot-data endpoint
+# --- Removed Orphaned Function Body ---
+# The body of the old /api/plot-data function was here and has been removed.
+# --- End Removed Orphaned Function Body ---
 
 
 @app.route("/api/sliding-plot-data")
@@ -753,7 +755,7 @@ def get_sliding_plot_data():
     sliding_data = analysis_results["sliding_window"]
     # Labels are the window centers in k tokens
     labels = [f"{k}k" for k in sliding_data.get("window_centers_k", [])]
-    # Removed unused bucket_labels assignment
+    # Removed unused bucket_labels assignment (this comment might be redundant now)
     datasets = []
 
     # Sort models for consistent coloring
