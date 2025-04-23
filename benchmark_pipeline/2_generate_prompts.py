@@ -557,7 +557,6 @@ def assign_prompts_to_buckets(
         buckets[bucket_key] = []  # Initialize empty list for each defined bucket
         bucket_ranges.append(bucket_key)
 
-    # unassigned_count = 0 # Removed as it became unused after changing warning to error
     for stats in stats_list:
         tokens = stats["prompt_tokens"]
         assigned = False
@@ -684,7 +683,6 @@ def copy_selected_files(
     os.makedirs(output_dir, exist_ok=True)
 
     copied_files_count = 0
-    # error_count = 0 # Removed as it became unused after changing warning to error
 
     print(
         f"\n--- Copying {len(kept_prefixes)} Selected Benchmark Files to Final Location ---"
