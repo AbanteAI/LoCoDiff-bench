@@ -3,13 +3,33 @@ import os
 import json
 import glob
 import re
-import subprocess  # Added for running analysis script
-import sys  # Added to get current python executable
-from flask import Flask, render_template, abort, url_for, send_from_directory
+import sys
+from flask import (
+    Flask,
+    render_template,
+    abort,
+    url_for,
+    send_from_directory,
+    current_app,
+)
 from markupsafe import escape
-import shutil
 import webbrowser
 import threading
+from typing import Any, Dict, Optional, Tuple, List
+from collections import defaultdict
+
+# Attempt to import pandas and matplotlib, provide guidance if missing
+try:
+    import pandas as pd  # noqa: F401
+    import matplotlib.pyplot as plt  # noqa: F401
+    import matplotlib.ticker as mticker  # noqa: F401
+except ImportError as e:
+    print(
+        f"Error importing libraries: {e}. Please ensure pandas and matplotlib are installed."
+    )
+    print("You may need to run: pip install pandas matplotlib")
+    sys.exit(1)
+
 
 # --- Configuration ---
 # Assuming the app is run from the root of the repository
@@ -27,11 +47,38 @@ PLOT_STATIC_PATH = os.path.join(STATIC_DIR, PLOT_STATIC_DEST_FILENAME)
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config["BENCHMARK_DIR"] = BENCHMARK_DIR
 app.config["RESULTS_BASE_DIR"] = RESULTS_BASE_DIR
-app.config["STATIC_DIR"] = (
-    STATIC_DIR  # Make static dir accessible in templates if needed
-)
+app.config["STATIC_DIR"] = STATIC_DIR
+# Add plot path to config for easy access in templates/routes
+app.config["PLOT_STATIC_PATH"] = PLOT_STATIC_PATH
+app.config["PLOT_STATIC_DEST_FILENAME"] = PLOT_STATIC_DEST_FILENAME
+# Placeholder for analysis results calculated at startup
+app.config["ANALYSIS_RESULTS"] = None
 
-# --- Helper Functions ---
+
+# --- Helper Functions (Moved from analyze_results.py and app.py) ---
+
+
+def format_bucket_key(key_str: str) -> str:
+    """Formats a bucket key string 'min-max' into 'min/1k-max/1k k'."""
+    try:
+        min_val, max_val = map(int, key_str.split("-"))
+        min_k = min_val // 1000
+        max_k = max_val // 1000
+        return f"{min_k}-{max_k}k"
+    except ValueError:
+        return key_str
+
+
+def load_json_file(filepath: str) -> Optional[Dict[str, Any]]:
+    """Loads a JSON file, returning None on error."""
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Error reading or parsing JSON file {filepath}: {e}")
+        return None
 
 
 def load_benchmark_metadata(benchmark_dir):
@@ -49,8 +96,212 @@ def load_benchmark_metadata(benchmark_dir):
         return None
 
 
+# Removed duplicate definition of load_benchmark_metadata here
+
+
+def scan_results_directory(
+    results_base_dir: str,
+) -> Tuple[List[str], Dict[str, Dict[str, Optional[Dict[str, Any]]]]]:
+    """
+    Scans the results directory to find all models and their latest run metadata for each benchmark case.
+    (Combined logic from find_models_in_results and loading latest metadata)
+    """
+    print(f"Scanning results directory: {results_base_dir}...")
+    latest_runs: Dict[str, Dict[str, Tuple[str, str]]] = defaultdict(
+        lambda: defaultdict(lambda: ("", ""))
+    )
+    models = set()
+
+    pattern = os.path.join(results_base_dir, "*", "*", "*", "metadata.json")
+    metadata_files = glob.glob(pattern)
+
+    for metadata_path in metadata_files:
+        try:
+            parts = metadata_path.split(os.sep)
+            if len(parts) >= 4:
+                timestamp = parts[-2]
+                model_name = parts[-3]
+                benchmark_case_prefix = parts[-4]
+
+                if not re.match(r"\d{8}_\d{6}", timestamp):
+                    continue
+
+                models.add(model_name)
+                current_latest_ts, _ = latest_runs[model_name][benchmark_case_prefix]
+                if timestamp > current_latest_ts:
+                    latest_runs[model_name][benchmark_case_prefix] = (
+                        timestamp,
+                        metadata_path,
+                    )
+        except IndexError:
+            pass  # Ignore paths that don't match expected structure
+
+    results_data: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = defaultdict(dict)
+    for model_name, cases in latest_runs.items():
+        for case_prefix, (_, metadata_path) in cases.items():
+            results_data[model_name][case_prefix] = load_json_file(metadata_path)
+
+    sorted_models = sorted(list(models))
+    print(f"Scan complete. Found {len(sorted_models)} models.")
+    return sorted_models, results_data
+
+
+def analyze_results(
+    benchmark_metadata: dict,
+    models_found: List[str],
+    results_data: Dict[str, Dict[str, Optional[Dict[str, Any]]]],
+) -> dict:
+    """
+    Analyzes benchmark results using pre-scanned data.
+    (Directly from analyze_results.py)
+    """
+    analysis: dict[str, Any] = {"models": {}}
+    all_bucket_keys = sorted(
+        benchmark_metadata.get("benchmark_buckets", {}).keys(),
+        key=lambda k: int(k.split("-")[0]),
+    )
+    analysis["bucket_keys"] = all_bucket_keys
+    analysis["formatted_bucket_keys"] = [
+        format_bucket_key(k) for k in all_bucket_keys
+    ]  # Add formatted keys
+
+    print(f"Analyzing results for models: {models_found}")
+    print(f"Using {len(all_bucket_keys)} buckets defined in benchmark metadata.")
+
+    for model_name in models_found:
+        analysis["models"][model_name] = {
+            "total_benchmarks": 0,
+            "runs_found": 0,
+            "successful_runs": 0,
+            "total_cost_usd": 0.0,
+            "success_rate": 0.0,
+            "buckets": {
+                key: {
+                    "total_in_bucket": 0,
+                    "runs_found": 0,
+                    "successful_runs": 0,
+                    "success_rate": 0.0,
+                }
+                for key in all_bucket_keys
+            },
+        }
+
+    defined_buckets = benchmark_metadata.get("benchmark_buckets", {})
+    if not defined_buckets:
+        print("Warning: No benchmark buckets found in metadata.")
+        return analysis
+
+    for bucket_key, benchmark_cases in defined_buckets.items():
+        for case_info in benchmark_cases:
+            benchmark_case_prefix = case_info["benchmark_case_prefix"]
+
+            for model_name in models_found:
+                analysis["models"][model_name]["total_benchmarks"] += 1
+                analysis["models"][model_name]["buckets"][bucket_key][
+                    "total_in_bucket"
+                ] += 1
+
+                result_meta = results_data.get(model_name, {}).get(
+                    benchmark_case_prefix
+                )
+
+                if result_meta is not None:
+                    analysis["models"][model_name]["runs_found"] += 1
+                    analysis["models"][model_name]["buckets"][bucket_key][
+                        "runs_found"
+                    ] += 1
+
+                    if result_meta.get("success", False):
+                        analysis["models"][model_name]["successful_runs"] += 1
+                        analysis["models"][model_name]["buckets"][bucket_key][
+                            "successful_runs"
+                        ] += 1
+
+                    cost = result_meta.get("cost_usd", 0.0) or 0.0
+                    analysis["models"][model_name]["total_cost_usd"] += float(cost)
+
+    for model_name, model_stats in analysis["models"].items():
+        if model_stats["runs_found"] > 0:
+            model_stats["success_rate"] = (
+                model_stats["successful_runs"] / model_stats["runs_found"]
+            )
+        for bucket_key, bucket_stats in model_stats["buckets"].items():
+            if bucket_stats["runs_found"] > 0:
+                bucket_stats["success_rate"] = (
+                    bucket_stats["successful_runs"] / bucket_stats["runs_found"]
+                )
+
+    return analysis
+
+
+def generate_plot(analysis_results: dict, output_filename: str):
+    """
+    Generates and saves a plot of per-bucket success rates.
+    (Directly from analyze_results.py, saves to specified path)
+    """
+    print(f"\nGenerating plot and saving to {output_filename}...")
+    if not analysis_results or not analysis_results.get("models"):
+        print("No analysis results found to generate plot.")
+        return False  # Indicate failure
+
+    models = sorted(list(analysis_results["models"].keys()))
+    bucket_keys = analysis_results["bucket_keys"]
+    formatted_bucket_labels = analysis_results["formatted_bucket_keys"]
+    x_indices = range(len(bucket_keys))
+
+    plt.figure(figsize=(12, 7))
+
+    for model_name in models:
+        success_rates = []
+        for key in bucket_keys:
+            rate = analysis_results["models"][model_name]["buckets"][key][
+                "success_rate"
+            ]
+            runs_found = analysis_results["models"][model_name]["buckets"][key][
+                "runs_found"
+            ]
+            success_rates.append(rate if runs_found > 0 else float("nan"))
+
+        total_cost = analysis_results["models"][model_name].get("total_cost_usd", 0.0)
+        legend_label = f"{model_name} (${total_cost:.2f})"
+        plt.plot(
+            x_indices, success_rates, marker="o", linestyle="-", label=legend_label
+        )
+
+    plt.title("Benchmark Success Rate per Prompt Token Bucket")
+    plt.xlabel("Prompt Token Bucket (k tk)")
+    plt.ylabel("Success Rate")
+    plt.gca().yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    plt.ylim(0, 1.05)
+    plt.xticks(x_indices, formatted_bucket_labels, rotation=45, ha="right")
+    plt.legend(title="Models", bbox_to_anchor=(1.04, 1), loc="upper left")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout(rect=(0, 0, 0.85, 1))
+
+    output_dir = os.path.dirname(output_filename)
+    if output_dir and not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"Created directory for plot: {output_dir}")
+        except OSError as e:
+            print(f"Error creating directory {output_dir}: {e}")
+            return False  # Indicate failure
+
+    try:
+        plt.savefig(output_filename, dpi=300, bbox_inches="tight")
+        plt.close()  # Close the figure to free memory
+        print(f"Plot saved successfully to {output_filename}")
+        return True  # Indicate success
+    except Exception as e:
+        print(f"Error saving plot to {output_filename}: {e}")
+        plt.close()  # Close the figure even if saving failed
+        return False  # Indicate failure
+
+
 def find_models_in_results(results_base_dir):
     """Finds all unique model names present in the results directory structure."""
+    # This function is now effectively part of scan_results_directory,
+    # but keep it for the model_results route fallback check.
     models = set()
     # Pattern: results_base_dir / * (benchmark_case) / * (model_name) / * (timestamp)
     pattern = os.path.join(results_base_dir, "*", "*")
@@ -188,49 +439,31 @@ def get_run_details(
     return details
 
 
-def copy_plot_to_static():
-    """Copies the benchmark plot to the static directory if it exists."""
-    if not os.path.exists(STATIC_DIR):
-        os.makedirs(STATIC_DIR, exist_ok=True)
-
-    # PLOT_FILENAME now points to the source location (e.g., benchmark_results/...)
-    # PLOT_STATIC_PATH points to the destination in the static folder
-    if os.path.exists(PLOT_FILENAME):
-        try:
-            shutil.copy2(PLOT_FILENAME, PLOT_STATIC_PATH)  # copy2 preserves metadata
-            print(f"Copied plot from {PLOT_FILENAME} to {PLOT_STATIC_PATH}")
-            return True
-        except Exception as e:
-            print(
-                f"Error copying plot file from {PLOT_FILENAME} to {PLOT_STATIC_PATH}: {e}"
-            )
-            return False
-    else:
-        print(
-            f"Warning: Source plot file {PLOT_FILENAME} not found. Cannot copy to static dir."
-        )
-        # Check if the destination plot already exists in static dir from a previous run
-        return os.path.exists(PLOT_STATIC_PATH)
-
-
 # --- Routes ---
 
 
 @app.route("/")
 def index():
     """Index page: Shows overall summary, models, and plot."""
-    benchmark_metadata = load_benchmark_metadata(app.config["BENCHMARK_DIR"])
-    models = find_models_in_results(app.config["RESULTS_BASE_DIR"])
-    plot_exists = copy_plot_to_static()  # Ensure plot is in static dir for serving
-    # Use the destination filename for the URL
-    plot_url = (
-        url_for("static", filename=PLOT_STATIC_DEST_FILENAME) if plot_exists else None
+    benchmark_metadata = load_benchmark_metadata(current_app.config["BENCHMARK_DIR"])
+    # Retrieve pre-calculated analysis results and models found
+    analysis_results = current_app.config.get("ANALYSIS_RESULTS")
+    models = (
+        sorted(list(analysis_results["models"].keys()))
+        if analysis_results and analysis_results.get("models")
+        else []
     )
 
-    # Basic stats (can be expanded)
+    plot_exists = os.path.exists(current_app.config["PLOT_STATIC_PATH"])
+    plot_url = (
+        url_for("static", filename=current_app.config["PLOT_STATIC_DEST_FILENAME"])
+        if plot_exists
+        else None
+    )
+
     total_cases = 0
     if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
-        for bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
+        for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
             total_cases += len(cases)
 
     return render_template(
@@ -238,35 +471,42 @@ def index():
         models=models,
         total_cases=total_cases,
         plot_url=plot_url,
-        benchmark_metadata=benchmark_metadata,  # Pass metadata for potential display
+        benchmark_metadata=benchmark_metadata,
+        analysis_results=analysis_results,  # Pass full analysis results
     )
 
 
 @app.route("/model/<path:model_name>")
 def model_results(model_name):
     """Shows results for a specific model, grouped by bucket."""
-    # model_name might have been sanitized (e.g., openai/gpt-4o -> openai_gpt-4o)
-    # We need to find runs using the name found in the filesystem.
-    # The find_models_in_results should return the filesystem name.
-    safe_model_name = escape(model_name)  # Escape for display
+    safe_model_name = escape(model_name)
+    benchmark_metadata = load_benchmark_metadata(current_app.config["BENCHMARK_DIR"])
+    all_runs = find_runs_for_model(model_name, current_app.config["RESULTS_BASE_DIR"])
 
-    benchmark_metadata = load_benchmark_metadata(app.config["BENCHMARK_DIR"])
-    all_runs = find_runs_for_model(
-        model_name, app.config["RESULTS_BASE_DIR"]
-    )  # Use original name for searching
-
-    if not all_runs and not any(
-        m == model_name for m in find_models_in_results(app.config["RESULTS_BASE_DIR"])
-    ):
-        abort(404, description=f"Model '{safe_model_name}' not found in results.")
+    # Check if model exists based on analysis results (more reliable than scanning again)
+    analysis_results = current_app.config.get("ANALYSIS_RESULTS")
+    if not analysis_results or model_name not in analysis_results.get("models", {}):
+        # Check filesystem as fallback if analysis hasn't run or failed
+        if not any(
+            m == model_name
+            for m in find_models_in_results(current_app.config["RESULTS_BASE_DIR"])
+        ):
+            abort(404, description=f"Model '{safe_model_name}' not found in results.")
 
     runs_by_bucket = {}
     if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
-        # Initialize buckets based on metadata
-        for bucket_key in benchmark_metadata["benchmark_buckets"]:
+        # Use bucket keys from analysis results if available, otherwise from metadata
+        bucket_keys = (
+            analysis_results.get("bucket_keys")
+            if analysis_results
+            else sorted(
+                benchmark_metadata["benchmark_buckets"].keys(),
+                key=lambda k: int(k.split("-")[0]),
+            )
+        )
+        for bucket_key in bucket_keys:
             runs_by_bucket[bucket_key] = []
 
-        # Assign runs to buckets
         case_to_bucket = {}
         for bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
             for case_info in cases:
@@ -274,35 +514,34 @@ def model_results(model_name):
 
         for run in all_runs:
             bucket_key = case_to_bucket.get(run["benchmark_case_prefix"])
-            if bucket_key:
-                if bucket_key not in runs_by_bucket:
-                    runs_by_bucket[
-                        bucket_key
-                    ] = []  # Should exist from init, but safety check
+            if bucket_key and bucket_key in runs_by_bucket:
                 runs_by_bucket[bucket_key].append(run)
             else:
-                # Handle runs for cases not found in current metadata?
                 if "unknown" not in runs_by_bucket:
                     runs_by_bucket["unknown"] = []
                 runs_by_bucket["unknown"].append(run)
 
-        # Sort buckets numerically by lower bound for display
-        sorted_bucket_keys = sorted(
-            runs_by_bucket.keys(),
-            key=lambda k: int(k.split("-")[0]) if k != "unknown" else float("inf"),
-        )
-        sorted_runs_by_bucket = {k: runs_by_bucket[k] for k in sorted_bucket_keys}
+        # Use the sorted keys for the final dict to maintain order
+        sorted_runs_by_bucket = {
+            k: runs_by_bucket[k] for k in bucket_keys if k in runs_by_bucket
+        }
+        if "unknown" in runs_by_bucket:
+            sorted_runs_by_bucket["unknown"] = runs_by_bucket["unknown"]
 
     else:
-        # If no metadata, just list all runs without bucketing
         sorted_runs_by_bucket = {"all_runs": all_runs}
 
     return render_template(
         "model_results.html",
-        model_name=safe_model_name,  # Display escaped name
-        original_model_name=model_name,  # Pass original name for link generation
+        model_name=safe_model_name,
+        original_model_name=model_name,
         runs_by_bucket=sorted_runs_by_bucket,
-        benchmark_metadata=benchmark_metadata,  # Pass metadata for context
+        benchmark_metadata=benchmark_metadata,
+        # Pass formatted bucket keys from analysis if available
+        formatted_bucket_keys=analysis_results.get("formatted_bucket_keys")
+        if analysis_results
+        else None,
+        bucket_keys=analysis_results.get("bucket_keys") if analysis_results else None,
     )
 
 
@@ -438,69 +677,71 @@ def open_browser(host, port):
     webbrowser.open_new_tab(f"http://{url_host}:{port}")
 
 
+# --- Analysis and Plotting Execution (at startup) ---
+
+
+def run_analysis_and_plotting():
+    """Performs analysis and generates plot, storing results in app.config."""
+    # Imports are now at top level
+
+    # Use app context to access config
+    with app.app_context():
+        print("\n--- Running Analysis and Plotting ---")
+        benchmark_metadata = load_benchmark_metadata(
+            current_app.config["BENCHMARK_DIR"]
+        )
+        if not benchmark_metadata:
+            print(
+                "Error: Benchmark metadata not found. Cannot perform analysis.",
+                file=sys.stderr,
+            )
+            current_app.config["ANALYSIS_RESULTS"] = None  # Ensure it's None
+            return
+
+        models_found, results_data = scan_results_directory(
+            current_app.config["RESULTS_BASE_DIR"]
+        )
+        if not models_found:
+            print(
+                "Warning: No models found in results directory. Analysis will be empty."
+            )
+            # Store empty structure
+            current_app.config["ANALYSIS_RESULTS"] = {
+                "models": {},
+                "bucket_keys": [],
+                "formatted_bucket_keys": [],
+            }
+            # Attempt to generate an empty plot? Or just skip? Skip for now.
+            print("Skipping plot generation as no models were found.")
+            return
+
+        analysis_results = analyze_results(
+            benchmark_metadata, models_found, results_data
+        )
+        current_app.config["ANALYSIS_RESULTS"] = analysis_results  # Store results
+
+        # Generate plot directly into static directory
+        plot_output_path = current_app.config["PLOT_STATIC_PATH"]
+        generate_plot(analysis_results, plot_output_path)
+
+        print("--- Finished Analysis and Plotting ---\n")
+
+
 if __name__ == "__main__":
     # Configuration for running directly
-    HOST = "127.0.0.1"  # Default to localhost for security unless specified
+    HOST = "127.0.0.1"
     PORT = 5001
-    DEBUG = True
+    DEBUG = True  # Flask debug mode
 
-    # --- Run Analysis Script ---
-    print("\n--- Running analyze_results.py to update plot ---")
-    # Define path before try block to ensure it's bound in except blocks
-    analysis_script_path = os.path.join(
-        "results_explorer", "analyze_results.py"
-    )  # Updated path
-    try:
-        # Run the script using the python executable from the current environment
-        # Pass necessary arguments if defaults are not sufficient (using defaults here)
-        # Capture output and errors
-        analysis_process = subprocess.run(
-            [sys.executable, analysis_script_path],  # Use updated path
-            check=False,  # Don't throw exception on non-zero exit code
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-        # Print stdout and stderr
-        if analysis_process.stdout:
-            print("Analysis Script Output:\n", analysis_process.stdout)
-        if analysis_process.stderr:
-            print(
-                "Analysis Script Error Output:\n",
-                analysis_process.stderr,
-                file=sys.stderr,
-            )
-
-        if analysis_process.returncode != 0:
-            print(
-                f"Warning: analyze_results.py exited with code {analysis_process.returncode}",
-                file=sys.stderr,
-            )
-        else:
-            print("analyze_results.py completed successfully.")
-
-    except FileNotFoundError:
-        print(
-            f"Error: Analysis script not found at '{analysis_script_path}'. Make sure you are in the repository root.",  # Updated error message
-            file=sys.stderr,
-        )
-    except Exception as e:
-        print(
-            f"Error running analysis script '{analysis_script_path}': {e}",
-            file=sys.stderr,
-        )  # Updated error message
-    print("--- Finished running analyze_results.py ---\n")
-
-    # Ensure plot is available in static dir after potentially running analysis
-    copy_plot_to_static()
+    # Run analysis and plotting before starting the server
+    # This happens only once when the main process starts (not in reloader subprocess)
+    if not DEBUG or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        run_analysis_and_plotting()
 
     # Open browser tab shortly after starting the server
-    # Use a timer to avoid race condition where browser opens before server is ready
-    # Check WERKZEUG_RUN_MAIN to prevent the reloader from opening a second tab
-    if DEBUG and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-        threading.Timer(1, lambda: open_browser(HOST, PORT)).start()
+    if not DEBUG or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        # Delay slightly to ensure server is likely up
+        threading.Timer(1.5, lambda: open_browser(HOST, PORT)).start()
 
     # Run the Flask app
-    # Note: Running with host='0.0.0.0' makes it accessible on the network
-    # Change HOST above if network access is desired by default when running directly.
     app.run(debug=DEBUG, host=HOST, port=PORT)
