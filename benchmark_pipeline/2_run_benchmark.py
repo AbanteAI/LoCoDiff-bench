@@ -710,12 +710,12 @@ async def run_benchmark_case(
                     run_results["success"] = True
                     run_attempt_counter["success"] += 1
                 else:
-                    # Create a unified diff using the *original* expected content
-                    # (before stripping) to show the actual difference, even if it's just whitespace.
+                    # Create a unified diff using the *stripped* expected content
+                    # to align the diff with the success/failure logic.
                     diff_lines = difflib.unified_diff(
-                        expected_content.splitlines(
+                        expected_content_stripped.splitlines(
                             keepends=True
-                        ),  # Use original for diff
+                        ),  # Use stripped for diff
                         extracted_content.splitlines(keepends=True),
                         fromfile="expected_output.txt",
                         tofile="model_output.txt",
