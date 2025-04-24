@@ -2,10 +2,10 @@
 import os
 import json
 import glob
-import argparse  # Added import
+import argparse
 import re
 import sys
-import math  # Added for Wilson score calculation
+import math
 from flask import (
     Flask,
     render_template,
@@ -19,7 +19,6 @@ import threading
 from typing import Any, Dict, Optional, Tuple, List
 from collections import defaultdict
 
-# pandas is still useful for analysis but we no longer need matplotlib
 try:
     import pandas as pd  # noqa: F401
 except ImportError as e:
@@ -95,7 +94,7 @@ def load_benchmark_metadata(prompts_dir: str):
 
 
 def scan_results_directory(
-    results_dir: str,  # Changed from results_base_dir
+    results_dir: str,
 ) -> Tuple[List[str], Dict[str, Dict[str, Optional[Dict[str, Any]]]]]:
     """
     Scans the results subdirectory to find all models and their latest run metadata for each benchmark case.
@@ -421,10 +420,7 @@ def calculate_wilson_interval(
     return lower, upper
 
 
-# Plot generation function has been removed in favor of the client-side Chart.js visualization
-
-
-def find_models_in_results(results_dir: str):  # Changed from results_base_dir
+def find_models_in_results(results_dir: str):
     """
     Finds all unique model names present in the results subdirectory structure.
 
@@ -501,9 +497,9 @@ def get_run_details(
     benchmark_case_prefix: str,
     model_name: str,
     timestamp: str,
-    prompts_dir: str,  # Changed from benchmark_dir
-    results_dir: str,  # Changed from results_base_dir
-    benchmark_run_dir: Optional[str] = None,  # Added benchmark_run_dir parameter
+    prompts_dir: str,
+    results_dir: str,
+    benchmark_run_dir: Optional[str] = None,
 ):
     """
     Loads all details for a specific run, accessing files from prompts and results subdirectories.

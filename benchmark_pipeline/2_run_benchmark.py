@@ -526,7 +526,7 @@ def _save_text_file(filepath: Path, content: str):
 async def run_single_benchmark(
     benchmark_case_prefix: str,
     model: str,
-    prompts_dir: Path,  # Changed from benchmark_dir
+    prompts_dir: Path,
     results_base_dir: Path,
     semaphore: asyncio.Semaphore,
 ) -> Dict[str, Any]:
@@ -546,10 +546,8 @@ async def run_single_benchmark(
     async with semaphore:
         prompt_filename = f"{benchmark_case_prefix}_prompt.txt"
         expected_filename = f"{benchmark_case_prefix}_expectedoutput.txt"
-        prompt_filepath = prompts_dir / prompt_filename  # Changed from benchmark_dir
-        expected_filepath = (
-            prompts_dir / expected_filename
-        )  # Changed from benchmark_dir
+        prompt_filepath = prompts_dir / prompt_filename
+        expected_filepath = prompts_dir / expected_filename
 
         print(f"Starting benchmark: {benchmark_case_prefix} with model {model}")
 
@@ -557,7 +555,7 @@ async def run_single_benchmark(
         run_metadata: Dict[str, Any] = {
             "model": model,
             "benchmark_case": benchmark_case_prefix,
-            "prompts_dir": str(prompts_dir),  # Changed from benchmark_dir
+            "prompts_dir": str(prompts_dir),
             "prompt_file": str(prompt_filepath),
             "expected_file": str(expected_filepath),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -822,7 +820,6 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Run benchmark cases against a model using OpenRouter, using a unified benchmark run directory."
     )
-    # Removed default paths for benchmark/results dirs
 
     parser.add_argument(
         "--model",
@@ -835,7 +832,6 @@ async def main():
         required=True,
         help="Path to the directory containing the benchmark run data (subdirectories: 'prompts/', 'results/').",
     )
-    # Removed --benchmark-dir and --results-dir arguments
     parser.add_argument(
         "--num-runs",
         type=int,
