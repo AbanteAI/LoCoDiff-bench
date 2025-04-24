@@ -696,19 +696,26 @@ async def run_benchmark_case(
             run_results["extracted_path"] = extracted_path
             run_results["extraction_successful"] = True
 
-            # 3. Compare extracted to expected
+            # 3. Compare extracted to expected (stripping both for consistency)
             diff_path = os.path.join(run_dir, "output.diff")
+            # extracted_content is already stripped by extract_code_from_backticks
+            # Strip expected_content here to handle potential trailing newlines/whitespace
+            # from the original file that might cause false negatives.
+            expected_content_stripped = expected_content.strip()
             with open(diff_path, "w", encoding="utf-8") as f:
-                if extracted_content == expected_content:
+                if extracted_content == expected_content_stripped:
                     f.write(
                         "No differences found. Output matches expected content exactly.\n"
                     )
                     run_results["success"] = True
                     run_attempt_counter["success"] += 1
                 else:
-                    # Create a unified diff
+                    # Create a unified diff using the *original* expected content
+                    # (before stripping) to show the actual difference, even if it's just whitespace.
                     diff_lines = difflib.unified_diff(
-                        expected_content.splitlines(keepends=True),
+                        expected_content.splitlines(
+                            keepends=True
+                        ),  # Use original for diff
                         extracted_content.splitlines(keepends=True),
                         fromfile="expected_output.txt",
                         tofile="model_output.txt",
