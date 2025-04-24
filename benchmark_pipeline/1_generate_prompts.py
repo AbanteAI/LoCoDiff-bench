@@ -434,7 +434,7 @@ def generate_prompts_and_expected(
     print(f"Repository at commit: {head_commit_hash}")
 
     # --- Collect Files ---
-    print("Collecting files matching extensions...")
+    print('Collecting files matching extensions...')
     for root, _, files in os.walk(repo_path):
         if ".git" in root.split(os.sep):
             continue
