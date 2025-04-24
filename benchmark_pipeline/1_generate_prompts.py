@@ -1092,21 +1092,20 @@ def main():
             if not basename.endswith(prompt_suffix):
                 continue  # Should not happen with glob pattern
 
-            # Attempt to extract original extension from filename
-            # Example: myorg_myrepo_src_utils_helpers_py_prompt.txt -> _py -> .py
-            base_no_suffix = basename[: -len(prompt_suffix)]
-            parts = base_no_suffix.split("_")
+            # Attempt to extract original extension from filename based on the generation format:
+            # {org}_{repo}_{path_with_underscores}_{ext_part}_prompt.txt
+            base_no_suffix = basename[:-len(prompt_suffix)]
             inferred_ext = ""
-            # Look for a part that could be an extension (simple heuristic)
-            for part in reversed(parts):
-                # Check if part looks like a file extension (e.g., 'py', 'js', 'jsx', 'ts', 'tsx', 'zig')
-                # This heuristic might need refinement for less common or multi-part extensions
-                if 1 < len(part) < 7:
-                    potential_ext = "." + part
-                    # Check if this potential extension is actually defined in our config
+            if '_' in base_no_suffix:
+                # Split from the right at the last underscore
+                prefix, ext_part = base_no_suffix.rsplit('_', 1)
+                # Check if the part after the last underscore looks like a plausible extension part
+                # (e.g., not empty, reasonable length - adjust heuristic if needed)
+                if ext_part and len(ext_part) < 7:
+                    potential_ext = "." + ext_part
+                    # Check if this potential extension is defined in our config
                     if potential_ext in ext_to_lang:
                         inferred_ext = potential_ext
-                        break  # Found a likely match
 
             lang_found = ext_to_lang.get(inferred_ext)
             if lang_found:
