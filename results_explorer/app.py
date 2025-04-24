@@ -159,19 +159,20 @@ def analyze_results(
             # "buckets" structure removed
         }
 
-    defined_buckets = benchmark_metadata.get("benchmark_buckets", {})
-    if not defined_buckets:
-        print(
-            "Warning: No benchmark buckets found in metadata. Cannot perform analysis."
-        )
-        # If no buckets, we can't get case info for sliding window either
+    # Get benchmark cases from the flattened structure
+    benchmark_cases = benchmark_metadata.get("benchmark_cases", [])
+
+    if not benchmark_cases:
+        print("Warning: No benchmark cases found in metadata. Cannot perform analysis.")
+        # If no cases, we can't get case info for sliding window either
         analysis["sliding_window"] = None  # Ensure sliding window is None
         return analysis  # Return early
 
-    # Iterate through cases primarily to get overall stats and case list for sliding window
-    all_cases_info = []
-    for _bucket_key, benchmark_cases in defined_buckets.items():
-        all_cases_info.extend(benchmark_cases)  # Collect all case info
+    # Use the benchmark_cases list we've already extracted (directly or from buckets)
+    # No need to iterate through buckets again
+    all_cases_info = (
+        benchmark_cases  # This was already populated to handle both formats
+    )
 
     print(f"Found {len(all_cases_info)} total benchmark cases defined in metadata.")
 
@@ -284,14 +285,13 @@ def analyze_results(
                 for center in window_centers
             }
 
-        # Iterate through all benchmark cases
-        all_cases_info = []
-        for _bucket_key, cases in defined_buckets.items():
-            all_cases_info.extend(cases)
+        # Use benchmark_cases that was already populated earlier
+        # No need to re-collect cases from buckets
 
         print(
-            f"Processing {len(all_cases_info)} total benchmark cases for sliding window..."
+            f"Processing {len(benchmark_cases)} total benchmark cases for sliding window..."
         )
+        all_cases_info = benchmark_cases  # Reuse the list we already created
         for case_info in all_cases_info:
             benchmark_case_prefix = case_info["benchmark_case_prefix"]
             prompt_tokens = case_info.get("prompt_tokens")
@@ -558,9 +558,8 @@ def index():
     )
 
     total_cases = 0
-    if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
-        for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-            total_cases += len(cases)
+    if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
+        total_cases = len(benchmark_metadata["benchmark_cases"])
 
     return render_template(
         "index.html",
@@ -588,59 +587,36 @@ def model_results(model_name):
         ):
             abort(404, description=f"Model '{safe_model_name}' not found in results.")
 
-    runs_by_bucket = {}
-    if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
-        # Use bucket keys from analysis results if available, otherwise from metadata
-        bucket_keys = None
-        if analysis_results:
-            bucket_keys = analysis_results.get("bucket_keys")
-
-        # If bucket_keys is None (not set in analysis_results or analysis_results is None),
-        # fall back to sorting the bucket keys from benchmark_metadata
-        if bucket_keys is None:
-            bucket_keys = sorted(
-                benchmark_metadata["benchmark_buckets"].keys(),
-                key=lambda k: int(k.split("-")[0]),
+    # Create a dictionary to map benchmark case prefixes to their prompt tokens
+    case_prompt_tokens = {}
+    if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
+        # Build mapping from benchmark case prefix to prompt tokens
+        for case_info in benchmark_metadata["benchmark_cases"]:
+            case_prompt_tokens[case_info["benchmark_case_prefix"]] = case_info.get(
+                "prompt_tokens", 0
             )
 
-        for bucket_key in bucket_keys:
-            runs_by_bucket[bucket_key] = []
+    # Assign prompt tokens to runs based on their case prefix (or from run metadata if available)
+    for run in all_runs:
+        # First try to get tokens from the run's metadata
+        if run.get("metadata") and run["metadata"].get("prompt_tokens") is not None:
+            run["prompt_tokens"] = run["metadata"]["prompt_tokens"]
+        # Otherwise, look it up from the benchmark cases
+        elif run["benchmark_case_prefix"] in case_prompt_tokens:
+            run["prompt_tokens"] = case_prompt_tokens[run["benchmark_case_prefix"]]
+        # If not found anywhere, default to 0
+        else:
+            run["prompt_tokens"] = 0
 
-        case_to_bucket = {}
-        for bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-            for case_info in cases:
-                case_to_bucket[case_info["benchmark_case_prefix"]] = bucket_key
-
-        for run in all_runs:
-            bucket_key = case_to_bucket.get(run["benchmark_case_prefix"])
-            if bucket_key and bucket_key in runs_by_bucket:
-                runs_by_bucket[bucket_key].append(run)
-            else:
-                if "unknown" not in runs_by_bucket:
-                    runs_by_bucket["unknown"] = []
-                runs_by_bucket["unknown"].append(run)
-
-        # Use the sorted keys for the final dict to maintain order
-        sorted_runs_by_bucket = {
-            k: runs_by_bucket[k] for k in bucket_keys if k in runs_by_bucket
-        }
-        if "unknown" in runs_by_bucket:
-            sorted_runs_by_bucket["unknown"] = runs_by_bucket["unknown"]
-
-    else:
-        sorted_runs_by_bucket = {"all_runs": all_runs}
+    # Sort all runs by prompt token count (ascending order)
+    sorted_runs = sorted(all_runs, key=lambda run: run["prompt_tokens"])
 
     return render_template(
         "model_results.html",
         model_name=safe_model_name,
         original_model_name=model_name,
-        runs_by_bucket=sorted_runs_by_bucket,
+        runs=sorted_runs,
         benchmark_metadata=benchmark_metadata,
-        # Pass formatted bucket keys from analysis if available
-        formatted_bucket_keys=analysis_results.get("formatted_bucket_keys")
-        if analysis_results
-        else None,
-        bucket_keys=analysis_results.get("bucket_keys") if analysis_results else None,
     )
 
 
