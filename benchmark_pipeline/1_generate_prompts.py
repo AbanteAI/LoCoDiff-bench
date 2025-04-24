@@ -547,35 +547,10 @@ def print_stats_summary(stats_list: List[Dict[str, Any]], title: str):
         return
 
     count = len(stats_list)
-    # Remove unused variable assignments to fix ruff errors
-    # prompt_tokens = [s["prompt_tokens"] for s in stats_list]
-    # expected_tokens = [s["expected_tokens"] for s in stats_list]
-    # num_commits = [s["num_commits"] for s in stats_list]
-    # lines_added = [s["lines_added"] for s in stats_list]
-    # lines_deleted = [s["lines_deleted"] for s in stats_list]
-    # final_lines = [s["final_lines"] for s in stats_list]
+    # Unused variable assignments removed to fix ruff errors and per review feedback
 
     print(f"\n--- {title} (Count: {count}) ---")
-    # Reduced verbosity: Removed detailed stats printing below
-    # if count > 0:
-    #     print(
-    #         f"  Prompt Tokens:  Min={min(prompt_tokens)}, Max={max(prompt_tokens)}, Avg={mean(prompt_tokens):.0f}, Median={median(prompt_tokens):.0f}, StdDev={stdev(prompt_tokens) if count > 1 else 0:.0f}"
-    #     )
-    #     print(
-    #         f"  Expected Tokens: Min={min(expected_tokens)}, Max={max(expected_tokens)}, Avg={mean(expected_tokens):.0f}, Median={median(expected_tokens):.0f}, StdDev={stdev(expected_tokens) if count > 1 else 0:.0f}"
-    #     )
-    #     print(
-    #         f"  Num Commits:    Min={min(num_commits)}, Max={max(num_commits)}, Avg={mean(num_commits):.1f}, Median={median(num_commits):.1f}"
-    #     )
-    #     print(
-    #         f"  Lines Added:    Min={min(lines_added)}, Max={max(lines_added)}, Avg={mean(lines_added):.0f}, Median={median(lines_added):.0f}"
-    #     )
-    #     print(
-    #         f"  Lines Deleted:  Min={min(lines_deleted)}, Max={max(lines_deleted)}, Avg={mean(lines_deleted):.0f}, Median={median(lines_deleted):.0f}"
-    #     )
-    #     print( # Also comment out Final Lines stats
-    #         f"  Final Lines:    Min={min(final_lines)}, Max={max(final_lines)}, Avg={mean(final_lines):.0f}, Median={median(final_lines):.0f}"
-    #     )
+    # Reduced verbosity: Removed detailed stats printing below per review feedback
 
 
 def filter_prompts_by_token_range(
