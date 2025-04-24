@@ -1096,21 +1096,34 @@ def main():
             # {org}_{repo}_{path_with_underscores}_{ext_part}_prompt.txt
             base_no_suffix = basename[: -len(prompt_suffix)]
             inferred_ext = ""
+            potential_ext = ""  # Initialize potential_ext for debug print
             if "_" in base_no_suffix:
                 # Split from the right at the last underscore
                 prefix, ext_part = base_no_suffix.rsplit("_", 1)
                 # Check if the part after the last underscore looks like a plausible extension part
                 # (e.g., not empty, reasonable length - adjust heuristic if needed)
                 if ext_part and len(ext_part) < 7:
-                    potential_ext = "." + ext_part
+                    potential_ext = "." + ext_part  # Assign potential_ext here
                     # Check if this potential extension is defined in our config
                     if potential_ext in ext_to_lang:
                         inferred_ext = potential_ext
 
+            # --- DEBUGGING ---
+            print(
+                f"  DEBUG: basename='{basename}', potential_ext='{potential_ext}'",
+                end="",
+            )
+            # --- END DEBUGGING ---
             lang_found = ext_to_lang.get(inferred_ext)
             if lang_found:
+                # --- DEBUGGING ---
+                print(f", lang_found='{lang_found}'")
+                # --- END DEBUGGING ---
                 lang_counts[lang_found] += 1
             else:
+                # --- DEBUGGING ---
+                print(", lang_found=None")
+                # --- END DEBUGGING ---
                 # This case means the inferred extension wasn't in our config map
                 # Or we couldn't infer an extension reliably from the filename parts
                 unknown_ext_count += 1
