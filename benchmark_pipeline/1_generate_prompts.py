@@ -547,12 +547,13 @@ def print_stats_summary(stats_list: List[Dict[str, Any]], title: str):
         return
 
     count = len(stats_list)
-    prompt_tokens = [s["prompt_tokens"] for s in stats_list]
-    expected_tokens = [s["expected_tokens"] for s in stats_list]
-    num_commits = [s["num_commits"] for s in stats_list]
-    lines_added = [s["lines_added"] for s in stats_list]
-    lines_deleted = [s["lines_deleted"] for s in stats_list]
-    final_lines = [s["final_lines"] for s in stats_list]
+    # Remove unused variable assignments to fix ruff errors
+    # prompt_tokens = [s["prompt_tokens"] for s in stats_list]
+    # expected_tokens = [s["expected_tokens"] for s in stats_list]
+    # num_commits = [s["num_commits"] for s in stats_list]
+    # lines_added = [s["lines_added"] for s in stats_list]
+    # lines_deleted = [s["lines_deleted"] for s in stats_list]
+    # final_lines = [s["final_lines"] for s in stats_list]
 
     print(f"\n--- {title} (Count: {count}) ---")
     # Reduced verbosity: Removed detailed stats printing below
