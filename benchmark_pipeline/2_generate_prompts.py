@@ -12,10 +12,10 @@ Purpose:
     2. An expected output file (*_expectedoutput.txt): Contains the exact final
        content of the original file. This serves as the ground truth for scoring.
 
-  The script applies filters based on file modification date and the token count
-  of the expected output. It then buckets the generated prompts based on their
-  token count, samples prompts within each bucket to meet a specified maximum,
-  and saves metadata about the final benchmark set.
+  The script applies filters based on file modification date and the token counts
+  of both the prompt and the expected output. It then samples a specified number
+  of prompts from the filtered set, aiming for a distribution across the allowed
+  token range, and saves metadata about the final benchmark set.
 
 Arguments:
   --extensions, -e (required): List of file extensions to process (e.g., '.py' '.js').
@@ -23,12 +23,13 @@ Arguments:
                           (default: 'cached-repos').
   --output-dir (optional): Directory to save generated prompt/expected files
                            (default: 'generated_prompts').
-  --buckets (optional): Comma-separated list of bucket boundaries in thousands
-                        of prompt tokens (e.g., "0,20,40,80,100"). Defines the
-                        token ranges for grouping prompts. (default: "0,20,40,60,80,100").
-                        The highest value also acts as a maximum token filter.
-  --max-per-bucket (optional): Maximum number of prompts to keep per bucket after
-                               sampling (default: 10).
+  --min-prompt-tokens (optional): Minimum number of tokens (in thousands, e.g., 0)
+                                  allowed in the generated prompt file (default: 0).
+  --max-prompt-tokens (optional): Maximum number of tokens (in thousands, e.g., 50)
+                                  allowed in the generated prompt file (default: 50).
+  --add-prompts (optional): The target number of *additional* prompts to generate
+                            and add to the existing set (default: 0). If 0, only
+                            reports existing count and exits.
   --modified-within-months (optional): Only process files last modified within the
                                        specified number of months (default: 3).
                                        Set <= 0 to disable.
@@ -39,7 +40,7 @@ Arguments:
 Inputs:
   - Repositories cloned by `1_clone_repos.py` located in the `cache-dir`
     (default: 'cached-repos/'). Expects standard git repository structure within.
-  - Command-line arguments specifying extensions, directories, and filtering/bucketing parameters.
+  - Command-line arguments specifying extensions, directories, and filtering/sampling parameters.
 
 Outputs:
   - Creates the `output-dir` (default: 'generated_prompts/') if it doesn't exist.
@@ -47,8 +48,8 @@ Outputs:
     - `repo_path_prompt.txt`: Contains the reconstruction prompt (filename format uses repo name and sanitized relative path).
     - `repo_path_expectedoutput.txt`: Contains the ground truth file content (filename format uses repo name and sanitized relative path).
   - Creates `output-dir/metadata.json`: Contains metadata about the generation
-    parameters and the final set of benchmark cases organized by bucket.
-  - Prints statistics about the generation process, filtering, and final bucket distribution to the console.
+    parameters and the final list of benchmark cases.
+  - Prints statistics about the generation process, filtering, and final sampling results to the console.
 
 File Modifications:
   - Creates the `output-dir` if it doesn't exist.
@@ -56,8 +57,8 @@ File Modifications:
   - Creates `*_expectedoutput.txt` files within `output-dir`.
   - Creates or overwrites `metadata.json` within `output-dir`.
   - Deletes prompt/expected file pairs from `output-dir` that are filtered out due
-    to token limits (prompt token > max bucket boundary, or expected token > max_expected_tokens)
-    or removed during the sampling process (`max-per-bucket`).
+    to token limits (prompt token outside min/max range, or expected token > max_expected_tokens)
+    or removed during the sampling process (`num-prompts`).
   - Does *not* modify files within the `cache-dir`.
 """
 
@@ -72,8 +73,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 import tiktoken
-from collections import defaultdict
-from statistics import mean
+from statistics import mean, median, stdev
 import random
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
@@ -117,9 +117,9 @@ class Config:
     cache_dir: str
     output_dir: str
     temp_dir: str  # Added temporary directory
-    buckets_str: str  # Original comma-separated string for metadata
-    bucket_boundaries: List[int]  # Processed list of token boundaries
-    max_per_bucket: int
+    min_prompt_tokens: int
+    max_prompt_tokens: int
+    add_prompts: int  # Renamed from num_prompts
     modified_within_months: int
     max_expected_tokens: int
     encoder: tiktoken.Encoding  # Encoder instance is now required
@@ -436,234 +436,151 @@ def generate_prompts_and_expected(
     return stats_list, date_filtered_count, expected_token_filtered_count
 
 
-# --- Statistics, Filtering, Bucketing, Sampling, and Deletion Functions ---
+# --- Statistics, Filtering, Sampling, and Deletion Functions ---
 
 
-def print_stats_table(stats_list: List[Dict[str, Any]]):
-    """Prints a formatted table of the collected statistics."""
+def print_stats_summary(stats_list: List[Dict[str, Any]], title: str):
+    """Prints a summary of statistics for a list of prompts."""
     if not stats_list:
-        print("No statistics generated.")
+        print(f"\n--- {title} ---")
+        print("No prompts in this set.")
         return
 
-    # Sort by prompt tokens (descending) before printing
-    stats_list.sort(key=lambda x: x["prompt_tokens"], reverse=True)
+    count = len(stats_list)
+    prompt_tokens = [s["prompt_tokens"] for s in stats_list]
+    expected_tokens = [s["expected_tokens"] for s in stats_list]
+    num_commits = [s["num_commits"] for s in stats_list]
+    lines_added = [s["lines_added"] for s in stats_list]
+    lines_deleted = [s["lines_deleted"] for s in stats_list]
+    final_lines = [s["final_lines"] for s in stats_list]
 
-    # Determine column widths dynamically
-    max_len_filename = max(len(s["filename"]) for s in stats_list) if stats_list else 10
-    col_widths = {
-        "filename": max(max_len_filename, 8),  # Min width 8 for "Filename"
-        "prompt_tokens": 13,  # "Prompt Tokens"
-        "expected_tokens": 15,  # "Expected Tokens"
-        "num_commits": 8,  # "Commits"
-        "lines_added": 7,  # "Added"
-        "lines_deleted": 9,  # "Deleted"
-        "final_lines": 11,  # "Final Lines"
-    }
-
-    # Header
-    header = (
-        f"{'Filename':<{col_widths['filename']}} | "
-        f"{'Prompt Tokens':>{col_widths['prompt_tokens']}} | "
-        f"{'Expected Tokens':>{col_widths['expected_tokens']}} | "
-        f"{'Commits':>{col_widths['num_commits']}} | "
-        f"{'Added':>{col_widths['lines_added']}} | "
-        f"{'Deleted':>{col_widths['lines_deleted']}} | "
-        f"{'Final Lines':>{col_widths['final_lines']}}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    # Rows
-    for stats in stats_list:
-        row = (
-            f"{stats['filename']:<{col_widths['filename']}} | "
-            f"{stats['prompt_tokens']:>{col_widths['prompt_tokens']}} | "
-            f"{stats['expected_tokens']:>{col_widths['expected_tokens']}} | "
-            f"{stats['num_commits']:>{col_widths['num_commits']}} | "
-            f"{stats['lines_added']:>{col_widths['lines_added']}} | "
-            f"{stats['lines_deleted']:>{col_widths['lines_deleted']}} | "
-            f"{stats['final_lines']:>{col_widths['final_lines']}}"
+    print(f"\n--- {title} (Count: {count}) ---")
+    if count > 0:
+        print(
+            f"  Prompt Tokens:  Min={min(prompt_tokens)}, Max={max(prompt_tokens)}, Avg={mean(prompt_tokens):.0f}, Median={median(prompt_tokens):.0f}, StdDev={stdev(prompt_tokens) if count > 1 else 0:.0f}"
         )
-        print(row)
+        print(
+            f"  Expected Tokens: Min={min(expected_tokens)}, Max={max(expected_tokens)}, Avg={mean(expected_tokens):.0f}, Median={median(expected_tokens):.0f}, StdDev={stdev(expected_tokens) if count > 1 else 0:.0f}"
+        )
+        print(
+            f"  Num Commits:    Min={min(num_commits)}, Max={max(num_commits)}, Avg={mean(num_commits):.1f}, Median={median(num_commits):.1f}"
+        )
+        print(
+            f"  Lines Added:    Min={min(lines_added)}, Max={max(lines_added)}, Avg={mean(lines_added):.0f}, Median={median(lines_added):.0f}"
+        )
+        print(
+            f"  Lines Deleted:  Min={min(lines_deleted)}, Max={max(lines_deleted)}, Avg={mean(lines_deleted):.0f}, Median={median(lines_deleted):.0f}"
+        )
+        print(
+            f"  Final Lines:    Min={min(final_lines)}, Max={max(final_lines)}, Avg={mean(final_lines):.0f}, Median={median(final_lines):.0f}"
+        )
 
 
-def filter_prompts(
+def filter_prompts_by_token_range(
     stats_list: List[Dict[str, Any]], cfg: Config
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Filters the list of generated prompt statistics based on token limits.
+    Filters the list of generated prompt statistics based on prompt token limits.
 
     Args:
         stats_list: The initial list of statistics for all generated prompts.
-        cfg: The configuration object containing bucket_boundaries.
+        cfg: The configuration object containing min_prompt_tokens and max_prompt_tokens.
 
     Returns:
         A tuple containing:
         - A list of statistics dictionaries for prompts that pass the filter.
         - The count of prompts that were filtered out.
     """
-    bucket_boundaries = cfg.bucket_boundaries
-    if not bucket_boundaries or len(bucket_boundaries) < 2:
-        raise ValueError("Config bucket_boundaries must contain at least two elements.")
-    max_tokens = bucket_boundaries[-1]  # Highest boundary is the max prompt tokens
+    min_tokens = cfg.min_prompt_tokens
+    max_tokens = cfg.max_prompt_tokens
 
-    print(f"\n--- Filtering Prompts (Max Prompt Tokens: {max_tokens}) ---")
+    print(f"\n--- Filtering Prompts (Range: [{min_tokens}, {max_tokens}] Tokens) ---")
     kept_stats = []
     filtered_count = 0
 
     for stats in stats_list:
-        # Filter prompts strictly greater than the max boundary,
-        # or exactly zero if the first boundary is > 0 (meaning 0 is excluded).
-        if stats["prompt_tokens"] > max_tokens or (
-            bucket_boundaries[0] > 0 and stats["prompt_tokens"] == 0
-        ):
+        tokens = stats["prompt_tokens"]
+        if tokens < min_tokens or tokens > max_tokens:
             filtered_count += 1
         else:
-            # Keep prompts within the overall range [min_boundary, max_boundary]
-            # Note: The lower bound check happens implicitly during bucketing.
             kept_stats.append(stats)
 
     print(
-        f"Filtered out {filtered_count} prompts exceeding token limit ({max_tokens}) or below minimum boundary ({bucket_boundaries[0]})."
+        f"Filtered out {filtered_count} prompts outside the token range [{min_tokens}, {max_tokens}]."
     )
     return kept_stats, filtered_count
 
 
-def assign_prompts_to_buckets(
+def sample_prompts(
     stats_list: List[Dict[str, Any]], cfg: Config
-) -> Dict[Tuple[int, int], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Assigns filtered prompt statistics to buckets based on prompt token count.
+    Samples prompts from the filtered list to meet the num_prompts target.
+    Uses targeted sampling to aim for distribution across the token range.
 
     Args:
-        stats_list: List of statistics dictionaries (already filtered).
-        cfg: The configuration object containing bucket_boundaries.
-
-    Returns:
-        A dictionary where keys are bucket range tuples (min_token, max_token)
-        and values are lists of stats dictionaries belonging to that bucket.
-    """
-    bucket_boundaries = cfg.bucket_boundaries
-    max_tokens = bucket_boundaries[-1]
-
-    print("\n--- Assigning Prompts to Buckets ---")
-    buckets = defaultdict(list)
-    # Define bucket ranges and initialize dictionary
-    bucket_ranges = []
-    for i in range(len(bucket_boundaries) - 1):
-        min_tk = bucket_boundaries[i]
-        max_tk = bucket_boundaries[i + 1]
-        bucket_key = (min_tk, max_tk)
-        buckets[bucket_key] = []  # Initialize empty list for each defined bucket
-        bucket_ranges.append(bucket_key)
-
-    for stats in stats_list:
-        tokens = stats["prompt_tokens"]
-        assigned = False
-        for min_tk, max_tk in bucket_ranges:
-            # Check if token count falls within the bucket range [min_tk, max_tk).
-            # Special case: Include 0 tokens if min_tk is 0.
-            # Special case: Include the upper boundary max_tk if it's the very last boundary.
-            is_last_bucket = max_tk == max_tokens
-            in_range = (tokens >= min_tk and tokens < max_tk) or (
-                min_tk == 0 and tokens == 0
-            )
-            # Include the max_tokens value itself in the last bucket
-            if is_last_bucket and tokens == max_tk:
-                in_range = True
-
-            if in_range:
-                buckets[(min_tk, max_tk)].append(stats)
-                assigned = True
-                break
-
-        if not assigned:
-            # This should ideally not happen if filtering and bucketing logic is correct
-            # This should ideally not happen if filtering and bucketing logic is correct
-            raise ValueError(
-                f"Error: Prompt with {tokens} tokens did not fit into any bucket defined by {bucket_boundaries}. Stats: {stats}"
-            )
-            # unassigned_count += 1 # Unreachable after raise
-
-    # if unassigned_count > 0: # Unreachable after raise
-    #     print(f"Warning: {unassigned_count} prompts could not be assigned to a bucket.")
-
-    # Print summary of bucket assignments
-    for bucket_key, items in buckets.items():
-        print(f"  Bucket {bucket_key}: Assigned {len(items)} prompts.")
-
-    return buckets
-
-
-def sample_prompts_from_buckets(
-    buckets: Dict[Tuple[int, int], List[Dict[str, Any]]], cfg: Config
-) -> Tuple[Dict[Tuple[int, int], List[Dict[str, Any]]], int]:
-    """
-    Samples prompts within each bucket to meet the max_per_bucket limit.
-
-    Args:
-        buckets: Dictionary mapping bucket ranges to lists of prompt stats.
-        cfg: The configuration object containing max_per_bucket.
+        stats_list: List of statistics dictionaries (already filtered by token range).
+        cfg: The configuration object containing add_prompts, min_prompt_tokens, max_prompt_tokens.
 
     Returns:
         A tuple containing:
-        - A dictionary containing the final sampled buckets.
+        - A list containing the final sampled prompt statistics.
         - The total number of prompts sampled out (discarded).
     """
-    print(f"\n--- Sampling Buckets (Max per Bucket: {cfg.max_per_bucket}) ---")
-    final_sampled_buckets = {}
-    total_sampled_out = 0
+    num_to_add = cfg.add_prompts  # Use add_prompts from config
+    min_tk = cfg.min_prompt_tokens
+    max_tk = cfg.max_prompt_tokens
 
-    # Iterate through the buckets, ensuring consistent order for logging
-    sorted_bucket_keys = sorted(buckets.keys(), key=lambda x: x[0])
+    print(
+        f"\n--- Sampling Prompts to Add (Target: {num_to_add}, Range: [{min_tk}, {max_tk}]) ---"
+    )
 
-    for bucket_key in sorted_bucket_keys:
-        items = buckets[bucket_key]
-        if len(items) > cfg.max_per_bucket:
-            # --- Targeted Sampling Logic ---
-            # This logic aims to select prompts that are somewhat evenly distributed
-            # within the token range of the bucket, rather than purely random selection.
-            min_tk, max_tk = bucket_key
-            items_to_keep = []
-            available_items = list(items)  # Create a mutable copy
+    if not stats_list:
+        print("No new candidate prompts available to sample from.")
+        return [], 0
 
-            for _ in range(cfg.max_per_bucket):
-                if not available_items:
-                    break  # Should not happen if len(items) > max_per_bucket initially
+    if len(stats_list) <= num_to_add:
+        print(
+            f"Number of available new prompts ({len(stats_list)}) is less than or equal to target ({num_to_add}). Keeping all available."
+        )
+        # Return the available stats, 0 sampled out
+        return stats_list, 0
 
-                # 1. Choose a random target token count within the bucket's range.
-                target_token_count = random.uniform(min_tk, max_tk)
+    # --- Targeted Sampling Logic ---
+    items_to_keep = []
+    available_items = list(stats_list)  # Create a mutable copy
+    # Sample exactly num_to_add items
+    num_to_sample = num_to_add
 
-                # 2. Find the available prompt that is closest to this target token count.
-                closest_item = min(
-                    available_items,
-                    key=lambda item: abs(item["prompt_tokens"] - target_token_count),
-                )
+    print(
+        f"Sampling {num_to_sample} prompts from {len(available_items)} new candidates..."
+    )
 
-                # 3. Select this closest prompt and remove it from the available pool.
-                items_to_keep.append(closest_item)
-                available_items.remove(closest_item)
-            # --- End Targeted Sampling ---
+    for i in tqdm(range(num_to_sample), desc="Sampling prompts to add"):
+        if not available_items:
+            print("\nWarning: Ran out of available items during sampling.")
+            break
 
-            # Items remaining in available_items are the ones sampled out.
-            items_sampled_out_count = len(available_items)
-            total_sampled_out += items_sampled_out_count
-            print(
-                f"  Bucket {bucket_key}: Sampled down from {len(items)} to {cfg.max_per_bucket} (removed {items_sampled_out_count}, targeted sampling)."
-            )
+        # 1. Choose a random target token count within the overall range.
+        target_token_count = random.uniform(min_tk, max_tk)
 
-            # Store the kept items for this bucket
-            final_sampled_buckets[bucket_key] = items_to_keep
-        else:
-            # Keep all items if count is within limit
-            final_sampled_buckets[bucket_key] = items
-            if items:  # Only print if bucket wasn't empty
-                print(
-                    f"  Bucket {bucket_key}: Kept all {len(items)} items (within limit)."
-                )
+        # 2. Find the available prompt that is closest to this target token count.
+        closest_item = min(
+            available_items,
+            key=lambda item: abs(item["prompt_tokens"] - target_token_count),
+        )
 
-    print(f"\nTotal prompts removed during sampling: {total_sampled_out}")
-    return final_sampled_buckets, total_sampled_out
+        # 3. Select this closest prompt and remove it from the available pool.
+        items_to_keep.append(closest_item)
+        available_items.remove(closest_item)
+    # --- End Targeted Sampling ---
+
+    items_sampled_out_count = len(stats_list) - len(items_to_keep)
+    print(
+        f"\nSampled down from {len(stats_list)} to {len(items_to_keep)} (removed {items_sampled_out_count}, targeted sampling)."
+    )
+
+    return items_to_keep, items_sampled_out_count
 
 
 def copy_selected_files(
@@ -728,127 +645,158 @@ def copy_selected_files(
     #     print(f"Encountered errors with {error_count} benchmark sets.")
 
 
-def print_bucket_stats_table(buckets):
-    """Prints a formatted table of the bucket statistics."""
-    print("\n--- Final Benchmark Set Statistics (Averages per Bucket) ---")
-    if not buckets:
-        print("No buckets to display statistics for.")
-        return
+def load_existing_metadata_and_prefixes(
+    output_dir: str,
+) -> Tuple[List[Dict[str, Any]], set[str]]:
+    """
+    Loads existing metadata and identifies all existing benchmark case prefixes.
 
-    # Define columns and widths (reduced for better terminal fit)
-    col_widths = {
-        "bucket_range": 22,  # e.g., "0 - 20000 tokens"
-        "count": 6,
-        "avg_prompt_tokens": 12,  # Reduced width
-        "avg_expected_tokens": 13,  # Reduced width
-        "avg_num_commits": 10,  # Reduced width
-        "avg_lines_added": 10,  # Reduced width
-        "avg_lines_deleted": 11,  # Reduced width
-        "avg_final_lines": 11,  # Reduced width
-    }
+    Args:
+        output_dir: The directory where metadata and prompts are stored.
 
-    # Header
-    header = (
-        f"{'Bucket Range':<{col_widths['bucket_range']}} | "
-        f"{'Count':>{col_widths['count']}} | "
-        f"{'Avg Prompt':>{col_widths['avg_prompt_tokens']}} | "  # Shortened title
-        f"{'Avg Expected':>{col_widths['avg_expected_tokens']}} | "  # Shortened title
-        f"{'Avg Commits':>{col_widths['avg_num_commits']}} | "
-        f"{'Avg Added':>{col_widths['avg_lines_added']}} | "
-        f"{'Avg Deleted':>{col_widths['avg_lines_deleted']}} | "
-        f"{'Avg Final':>{col_widths['avg_final_lines']}}"  # Shortened title
-    )
-    print(header)
-    print("-" * len(header))
+    Returns:
+        A tuple containing:
+        - A list of previous generation run dictionaries loaded from metadata.json (or an empty list).
+        - A set of all unique benchmark_case_prefix strings found in the metadata and by scanning the output_dir.
+    """
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    existing_metadata_runs: List[Dict[str, Any]] = []
+    existing_prefixes: set[str] = set()
 
-    # Sort buckets by the lower bound of the token range for consistent order
-    # Filter out empty buckets before sorting and printing
-    sorted_bucket_keys = sorted(
-        [key for key, items in buckets.items() if items], key=lambda x: x[0]
-    )
+    # 1. Load from metadata.json
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as mf:
+                # Expect metadata to be a list of run dictionaries
+                loaded_data = json.load(mf)
+                if isinstance(loaded_data, list):
+                    existing_metadata_runs = loaded_data
+                    for run_data in existing_metadata_runs:
+                        if isinstance(run_data, dict) and "benchmark_cases" in run_data:
+                            if isinstance(run_data["benchmark_cases"], list):
+                                for case in run_data["benchmark_cases"]:
+                                    if (
+                                        isinstance(case, dict)
+                                        and "benchmark_case_prefix" in case
+                                    ):
+                                        existing_prefixes.add(
+                                            case["benchmark_case_prefix"]
+                                        )
+                            else:
+                                print(
+                                    f"Warning: 'benchmark_cases' in metadata run is not a list: {run_data}"
+                                )
+                        else:
+                            print(
+                                f"Warning: Invalid run structure in metadata: {run_data}"
+                            )
+                elif isinstance(loaded_data, dict):
+                    # Handle legacy format (single run object) gracefully
+                    print(
+                        "Warning: Found legacy metadata format (single object). Converting to list format."
+                    )
+                    # Check if it looks like the old format
+                    if (
+                        "generation_parameters" in loaded_data
+                        and "benchmark_cases" in loaded_data
+                    ):
+                        existing_metadata_runs = [loaded_data]  # Wrap it in a list
+                        if isinstance(loaded_data["benchmark_cases"], list):
+                            for case in loaded_data["benchmark_cases"]:
+                                if (
+                                    isinstance(case, dict)
+                                    and "benchmark_case_prefix" in case
+                                ):
+                                    existing_prefixes.add(case["benchmark_case_prefix"])
+                        else:
+                            print(
+                                "Warning: 'benchmark_cases' in legacy metadata is not a list."
+                            )
+                    else:
+                        print(
+                            "Warning: Legacy metadata format unrecognized. Starting fresh."
+                        )
 
-    total_count = 0
-    # Rows
-    for bucket_key in sorted_bucket_keys:
-        items = buckets[bucket_key]
-        count = len(items)
-        total_count += count
-        range_str = f"{bucket_key[0]} - {bucket_key[1]} tokens"
+                else:
+                    print(
+                        f"Warning: Existing {metadata_path} is not a list or recognized legacy format. Starting fresh."
+                    )
+        except (json.JSONDecodeError, IOError) as e:
+            print(
+                f"Warning: Error reading or parsing existing {metadata_path}: {e}. Starting fresh."
+            )
+            existing_metadata_runs = []  # Reset on error
 
-        # Calculate averages and round them to the nearest integer
-        avg_prompt_tokens = round(mean(item["prompt_tokens"] for item in items))
-        avg_expected_tokens = round(mean(item["expected_tokens"] for item in items))
-        avg_num_commits = round(mean(item["num_commits"] for item in items))
-        avg_lines_added = round(mean(item["lines_added"] for item in items))
-        avg_lines_deleted = round(mean(item["lines_deleted"] for item in items))
-        avg_final_lines = round(mean(item["final_lines"] for item in items))
+    # 2. Scan output directory for existing prompt files
+    try:
+        # Use glob directly due to 'from glob import glob'
+        prompt_files = glob(os.path.join(output_dir, "*_prompt.txt"))
+        for f_path in prompt_files:
+            basename = os.path.basename(f_path)
+            prefix = basename[:-11]  # Remove '_prompt.txt'
+            existing_prefixes.add(prefix)
+    except OSError as e:
+        print(f"Warning: Error scanning output directory {output_dir}: {e}")
 
-        # Format rounded averages as integers (:d)
-        row = (
-            f"{range_str:<{col_widths['bucket_range']}} | "
-            f"{count:>{col_widths['count']}} | "
-            f"{avg_prompt_tokens:>{col_widths['avg_prompt_tokens']}d} | "
-            f"{avg_expected_tokens:>{col_widths['avg_expected_tokens']}d} | "
-            f"{avg_num_commits:>{col_widths['avg_num_commits']}d} | "
-            f"{avg_lines_added:>{col_widths['avg_lines_added']}d} | "
-            f"{avg_lines_deleted:>{col_widths['avg_lines_deleted']}d} | "
-            f"{avg_final_lines:>{col_widths['avg_final_lines']}d}"
-        )
-        print(row)
-
-    print("-" * len(header))
-    print(f"Total prompts in final set: {total_count}")
+    return existing_metadata_runs, existing_prefixes
 
 
 def save_benchmark_metadata(
-    final_buckets: Dict[Tuple[int, int], List[Dict[str, Any]]], cfg: Config
+    existing_runs: List[Dict[str, Any]],
+    newly_added_stats: List[Dict[str, Any]],
+    cfg: Config,
 ):
     """
-    Saves the final benchmark structure and generation parameters to metadata.json.
+    Appends the current generation run's metadata to the list of existing runs
+    and saves the updated list to metadata.json.
 
     Args:
-        final_buckets: Dictionary mapping bucket ranges to lists of kept prompt stats.
-        cfg: The configuration object containing output_dir and other parameters.
+        existing_runs: The list of run dictionaries loaded from the existing metadata.
+        newly_added_stats: List of statistics for the prompts added in *this* run.
+        cfg: The configuration object for the current run.
     """
-    # Create generation_params dict from Config, excluding non-serializable fields
-    generation_params = asdict(cfg)
-    # Remove fields that are not JSON serializable or derived
-    generation_params.pop("encoder", None)
-    generation_params.pop("bucket_boundaries", None)  # Remove the list, keep the string
+    # Create generation_params dict for the current run
+    current_run_params = asdict(cfg)
+    current_run_params.pop("encoder", None)  # Exclude non-serializable encoder
 
-    metadata = {
-        "generation_parameters": generation_params,
-        "benchmark_cases": [],  # Flat list of benchmark cases instead of bucket structure
+    # Create the list of benchmark cases for the current run
+    current_run_cases = []
+    for stats in newly_added_stats:
+        current_run_cases.append(
+            {
+                "benchmark_case_prefix": stats["benchmark_case_prefix"],
+                "original_filename": stats["filename"],
+                "repo_name": stats["repo_name"],
+                "repo_commit_hash": stats["repo_commit_hash"],
+                "prompt_tokens": stats["prompt_tokens"],
+                "expected_tokens": stats["expected_tokens"],
+                "num_commits": stats["num_commits"],
+            }
+        )
+
+    # Create the dictionary for the current run
+    current_run_metadata = {
+        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "generation_parameters": current_run_params,
+        "benchmark_cases_added": current_run_cases,  # Store only newly added cases
     }
 
-    # Collect all benchmark cases from all buckets into a single flat list
-    for bucket_key, stats_list in final_buckets.items():
-        # Only include buckets that have prompts in them
-        if stats_list:
-            for stats in stats_list:
-                # Store only the necessary info for analysis
-                metadata["benchmark_cases"].append(
-                    {
-                        "benchmark_case_prefix": stats["benchmark_case_prefix"],
-                        "original_filename": stats["filename"],
-                        "repo_name": stats["repo_name"],
-                        "repo_commit_hash": stats["repo_commit_hash"],
-                        "prompt_tokens": stats["prompt_tokens"],
-                    }
-                )
+    # Append the current run's metadata to the list of existing runs
+    updated_metadata_runs = existing_runs + [current_run_metadata]
 
+    # Save the updated list back to metadata.json
     metadata_path = os.path.join(cfg.output_dir, "metadata.json")
     try:
+        # Ensure parent directory exists (though output_dir should already exist)
+        os.makedirs(cfg.output_dir, exist_ok=True)
         with open(metadata_path, "w", encoding="utf-8") as mf:
-            json.dump(metadata, mf, indent=4)
-        print(f"\nSaved final benchmark structure metadata to {metadata_path}")
-    except (
-        IOError,
-        TypeError,
-    ) as e:  # Catch specific errors related to writing/serialization
-        # Raise error instead of printing warning
+            json.dump(updated_metadata_runs, mf, indent=4)
+        print(
+            f"\nAppended current run metadata to {metadata_path} ({len(newly_added_stats)} cases added)."
+        )
+    except (IOError, TypeError) as e:
         raise RuntimeError(
-            f"Error: Failed to save metadata to {metadata_path}: {e}"
+            f"Error: Failed to save updated metadata to {metadata_path}: {e}"
         ) from e
 
 
@@ -893,25 +841,31 @@ def main():
         default="generated_prompts_temp",
         help="Directory for storing temporarily generated files (default: 'generated_prompts_temp').",
     )
-    # Add arguments for filtering/bucketing/sampling parameters
+    # Add arguments for filtering/sampling parameters
     parser.add_argument(
-        "--buckets",
-        type=str,
-        default="0,20,40,60,80,100",  # Default buckets up to 100k
-        help='Comma-separated list of bucket boundaries in thousands of tokens (e.g., "0,10,20,40,80"). Defines buckets [0k-10k), [10k-20k), [20k-40k), [40k-80k).',
+        "--min-prompt-tokens",
+        type=int,
+        default=0,
+        help="Minimum number of tokens (in thousands) allowed in the prompt file (default: 0).",
     )
     parser.add_argument(
-        "--max-per-bucket",
+        "--max-prompt-tokens",
         type=int,
-        default=10,
-        help="Maximum number of prompts per bucket after sampling (default: 10).",
+        default=50,  # Default is 50k tokens
+        help="Maximum number of tokens (in thousands) allowed in the prompt file (default: 50).",
+    )
+    parser.add_argument(
+        "--add-prompts",  # Renamed from num-prompts
+        type=int,
+        default=0,  # Default to 0, meaning only report existing count
+        help="Target number of *additional* prompts to generate and add to the existing set (default: 0).",
     )
     parser.add_argument(
         "--modified-within-months",
         type=int,
-        default=3,
+        default=6,
         metavar="N",
-        help="Only process files modified in the last N months (default: 3). Set to 0 or negative to disable.",
+        help="Only process files modified in the last N months (default: 6). Set to 0 or negative to disable.",
     )
     parser.add_argument(
         "--max-expected-tokens",
@@ -925,27 +879,19 @@ def main():
 
     print("--- Starting Prompt Generation ---")
 
-    # --- Parse and validate bucket boundaries ---
-    try:
-        bucket_boundaries_k = [int(b.strip()) for b in args.buckets.split(",")]
-        if len(bucket_boundaries_k) < 2:
-            raise ValueError(
-                "Must specify at least two bucket boundaries (e.g., '0,100')."
-            )
-        if not all(
-            bucket_boundaries_k[i] < bucket_boundaries_k[i + 1]
-            for i in range(len(bucket_boundaries_k) - 1)
-        ):
-            raise ValueError("Bucket boundaries must be strictly increasing.")
-        if bucket_boundaries_k[0] < 0:
-            raise ValueError("Bucket boundaries cannot be negative.")
-        # Convert k-tokens to actual token counts
-        bucket_boundaries = [b * 1000 for b in bucket_boundaries_k]
-        print(f"Using bucket boundaries (tokens): {bucket_boundaries}")
-    except ValueError as e:
-        print(f"Error parsing --buckets argument '{args.buckets}': {e}")
+    # --- Validate arguments ---
+    if args.min_prompt_tokens < 0:
+        print("Error: --min-prompt-tokens cannot be negative.")
         return 1
-    # --- End bucket parsing ---
+    # Note: Comparison is done on k-token values here before conversion
+    if args.max_prompt_tokens <= args.min_prompt_tokens:
+        print("Error: --max-prompt-tokens must be greater than --min-prompt-tokens.")
+        return 1
+    # Allow add_prompts to be 0 (for reporting mode)
+    if args.add_prompts < 0:
+        print("Error: --add-prompts cannot be negative.")
+        return 1
+    # --- End argument validation ---
 
     # --- Create Config object ---
     # Parse extensions from comma-separated string to list
@@ -956,15 +902,30 @@ def main():
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
         temp_dir=args.temp_dir,  # Add temp_dir
-        buckets_str=args.buckets,  # Store original string
-        bucket_boundaries=bucket_boundaries,  # Store processed list
-        max_per_bucket=args.max_per_bucket,
+        # Convert k-tokens from args to absolute tokens for internal use
+        min_prompt_tokens=args.min_prompt_tokens * 1000,
+        max_prompt_tokens=args.max_prompt_tokens * 1000,
+        add_prompts=args.add_prompts,  # Renamed from num_prompts
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
         encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
     )
     print(f"Configuration loaded: {cfg}")
     # --- End Config creation ---
+
+    # --- Load existing data ---
+    existing_metadata_runs, existing_prefixes = load_existing_metadata_and_prefixes(
+        cfg.output_dir
+    )
+    print(f"\nFound {len(existing_prefixes)} existing benchmark prompts.")
+    # --- End Load existing data ---
+
+    # --- Reporting Mode Check ---
+    if cfg.add_prompts == 0:
+        print("\n--add-prompts is 0. Running in reporting mode only. Exiting.")
+        # Optionally print summary of existing metadata here if desired
+        return 0
+    # --- End Reporting Mode Check ---
 
     repo_paths = find_repo_dirs(cfg.cache_dir)
 
@@ -973,9 +934,9 @@ def main():
         print("Please run the clone_repos.py script first.")
         return 1
 
-    print(f"Found {len(repo_paths)} repositories to process.")
+    print(f"Found {len(repo_paths)} repositories to process for potential new prompts.")
 
-    all_stats = []
+    all_candidate_stats = []  # Changed name from all_stats
     generation_errors = 0
     total_date_filtered_count = 0  # Initialize counter for date filtering
     total_expected_token_filtered_count = (
@@ -993,7 +954,7 @@ def main():
                 date_filtered_count,
                 expected_token_filtered_count,
             ) = generate_prompts_and_expected(repo_path, cfg)  # Pass cfg object
-            all_stats.extend(stats_list)
+            all_candidate_stats.extend(stats_list)  # Add to candidates
             total_date_filtered_count += date_filtered_count  # Accumulate date count
             total_expected_token_filtered_count += (
                 expected_token_filtered_count  # Accumulate token count
@@ -1010,8 +971,8 @@ def main():
             f"\nWarning: Encountered errors during prompt generation for {generation_errors} repositories."
         )
 
-    if not all_stats:
-        print("\nError: No prompts were generated successfully.")
+    if not all_candidate_stats:
+        print("\nError: No potential prompt candidates were generated successfully.")
         return 1
 
     # Report total files filtered by date
@@ -1027,33 +988,75 @@ def main():
 
     # --- Post-Generation Processing ---
 
-    # Print initial statistics table for all generated prompts (before filtering/sampling)
-    print("\n--- Initial Generation Statistics (All Repos, Pre-Filtering/Sampling) ---")
-    print_stats_table(all_stats)
+    # Print summary statistics for all potential candidates
+    print_stats_summary(
+        all_candidate_stats, "Initial Candidate Statistics (All Repos, Pre-Filtering)"
+    )
 
-    # 1. Filter prompts by token limits
-    filtered_stats, _ = filter_prompts(all_stats, cfg)
+    # 1. Filter candidates by token range
+    filtered_candidate_stats, _ = filter_prompts_by_token_range(
+        all_candidate_stats, cfg
+    )
+    print_stats_summary(
+        filtered_candidate_stats, "Statistics After Token Range Filtering"
+    )
 
-    # 2. Assign filtered prompts to buckets
-    buckets = assign_prompts_to_buckets(filtered_stats, cfg)
+    # 2. Filter out existing prompts
+    new_candidate_stats = [
+        stats
+        for stats in filtered_candidate_stats
+        if stats["benchmark_case_prefix"] not in existing_prefixes
+    ]
+    print(
+        f"\nFiltered out {len(filtered_candidate_stats) - len(new_candidate_stats)} candidates that already exist."
+    )
+    print_stats_summary(
+        new_candidate_stats, "Statistics of New Candidates (Non-Existing)"
+    )
 
-    # 3. Sample prompts from buckets
-    final_buckets, _ = sample_prompts_from_buckets(buckets, cfg)
+    if not new_candidate_stats:
+        print("\nNo new, valid candidates found to add. Exiting.")
+        # Clean up temp dir even if no files are added
+        if os.path.exists(cfg.temp_dir):
+            try:
+                shutil.rmtree(cfg.temp_dir)
+                print(f"Successfully removed temporary directory: {cfg.temp_dir}")
+            except OSError as e:
+                print(
+                    f"Warning: Failed to remove temporary directory {cfg.temp_dir}: {e}"
+                )
+        return 0
 
-    # Print statistics for the final selected buckets
-    print_bucket_stats_table(final_buckets)
+    # 3. Sample prompts to add from the new candidates
+    prompts_to_add_stats, _ = sample_prompts(new_candidate_stats, cfg)
+    print_stats_summary(
+        prompts_to_add_stats,
+        f"Statistics of {len(prompts_to_add_stats)} Prompts Selected to Add",
+    )
 
-    # 4. Determine which files were kept after sampling and filtering
-    kept_prefixes = set()
-    for bucket_key, stats_list in final_buckets.items():
-        for stats in stats_list:
-            kept_prefixes.add(stats["benchmark_case_prefix"])
+    if not prompts_to_add_stats:
+        print("\nNo prompts were selected during sampling. Exiting.")
+        # Clean up temp dir even if no files are added
+        if os.path.exists(cfg.temp_dir):
+            try:
+                shutil.rmtree(cfg.temp_dir)
+                print(f"Successfully removed temporary directory: {cfg.temp_dir}")
+            except OSError as e:
+                print(
+                    f"Warning: Failed to remove temporary directory {cfg.temp_dir}: {e}"
+                )
+        return 0
 
-    # 5. Copy selected files from temp directory to output directory
-    copy_selected_files(kept_prefixes, cfg.temp_dir, cfg.output_dir)
+    # 4. Determine prefixes of the prompts to add
+    prefixes_to_add = set()
+    for stats in prompts_to_add_stats:
+        prefixes_to_add.add(stats["benchmark_case_prefix"])
 
-    # 6. Save the final benchmark structure metadata to the output directory
-    save_benchmark_metadata(final_buckets, cfg)
+    # 5. Copy the selected new files from temp directory to output directory
+    copy_selected_files(prefixes_to_add, cfg.temp_dir, cfg.output_dir)
+
+    # 6. Save the updated metadata (appending the new run)
+    save_benchmark_metadata(existing_metadata_runs, prompts_to_add_stats, cfg)
 
     # 7. Clean up temporary directory
     print(f"\nCleaning up temporary directory: {cfg.temp_dir}")

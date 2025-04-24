@@ -432,14 +432,81 @@ def extract_code_from_backticks(text: str) -> str | None:
 
 
 def find_benchmark_cases(benchmark_dir: str) -> list[str]:
-    """Finds all benchmark case prefixes in the given directory."""
-    prompt_files = glob.glob(os.path.join(benchmark_dir, "*_prompt.txt"))
+    """
+    Finds all unique benchmark case prefixes defined in the benchmark metadata.
+    Falls back to scanning directory if metadata is missing or invalid.
+    """
     prefixes = set()
-    for f in prompt_files:
-        basename = os.path.basename(f)
-        # Extract prefix by removing '_prompt.txt'
-        prefix = basename[:-11]  # Length of '_prompt.txt' is 11
-        prefixes.add(prefix)
+    metadata_path = os.path.join(benchmark_dir, "metadata.json")
+    metadata_loaded = False
+
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as mf:
+                metadata = json.load(mf)
+            # Expect metadata to be a list of run dictionaries
+            if isinstance(metadata, list):
+                for run_data in metadata:
+                    # Check for the key used in the new format
+                    cases_key = "benchmark_cases_added"
+                    if cases_key not in run_data and "benchmark_cases" in run_data:
+                        # Support legacy key for backward compatibility if needed
+                        cases_key = "benchmark_cases"
+                        print(
+                            f"Note: Found legacy 'benchmark_cases' key in run: {run_data.get('run_timestamp_utc', 'Unknown timestamp')}"
+                        )
+
+                    if isinstance(run_data, dict) and cases_key in run_data:
+                        if isinstance(run_data[cases_key], list):
+                            for case in run_data[cases_key]:
+                                if (
+                                    isinstance(case, dict)
+                                    and "benchmark_case_prefix" in case
+                                ):
+                                    prefixes.add(case["benchmark_case_prefix"])
+                        else:
+                            print(
+                                f"Warning: '{cases_key}' in metadata run is not a list."
+                            )
+                    else:
+                        print(
+                            f"Warning: Invalid run structure or missing '{cases_key}' key in metadata."
+                        )
+                metadata_loaded = True  # Mark metadata as successfully processed
+            else:
+                print(
+                    f"Warning: Metadata file {metadata_path} is not a list. Expected list of runs."
+                )
+        except (json.JSONDecodeError, IOError) as e:
+            print(
+                f"Warning: Error reading/parsing {metadata_path}: {e}. Falling back to directory scan."
+            )
+        except Exception as e:
+            print(
+                f"Warning: Unexpected error processing {metadata_path}: {e}. Falling back to directory scan."
+            )
+
+    # Fallback or verification: Scan directory if metadata loading failed or as a supplement
+    if not metadata_loaded:
+        print("Scanning directory for prompt files as fallback...")
+        try:
+            prompt_files = glob.glob(os.path.join(benchmark_dir, "*_prompt.txt"))
+            for f_path in prompt_files:
+                basename = os.path.basename(f_path)
+                prefix = basename[:-11]  # Remove '_prompt.txt'
+                prefixes.add(prefix)
+            if not prefixes:
+                print("Warning: Fallback directory scan found no prompt files.")
+        except OSError as e:
+            print(f"Warning: Error during fallback directory scan: {e}")
+
+    if not prefixes:
+        print(
+            "Error: No benchmark cases found either in metadata or by scanning the directory."
+        )
+        # Consider raising an error or returning empty list depending on desired behavior
+        # return [] # Return empty list
+
     return sorted(list(prefixes))
 
 
