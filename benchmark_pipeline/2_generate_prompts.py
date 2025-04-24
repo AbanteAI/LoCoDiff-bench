@@ -23,10 +23,10 @@ Arguments:
                           (default: 'cached-repos').
   --output-dir (optional): Directory to save generated prompt/expected files
                            (default: 'generated_prompts').
-  --min-prompt-tokens (optional): Minimum number of tokens allowed in the generated
-                                  prompt file (default: 0).
-  --max-prompt-tokens (optional): Maximum number of tokens allowed in the generated
-                                  prompt file (default: 50000).
+  --min-prompt-tokens (optional): Minimum number of tokens (in thousands, e.g., 0)
+                                  allowed in the generated prompt file (default: 0).
+  --max-prompt-tokens (optional): Maximum number of tokens (in thousands, e.g., 50)
+                                  allowed in the generated prompt file (default: 50).
   --num-prompts (optional): The target number of prompts to generate in the final
                             benchmark set after sampling (default: 100).
   --modified-within-months (optional): Only process files last modified within the
@@ -739,13 +739,13 @@ def main():
         "--min-prompt-tokens",
         type=int,
         default=0,
-        help="Minimum number of tokens allowed in the prompt file (default: 0).",
+        help="Minimum number of tokens (in thousands) allowed in the prompt file (default: 0).",
     )
     parser.add_argument(
         "--max-prompt-tokens",
         type=int,
-        default=50000,
-        help="Maximum number of tokens allowed in the prompt file (default: 50000).",
+        default=50,  # Default is 50k tokens
+        help="Maximum number of tokens (in thousands) allowed in the prompt file (default: 50).",
     )
     parser.add_argument(
         "--num-prompts",
@@ -776,6 +776,7 @@ def main():
     if args.min_prompt_tokens < 0:
         print("Error: --min-prompt-tokens cannot be negative.")
         return 1
+    # Note: Comparison is done on k-token values here before conversion
     if args.max_prompt_tokens <= args.min_prompt_tokens:
         print("Error: --max-prompt-tokens must be greater than --min-prompt-tokens.")
         return 1
@@ -793,8 +794,9 @@ def main():
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
         temp_dir=args.temp_dir,  # Add temp_dir
-        min_prompt_tokens=args.min_prompt_tokens,
-        max_prompt_tokens=args.max_prompt_tokens,
+        # Convert k-tokens from args to absolute tokens for internal use
+        min_prompt_tokens=args.min_prompt_tokens * 1000,
+        max_prompt_tokens=args.max_prompt_tokens * 1000,
         num_prompts=args.num_prompts,
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
