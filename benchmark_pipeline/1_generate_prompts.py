@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Generates benchmark prompts and expected outputs from cloned repositories.
+Generates benchmark prompts and expected outputs from specified repositories.
 
 Purpose:
-  This script iterates through specified files (matching given extensions) within
-  repositories located in the 'cached-repos/' directory. For each eligible file,
-  it generates two corresponding files in the 'generated_prompts/' directory:
+  This script clones specified repositories (if not already cached) and then
+  iterates through files (matching given extensions) within those repositories.
+  For each eligible file, it generates two corresponding files in the
+  'generated_prompts/' directory:
     1. A prompt file (*_prompt.txt): Contains instructions and the full git log
        history (with diffs) for the original file. The model's task is to
        reconstruct the file's final state based on this history.
@@ -18,6 +19,8 @@ Purpose:
   token range, and saves metadata about the final benchmark set.
 
 Arguments:
+  --repos, -r (required): List of GitHub repositories to process (format: 'org/repo'
+                          or full URL). These will be cloned if not already in cache.
   --extensions, -e (required): List of file extensions to process (e.g., '.py' '.js').
   --cache-dir (optional): Path to the directory containing cached repositories
                           (default: 'cached-repos').
@@ -31,16 +34,15 @@ Arguments:
                             and add to the existing set (default: 0). If 0, only
                             reports existing count and exits.
   --modified-within-months (optional): Only process files last modified within the
-                                       specified number of months (default: 3).
+                                       specified number of months (default: 6).
                                        Set <= 0 to disable.
   --max-expected-tokens (optional): Skip files whose final content (expected output)
                                     exceeds this token count (default: 12000).
                                     Set <= 0 to disable.
 
 Inputs:
-  - Repositories cloned by `1_clone_repos.py` located in the `cache-dir`
-    (default: 'cached-repos/'). Expects standard git repository structure within.
-  - Command-line arguments specifying extensions, directories, and filtering/sampling parameters.
+  - Command-line arguments specifying repositories, extensions, directories, and
+    filtering/sampling parameters.
 
 Outputs:
   - Creates the `output-dir` (default: 'generated_prompts/') if it doesn't exist.
@@ -59,7 +61,8 @@ File Modifications:
   - Deletes prompt/expected file pairs from `output-dir` that are filtered out due
     to token limits (prompt token outside min/max range, or expected token > max_expected_tokens)
     or removed during the sampling process (`num-prompts`).
-  - Does *not* modify files within the `cache-dir`.
+  - Creates the `cache-dir` (default: 'cached-repos/') if it doesn't exist.
+  - Clones repositories into the cache-dir if they don't already exist there.
 """
 
 import argparse
@@ -78,6 +81,91 @@ import random
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any
+from urllib.parse import urlparse
+
+
+# --- Repository Cloning Functions ---
+
+
+def standardize_repo_name(repo_name):
+    """
+    Convert various GitHub repository reference formats to a standard 'org/repo' format.
+
+    Args:
+        repo_name: A GitHub repository name, either as a full URL (https://github.com/org/repo)
+                   or in the shorter format (org/repo).
+
+    Returns:
+        A standardized repository name in 'org/repo' format.
+
+    Raises:
+        ValueError: If the repository name cannot be parsed into a valid
+                    org/repo format.
+    """
+    if repo_name.startswith("http"):
+        # It's a full URL, extract the path
+        parsed_url = urlparse(repo_name)
+        path_parts = [p for p in parsed_url.path.split("/") if p]
+        if len(path_parts) >= 2:
+            org, repo = path_parts[:2]
+            return f"{org}/{repo}"
+        else:
+            raise ValueError(f"Invalid GitHub URL: {repo_name}")
+    else:
+        # Assume it's in org/repo format
+        if repo_name.count("/") != 1:
+            raise ValueError(
+                f"Repository name should be in 'org/repo' format: {repo_name}"
+            )
+        return repo_name
+
+
+def clone_repo_to_cache(repo_name, cache_dir):
+    """
+    Clone a GitHub repository into the cached-repos directory.
+
+    Args:
+        repo_name: A GitHub repository name, either as a full URL (https://github.com/org/repo)
+                   or in the shorter format (org/repo).
+        cache_dir: Directory to store cloned repositories.
+
+    Returns:
+        The path to the cloned repository (cache_dir/org/repo).
+    """
+    # Create cache_dir directory if it doesn't exist
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+        print(f"Created cache directory: {cache_dir}")
+
+    # Standardize the repository name
+    std_repo_name = standardize_repo_name(repo_name)
+
+    # Generate target directory name
+    org, repo = std_repo_name.split("/")
+    target_dir = os.path.join(cache_dir, org, repo)
+
+    # Check if repo already exists
+    if os.path.exists(target_dir):
+        print(f"Repository already exists at {target_dir}")
+        # Optionally, you could pull the latest changes here
+        return target_dir
+
+    # Create parent directory if needed
+    os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+
+    # Clone the repository
+    github_url = f"https://github.com/{std_repo_name}.git"
+    try:
+        # Don't capture output so clone progress is visible to the user
+        subprocess.run(
+            ["git", "clone", github_url, target_dir],
+            check=True,
+        )
+        print(f"Successfully cloned {std_repo_name} to {target_dir}")
+        return target_dir
+    except subprocess.CalledProcessError as e:
+        print(f"Error cloning repository: {e}")
+        raise
 
 
 # --- Helper Functions ---
@@ -803,21 +891,16 @@ def save_benchmark_metadata(
 # --- Main Script Logic ---
 
 
-def find_repo_dirs(cache_dir="cached-repos"):
-    """Finds repository directories within the cache directory."""
-    # Assumes structure cache_dir/org/repo
-    pattern = os.path.join(cache_dir, "*", "*")
-    repo_dirs = [
-        d
-        for d in glob(pattern)
-        if os.path.isdir(d) and os.path.exists(os.path.join(d, ".git"))
-    ]
-    return repo_dirs
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate benchmark prompts and expected outputs from previously cloned repositories."
+        description="Generate benchmark prompts and expected outputs from specified repositories."
+    )
+    parser.add_argument(
+        "--repos",
+        "-r",
+        nargs="+",
+        required=True,
+        help="List of GitHub repositories to process (format: 'org/repo' or full URL).",
     )
     parser.add_argument(
         "--extensions",
@@ -927,14 +1010,35 @@ def main():
         return 0
     # --- End Reporting Mode Check ---
 
-    repo_paths = find_repo_dirs(cfg.cache_dir)
+    # --- Clone repos if needed and build repo paths list ---
+    print(f"Processing {len(args.repos)} repositories...")
+    repo_paths = []
+    success_count = 0
+    fail_count = 0
+
+    for repo_name in args.repos:
+        print(f"\nProcessing repository: {repo_name}")
+        try:
+            repo_path = clone_repo_to_cache(repo_name, cfg.cache_dir)
+            repo_paths.append(repo_path)
+            success_count += 1
+        except ValueError as e:
+            print(f"Error processing repository name {repo_name}: {e}")
+            fail_count += 1
+        except Exception as e:
+            print(f"Failed to process {repo_name}: {e}")
+            fail_count += 1
+
+    if fail_count > 0:
+        print(f"\nWarning: Failed to process {fail_count} repositories.")
 
     if not repo_paths:
-        print(f"Error: No valid repository directories found in {cfg.cache_dir}")
-        print("Please run the clone_repos.py script first.")
+        print("Error: No valid repository directories found to process.")
         return 1
 
-    print(f"Found {len(repo_paths)} repositories to process for potential new prompts.")
+    print(
+        f"Successfully prepared {len(repo_paths)} repositories for prompt generation."
+    )
 
     all_candidate_stats = []  # Changed name from all_stats
     generation_errors = 0
