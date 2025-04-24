@@ -2,6 +2,7 @@
 import os
 import json
 import glob
+import argparse  # Added import
 import re
 import sys
 import math  # Added for Wilson score calculation
@@ -598,6 +599,7 @@ def index():
     benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
     if not benchmark_run_dir:
         abort(500, "Benchmark run directory not configured.")
+    assert isinstance(benchmark_run_dir, str)  # Assure pyright
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
 
     benchmark_metadata = load_benchmark_metadata(prompts_dir)
@@ -629,6 +631,7 @@ def model_results(model_name):
     benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
     if not benchmark_run_dir:
         abort(500, "Benchmark run directory not configured.")
+    assert isinstance(benchmark_run_dir, str)  # Assure pyright
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
     results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
 
@@ -720,6 +723,7 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
     benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
     if not benchmark_run_dir:
         abort(500, "Benchmark run directory not configured.")
+    assert isinstance(benchmark_run_dir, str)  # Assure pyright
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
     results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
 
@@ -850,6 +854,7 @@ def serve_file(filepath):
     benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
     if not benchmark_run_dir:
         abort(500, "Benchmark run directory not configured for file serving.")
+    assert isinstance(benchmark_run_dir, str)  # Assure pyright
 
     # Get the absolute path to the benchmark run directory
     run_dir_abs = os.path.abspath(benchmark_run_dir)
