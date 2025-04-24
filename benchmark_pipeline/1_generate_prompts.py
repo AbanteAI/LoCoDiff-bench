@@ -200,7 +200,6 @@ def get_repo_head_commit_hash(repo_path: str) -> str:
 class Config:
     """Configuration settings for the prompt generation script."""
 
-    # extensions: List[str] # Removed, loaded from languages.yaml
     benchmark_run_dir: str  # New required directory
     prompts_dir: str  # Derived: benchmark_run_dir / "prompts"
     temp_dir: str  # Derived: benchmark_run_dir / "prompts_temp"
@@ -917,7 +916,7 @@ def save_benchmark_metadata(
     # Create the dictionary for the current run
     current_run_metadata = {
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "language_config_path": DEFAULT_LANGUAGE_CONFIG_PATH,  # Record which config was used
+        # "language_config_path": DEFAULT_LANGUAGE_CONFIG_PATH,  # Removed per review
         "language_config_content": language_config,  # Store the actual config used
         "generation_parameters": current_run_params,
         "benchmark_cases_added": current_run_cases,  # Store only newly added cases
@@ -958,14 +957,6 @@ def main():
         required=True,
         help="List of GitHub repositories to process (format: 'org/repo' or full URL).",
     )
-    # Removed --extensions argument, will use languages.yaml instead
-    # parser.add_argument(
-    #     "--extensions",
-    #     "-e",
-    #     type=str,
-    #     required=True,
-    #     help="Comma-separated list of file extensions to process (include the dot), e.g., .py,.txt,.js",
-    # )
     parser.add_argument(
         "--benchmark-run-dir",
         required=True,
@@ -1038,16 +1029,12 @@ def main():
         return 1  # Use return inside main()
 
     # --- Create Config object ---
-    # Removed extension_list logic
-    # extension_list = [ext.strip() for ext in args.extensions.split(",")]
-
     # Define derived paths
     benchmark_run_dir = args.benchmark_run_dir
     prompts_dir = os.path.join(benchmark_run_dir, "prompts")
     temp_dir = os.path.join(benchmark_run_dir, "prompts_temp")
 
     cfg = Config(
-        # extensions=extension_list, # Removed
         benchmark_run_dir=benchmark_run_dir,
         prompts_dir=prompts_dir,
         temp_dir=temp_dir,
