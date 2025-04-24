@@ -503,7 +503,7 @@ def get_run_details(
     timestamp: str,
     prompts_dir: str,  # Changed from benchmark_dir
     results_dir: str,  # Changed from results_base_dir
-    benchmark_run_dir: str = None,  # Added benchmark_run_dir parameter
+    benchmark_run_dir: Optional[str] = None,  # Added benchmark_run_dir parameter
 ):
     """
     Loads all details for a specific run, accessing files from prompts and results subdirectories.
