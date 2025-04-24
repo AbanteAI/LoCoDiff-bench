@@ -546,10 +546,8 @@ def print_stats_summary(stats_list: List[Dict[str, Any]], title: str):
         return
 
     count = len(stats_list)
-    # Unused variable assignments removed to fix ruff errors and per review feedback
 
     print(f"\n--- {title} (Count: {count}) ---")
-    # Reduced verbosity: Removed detailed stats printing below per review feedback
 
 
 def filter_prompts_by_token_range(
@@ -899,8 +897,6 @@ def main():
         required=True,
         help="Directory where benchmark run data (prompts, results) will be stored. Will be created if it doesn't exist.",
     )
-    # Removed --cache-dir argument as it's now hardcoded
-    # Removed --output-dir and --temp-dir arguments
     # Add arguments for filtering/sampling parameters
     parser.add_argument(
         "--min-prompt-tokens",
@@ -915,7 +911,7 @@ def main():
         help="Maximum number of tokens (in thousands) allowed in the prompt file (default: 50).",
     )
     parser.add_argument(
-        "--add-prompts",  # Renamed from num-prompts
+        "--add-prompts",
         type=int,
         default=0,  # Default to 0, meaning only report existing count
         help="Target number of *additional* prompts to generate and add to the existing set (default: 0).",
@@ -970,12 +966,11 @@ def main():
         # Convert k-tokens from args to absolute tokens for internal use
         min_prompt_tokens=args.min_prompt_tokens * 1000,
         max_prompt_tokens=args.max_prompt_tokens * 1000,
-        add_prompts=args.add_prompts,  # Renamed from num_prompts
+        add_prompts=args.add_prompts,
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
         encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
     )
-    # print(f"Configuration loaded: {cfg}") # Reduced verbosity
     print(
         f"Configuration loaded. Benchmark run dir: {cfg.benchmark_run_dir}, Add prompts: {cfg.add_prompts}"
     )
