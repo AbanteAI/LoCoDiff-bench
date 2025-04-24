@@ -13,6 +13,13 @@ fi
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
+# Debug prints
+echo "Running git status..."
+git status
+
+echo "Running git log -n 2..."
+git log -n 2
+
 # Verify ruff version
 echo "Ruff version in precommit:"
 ruff --version
