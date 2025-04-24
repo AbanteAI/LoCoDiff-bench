@@ -27,17 +27,19 @@ except ImportError as e:
     # Not exiting as pandas is not strictly required for basic functionality
 
 
-# --- Configuration ---
-# Assuming the app is run from the root of the repository
-BENCHMARK_DIR = "generated_prompts"
-RESULTS_BASE_DIR = "benchmark_results"
-STATIC_DIR = "results_explorer/static"  # Updated directory name
+# --- Configuration (Set via command-line arg when run directly) ---
+# Constants for subdirectory names
+PROMPTS_SUBDIR = "prompts"
+RESULTS_SUBDIR = "results"
+STATIC_DIR_NAME = "static"  # Relative to this script's location
 
 # --- Flask App Initialization ---
-app = Flask(__name__, template_folder="templates", static_folder="static")
-app.config["BENCHMARK_DIR"] = BENCHMARK_DIR
-app.config["RESULTS_BASE_DIR"] = RESULTS_BASE_DIR
-app.config["STATIC_DIR"] = STATIC_DIR
+# Determine static folder path relative to this script's location
+script_dir = os.path.dirname(os.path.abspath(__file__))
+static_folder_path = os.path.join(script_dir, STATIC_DIR_NAME)
+
+app = Flask(__name__, template_folder="templates", static_folder=static_folder_path)
+# BENCHMARK_RUN_DIR will be set in app.config when run directly via __main__
 # Placeholder for analysis results calculated at startup
 app.config["ANALYSIS_RESULTS"] = None
 
@@ -68,9 +70,14 @@ def load_json_file(filepath: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def load_benchmark_metadata(benchmark_dir):
-    """Loads the benchmark structure metadata from metadata.json."""
-    metadata_path = os.path.join(benchmark_dir, "metadata.json")
+def load_benchmark_metadata(prompts_dir: str):
+    """
+    Loads the benchmark structure metadata from metadata.json located in the prompts subdirectory.
+
+    Args:
+        prompts_dir: The path to the 'prompts' subdirectory within the benchmark run directory.
+    """
+    metadata_path = os.path.join(prompts_dir, "metadata.json")
     if not os.path.exists(metadata_path):
         print(f"Warning: Benchmark metadata file not found at {metadata_path}")
         return None
@@ -87,19 +94,23 @@ def load_benchmark_metadata(benchmark_dir):
 
 
 def scan_results_directory(
-    results_base_dir: str,
+    results_dir: str,  # Changed from results_base_dir
 ) -> Tuple[List[str], Dict[str, Dict[str, Optional[Dict[str, Any]]]]]:
     """
-    Scans the results directory to find all models and their latest run metadata for each benchmark case.
+    Scans the results subdirectory to find all models and their latest run metadata for each benchmark case.
     (Combined logic from find_models_in_results and loading latest metadata)
+
+    Args:
+        results_dir: The path to the 'results' subdirectory within the benchmark run directory.
     """
-    print(f"Scanning results directory: {results_base_dir}...")
+    print(f"Scanning results directory: {results_dir}...")
     latest_runs: Dict[str, Dict[str, Tuple[str, str]]] = defaultdict(
         lambda: defaultdict(lambda: ("", ""))
     )
     models = set()
 
-    pattern = os.path.join(results_base_dir, "*", "*", "*", "metadata.json")
+    # Pattern: <run_dir>/results/[benchmark_case]/[model_name]/[timestamp]/metadata.json
+    pattern = os.path.join(results_dir, "*", "*", "*", "metadata.json")
     metadata_files = glob.glob(pattern)
 
     for metadata_path in metadata_files:
@@ -412,13 +423,18 @@ def calculate_wilson_interval(
 # Plot generation function has been removed in favor of the client-side Chart.js visualization
 
 
-def find_models_in_results(results_base_dir):
-    """Finds all unique model names present in the results directory structure."""
+def find_models_in_results(results_dir: str):  # Changed from results_base_dir
+    """
+    Finds all unique model names present in the results subdirectory structure.
+
+    Args:
+        results_dir: The path to the 'results' subdirectory within the benchmark run directory.
+    """
     # This function is now effectively part of scan_results_directory,
     # but keep it for the model_results route fallback check.
     models = set()
-    # Pattern: results_base_dir / * (benchmark_case) / * (model_name) / * (timestamp)
-    pattern = os.path.join(results_base_dir, "*", "*")
+    # Pattern: <run_dir>/results/[benchmark_case]/[model_name]
+    pattern = os.path.join(results_dir, "*", "*")
     potential_model_dirs = glob.glob(pattern)
     for path in potential_model_dirs:
         if os.path.isdir(path):
@@ -437,11 +453,19 @@ def find_models_in_results(results_base_dir):
     return sorted(list(models))
 
 
-def find_runs_for_model(model_name, results_base_dir):
-    """Finds all run directories for a specific model."""
+def find_runs_for_model(
+    model_name: str, results_dir: str
+):  # Changed from results_base_dir
+    """
+    Finds all run directories for a specific model within the results subdirectory.
+
+    Args:
+        model_name: The name of the model.
+        results_dir: The path to the 'results' subdirectory within the benchmark run directory.
+    """
     runs = []
-    # Pattern: results_base_dir / * (benchmark_case) / model_name / * (timestamp)
-    pattern = os.path.join(results_base_dir, "*", model_name, "*")
+    # Pattern: <run_dir>/results/[benchmark_case]/[model_name]/[timestamp]
+    pattern = os.path.join(results_dir, "*", model_name, "*")
     potential_run_dirs = glob.glob(pattern)
     for run_dir in potential_run_dirs:
         if os.path.isdir(run_dir) and re.match(
@@ -473,12 +497,24 @@ def find_runs_for_model(model_name, results_base_dir):
 
 
 def get_run_details(
-    benchmark_case_prefix, model_name, timestamp, benchmark_dir, results_base_dir
+    benchmark_case_prefix: str,
+    model_name: str,
+    timestamp: str,
+    prompts_dir: str,  # Changed from benchmark_dir
+    results_dir: str,  # Changed from results_base_dir
 ):
-    """Loads all details for a specific run."""
-    run_dir = os.path.join(
-        results_base_dir, benchmark_case_prefix, model_name, timestamp
-    )
+    """
+    Loads all details for a specific run, accessing files from prompts and results subdirectories.
+
+    Args:
+        benchmark_case_prefix: The benchmark case identifier.
+        model_name: The model name.
+        timestamp: The run timestamp.
+        prompts_dir: Path to the 'prompts' subdirectory.
+        results_dir: Path to the 'results' subdirectory.
+    """
+    # Path to the specific run directory within the results subdirectory
+    run_dir = os.path.join(results_dir, benchmark_case_prefix, model_name, timestamp)
     details = {
         "benchmark_case_prefix": benchmark_case_prefix,
         "model_name": model_name,
@@ -512,12 +548,12 @@ def get_run_details(
             details["error"] = f"Error loading metadata.json: {e}"
             # Continue loading other files if possible
 
-    # Load prompt and expected from benchmark_dir
+    # Load prompt and expected from prompts_dir
     prompt_filename = f"{benchmark_case_prefix}_prompt.txt"
     expected_filename = f"{benchmark_case_prefix}_expectedoutput.txt"
-    # Check existence and store relative paths for prompt and expected files
-    prompt_rel_path = os.path.join(benchmark_dir, prompt_filename)
-    expected_rel_path = os.path.join(benchmark_dir, expected_filename)
+    # Check existence and store relative paths for prompt and expected files within prompts_dir
+    prompt_rel_path = os.path.join(prompts_dir, prompt_filename)
+    expected_rel_path = os.path.join(prompts_dir, expected_filename)
 
     if os.path.exists(prompt_rel_path):
         details["prompt_exists"] = True
@@ -559,7 +595,12 @@ def get_run_details(
 @app.route("/")
 def index():
     """Index page: Shows overall summary, models, and dynamic chart."""
-    benchmark_metadata = load_benchmark_metadata(current_app.config["BENCHMARK_DIR"])
+    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
+    if not benchmark_run_dir:
+        abort(500, "Benchmark run directory not configured.")
+    prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
+
+    benchmark_metadata = load_benchmark_metadata(prompts_dir)
     # Retrieve pre-calculated analysis results and models found
     analysis_results = current_app.config.get("ANALYSIS_RESULTS")
     models = (
@@ -585,17 +626,20 @@ def index():
 def model_results(model_name):
     """Shows results for a specific model, grouped by bucket."""
     safe_model_name = escape(model_name)
-    benchmark_metadata = load_benchmark_metadata(current_app.config["BENCHMARK_DIR"])
-    all_runs = find_runs_for_model(model_name, current_app.config["RESULTS_BASE_DIR"])
+    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
+    if not benchmark_run_dir:
+        abort(500, "Benchmark run directory not configured.")
+    prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
+    results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
+
+    benchmark_metadata = load_benchmark_metadata(prompts_dir)
+    all_runs = find_runs_for_model(model_name, results_dir)
 
     # Check if model exists based on analysis results (more reliable than scanning again)
     analysis_results = current_app.config.get("ANALYSIS_RESULTS")
     if not analysis_results or model_name not in analysis_results.get("models", {}):
         # Check filesystem as fallback if analysis hasn't run or failed
-        if not any(
-            m == model_name
-            for m in find_models_in_results(current_app.config["RESULTS_BASE_DIR"])
-        ):
+        if not any(m == model_name for m in find_models_in_results(results_dir)):
             abort(404, description=f"Model '{safe_model_name}' not found in results.")
 
     # --- Aggregate prompt tokens from all metadata runs ---
@@ -673,12 +717,18 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
     safe_model_name = escape(model_name)
     safe_timestamp = escape(timestamp)
 
+    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
+    if not benchmark_run_dir:
+        abort(500, "Benchmark run directory not configured.")
+    prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
+    results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
+
     details = get_run_details(
         benchmark_case_prefix,
         model_name,  # Use original model name for path construction
         timestamp,
-        app.config["BENCHMARK_DIR"],
-        app.config["RESULTS_BASE_DIR"],
+        prompts_dir,  # Pass derived prompts path
+        results_dir,  # Pass derived results path
     )
 
     if details.get("error") and "Run directory not found" in details["error"]:
@@ -796,43 +846,44 @@ def serve_file(filepath):
     if ".." in filepath or filepath.startswith("/"):
         abort(403, "Invalid file path.")
 
-    # Define allowed base directories relative to app root
-    allowed_dirs_rel = [app.config["BENCHMARK_DIR"], app.config["RESULTS_BASE_DIR"]]
-    # Get the absolute path to the repository root directory
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    # Define allowed base directories relative to app root (now within benchmark_run_dir)
+    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
+    if not benchmark_run_dir:
+        abort(500, "Benchmark run directory not configured for file serving.")
 
-    allowed_dirs_abs = [
-        os.path.abspath(os.path.join(repo_root, d)) for d in allowed_dirs_rel
+    # Get the absolute path to the benchmark run directory
+    run_dir_abs = os.path.abspath(benchmark_run_dir)
+    allowed_subdirs_abs = [
+        os.path.join(run_dir_abs, PROMPTS_SUBDIR),
+        os.path.join(run_dir_abs, RESULTS_SUBDIR),
     ]
 
-    # Construct the absolute path requested by the user, relative to repo root
-    requested_path_abs = os.path.abspath(os.path.join(repo_root, filepath))
+    # Construct the absolute path requested by the user, relative to the benchmark run dir
+    # Assume filepath is relative to the benchmark_run_dir (e.g., "prompts/case_prompt.txt")
+    requested_path_abs = os.path.abspath(os.path.join(run_dir_abs, filepath))
 
-    # Security Check: Ensure the requested path is within one of the allowed directories
-    is_allowed = False
+    # Security Check: Ensure the requested path is within one of the allowed subdirectories
     serving_directory = None
     filename = None
-    for allowed_dir in allowed_dirs_abs:
-        # Check if the requested path starts with the allowed directory path + separator
-        # This ensures we don't match partial directory names
-        # Use os.path.normcase for case-insensitive comparison on relevant systems
+    for allowed_subdir in allowed_subdirs_abs:
+        # Check if the requested path starts with the allowed subdirectory path + separator
         if os.path.normcase(requested_path_abs).startswith(
-            os.path.normcase(allowed_dir + os.sep)
+            os.path.normcase(allowed_subdir + os.sep)
         ):
             is_allowed = True
-            serving_directory = allowed_dir
-            # Calculate filename relative to the serving directory
-            filename = os.path.relpath(requested_path_abs, allowed_dir)
-            # Double-check filename doesn't try to escape upwards (should be prevented by startswith check)
+            serving_directory = allowed_subdir
+            # Calculate filename relative to the serving subdirectory
+            filename = os.path.relpath(requested_path_abs, allowed_subdir)
+            # Double-check filename doesn't try to escape upwards
             if ".." in filename or filename.startswith(os.sep):
-                is_allowed = False  # Abort if relpath calculation seems suspicious
+                is_allowed = False
                 break
-            break  # Found the allowed directory
+            break  # Found the allowed subdirectory
 
     if not is_allowed or serving_directory is None or filename is None:
         abort(
             403,
-            "Access denied: File is outside allowed directories or path calculation failed.",
+            "Access denied: File is outside allowed subdirectories (prompts/ or results/) or path calculation failed.",
         )
 
     # Determine mimetype (simple check for text files)
@@ -872,21 +923,32 @@ def run_data_analysis():
     """Performs benchmark results analysis, storing results in app.config."""
     # Use app context to access config
     with app.app_context():
+        benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
+        if not benchmark_run_dir:
+            print(
+                "Error: BENCHMARK_RUN_DIR not set in app config. Cannot run analysis.",
+                file=sys.stderr,
+            )
+            current_app.config["ANALYSIS_RESULTS"] = None
+            return
+
+        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
+        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
+
         print("\n--- Running Benchmark Data Analysis ---")
-        benchmark_metadata = load_benchmark_metadata(
-            current_app.config["BENCHMARK_DIR"]
-        )
+        print(f"Using prompts dir: {prompts_dir}")
+        print(f"Using results dir: {results_dir}")
+
+        benchmark_metadata = load_benchmark_metadata(prompts_dir)
         if not benchmark_metadata:
             print(
-                "Error: Benchmark metadata not found. Cannot perform analysis.",
+                f"Error: Benchmark metadata not found in {prompts_dir}. Cannot perform analysis.",
                 file=sys.stderr,
             )
             current_app.config["ANALYSIS_RESULTS"] = None  # Ensure it's None
             return
 
-        models_found, results_data = scan_results_directory(
-            current_app.config["RESULTS_BASE_DIR"]
-        )
+        models_found, results_data = scan_results_directory(results_dir)
         if not models_found:
             print(
                 "Warning: No models found in results directory. Analysis will be empty."
@@ -908,20 +970,48 @@ def run_data_analysis():
 
 
 if __name__ == "__main__":
-    # Configuration for running directly
-    HOST = "127.0.0.1"
-    PORT = 5001
-    DEBUG = True  # Flask debug mode
+    # --- Argument Parsing for Direct Execution ---
+    parser = argparse.ArgumentParser(
+        description="Run the LoCoDiff Benchmark Explorer web app."
+    )
+    parser.add_argument(
+        "--benchmark-run-dir",
+        required=True,
+        help="Path to the directory containing the benchmark run data (subdirectories: 'prompts/', 'results/').",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host address to bind the server to (default: 127.0.0.1). Use 0.0.0.0 for external access.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5001,
+        help="Port number to run the server on (default: 5001).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable Flask debug mode (enables auto-reloading).",
+    )
+    args = parser.parse_args()
 
+    # --- Configure App ---
+    app.config["BENCHMARK_RUN_DIR"] = args.benchmark_run_dir
+    # Ensure the static directory exists (needed for Chart.js etc.)
+    os.makedirs(app.static_folder, exist_ok=True)
+
+    # --- Run Analysis and Start Server ---
     # Run data analysis before starting the server
     # This happens only once when the main process starts (not in reloader subprocess)
-    if not DEBUG or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    if not args.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         run_data_analysis()
 
     # Open browser tab shortly after starting the server
-    if not DEBUG or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    if not args.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         # Delay slightly to ensure server is likely up
-        threading.Timer(1.5, lambda: open_browser(HOST, PORT)).start()
+        threading.Timer(1.5, lambda: open_browser(args.host, args.port)).start()
 
     # Run the Flask app
-    app.run(debug=DEBUG, host=HOST, port=PORT)
+    app.run(debug=args.debug, host=args.host, port=args.port)
