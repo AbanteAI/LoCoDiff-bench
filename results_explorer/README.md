@@ -57,3 +57,5 @@ python results_explorer/app.py --benchmark-run-dir path/to/run --host 0.0.0.0 --
     *   Raw model response
     *   Extracted output (if successful)
     *   Diff between expected and extracted output
+
+<!-- Mentat test comment -->
