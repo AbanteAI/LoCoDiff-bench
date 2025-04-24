@@ -748,10 +748,15 @@ def load_existing_metadata_and_prefixes(
                 loaded_data = json.load(mf)
                 if isinstance(loaded_data, list):
                     existing_metadata_runs = loaded_data
-                    for run_data in existing_metadata_runs:
-                        if isinstance(run_data, dict) and "benchmark_cases" in run_data:
-                            if isinstance(run_data["benchmark_cases"], list):
-                                for case in run_data["benchmark_cases"]:
+                    for run_index, run_data in enumerate(existing_metadata_runs):
+                        # Check if the item is a dictionary and contains the expected key for the current format
+                        if (
+                            isinstance(run_data, dict)
+                            and "benchmark_cases_added" in run_data
+                        ):
+                            cases_list = run_data["benchmark_cases_added"]
+                            if isinstance(cases_list, list):
+                                for case in cases_list:
                                     if (
                                         isinstance(case, dict)
                                         and "benchmark_case_prefix" in case
@@ -760,53 +765,29 @@ def load_existing_metadata_and_prefixes(
                                             case["benchmark_case_prefix"]
                                         )
                             else:
-                                # print(f"Warning: 'benchmark_cases' in metadata run is not a list: {run_data}") # Reduced verbosity
+                                # The expected key exists, but its value is not a list
                                 print(
-                                    f"Warning: Skipping invalid 'benchmark_cases' list found in {metadata_path}"
+                                    f"Warning: 'benchmark_cases_added' in run item {run_index} of {metadata_path} is not a list."
                                 )
                         else:
-                            # print(f"Warning: Invalid run structure in metadata: {run_data}") # Reduced verbosity
+                            # This item in the list doesn't look like the expected run dictionary structure
                             print(
-                                f"Warning: Skipping invalid run structure found in {metadata_path}"
+                                f"Warning: Skipping item at index {run_index} in {metadata_path} as it does not match expected structure (missing 'benchmark_cases_added' key or not a dictionary): {type(run_data)}"
                             )
-                elif isinstance(loaded_data, dict):
-                    # Handle legacy format (single run object) gracefully
-                    print(
-                        "Warning: Found legacy metadata format (single object). Converting to list format."
-                    )
-                    # Check if it looks like the old format
-                    if (
-                        "generation_parameters" in loaded_data
-                        and "benchmark_cases" in loaded_data
-                    ):
-                        existing_metadata_runs = [loaded_data]  # Wrap it in a list
-                        if isinstance(loaded_data["benchmark_cases"], list):
-                            for case in loaded_data["benchmark_cases"]:
-                                if (
-                                    isinstance(case, dict)
-                                    and "benchmark_case_prefix" in case
-                                ):
-                                    existing_prefixes.add(case["benchmark_case_prefix"])
-                        else:
-                            print(
-                                "Warning: 'benchmark_cases' in legacy metadata is not a list."
-                            )
-                    else:
-                        print(
-                            "Warning: Legacy metadata format unrecognized. Starting fresh."
-                        )
-
                 else:
+                    # The top-level structure is not a list, which is the only supported format now
                     print(
-                        f"Warning: Existing {metadata_path} is not a list or recognized legacy format. Starting fresh."
+                        f"Warning: Existing {metadata_path} is not a list. Only list format is supported. Starting fresh."
                     )
+                    existing_metadata_runs = []  # Reset as the format is unsupported
+
         except (json.JSONDecodeError, IOError) as e:
             print(
                 f"Warning: Error reading or parsing existing {metadata_path}: {e}. Starting fresh."
             )
             existing_metadata_runs = []  # Reset on error
 
-    # 2. Scan output directory for existing prompt files
+    # 2. Scan output directory for existing prompt files (keeps working as before)
     try:
         # Use glob directly due to 'from glob import glob'
         prompt_files = glob(os.path.join(output_dir, "*_prompt.txt"))
