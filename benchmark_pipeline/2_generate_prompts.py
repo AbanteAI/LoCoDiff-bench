@@ -863,9 +863,9 @@ def main():
     parser.add_argument(
         "--modified-within-months",
         type=int,
-        default=3,
+        default=6,
         metavar="N",
-        help="Only process files modified in the last N months (default: 3). Set to 0 or negative to disable.",
+        help="Only process files modified in the last N months (default: 6). Set to 0 or negative to disable.",
     )
     parser.add_argument(
         "--max-expected-tokens",
