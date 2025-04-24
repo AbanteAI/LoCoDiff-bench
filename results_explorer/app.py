@@ -596,10 +596,12 @@ def get_run_details(
 @app.route("/")
 def index():
     """Index page: Shows overall summary, models, and dynamic chart."""
-    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
-    if not benchmark_run_dir:
+    benchmark_run_dir_maybe_none = current_app.config.get("BENCHMARK_RUN_DIR")
+    if benchmark_run_dir_maybe_none is None:
         abort(500, "Benchmark run directory not configured.")
-    assert isinstance(benchmark_run_dir, str)  # Assure pyright
+    benchmark_run_dir: str = (
+        benchmark_run_dir_maybe_none  # Explicitly typed after check
+    )
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
 
     benchmark_metadata = load_benchmark_metadata(prompts_dir)
@@ -628,10 +630,12 @@ def index():
 def model_results(model_name):
     """Shows results for a specific model, grouped by bucket."""
     safe_model_name = escape(model_name)
-    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
-    if not benchmark_run_dir:
+    benchmark_run_dir_maybe_none = current_app.config.get("BENCHMARK_RUN_DIR")
+    if benchmark_run_dir_maybe_none is None:
         abort(500, "Benchmark run directory not configured.")
-    assert isinstance(benchmark_run_dir, str)  # Assure pyright
+    benchmark_run_dir: str = (
+        benchmark_run_dir_maybe_none  # Explicitly typed after check
+    )
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
     results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
 
@@ -720,10 +724,12 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
     safe_model_name = escape(model_name)
     safe_timestamp = escape(timestamp)
 
-    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
-    if not benchmark_run_dir:
+    benchmark_run_dir_maybe_none = current_app.config.get("BENCHMARK_RUN_DIR")
+    if benchmark_run_dir_maybe_none is None:
         abort(500, "Benchmark run directory not configured.")
-    assert isinstance(benchmark_run_dir, str)  # Assure pyright
+    benchmark_run_dir: str = (
+        benchmark_run_dir_maybe_none  # Explicitly typed after check
+    )
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
     results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
 
@@ -851,10 +857,12 @@ def serve_file(filepath):
         abort(403, "Invalid file path.")
 
     # Define allowed base directories relative to app root (now within benchmark_run_dir)
-    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
-    if not benchmark_run_dir:
+    benchmark_run_dir_maybe_none = current_app.config.get("BENCHMARK_RUN_DIR")
+    if benchmark_run_dir_maybe_none is None:
         abort(500, "Benchmark run directory not configured for file serving.")
-    assert isinstance(benchmark_run_dir, str)  # Assure pyright
+    benchmark_run_dir: str = (
+        benchmark_run_dir_maybe_none  # Explicitly typed after check
+    )
 
     # Get the absolute path to the benchmark run directory
     run_dir_abs = os.path.abspath(benchmark_run_dir)
@@ -868,6 +876,7 @@ def serve_file(filepath):
     requested_path_abs = os.path.abspath(os.path.join(run_dir_abs, filepath))
 
     # Security Check: Ensure the requested path is within one of the allowed subdirectories
+    is_allowed = False  # Initialize before loop
     serving_directory = None
     filename = None
     for allowed_subdir in allowed_subdirs_abs:
@@ -928,14 +937,17 @@ def run_data_analysis():
     """Performs benchmark results analysis, storing results in app.config."""
     # Use app context to access config
     with app.app_context():
-        benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
-        if not benchmark_run_dir:
+        benchmark_run_dir_maybe_none = current_app.config.get("BENCHMARK_RUN_DIR")
+        if benchmark_run_dir_maybe_none is None:
             print(
                 "Error: BENCHMARK_RUN_DIR not set in app config. Cannot run analysis.",
                 file=sys.stderr,
             )
             current_app.config["ANALYSIS_RESULTS"] = None
             return
+        benchmark_run_dir: str = (
+            benchmark_run_dir_maybe_none  # Explicitly typed after check
+        )
 
         prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
         results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
@@ -1005,7 +1017,12 @@ if __name__ == "__main__":
     # --- Configure App ---
     app.config["BENCHMARK_RUN_DIR"] = args.benchmark_run_dir
     # Ensure the static directory exists (needed for Chart.js etc.)
-    os.makedirs(app.static_folder, exist_ok=True)
+    static_folder = app.static_folder
+    if static_folder is None:
+        print("Error: Flask app static folder is not configured.", file=sys.stderr)
+        sys.exit(1)
+    assert isinstance(static_folder, str)  # Assure pyright it's a string path
+    os.makedirs(static_folder, exist_ok=True)
 
     # --- Run Analysis and Start Server ---
     # Run data analysis before starting the server
