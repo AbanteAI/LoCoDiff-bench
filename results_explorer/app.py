@@ -605,8 +605,8 @@ def model_results(model_name):
         # If not found anywhere, default to 0
         else:
             run["prompt_tokens"] = 0
-    
-    # Sort all runs by prompt token count (ascending)
+
+    # Sort all runs by prompt token count (ascending order)
     sorted_runs = sorted(all_runs, key=lambda run: run["prompt_tokens"])
 
     return render_template(
