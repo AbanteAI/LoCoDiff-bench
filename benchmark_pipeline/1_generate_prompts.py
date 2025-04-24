@@ -385,8 +385,8 @@ print('Hello, world!')
 
 
 def generate_prompts_and_expected(
-    repo_path: str, cfg: Config
-) -> Tuple[List[Dict[str, Any]], int, int]:
+    repo_path: str, cfg: Config, existing_prefixes: set[str]
+) -> Tuple[List[Dict[str, Any]], int, int, int]:
     """
     Generates prompts and expected outputs for eligible files in a repository.
 
@@ -397,12 +397,14 @@ def generate_prompts_and_expected(
     Args:
         repo_path: Path to the cloned repository.
         cfg: Configuration object.
+        existing_prefixes: Set of benchmark case prefixes that already exist.
 
     Returns:
-        Tuple: (stats_list, date_filtered_count, expected_token_filtered_count)
+        Tuple: (stats_list, date_filtered_count, expected_token_filtered_count, already_exists_count)
             - stats_list: List of dictionaries with statistics for each generated case.
             - date_filtered_count: Number of files skipped due to modification date.
             - expected_token_filtered_count: Number of files skipped due to expected token limit.
+            - already_exists_count: Number of files skipped because they already exist.
     """
     # Ensure temporary directory exists
     if not os.path.exists(cfg.temp_dir):
@@ -415,6 +417,7 @@ def generate_prompts_and_expected(
     files_to_process = []
     date_filtered_count = 0
     expected_token_filtered_count = 0
+    already_exists_count = 0
 
     # --- Calculate Date Threshold ---
     threshold_timestamp = None
@@ -477,6 +480,11 @@ def generate_prompts_and_expected(
         prompt_fname = f"{repo_file_prefix}_prompt.txt"
         expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
 
+        # Check if this file already exists in the benchmark set
+        if repo_file_prefix in existing_prefixes:
+            already_exists_count += 1
+            continue
+
         # Write to temp directory instead of output directory
         prompt_path = os.path.join(cfg.temp_dir, prompt_fname)
         expected_path = os.path.join(cfg.temp_dir, expected_fname)
@@ -521,7 +529,12 @@ def generate_prompts_and_expected(
         }
         stats_list.append(file_stats)
 
-    return stats_list, date_filtered_count, expected_token_filtered_count
+    return (
+        stats_list,
+        date_filtered_count,
+        expected_token_filtered_count,
+        already_exists_count,
+    )
 
 
 # --- Statistics, Filtering, Sampling, and Deletion Functions ---
@@ -1046,25 +1059,33 @@ def main():
     total_expected_token_filtered_count = (
         0  # Initialize counter for expected token filtering
     )
+    total_already_exists_count = 0  # Initialize counter for already existing files
 
     for repo_path in repo_paths:
         repo_name = os.path.basename(os.path.normpath(repo_path))
         org_name = os.path.basename(os.path.dirname(repo_path))
         print(f"\nProcessing repository: {org_name}/{repo_name} ({repo_path})")
         try:
-            # Pass the config object
+            # Pass the config object and existing prefixes
             (
                 stats_list,
                 date_filtered_count,
                 expected_token_filtered_count,
-            ) = generate_prompts_and_expected(repo_path, cfg)  # Pass cfg object
+                already_exists_count,
+            ) = generate_prompts_and_expected(
+                repo_path, cfg, existing_prefixes
+            )  # Pass cfg object and existing prefixes
             all_candidate_stats.extend(stats_list)  # Add to candidates
             total_date_filtered_count += date_filtered_count  # Accumulate date count
             total_expected_token_filtered_count += (
                 expected_token_filtered_count  # Accumulate token count
             )
+            total_already_exists_count += (
+                already_exists_count  # Accumulate already exists count
+            )
             print(
-                f"Generated {len(stats_list)} prompts for {org_name}/{repo_name} (skipped {date_filtered_count} by date, {expected_token_filtered_count} by expected tokens)."
+                f"Generated {len(stats_list)} prompts for {org_name}/{repo_name} (skipped {date_filtered_count} by date, "
+                f"{expected_token_filtered_count} by expected tokens, {already_exists_count} already exist)."
             )
         except Exception as e:
             print(f"Error generating prompts for {org_name}/{repo_name}: {e}")
@@ -1089,6 +1110,10 @@ def main():
         print(
             f"\nFiltered out a total of {total_expected_token_filtered_count} files across all repositories due to expected output token constraint (more than {cfg.max_expected_tokens} tokens)."
         )
+    # Report total files skipped because they already exist
+    print(
+        f"\nSkipped processing a total of {total_already_exists_count} files across all repositories because they already exist in the benchmark set."
+    )
 
     # --- Post-Generation Processing ---
 
