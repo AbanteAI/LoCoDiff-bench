@@ -22,10 +22,10 @@ Arguments:
   --repos, -r (required): List of GitHub repositories to process (format: 'org/repo'
                           or full URL). These will be cloned if not already in cache.
   --extensions, -e (required): List of file extensions to process (e.g., '.py' '.js').
+  --benchmark-run-dir (required): Path to the directory where benchmark run data
+                                  (prompts, results) will be stored.
   --cache-dir (optional): Path to the directory containing cached repositories
                           (default: 'cached-repos').
-  --output-dir (optional): Directory to save generated prompt/expected files
-                           (default: 'generated_prompts').
   --min-prompt-tokens (optional): Minimum number of tokens (in thousands, e.g., 0)
                                   allowed in the generated prompt file (default: 0).
   --max-prompt-tokens (optional): Maximum number of tokens (in thousands, e.g., 50)
@@ -45,22 +45,23 @@ Inputs:
     filtering/sampling parameters.
 
 Outputs:
-  - Creates the `output-dir` (default: 'generated_prompts/') if it doesn't exist.
-  - Populates `output-dir` with pairs of files for each processed source file:
+  - Creates the `<benchmark_run_dir>/prompts/` directory if it doesn't exist.
+  - Creates the `<benchmark_run_dir>/prompts_temp/` directory for temporary files.
+  - Populates `<benchmark_run_dir>/prompts/` with pairs of files for each processed source file:
     - `repo_path_prompt.txt`: Contains the reconstruction prompt (filename format uses repo name and sanitized relative path).
     - `repo_path_expectedoutput.txt`: Contains the ground truth file content (filename format uses repo name and sanitized relative path).
-  - Creates `output-dir/metadata.json`: Contains metadata about the generation
+  - Creates `<benchmark_run_dir>/prompts/metadata.json`: Contains metadata about the generation
     parameters and the final list of benchmark cases.
   - Prints statistics about the generation process, filtering, and final sampling results to the console.
 
 File Modifications:
-  - Creates the `output-dir` if it doesn't exist.
-  - Creates `*_prompt.txt` files within `output-dir`.
-  - Creates `*_expectedoutput.txt` files within `output-dir`.
-  - Creates or overwrites `metadata.json` within `output-dir`.
-  - Deletes prompt/expected file pairs from `output-dir` that are filtered out due
-    to token limits (prompt token outside min/max range, or expected token > max_expected_tokens)
-    or removed during the sampling process (`num-prompts`).
+  - Creates the `<benchmark_run_dir>/prompts/` directory if it doesn't exist.
+  - Creates the `<benchmark_run_dir>/prompts_temp/` directory if it doesn't exist.
+  - Creates `*_prompt.txt` files within `<benchmark_run_dir>/prompts_temp/` initially.
+  - Creates `*_expectedoutput.txt` files within `<benchmark_run_dir>/prompts_temp/` initially.
+  - Copies selected `*_prompt.txt` and `*_expectedoutput.txt` files from `<benchmark_run_dir>/prompts_temp/` to `<benchmark_run_dir>/prompts/`.
+  - Creates or overwrites `metadata.json` within `<benchmark_run_dir>/prompts/`.
+  - Deletes the `<benchmark_run_dir>/prompts_temp/` directory after completion.
   - Creates the `cache-dir` (default: 'cached-repos/') if it doesn't exist.
   - Clones repositories into the cache-dir if they don't already exist there.
 """
@@ -201,9 +202,10 @@ class Config:
     """Configuration settings for the prompt generation script."""
 
     extensions: List[str]
+    benchmark_run_dir: str  # New required directory
+    prompts_dir: str  # Derived: benchmark_run_dir / "prompts"
+    temp_dir: str  # Derived: benchmark_run_dir / "prompts_temp"
     cache_dir: str
-    output_dir: str
-    temp_dir: str  # Added temporary directory
     min_prompt_tokens: int
     max_prompt_tokens: int
     add_prompts: int  # Renamed from num_prompts
@@ -391,7 +393,7 @@ def generate_prompts_and_expected(
 
     Iterates through files matching specified extensions, applies date and token
     filters, fetches git history, calculates stats, and writes output files to
-    the temporary directory.
+    the temporary directory (`cfg.temp_dir`).
 
     Args:
         repo_path: Path to the cloned repository.
@@ -479,12 +481,12 @@ def generate_prompts_and_expected(
         prompt_fname = f"{repo_file_prefix}_prompt.txt"
         expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
 
-        # Check if this file already exists in the benchmark set
+        # Check if this file already exists in the benchmark set (based on existing prefixes loaded from prompts_dir)
         if repo_file_prefix in existing_prefixes:
             already_exists_count += 1
             continue
 
-        # Write to temp directory instead of output directory
+        # Write to temp directory (e.g., <benchmark_run_dir>/prompts_temp/)
         prompt_path = os.path.join(cfg.temp_dir, prompt_fname)
         expected_path = os.path.join(cfg.temp_dir, expected_fname)
 
@@ -663,23 +665,23 @@ def sample_prompts(
 def copy_selected_files(
     kept_prefixes: set[str],
     temp_dir: str,
-    output_dir: str,
+    prompts_dir: str,  # Changed from output_dir
 ):
     """
-    Copies selected prompt and expected output files from temporary directory to output directory.
+    Copies selected prompt and expected output files from temporary directory to the final prompts directory.
 
     Args:
         kept_prefixes: A set of benchmark case prefixes to copy.
-        temp_dir: The source directory containing temporary files.
-        output_dir: The destination directory to copy selected files to.
+        temp_dir: The source directory containing temporary files (e.g., <run_dir>/prompts_temp/).
+        prompts_dir: The destination directory to copy selected files to (e.g., <run_dir>/prompts/).
     """
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
+    # Ensure prompts directory exists
+    os.makedirs(prompts_dir, exist_ok=True)
 
     copied_files_count = 0
 
     print(
-        f"\n--- Copying {len(kept_prefixes)} Selected Benchmark Files to Final Location ---"
+        f"\n--- Copying {len(kept_prefixes)} Selected Benchmark Files to Final Location ({prompts_dir}) ---"
     )
 
     if not kept_prefixes:
@@ -693,8 +695,12 @@ def copy_selected_files(
         source_prompt_path = os.path.join(temp_dir, prompt_filename)
         source_expected_path = os.path.join(temp_dir, expected_filename)
 
-        dest_prompt_path = os.path.join(output_dir, prompt_filename)
-        dest_expected_path = os.path.join(output_dir, expected_filename)
+        dest_prompt_path = os.path.join(
+            prompts_dir, prompt_filename
+        )  # Changed from output_dir
+        dest_expected_path = os.path.join(
+            prompts_dir, expected_filename
+        )  # Changed from output_dir
 
         # Skip if source files don't exist
         if not os.path.exists(source_prompt_path) or not os.path.exists(
@@ -723,20 +729,22 @@ def copy_selected_files(
 
 
 def load_existing_metadata_and_prefixes(
-    output_dir: str,
+    prompts_dir: str,  # Changed from output_dir
 ) -> Tuple[List[Dict[str, Any]], set[str]]:
     """
-    Loads existing metadata and identifies all existing benchmark case prefixes.
+    Loads existing metadata and identifies all existing benchmark case prefixes from the prompts directory.
 
     Args:
-        output_dir: The directory where metadata and prompts are stored.
+        prompts_dir: The directory where metadata and final prompt files are stored (e.g., <run_dir>/prompts/).
 
     Returns:
         A tuple containing:
         - A list of previous generation run dictionaries loaded from metadata.json (or an empty list).
-        - A set of all unique benchmark_case_prefix strings found in the metadata and by scanning the output_dir.
+        - A set of all unique benchmark_case_prefix strings found in the metadata and by scanning the prompts_dir.
     """
-    metadata_path = os.path.join(output_dir, "metadata.json")
+    metadata_path = os.path.join(
+        prompts_dir, "metadata.json"
+    )  # Changed from output_dir
     existing_metadata_runs: List[Dict[str, Any]] = []
     existing_prefixes: set[str] = set()
 
@@ -787,16 +795,20 @@ def load_existing_metadata_and_prefixes(
             )
             existing_metadata_runs = []  # Reset on error
 
-    # 2. Scan output directory for existing prompt files (keeps working as before)
+    # 2. Scan prompts directory for existing prompt files (keeps working as before)
     try:
         # Use glob directly due to 'from glob import glob'
-        prompt_files = glob(os.path.join(output_dir, "*_prompt.txt"))
+        prompt_files = glob(
+            os.path.join(prompts_dir, "*_prompt.txt")
+        )  # Changed from output_dir
         for f_path in prompt_files:
             basename = os.path.basename(f_path)
             prefix = basename[:-11]  # Remove '_prompt.txt'
             existing_prefixes.add(prefix)
     except OSError as e:
-        print(f"Warning: Error scanning output directory {output_dir}: {e}")
+        print(
+            f"Warning: Error scanning prompts directory {prompts_dir}: {e}"
+        )  # Changed from output_dir
 
     return existing_metadata_runs, existing_prefixes
 
@@ -815,9 +827,11 @@ def save_benchmark_metadata(
         newly_added_stats: List of statistics for the prompts added in *this* run.
         cfg: The configuration object for the current run.
     """
-    # Create generation_params dict for the current run
+    # Create generation_params dict for the current run, excluding derived/internal paths
     current_run_params = asdict(cfg)
     current_run_params.pop("encoder", None)  # Exclude non-serializable encoder
+    current_run_params.pop("prompts_dir", None)  # Exclude derived path
+    current_run_params.pop("temp_dir", None)  # Exclude derived path
 
     # Create the list of benchmark cases for the current run
     current_run_cases = []
@@ -844,11 +858,13 @@ def save_benchmark_metadata(
     # Append the current run's metadata to the list of existing runs
     updated_metadata_runs = existing_runs + [current_run_metadata]
 
-    # Save the updated list back to metadata.json
-    metadata_path = os.path.join(cfg.output_dir, "metadata.json")
+    # Save the updated list back to metadata.json in the prompts directory
+    metadata_path = os.path.join(
+        cfg.prompts_dir, "metadata.json"
+    )  # Changed from output_dir
     try:
-        # Ensure parent directory exists (though output_dir should already exist)
-        os.makedirs(cfg.output_dir, exist_ok=True)
+        # Ensure parent directory exists (prompts_dir should already exist from copy step)
+        os.makedirs(cfg.prompts_dir, exist_ok=True)  # Changed from output_dir
         with open(metadata_path, "w", encoding="utf-8") as mf:
             json.dump(updated_metadata_runs, mf, indent=4)
         print(
@@ -882,20 +898,16 @@ def main():
         help="Comma-separated list of file extensions to process (include the dot), e.g., .py,.txt,.js",
     )
     parser.add_argument(
+        "--benchmark-run-dir",
+        required=True,
+        help="Directory where benchmark run data (prompts, results) will be stored. Will be created if it doesn't exist.",
+    )
+    parser.add_argument(
         "--cache-dir",
         default="cached-repos",
         help="Directory containing the cached repositories (default: 'cached-repos').",
     )
-    parser.add_argument(
-        "--output-dir",
-        default="generated_prompts",
-        help="Directory to save generated prompt/expected files (default: 'generated_prompts').",
-    )
-    parser.add_argument(
-        "--temp-dir",
-        default="generated_prompts_temp",
-        help="Directory for storing temporarily generated files (default: 'generated_prompts_temp').",
-    )
+    # Removed --output-dir and --temp-dir arguments
     # Add arguments for filtering/sampling parameters
     parser.add_argument(
         "--min-prompt-tokens",
@@ -952,11 +964,17 @@ def main():
     # Parse extensions from comma-separated string to list
     extension_list = [ext.strip() for ext in args.extensions.split(",")]
 
+    # Define derived paths
+    benchmark_run_dir = args.benchmark_run_dir
+    prompts_dir = os.path.join(benchmark_run_dir, "prompts")
+    temp_dir = os.path.join(benchmark_run_dir, "prompts_temp")
+
     cfg = Config(
         extensions=extension_list,
+        benchmark_run_dir=benchmark_run_dir,
+        prompts_dir=prompts_dir,
+        temp_dir=temp_dir,
         cache_dir=args.cache_dir,
-        output_dir=args.output_dir,
-        temp_dir=args.temp_dir,  # Add temp_dir
         # Convert k-tokens from args to absolute tokens for internal use
         min_prompt_tokens=args.min_prompt_tokens * 1000,
         max_prompt_tokens=args.max_prompt_tokens * 1000,
@@ -967,15 +985,19 @@ def main():
     )
     # print(f"Configuration loaded: {cfg}") # Reduced verbosity
     print(
-        f"Configuration loaded. Output dir: {cfg.output_dir}, Add prompts: {cfg.add_prompts}"
+        f"Configuration loaded. Benchmark run dir: {cfg.benchmark_run_dir}, Add prompts: {cfg.add_prompts}"
     )
     # --- End Config creation ---
 
     # --- Load existing data ---
+    # Ensure prompts directory exists before trying to load from it
+    os.makedirs(cfg.prompts_dir, exist_ok=True)
     existing_metadata_runs, existing_prefixes = load_existing_metadata_and_prefixes(
-        cfg.output_dir
+        cfg.prompts_dir  # Load from the final prompts directory
     )
-    print(f"\nFound {len(existing_prefixes)} existing benchmark prompts.")
+    print(
+        f"\nFound {len(existing_prefixes)} existing benchmark prompts in {cfg.prompts_dir}."
+    )
     # --- End Load existing data ---
 
     # --- Reporting Mode Check ---
@@ -1143,10 +1165,12 @@ def main():
     for stats in prompts_to_add_stats:
         prefixes_to_add.add(stats["benchmark_case_prefix"])
 
-    # 5. Copy the selected new files from temp directory to output directory
-    copy_selected_files(prefixes_to_add, cfg.temp_dir, cfg.output_dir)
+    # 5. Copy the selected new files from temp directory to the final prompts directory
+    copy_selected_files(
+        prefixes_to_add, cfg.temp_dir, cfg.prompts_dir
+    )  # Changed output_dir to prompts_dir
 
-    # 6. Save the updated metadata (appending the new run)
+    # 6. Save the updated metadata (appending the new run) to the prompts directory
     save_benchmark_metadata(existing_metadata_runs, prompts_to_add_stats, cfg)
 
     # 7. Clean up temporary directory
