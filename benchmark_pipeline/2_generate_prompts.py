@@ -729,7 +729,8 @@ def load_existing_metadata_and_prefixes(
 
     # 2. Scan output directory for existing prompt files
     try:
-        prompt_files = glob.glob(os.path.join(output_dir, "*_prompt.txt"))
+        # Use glob directly due to 'from glob import glob'
+        prompt_files = glob(os.path.join(output_dir, "*_prompt.txt"))
         for f_path in prompt_files:
             basename = os.path.basename(f_path)
             prefix = basename[:-11]  # Remove '_prompt.txt'
