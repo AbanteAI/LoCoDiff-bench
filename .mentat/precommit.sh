@@ -36,7 +36,8 @@ ruff check --fix .
 echo "Running type checker..."
 # We'll use the executable from the virtual environment directly
 # No need to reinstall dependencies as setup.sh should have done this
-.venv/bin/pyright .
+# Only check relevant source directories, exclude cached repos etc.
+.venv/bin/pyright benchmark_pipeline results_explorer
 
 # Note: Skipping pytest as there are currently no tests in the repository
 # If tests are added in the future, uncomment the following lines:
