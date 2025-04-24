@@ -792,7 +792,6 @@ async def run_benchmark(
     print(f"Found {len(all_case_prefixes)} benchmark cases.")
 
     # Check for existing run results
-    safe_model_name = sanitize_filename(model_name)
     existing_runs_info = {}
     existing_success_count = 0
     existing_failure_count = 0
