@@ -159,19 +159,26 @@ def analyze_results(
             # "buckets" structure removed
         }
 
-    defined_buckets = benchmark_metadata.get("benchmark_buckets", {})
-    if not defined_buckets:
-        print(
-            "Warning: No benchmark buckets found in metadata. Cannot perform analysis."
-        )
-        # If no buckets, we can't get case info for sliding window either
+    # Retrieve all benchmark cases from the flattened structure
+    benchmark_cases = benchmark_metadata.get("benchmark_cases", [])
+
+    # Fallback for backward compatibility with older benchmark_buckets structure
+    if not benchmark_cases and "benchmark_buckets" in benchmark_metadata:
+        # Extract cases from buckets if using the old format
+        for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
+            benchmark_cases.extend(cases)
+
+    if not benchmark_cases:
+        print("Warning: No benchmark cases found in metadata. Cannot perform analysis.")
+        # If no cases, we can't get case info for sliding window either
         analysis["sliding_window"] = None  # Ensure sliding window is None
         return analysis  # Return early
 
-    # Iterate through cases primarily to get overall stats and case list for sliding window
-    all_cases_info = []
-    for _bucket_key, benchmark_cases in defined_buckets.items():
-        all_cases_info.extend(benchmark_cases)  # Collect all case info
+    # Use the benchmark_cases list we've already extracted (directly or from buckets)
+    # No need to iterate through buckets again
+    all_cases_info = (
+        benchmark_cases  # This was already populated to handle both formats
+    )
 
     print(f"Found {len(all_cases_info)} total benchmark cases defined in metadata.")
 
@@ -284,14 +291,13 @@ def analyze_results(
                 for center in window_centers
             }
 
-        # Iterate through all benchmark cases
-        all_cases_info = []
-        for _bucket_key, cases in defined_buckets.items():
-            all_cases_info.extend(cases)
+        # Use benchmark_cases that was already populated earlier
+        # No need to re-collect cases from buckets
 
         print(
-            f"Processing {len(all_cases_info)} total benchmark cases for sliding window..."
+            f"Processing {len(benchmark_cases)} total benchmark cases for sliding window..."
         )
+        all_cases_info = benchmark_cases  # Reuse the list we already created
         for case_info in all_cases_info:
             benchmark_case_prefix = case_info["benchmark_case_prefix"]
             prompt_tokens = case_info.get("prompt_tokens")
@@ -558,9 +564,13 @@ def index():
     )
 
     total_cases = 0
-    if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
-        for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-            total_cases += len(cases)
+    if benchmark_metadata:
+        if "benchmark_cases" in benchmark_metadata:
+            total_cases = len(benchmark_metadata["benchmark_cases"])
+        elif "benchmark_buckets" in benchmark_metadata:
+            # Backward compatibility with older metadata format
+            for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
+                total_cases += len(cases)
 
     return render_template(
         "index.html",
@@ -589,27 +599,81 @@ def model_results(model_name):
             abort(404, description=f"Model '{safe_model_name}' not found in results.")
 
     runs_by_bucket = {}
-    if benchmark_metadata and "benchmark_buckets" in benchmark_metadata:
-        # Use bucket keys from analysis results if available, otherwise from metadata
+
+    # Process based on the available metadata structure
+    if benchmark_metadata:
+        # Define a function to determine bucket ranges dynamically
+        def get_bucket_ranges(benchmark_metadata):
+            # First try to use generation_parameters.buckets_str if available
+            if (
+                "generation_parameters" in benchmark_metadata
+                and "buckets_str" in benchmark_metadata["generation_parameters"]
+            ):
+                bucket_str = benchmark_metadata["generation_parameters"]["buckets_str"]
+                try:
+                    # Parse "0,20,40,60,80,100" into [0, 20, 40, 60, 80, 100]
+                    bucket_boundaries_k = [
+                        int(b.strip()) for b in bucket_str.split(",")
+                    ]
+                    # Create bucket ranges like ["0-20", "20-40", ...]
+                    return [
+                        f"{bucket_boundaries_k[i]}-{bucket_boundaries_k[i + 1]}"
+                        for i in range(len(bucket_boundaries_k) - 1)
+                    ]
+                except (ValueError, IndexError):
+                    pass  # Fall back to alternative method if parsing fails
+
+            # Alternative: If working with older format or parsing failed
+            if "benchmark_buckets" in benchmark_metadata:
+                return sorted(
+                    benchmark_metadata["benchmark_buckets"].keys(),
+                    key=lambda k: int(k.split("-")[0]),
+                )
+
+            # Default: Create reasonable default buckets if neither approach works
+            # Start with some reasonable bucket ranges if nothing else available
+            return ["0-20", "20-40", "40-60", "60-80", "80-100"]
+
+        # Get bucket ranges
         bucket_keys = None
         if analysis_results:
             bucket_keys = analysis_results.get("bucket_keys")
 
-        # If bucket_keys is None (not set in analysis_results or analysis_results is None),
-        # fall back to sorting the bucket keys from benchmark_metadata
         if bucket_keys is None:
-            bucket_keys = sorted(
-                benchmark_metadata["benchmark_buckets"].keys(),
-                key=lambda k: int(k.split("-")[0]),
-            )
+            bucket_keys = get_bucket_ranges(benchmark_metadata)
 
+        # Initialize bucket lists
         for bucket_key in bucket_keys:
             runs_by_bucket[bucket_key] = []
 
+        # Function to determine which bucket a case belongs to based on prompt_tokens
+        def get_bucket_for_tokens(prompt_tokens, bucket_keys):
+            for bucket_key in bucket_keys:
+                min_tokens, max_tokens = map(
+                    lambda x: int(x) * 1000, bucket_key.split("-")
+                )
+                # Check if token count falls within this bucket's range
+                if min_tokens <= prompt_tokens < max_tokens or (
+                    prompt_tokens == max_tokens and bucket_key == bucket_keys[-1]
+                ):
+                    return bucket_key
+            # If not in any defined bucket, put in the last bucket as fallback
+            return bucket_keys[-1] if bucket_keys else "unknown"
+
+        # Create case_to_bucket mapping
         case_to_bucket = {}
-        for bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-            for case_info in cases:
+
+        # Handle new flat structure
+        if "benchmark_cases" in benchmark_metadata:
+            for case_info in benchmark_metadata["benchmark_cases"]:
+                prompt_tokens = case_info.get("prompt_tokens", 0)
+                bucket_key = get_bucket_for_tokens(prompt_tokens, bucket_keys)
                 case_to_bucket[case_info["benchmark_case_prefix"]] = bucket_key
+        # Handle backward compatibility with older bucket structure
+        elif "benchmark_buckets" in benchmark_metadata:
+            for bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
+                for case_info in cases:
+                    case_to_bucket[case_info["benchmark_case_prefix"]] = bucket_key
 
         for run in all_runs:
             bucket_key = case_to_bucket.get(run["benchmark_case_prefix"])

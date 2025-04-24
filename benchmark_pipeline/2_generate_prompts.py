@@ -818,26 +818,24 @@ def save_benchmark_metadata(
 
     metadata = {
         "generation_parameters": generation_params,
-        "benchmark_buckets": {},
+        "benchmark_cases": [],  # Flat list of benchmark cases instead of bucket structure
     }
 
-    # Convert tuple keys to string representation for JSON compatibility
+    # Collect all benchmark cases from all buckets into a single flat list
     for bucket_key, stats_list in final_buckets.items():
         # Only include buckets that have prompts in them
         if stats_list:
-            # Convert tuple key (min_token, max_token) to string "min_token-max_token"
-            bucket_key_str = f"{bucket_key[0]}-{bucket_key[1]}"
-            # Store only the necessary info for analysis: benchmark_case_prefix and original filename
-            metadata["benchmark_buckets"][bucket_key_str] = [
-                {
-                    "benchmark_case_prefix": stats["benchmark_case_prefix"],
-                    "original_filename": stats["filename"],
-                    "repo_name": stats["repo_name"],
-                    "repo_commit_hash": stats["repo_commit_hash"],
-                    "prompt_tokens": stats["prompt_tokens"],
-                }
-                for stats in stats_list
-            ]
+            for stats in stats_list:
+                # Store only the necessary info for analysis
+                metadata["benchmark_cases"].append(
+                    {
+                        "benchmark_case_prefix": stats["benchmark_case_prefix"],
+                        "original_filename": stats["filename"],
+                        "repo_name": stats["repo_name"],
+                        "repo_commit_hash": stats["repo_commit_hash"],
+                        "prompt_tokens": stats["prompt_tokens"],
+                    }
+                )
 
     metadata_path = os.path.join(cfg.output_dir, "metadata.json")
     try:
