@@ -503,6 +503,7 @@ def get_run_details(
     timestamp: str,
     prompts_dir: str,  # Changed from benchmark_dir
     results_dir: str,  # Changed from results_base_dir
+    benchmark_run_dir: str = None,  # Added benchmark_run_dir parameter
 ):
     """
     Loads all details for a specific run, accessing files from prompts and results subdirectories.
@@ -513,7 +514,12 @@ def get_run_details(
         timestamp: The run timestamp.
         prompts_dir: Path to the 'prompts' subdirectory.
         results_dir: Path to the 'results' subdirectory.
+        benchmark_run_dir: Path to the benchmark run directory (parent of prompts and results).
     """
+    # If benchmark_run_dir isn't provided, derive it from prompts_dir or results_dir
+    if benchmark_run_dir is None:
+        # Assume prompts_dir is benchmark_run_dir/prompts
+        benchmark_run_dir = os.path.dirname(prompts_dir)
     # Path to the specific run directory within the results subdirectory
     run_dir = os.path.join(results_dir, benchmark_case_prefix, model_name, timestamp)
     details = {
@@ -553,31 +559,37 @@ def get_run_details(
     prompt_filename = f"{benchmark_case_prefix}_prompt.txt"
     expected_filename = f"{benchmark_case_prefix}_expectedoutput.txt"
     # Check existence and store relative paths for prompt and expected files within prompts_dir
-    prompt_rel_path = os.path.join(prompts_dir, prompt_filename)
-    expected_rel_path = os.path.join(prompts_dir, expected_filename)
+    prompt_abs_path = os.path.join(prompts_dir, prompt_filename)
+    expected_abs_path = os.path.join(prompts_dir, expected_filename)
 
-    if os.path.exists(prompt_rel_path):
+    if os.path.exists(prompt_abs_path):
         details["prompt_exists"] = True
+        # Store path relative to the benchmark_run_dir, not absolute path
+        prompt_rel_path = os.path.relpath(prompt_abs_path, benchmark_run_dir)
         details["prompt_rel_path"] = prompt_rel_path
     else:
         details["error"] = (
-            details.get("error", "") + f" Prompt file not found: {prompt_rel_path}"
+            details.get("error", "") + f" Prompt file not found: {prompt_abs_path}"
         )
 
-    if os.path.exists(expected_rel_path):
+    if os.path.exists(expected_abs_path):
         details["expected_exists"] = True
+        # Store path relative to the benchmark_run_dir, not absolute path
+        expected_rel_path = os.path.relpath(expected_abs_path, benchmark_run_dir)
         details["expected_rel_path"] = expected_rel_path
     else:
         details["error"] = (
             details.get("error", "")
-            + f" Expected output file not found: {expected_rel_path}"
+            + f" Expected output file not found: {expected_abs_path}"
         )
 
     # Check existence and store relative paths for files in run_dir
     def check_run_file(filename, exists_key, path_key):
-        rel_path = os.path.join(run_dir, filename)
-        if os.path.exists(rel_path):
+        abs_path = os.path.join(run_dir, filename)
+        if os.path.exists(abs_path):
             details[exists_key] = True
+            # Store path relative to the benchmark_run_dir, not absolute path
+            rel_path = os.path.relpath(abs_path, benchmark_run_dir)
             details[path_key] = rel_path
         # No error message here, as missing files might be expected (e.g., no diff on success)
 
@@ -739,6 +751,7 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
         timestamp,
         prompts_dir,  # Pass derived prompts path
         results_dir,  # Pass derived results path
+        benchmark_run_dir=benchmark_run_dir,  # Pass benchmark_run_dir explicitly
     )
 
     if details.get("error") and "Run directory not found" in details["error"]:
