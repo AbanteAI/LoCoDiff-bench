@@ -1094,11 +1094,11 @@ def main():
 
             # Attempt to extract original extension from filename based on the generation format:
             # {org}_{repo}_{path_with_underscores}_{ext_part}_prompt.txt
-            base_no_suffix = basename[:-len(prompt_suffix)]
+            base_no_suffix = basename[: -len(prompt_suffix)]
             inferred_ext = ""
-            if '_' in base_no_suffix:
+            if "_" in base_no_suffix:
                 # Split from the right at the last underscore
-                prefix, ext_part = base_no_suffix.rsplit('_', 1)
+                prefix, ext_part = base_no_suffix.rsplit("_", 1)
                 # Check if the part after the last underscore looks like a plausible extension part
                 # (e.g., not empty, reasonable length - adjust heuristic if needed)
                 if ext_part and len(ext_part) < 7:
