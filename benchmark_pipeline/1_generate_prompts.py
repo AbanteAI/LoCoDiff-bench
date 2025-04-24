@@ -368,7 +368,7 @@ Wrap the content of the file in triple backticks (```). Any text outside the fin
 
 ```python
 #!/usr/bin/env python
-print("Hello, world!")
+print('Hello, world!')
 ```
 
 # File History
