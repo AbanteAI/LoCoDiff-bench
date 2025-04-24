@@ -76,7 +76,6 @@ import subprocess
 import time
 from datetime import datetime, timezone
 import tiktoken
-from statistics import mean, median, stdev
 import random
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
@@ -556,25 +555,26 @@ def print_stats_summary(stats_list: List[Dict[str, Any]], title: str):
     final_lines = [s["final_lines"] for s in stats_list]
 
     print(f"\n--- {title} (Count: {count}) ---")
-    if count > 0:
-        print(
-            f"  Prompt Tokens:  Min={min(prompt_tokens)}, Max={max(prompt_tokens)}, Avg={mean(prompt_tokens):.0f}, Median={median(prompt_tokens):.0f}, StdDev={stdev(prompt_tokens) if count > 1 else 0:.0f}"
-        )
-        print(
-            f"  Expected Tokens: Min={min(expected_tokens)}, Max={max(expected_tokens)}, Avg={mean(expected_tokens):.0f}, Median={median(expected_tokens):.0f}, StdDev={stdev(expected_tokens) if count > 1 else 0:.0f}"
-        )
-        print(
-            f"  Num Commits:    Min={min(num_commits)}, Max={max(num_commits)}, Avg={mean(num_commits):.1f}, Median={median(num_commits):.1f}"
-        )
-        print(
-            f"  Lines Added:    Min={min(lines_added)}, Max={max(lines_added)}, Avg={mean(lines_added):.0f}, Median={median(lines_added):.0f}"
-        )
-        print(
-            f"  Lines Deleted:  Min={min(lines_deleted)}, Max={max(lines_deleted)}, Avg={mean(lines_deleted):.0f}, Median={median(lines_deleted):.0f}"
-        )
-        print(
-            f"  Final Lines:    Min={min(final_lines)}, Max={max(final_lines)}, Avg={mean(final_lines):.0f}, Median={median(final_lines):.0f}"
-        )
+    # Reduced verbosity: Removed detailed stats printing below
+    # if count > 0:
+    #     print(
+    #         f"  Prompt Tokens:  Min={min(prompt_tokens)}, Max={max(prompt_tokens)}, Avg={mean(prompt_tokens):.0f}, Median={median(prompt_tokens):.0f}, StdDev={stdev(prompt_tokens) if count > 1 else 0:.0f}"
+    #     )
+    #     print(
+    #         f"  Expected Tokens: Min={min(expected_tokens)}, Max={max(expected_tokens)}, Avg={mean(expected_tokens):.0f}, Median={median(expected_tokens):.0f}, StdDev={stdev(expected_tokens) if count > 1 else 0:.0f}"
+    #     )
+    #     print(
+    #         f"  Num Commits:    Min={min(num_commits)}, Max={max(num_commits)}, Avg={mean(num_commits):.1f}, Median={median(num_commits):.1f}"
+    #     )
+    #     print(
+    #         f"  Lines Added:    Min={min(lines_added)}, Max={max(lines_added)}, Avg={mean(lines_added):.0f}, Median={median(lines_added):.0f}"
+    #     )
+    #     print(
+    #         f"  Lines Deleted:  Min={min(lines_deleted)}, Max={max(lines_deleted)}, Avg={mean(lines_deleted):.0f}, Median={median(lines_deleted):.0f}"
+    #     )
+    #     print( # Also comment out Final Lines stats
+    #         f"  Final Lines:    Min={min(final_lines)}, Max={max(final_lines)}, Avg={mean(final_lines):.0f}, Median={median(final_lines):.0f}"
+    #     )
 
 
 def filter_prompts_by_token_range(
@@ -784,12 +784,14 @@ def load_existing_metadata_and_prefixes(
                                             case["benchmark_case_prefix"]
                                         )
                             else:
+                                # print(f"Warning: 'benchmark_cases' in metadata run is not a list: {run_data}") # Reduced verbosity
                                 print(
-                                    f"Warning: 'benchmark_cases' in metadata run is not a list: {run_data}"
+                                    f"Warning: Skipping invalid 'benchmark_cases' list found in {metadata_path}"
                                 )
                         else:
+                            # print(f"Warning: Invalid run structure in metadata: {run_data}") # Reduced verbosity
                             print(
-                                f"Warning: Invalid run structure in metadata: {run_data}"
+                                f"Warning: Skipping invalid run structure found in {metadata_path}"
                             )
                 elif isinstance(loaded_data, dict):
                     # Handle legacy format (single run object) gracefully
@@ -1006,7 +1008,10 @@ def main():
         max_expected_tokens=args.max_expected_tokens,
         encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
     )
-    print(f"Configuration loaded: {cfg}")
+    # print(f"Configuration loaded: {cfg}") # Reduced verbosity
+    print(
+        f"Configuration loaded. Output dir: {cfg.output_dir}, Add prompts: {cfg.add_prompts}"
+    )
     # --- End Config creation ---
 
     # --- Load existing data ---
