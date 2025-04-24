@@ -159,14 +159,8 @@ def analyze_results(
             # "buckets" structure removed
         }
 
-    # Retrieve all benchmark cases from the flattened structure
+    # Get benchmark cases from the flattened structure
     benchmark_cases = benchmark_metadata.get("benchmark_cases", [])
-
-    # Fallback for backward compatibility with older benchmark_buckets structure
-    if not benchmark_cases and "benchmark_buckets" in benchmark_metadata:
-        # Extract cases from buckets if using the old format
-        for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-            benchmark_cases.extend(cases)
 
     if not benchmark_cases:
         print("Warning: No benchmark cases found in metadata. Cannot perform analysis.")
@@ -564,13 +558,8 @@ def index():
     )
 
     total_cases = 0
-    if benchmark_metadata:
-        if "benchmark_cases" in benchmark_metadata:
-            total_cases = len(benchmark_metadata["benchmark_cases"])
-        elif "benchmark_buckets" in benchmark_metadata:
-            # Backward compatibility with older metadata format
-            for _bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-                total_cases += len(cases)
+    if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
+        total_cases = len(benchmark_metadata["benchmark_cases"])
 
     return render_template(
         "index.html",
@@ -623,12 +612,7 @@ def model_results(model_name):
                 except (ValueError, IndexError):
                     pass  # Fall back to alternative method if parsing fails
 
-            # Alternative: If working with older format or parsing failed
-            if "benchmark_buckets" in benchmark_metadata:
-                return sorted(
-                    benchmark_metadata["benchmark_buckets"].keys(),
-                    key=lambda k: int(k.split("-")[0]),
-                )
+            # No fallback to older format - just use default buckets
 
             # Default: Create reasonable default buckets if neither approach works
             # Start with some reasonable bucket ranges if nothing else available
@@ -663,17 +647,12 @@ def model_results(model_name):
         # Create case_to_bucket mapping
         case_to_bucket = {}
 
-        # Handle new flat structure
+        # Process benchmark cases and assign to buckets
         if "benchmark_cases" in benchmark_metadata:
             for case_info in benchmark_metadata["benchmark_cases"]:
                 prompt_tokens = case_info.get("prompt_tokens", 0)
                 bucket_key = get_bucket_for_tokens(prompt_tokens, bucket_keys)
                 case_to_bucket[case_info["benchmark_case_prefix"]] = bucket_key
-        # Handle backward compatibility with older bucket structure
-        elif "benchmark_buckets" in benchmark_metadata:
-            for bucket_key, cases in benchmark_metadata["benchmark_buckets"].items():
-                for case_info in cases:
-                    case_to_bucket[case_info["benchmark_case_prefix"]] = bucket_key
 
         for run in all_runs:
             bucket_key = case_to_bucket.get(run["benchmark_case_prefix"])
