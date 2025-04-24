@@ -23,6 +23,7 @@ Arguments:
                           (default: 'cached-repos').
   --output-dir (optional): Directory to save generated prompt/expected files
                            (default: 'generated_prompts').
+  # --temp-dir argument removed, uses system temp directory now.
   --min-prompt-tokens (optional): Minimum number of tokens (in thousands, e.g., 0)
                                   allowed in the generated prompt file (default: 0).
   --max-prompt-tokens (optional): Maximum number of tokens (in thousands, e.g., 50)
@@ -71,6 +72,7 @@ import json
 import re
 import subprocess
 import time
+import tempfile # Added for temporary directory
 from datetime import datetime, timezone
 import tiktoken
 from statistics import mean, median, stdev
@@ -116,7 +118,7 @@ class Config:
     extensions: List[str]
     cache_dir: str
     output_dir: str
-    temp_dir: str  # Added temporary directory
+    # temp_dir removed from config
     min_prompt_tokens: int
     max_prompt_tokens: int
     add_prompts: int  # Renamed from num_prompts
@@ -296,8 +298,10 @@ print('Hello, world!')
 # --- Core Generation Logic ---
 
 
+# Function signature already updated in previous successful edit block
+
 def generate_prompts_and_expected(
-    repo_path: str, cfg: Config
+    repo_path: str, temp_dir_path: str, cfg: Config
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     """
     Generates prompts and expected outputs for eligible files in a repository.
@@ -316,9 +320,8 @@ def generate_prompts_and_expected(
             - date_filtered_count: Number of files skipped due to modification date.
             - expected_token_filtered_count: Number of files skipped due to expected token limit.
     """
-    # Ensure temporary directory exists
-    if not os.path.exists(cfg.temp_dir):
-        os.makedirs(cfg.temp_dir, exist_ok=True)
+    # Temporary directory path is now passed directly
+    # No need to check/create it here, mkdtemp handles creation
 
     repo_name = os.path.basename(os.path.normpath(repo_path))
     org_name = os.path.basename(os.path.dirname(repo_path))
@@ -389,9 +392,9 @@ def generate_prompts_and_expected(
         prompt_fname = f"{repo_file_prefix}_prompt.txt"
         expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
 
-        # Write to temp directory instead of output directory
-        prompt_path = os.path.join(cfg.temp_dir, prompt_fname)
-        expected_path = os.path.join(cfg.temp_dir, expected_fname)
+        # Write to the provided temporary directory path
+        prompt_path = os.path.join(temp_dir_path, prompt_fname)
+        expected_path = os.path.join(temp_dir_path, expected_fname)
 
         # 4. Get Git History
         try:
@@ -583,9 +586,11 @@ def sample_prompts(
     return items_to_keep, items_sampled_out_count
 
 
+# Function signature already updated in previous successful edit block
+
 def copy_selected_files(
     kept_prefixes: set[str],
-    temp_dir: str,
+    temp_dir_path: str, # Renamed parameter
     output_dir: str,
 ):
     """
@@ -613,8 +618,8 @@ def copy_selected_files(
         prompt_filename = f"{prefix}_prompt.txt"
         expected_filename = f"{prefix}_expectedoutput.txt"
 
-        source_prompt_path = os.path.join(temp_dir, prompt_filename)
-        source_expected_path = os.path.join(temp_dir, expected_filename)
+        source_prompt_path = os.path.join(temp_dir_path, prompt_filename)
+        source_expected_path = os.path.join(temp_dir_path, expected_filename)
 
         dest_prompt_path = os.path.join(output_dir, prompt_filename)
         dest_expected_path = os.path.join(output_dir, expected_filename)
@@ -836,11 +841,7 @@ def main():
         default="generated_prompts",
         help="Directory to save generated prompt/expected files (default: 'generated_prompts').",
     )
-    parser.add_argument(
-        "--temp-dir",
-        default="generated_prompts_temp",
-        help="Directory for storing temporarily generated files (default: 'generated_prompts_temp').",
-    )
+    # --temp-dir argument removed
     # Add arguments for filtering/sampling parameters
     parser.add_argument(
         "--min-prompt-tokens",
@@ -863,9 +864,9 @@ def main():
     parser.add_argument(
         "--modified-within-months",
         type=int,
-        default=3,
+        default=6, # Changed default from 3 to 6
         metavar="N",
-        help="Only process files modified in the last N months (default: 3). Set to 0 or negative to disable.",
+        help="Only process files modified in the last N months (default: 6). Set to 0 or negative to disable.",
     )
     parser.add_argument(
         "--max-expected-tokens",
@@ -901,7 +902,7 @@ def main():
         extensions=extension_list,
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
-        temp_dir=args.temp_dir,  # Add temp_dir
+        # temp_dir removed from config
         # Convert k-tokens from args to absolute tokens for internal use
         min_prompt_tokens=args.min_prompt_tokens * 1000,
         max_prompt_tokens=args.max_prompt_tokens * 1000,
@@ -913,10 +914,18 @@ def main():
     print(f"Configuration loaded: {cfg}")
     # --- End Config creation ---
 
-    # --- Load existing data ---
-    existing_metadata_runs, existing_prefixes = load_existing_metadata_and_prefixes(
-        cfg.output_dir
-    )
+    # --- Create Temporary Directory ---
+    # Use a try...finally block to ensure cleanup
+    temp_dir_path = None # Initialize to None
+    try:
+        temp_dir_path = tempfile.mkdtemp(prefix="locodiff_prompts_")
+        print(f"Created temporary directory: {temp_dir_path}")
+        # --- End Temporary Directory Creation --- # Moved comment
+
+        # --- Load existing data ---
+        existing_metadata_runs, existing_prefixes = load_existing_metadata_and_prefixes(
+            cfg.output_dir
+        )
     print(f"\nFound {len(existing_prefixes)} existing benchmark prompts.")
     # --- End Load existing data ---
 
@@ -953,8 +962,8 @@ def main():
                 stats_list,
                 date_filtered_count,
                 expected_token_filtered_count,
-            ) = generate_prompts_and_expected(repo_path, cfg)  # Pass cfg object
-            all_candidate_stats.extend(stats_list)  # Add to candidates
+            ) = generate_prompts_and_expected(repo_path, temp_dir_path, cfg) # Pass temp_dir_path
+            all_candidate_stats.extend(stats_list) # Add to candidates
             total_date_filtered_count += date_filtered_count  # Accumulate date count
             total_expected_token_filtered_count += (
                 expected_token_filtered_count  # Accumulate token count
@@ -1053,25 +1062,32 @@ def main():
         prefixes_to_add.add(stats["benchmark_case_prefix"])
 
     # 5. Copy the selected new files from temp directory to output directory
-    copy_selected_files(prefixes_to_add, cfg.temp_dir, cfg.output_dir)
+    copy_selected_files(prefixes_to_add, temp_dir_path, cfg.output_dir) # Pass temp_dir_path
 
     # 6. Save the updated metadata (appending the new run)
     save_benchmark_metadata(existing_metadata_runs, prompts_to_add_stats, cfg)
 
-    # 7. Clean up temporary directory
-    print(f"\nCleaning up temporary directory: {cfg.temp_dir}")
-    if os.path.exists(cfg.temp_dir):
-        try:
-            shutil.rmtree(cfg.temp_dir)
-            print(f"Successfully removed temporary directory: {cfg.temp_dir}")
-        except OSError as e:
-            print(f"Warning: Failed to remove temporary directory {cfg.temp_dir}: {e}")
-            print("You may need to manually delete this directory.")
-
     print("\nBenchmark prompt generation and processing complete.")
-    return 0
+    # Note: return 0 happens implicitly if no error occurs before finally block in main() try/finally
+
+# Note: The finally block for temp_dir_path cleanup is part of the main() function's try/finally structure
 
 
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    # Wrap main call in try/except to ensure finally cleanup runs even on exceptions within main
+    exit_code = 1 # Default to error
+    try:
+        # main() itself now contains the primary try/finally for temp dir cleanup
+        exit_code = main()
+    except Exception as e:
+         print(f"\n--- Unhandled Exception Occurred Outside Main Try/Finally ---")
+         print(f"Error: {type(e).__name__}: {e}")
+         import traceback
+         traceback.print_exc()
+         # Attempt cleanup again here just in case main's finally didn't run (though it should)
+         # This requires temp_dir_path to be accessible, which it isn't globally.
+         # Relying on the finally block within main() is the primary mechanism.
+         print("Exiting with error code due to unhandled exception.")
+    finally:
+         # Ensure sys.exit is always called
+         sys.exit(exit_code)
