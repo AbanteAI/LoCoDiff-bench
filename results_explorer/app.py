@@ -350,6 +350,7 @@ def calculate_wilson_interval(
 ) -> Tuple[Optional[float], Optional[float]]:
     """
     Calculates the Wilson score interval for a binomial proportion.
+    This provides confidence bounds for success rates.
 
     Args:
         successes: Number of successful outcomes.
@@ -592,7 +593,9 @@ def model_results(model_name):
     if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
         # Build mapping from benchmark case prefix to prompt tokens
         for case_info in benchmark_metadata["benchmark_cases"]:
-            case_prompt_tokens[case_info["benchmark_case_prefix"]] = case_info.get("prompt_tokens", 0)
+            case_prompt_tokens[case_info["benchmark_case_prefix"]] = case_info.get(
+                "prompt_tokens", 0
+            )
 
     # Assign prompt tokens to runs based on their case prefix (or from run metadata if available)
     for run in all_runs:
