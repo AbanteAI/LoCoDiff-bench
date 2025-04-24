@@ -587,103 +587,34 @@ def model_results(model_name):
         ):
             abort(404, description=f"Model '{safe_model_name}' not found in results.")
 
-    runs_by_bucket = {}
+    # Create a dictionary to map benchmark case prefixes to their prompt tokens
+    case_prompt_tokens = {}
+    if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
+        # Build mapping from benchmark case prefix to prompt tokens
+        for case_info in benchmark_metadata["benchmark_cases"]:
+            case_prompt_tokens[case_info["benchmark_case_prefix"]] = case_info.get("prompt_tokens", 0)
 
-    # Process based on the available metadata structure
-    if benchmark_metadata:
-        # Define a function to determine bucket ranges dynamically
-        def get_bucket_ranges(benchmark_metadata):
-            # First try to use generation_parameters.buckets_str if available
-            if (
-                "generation_parameters" in benchmark_metadata
-                and "buckets_str" in benchmark_metadata["generation_parameters"]
-            ):
-                bucket_str = benchmark_metadata["generation_parameters"]["buckets_str"]
-                try:
-                    # Parse "0,20,40,60,80,100" into [0, 20, 40, 60, 80, 100]
-                    bucket_boundaries_k = [
-                        int(b.strip()) for b in bucket_str.split(",")
-                    ]
-                    # Create bucket ranges like ["0-20", "20-40", ...]
-                    return [
-                        f"{bucket_boundaries_k[i]}-{bucket_boundaries_k[i + 1]}"
-                        for i in range(len(bucket_boundaries_k) - 1)
-                    ]
-                except (ValueError, IndexError):
-                    pass  # Fall back to alternative method if parsing fails
-
-            # No fallback to older format - just use default buckets
-
-            # Default: Create reasonable default buckets if neither approach works
-            # Start with some reasonable bucket ranges if nothing else available
-            return ["0-20", "20-40", "40-60", "60-80", "80-100"]
-
-        # Get bucket ranges
-        bucket_keys = None
-        if analysis_results:
-            bucket_keys = analysis_results.get("bucket_keys")
-
-        if bucket_keys is None:
-            bucket_keys = get_bucket_ranges(benchmark_metadata)
-
-        # Initialize bucket lists
-        for bucket_key in bucket_keys:
-            runs_by_bucket[bucket_key] = []
-
-        # Function to determine which bucket a case belongs to based on prompt_tokens
-        def get_bucket_for_tokens(prompt_tokens, bucket_keys):
-            for bucket_key in bucket_keys:
-                min_tokens, max_tokens = map(
-                    lambda x: int(x) * 1000, bucket_key.split("-")
-                )
-                # Check if token count falls within this bucket's range
-                if min_tokens <= prompt_tokens < max_tokens or (
-                    prompt_tokens == max_tokens and bucket_key == bucket_keys[-1]
-                ):
-                    return bucket_key
-            # If not in any defined bucket, put in the last bucket as fallback
-            return bucket_keys[-1] if bucket_keys else "unknown"
-
-        # Create case_to_bucket mapping
-        case_to_bucket = {}
-
-        # Process benchmark cases and assign to buckets
-        if "benchmark_cases" in benchmark_metadata:
-            for case_info in benchmark_metadata["benchmark_cases"]:
-                prompt_tokens = case_info.get("prompt_tokens", 0)
-                bucket_key = get_bucket_for_tokens(prompt_tokens, bucket_keys)
-                case_to_bucket[case_info["benchmark_case_prefix"]] = bucket_key
-
-        for run in all_runs:
-            bucket_key = case_to_bucket.get(run["benchmark_case_prefix"])
-            if bucket_key and bucket_key in runs_by_bucket:
-                runs_by_bucket[bucket_key].append(run)
-            else:
-                if "unknown" not in runs_by_bucket:
-                    runs_by_bucket["unknown"] = []
-                runs_by_bucket["unknown"].append(run)
-
-        # Use the sorted keys for the final dict to maintain order
-        sorted_runs_by_bucket = {
-            k: runs_by_bucket[k] for k in bucket_keys if k in runs_by_bucket
-        }
-        if "unknown" in runs_by_bucket:
-            sorted_runs_by_bucket["unknown"] = runs_by_bucket["unknown"]
-
-    else:
-        sorted_runs_by_bucket = {"all_runs": all_runs}
+    # Assign prompt tokens to runs based on their case prefix (or from run metadata if available)
+    for run in all_runs:
+        # First try to get tokens from the run's metadata
+        if run.get("metadata") and run["metadata"].get("prompt_tokens") is not None:
+            run["prompt_tokens"] = run["metadata"]["prompt_tokens"]
+        # Otherwise, look it up from the benchmark cases
+        elif run["benchmark_case_prefix"] in case_prompt_tokens:
+            run["prompt_tokens"] = case_prompt_tokens[run["benchmark_case_prefix"]]
+        # If not found anywhere, default to 0
+        else:
+            run["prompt_tokens"] = 0
+    
+    # Sort all runs by prompt token count (ascending)
+    sorted_runs = sorted(all_runs, key=lambda run: run["prompt_tokens"])
 
     return render_template(
         "model_results.html",
         model_name=safe_model_name,
         original_model_name=model_name,
-        runs_by_bucket=sorted_runs_by_bucket,
+        runs=sorted_runs,
         benchmark_metadata=benchmark_metadata,
-        # Pass formatted bucket keys from analysis if available
-        formatted_bucket_keys=analysis_results.get("formatted_bucket_keys")
-        if analysis_results
-        else None,
-        bucket_keys=analysis_results.get("bucket_keys") if analysis_results else None,
     )
 
 
