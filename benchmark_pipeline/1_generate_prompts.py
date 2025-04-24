@@ -24,8 +24,6 @@ Arguments:
   --extensions, -e (required): List of file extensions to process (e.g., '.py' '.js').
   --benchmark-run-dir (required): Path to the directory where benchmark run data
                                   (prompts, results) will be stored.
-  --cache-dir (optional): Path to the directory containing cached repositories
-                          (default: 'cached-repos').
   --min-prompt-tokens (optional): Minimum number of tokens (in thousands, e.g., 0)
                                   allowed in the generated prompt file (default: 0).
   --max-prompt-tokens (optional): Maximum number of tokens (in thousands, e.g., 50)
@@ -62,8 +60,8 @@ File Modifications:
   - Copies selected `*_prompt.txt` and `*_expectedoutput.txt` files from `<benchmark_run_dir>/prompts_temp/` to `<benchmark_run_dir>/prompts/`.
   - Creates or overwrites `metadata.json` within `<benchmark_run_dir>/prompts/`.
   - Deletes the `<benchmark_run_dir>/prompts_temp/` directory after completion.
-  - Creates the `cache-dir` (default: 'cached-repos/') if it doesn't exist.
-  - Clones repositories into the cache-dir if they don't already exist there.
+  - Creates the `cached-repos/` directory if it doesn't exist.
+  - Clones repositories into the `cached-repos/` directory if they don't already exist there.
 """
 
 import argparse
@@ -205,7 +203,6 @@ class Config:
     benchmark_run_dir: str  # New required directory
     prompts_dir: str  # Derived: benchmark_run_dir / "prompts"
     temp_dir: str  # Derived: benchmark_run_dir / "prompts_temp"
-    cache_dir: str
     min_prompt_tokens: int
     max_prompt_tokens: int
     add_prompts: int  # Renamed from num_prompts
@@ -902,11 +899,7 @@ def main():
         required=True,
         help="Directory where benchmark run data (prompts, results) will be stored. Will be created if it doesn't exist.",
     )
-    parser.add_argument(
-        "--cache-dir",
-        default="cached-repos",
-        help="Directory containing the cached repositories (default: 'cached-repos').",
-    )
+    # Removed --cache-dir argument as it's now hardcoded
     # Removed --output-dir and --temp-dir arguments
     # Add arguments for filtering/sampling parameters
     parser.add_argument(
@@ -974,7 +967,6 @@ def main():
         benchmark_run_dir=benchmark_run_dir,
         prompts_dir=prompts_dir,
         temp_dir=temp_dir,
-        cache_dir=args.cache_dir,
         # Convert k-tokens from args to absolute tokens for internal use
         min_prompt_tokens=args.min_prompt_tokens * 1000,
         max_prompt_tokens=args.max_prompt_tokens * 1000,
@@ -1016,7 +1008,7 @@ def main():
     for repo_name in args.repos:
         print(f"\nProcessing repository: {repo_name}")
         try:
-            repo_path = clone_repo_to_cache(repo_name, cfg.cache_dir)
+            repo_path = clone_repo_to_cache(repo_name, "cached-repos")
             repo_paths.append(repo_path)
             success_count += 1
         except ValueError as e:
