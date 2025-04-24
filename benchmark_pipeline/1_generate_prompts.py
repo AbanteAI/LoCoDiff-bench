@@ -1093,16 +1093,20 @@ def main():
                 continue  # Should not happen with glob pattern
 
             # Attempt to extract original extension from filename based on the generation format:
-            # {org}_{repo}_{path_with_underscores}_{ext_part}_prompt.txt
+            # Example: aider_aider_cli.py_prompt.txt
             base_no_suffix = basename[: -len(prompt_suffix)]
             inferred_ext = ""
-            if "_" in base_no_suffix:
-                # Split from the right at the last underscore
-                _, last_part = base_no_suffix.rsplit("_", 1)
-                # Form a potential extension and check if it's known
-                potential_ext = "." + last_part
+
+            # Extract extension: everything after the last dot in the base name
+            if "." in base_no_suffix:
+                potential_ext = (
+                    "." + base_no_suffix.rsplit(".", 1)[1]
+                )  # ".py", ".js", ...
+                # Check if this potential extension is defined in our config
                 if potential_ext in ext_to_lang:
                     inferred_ext = potential_ext
+            else:
+                potential_ext = ""  # no dot found → leave blank
 
             lang_found = ext_to_lang.get(inferred_ext)
             if lang_found:
