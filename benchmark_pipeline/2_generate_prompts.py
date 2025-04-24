@@ -520,17 +520,13 @@ def sample_prompts(
 
     Args:
         stats_list: List of statistics dictionaries (already filtered by token range).
-        cfg: The configuration object containing num_prompts, min_prompt_tokens, max_prompt_tokens.
+        cfg: The configuration object containing add_prompts, min_prompt_tokens, max_prompt_tokens.
 
     Returns:
         A tuple containing:
         - A list containing the final sampled prompt statistics.
         - The total number of prompts sampled out (discarded).
     """
-    target_num_prompts = cfg.num_prompts
-    min_tk = cfg.min_prompt_tokens
-    max_tk = cfg.max_prompt_tokens
-
     num_to_add = cfg.add_prompts  # Use add_prompts from config
     min_tk = cfg.min_prompt_tokens
     max_tk = cfg.max_prompt_tokens
