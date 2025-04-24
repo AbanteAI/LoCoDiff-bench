@@ -143,80 +143,111 @@ def analyze_results(
     (Directly from analyze_results.py)
     """
     analysis: dict[str, Any] = {"models": {}}
-    # Removed bucket key initialization and formatting as bucket analysis is removed
-
     print(f"Analyzing results for models: {models_found}")
-    # Removed bucket count print statement
 
-    # Initialize basic model structure for overall stats
+    # --- Aggregate All Benchmark Cases from Metadata ---
+    all_cases_info_dict: Dict[str, Dict[str, Any]] = {}  # prefix -> {token_count, etc.}
+    max_token_limit = 0  # Track max token limit across all runs for sliding window
+
+    if isinstance(benchmark_metadata, list):  # New format: list of runs
+        print(f"Processing {len(benchmark_metadata)} runs from metadata...")
+        for run_index, run_data in enumerate(benchmark_metadata):
+            cases_key = "benchmark_cases_added"  # New key
+            if cases_key not in run_data and "benchmark_cases" in run_data:
+                cases_key = "benchmark_cases"  # Legacy key
+                # print(f"Note: Using legacy 'benchmark_cases' key for run {run_index}.")
+
+            if (
+                isinstance(run_data, dict)
+                and cases_key in run_data
+                and isinstance(run_data[cases_key], list)
+            ):
+                for case in run_data[cases_key]:
+                    if isinstance(case, dict) and "benchmark_case_prefix" in case:
+                        prefix = case["benchmark_case_prefix"]
+                        # Store info, potentially overwriting older info if prefix repeats (unlikely but possible)
+                        all_cases_info_dict[prefix] = {
+                            "prompt_tokens": case.get("prompt_tokens"),
+                            # Add other relevant case info if needed later
+                        }
+            else:
+                print(
+                    f"Warning: Skipping run {run_index} due to invalid structure or missing '{cases_key}'."
+                )
+
+            # Update max_token_limit based on this run's parameters
+            try:
+                gen_params = run_data.get("generation_parameters", {})
+                run_max_tokens = gen_params.get(
+                    "max_prompt_tokens", 0
+                )  # Absolute tokens
+                # Handle potential k-tokens in older metadata if necessary (adjust logic if needed)
+                # Example: if 'max_prompt_tokens' < 1000 and 'max_prompt_tokens' > 0: run_max_tokens *= 1000
+                max_token_limit = max(max_token_limit, run_max_tokens)
+            except Exception as e:
+                print(
+                    f"Warning: Could not determine max token limit for run {run_index}: {e}"
+                )
+
+    elif (
+        isinstance(benchmark_metadata, dict) and "benchmark_cases" in benchmark_metadata
+    ):  # Handle legacy format
+        print("Processing legacy metadata format (single run)...")
+        if isinstance(benchmark_metadata["benchmark_cases"], list):
+            for case in benchmark_metadata["benchmark_cases"]:
+                if isinstance(case, dict) and "benchmark_case_prefix" in case:
+                    prefix = case["benchmark_case_prefix"]
+                    all_cases_info_dict[prefix] = {
+                        "prompt_tokens": case.get("prompt_tokens")
+                    }
+        # Try to get max token limit from legacy params
+        try:
+            gen_params = benchmark_metadata.get("generation_parameters", {})
+            # Check for bucket boundaries first
+            if "buckets_str" in gen_params:
+                buckets_k_str = gen_params["buckets_str"]
+                bucket_boundaries_k = [
+                    int(b.strip()) for b in buckets_k_str.split(",") if b.strip()
+                ]
+                if bucket_boundaries_k:
+                    max_token_limit = max(bucket_boundaries_k) * 1000
+            # Fallback to max_prompt_tokens if buckets_str not present
+            elif "max_prompt_tokens" in gen_params:
+                max_token_limit = gen_params[
+                    "max_prompt_tokens"
+                ]  # Assume absolute in legacy? Adjust if needed.
+        except Exception as e:
+            print(
+                f"Warning: Could not determine max token limit from legacy metadata: {e}"
+            )
+
+    else:
+        print(
+            "Warning: Benchmark metadata is not in a recognized format (list of runs or legacy object). Analysis might be incomplete."
+        )
+
+    total_unique_cases = len(all_cases_info_dict)
+    print(
+        f"Found {total_unique_cases} total unique benchmark cases defined across all metadata runs."
+    )
+    if total_unique_cases == 0:
+        analysis["sliding_window"] = None
+        return analysis  # Cannot proceed without defined cases
+
+    # --- Initialize Model Stats ---
     for model_name in models_found:
         analysis["models"][model_name] = {
-            "total_benchmarks": 0,  # Will count all cases encountered
-            "runs_found": 0,
+            "total_benchmarks": total_unique_cases,  # Total defined cases
+            "runs_found": 0,  # Will count actual results found
             "successful_runs": 0,
             "total_cost_usd": 0.0,
             "success_rate": 0.0,
-            # "buckets" structure removed
         }
 
-    # Get benchmark cases from the flattened structure
-    benchmark_cases = benchmark_metadata.get("benchmark_cases", [])
-
-    if not benchmark_cases:
-        print("Warning: No benchmark cases found in metadata. Cannot perform analysis.")
-        # If no cases, we can't get case info for sliding window either
-        analysis["sliding_window"] = None  # Ensure sliding window is None
-        return analysis  # Return early
-
-    # Use the benchmark_cases list we've already extracted (directly or from buckets)
-    # No need to iterate through buckets again
-    all_cases_info = (
-        benchmark_cases  # This was already populated to handle both formats
-    )
-
-    print(f"Found {len(all_cases_info)} total benchmark cases defined in metadata.")
-
-    # Use a set to count unique benchmark cases processed per model to avoid overcounting total_benchmarks
-    processed_cases_per_model = defaultdict(set)
-
-    for case_info in all_cases_info:
-        benchmark_case_prefix = case_info["benchmark_case_prefix"]
-        for model_name in models_found:
-            # Increment total benchmark count only if this case hasn't been counted for this model yet
-            if benchmark_case_prefix not in processed_cases_per_model[model_name]:
-                analysis["models"][model_name]["total_benchmarks"] += 1
-                processed_cases_per_model[model_name].add(benchmark_case_prefix)
-
-            result_meta = results_data.get(model_name, {}).get(benchmark_case_prefix)
-
-            # Aggregate run stats only once per actual run result found
-            if (
-                result_meta is not None
-                and benchmark_case_prefix in processed_cases_per_model[model_name]
-            ):
-                # Check if we already processed this specific run for overall stats
-                # This check might be redundant if results_data only contains latest runs, but safer
-                # We need a way to ensure we only count cost/success once per model/case pair if multiple runs exist
-                # Assuming results_data *only* contains the latest run, this block is fine.
-                # If results_data could contain multiple runs, this logic needs refinement.
-                # For now, assume results_data is pre-filtered to latest runs.
-
-                # Count runs found, successful runs, and cost based on the (latest) result_meta
-                # This part seems okay assuming results_data has latest runs only.
-                # Let's refine the counting logic slightly. We should count runs_found etc. outside the
-                # processed_cases check, as those relate to actual runs, not just defined cases.
-
-                pass  # Defer run counting until after the loop for clarity
-
-    # Recalculate runs_found, successful_runs, and cost by iterating through the actual results_data
-    # This ensures we count based on actual runs, not just defined cases.
+    # --- Calculate Run Stats (Based on Latest Results Found) ---
     for model_name in models_found:
         model_results = results_data.get(model_name, {})
-        analysis["models"][model_name]["runs_found"] = len(
-            model_results
-        )  # Count actual runs found
-        analysis["models"][model_name]["successful_runs"] = 0
-        analysis["models"][model_name]["total_cost_usd"] = 0.0
+        analysis["models"][model_name]["runs_found"] = len(model_results)
         for case_prefix, result_meta in model_results.items():
             if result_meta is not None:
                 if result_meta.get("success", False):
@@ -224,39 +255,17 @@ def analyze_results(
                 cost = result_meta.get("cost_usd", 0.0) or 0.0
                 analysis["models"][model_name]["total_cost_usd"] += float(cost)
 
-    # Calculate overall success rates based on actual runs found
-    for model_name, model_stats in analysis["models"].items():
-        if model_stats["runs_found"] > 0:
-            model_stats["success_rate"] = (
-                model_stats["successful_runs"] / model_stats["runs_found"]
+        # Calculate overall success rates based on actual runs found
+        if analysis["models"][model_name]["runs_found"] > 0:
+            analysis["models"][model_name]["success_rate"] = (
+                analysis["models"][model_name]["successful_runs"]
+                / analysis["models"][model_name]["runs_found"]
             )
-        # Bucket rate calculation removed
 
     # --- Sliding Window Analysis ---
-    # Uses all_cases_info collected above
     print("Starting sliding window analysis...")
-    max_token_limit = 0
-    try:
-        if benchmark_metadata and "generation_parameters" in benchmark_metadata:
-            gen_params = benchmark_metadata["generation_parameters"]
-            if "buckets_str" in gen_params:
-                buckets_k_str = gen_params["buckets_str"]
-                # Parse the string "0,20,40,..." into a list of integers
-                bucket_boundaries_k = [
-                    int(b.strip()) for b in buckets_k_str.split(",") if b.strip()
-                ]
-                if bucket_boundaries_k:
-                    # Get the max k-token value and convert to actual token count
-                    max_token_limit = max(bucket_boundaries_k) * 1000
-                else:
-                    print("Warning: Parsed bucket boundaries string is empty.")
-            else:
-                print("Warning: 'buckets_str' not found in generation_parameters.")
-        else:
-            print("Warning: 'generation_parameters' not found in benchmark_metadata.")
-    except (ValueError, TypeError, AttributeError) as e:
-        print(f"Error parsing bucket boundaries for sliding window: {e}")
-        max_token_limit = 0  # Ensure it defaults to 0 on error
+    # Use max_token_limit determined from metadata runs
+    print(f"Using max token limit for sliding window: {max_token_limit}")
 
     if max_token_limit < 5000:
         print(
@@ -285,15 +294,11 @@ def analyze_results(
                 for center in window_centers
             }
 
-        # Use benchmark_cases that was already populated earlier
-        # No need to re-collect cases from buckets
-
+        # Iterate through the aggregated benchmark cases
         print(
-            f"Processing {len(benchmark_cases)} total benchmark cases for sliding window..."
+            f"Processing {total_unique_cases} unique benchmark cases for sliding window..."
         )
-        all_cases_info = benchmark_cases  # Reuse the list we already created
-        for case_info in all_cases_info:
-            benchmark_case_prefix = case_info["benchmark_case_prefix"]
+        for benchmark_case_prefix, case_info in all_cases_info_dict.items():
             prompt_tokens = case_info.get("prompt_tokens")
 
             if prompt_tokens is None:
@@ -302,24 +307,30 @@ def analyze_results(
                 )
                 continue
 
+            # Check results for each model for this specific case
             for model_name in models_found:
+                # Get the latest result for this model/case pair
                 result_meta = results_data.get(model_name, {}).get(
                     benchmark_case_prefix
                 )
+
+                # Only consider cases where a result actually exists for this model
                 if result_meta is not None:
                     is_success = result_meta.get("success", False)
 
-                    # Check which windows this case falls into
+                    # Check which windows this case falls into based on its prompt_tokens
                     for center in window_centers:
                         if abs(prompt_tokens - center) <= window_radius:
                             window_stats = analysis["sliding_window"]["models"][
                                 model_name
                             ][center]
+                            # Increment total count for this window/model pair
                             window_stats["total"] += 1
                             if is_success:
+                                # Increment success count if the result was successful
                                 window_stats["successful"] += 1
 
-        # Calculate rates
+        # Calculate rates and confidence intervals after processing all cases
         for model_name in models_found:
             for center in window_centers:
                 window_stats = analysis["sliding_window"]["models"][model_name][center]
@@ -587,26 +598,60 @@ def model_results(model_name):
         ):
             abort(404, description=f"Model '{safe_model_name}' not found in results.")
 
-    # Create a dictionary to map benchmark case prefixes to their prompt tokens
-    case_prompt_tokens = {}
-    if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
-        # Build mapping from benchmark case prefix to prompt tokens
-        for case_info in benchmark_metadata["benchmark_cases"]:
-            case_prompt_tokens[case_info["benchmark_case_prefix"]] = case_info.get(
-                "prompt_tokens", 0
-            )
+    # --- Aggregate prompt tokens from all metadata runs ---
+    case_prompt_tokens = {}  # prefix -> token_count
+    if isinstance(benchmark_metadata, list):  # New format
+        for run_data in benchmark_metadata:
+            cases_key = "benchmark_cases_added"
+            if cases_key not in run_data and "benchmark_cases" in run_data:
+                cases_key = "benchmark_cases"  # Legacy
 
-    # Assign prompt tokens to runs based on their case prefix (or from run metadata if available)
+            if (
+                isinstance(run_data, dict)
+                and cases_key in run_data
+                and isinstance(run_data[cases_key], list)
+            ):
+                for case in run_data[cases_key]:
+                    if isinstance(case, dict) and "benchmark_case_prefix" in case:
+                        prefix = case["benchmark_case_prefix"]
+                        # Store token count, potentially overwriting (should be consistent)
+                        case_prompt_tokens[prefix] = case.get("prompt_tokens")
+
+    elif (
+        isinstance(benchmark_metadata, dict) and "benchmark_cases" in benchmark_metadata
+    ):  # Legacy format
+        if isinstance(benchmark_metadata["benchmark_cases"], list):
+            for case in benchmark_metadata["benchmark_cases"]:
+                if isinstance(case, dict) and "benchmark_case_prefix" in case:
+                    prefix = case["benchmark_case_prefix"]
+                    case_prompt_tokens[prefix] = case.get("prompt_tokens")
+    # --- End aggregation ---
+
+    # Assign prompt tokens to runs based on the aggregated map
+    missing_token_count = 0
     for run in all_runs:
-        # First try to get tokens from the run's metadata
-        if run.get("metadata") and run["metadata"].get("prompt_tokens") is not None:
-            run["prompt_tokens"] = run["metadata"]["prompt_tokens"]
-        # Otherwise, look it up from the benchmark cases
-        elif run["benchmark_case_prefix"] in case_prompt_tokens:
-            run["prompt_tokens"] = case_prompt_tokens[run["benchmark_case_prefix"]]
-        # If not found anywhere, default to 0
+        prefix = run["benchmark_case_prefix"]
+        if prefix in case_prompt_tokens and case_prompt_tokens[prefix] is not None:
+            run["prompt_tokens"] = case_prompt_tokens[prefix]
         else:
-            run["prompt_tokens"] = 0
+            # Fallback: Try getting from the run's own metadata if lookup failed
+            if run.get("metadata") and run["metadata"].get("prompt_tokens") is not None:
+                run["prompt_tokens"] = run["metadata"]["prompt_tokens"]
+                if prefix not in case_prompt_tokens:  # Log if it wasn't in the main map
+                    print(
+                        f"Warning: Prompt tokens for case '{prefix}' found in run metadata but not in aggregated benchmark metadata."
+                    )
+            else:
+                run["prompt_tokens"] = 0  # Default if not found anywhere
+                missing_token_count += 1
+                print(
+                    f"Warning: Could not determine prompt tokens for case '{prefix}'. Defaulting to 0."
+                )
+
+    if missing_token_count > 0:
+        print(
+            f"Warning: Failed to find prompt tokens for {missing_token_count} run(s)."
+        )
 
     # Sort all runs by prompt token count (ascending order)
     sorted_runs = sorted(all_runs, key=lambda run: run["prompt_tokens"])

@@ -27,8 +27,9 @@ Arguments:
                                   allowed in the generated prompt file (default: 0).
   --max-prompt-tokens (optional): Maximum number of tokens (in thousands, e.g., 50)
                                   allowed in the generated prompt file (default: 50).
-  --num-prompts (optional): The target number of prompts to generate in the final
-                            benchmark set after sampling (default: 100).
+  --add-prompts (optional): The target number of *additional* prompts to generate
+                            and add to the existing set (default: 0). If 0, only
+                            reports existing count and exits.
   --modified-within-months (optional): Only process files last modified within the
                                        specified number of months (default: 3).
                                        Set <= 0 to disable.
@@ -118,7 +119,7 @@ class Config:
     temp_dir: str  # Added temporary directory
     min_prompt_tokens: int
     max_prompt_tokens: int
-    num_prompts: int
+    add_prompts: int  # Renamed from num_prompts
     modified_within_months: int
     max_expected_tokens: int
     encoder: tiktoken.Encoding  # Encoder instance is now required
@@ -530,28 +531,36 @@ def sample_prompts(
     min_tk = cfg.min_prompt_tokens
     max_tk = cfg.max_prompt_tokens
 
+    num_to_add = cfg.add_prompts  # Use add_prompts from config
+    min_tk = cfg.min_prompt_tokens
+    max_tk = cfg.max_prompt_tokens
+
     print(
-        f"\n--- Sampling Prompts (Target: {target_num_prompts}, Range: [{min_tk}, {max_tk}]) ---"
+        f"\n--- Sampling Prompts to Add (Target: {num_to_add}, Range: [{min_tk}, {max_tk}]) ---"
     )
 
     if not stats_list:
-        print("No prompts available to sample from.")
+        print("No new candidate prompts available to sample from.")
         return [], 0
 
-    if len(stats_list) <= target_num_prompts:
+    if len(stats_list) <= num_to_add:
         print(
-            f"Number of available prompts ({len(stats_list)}) is less than or equal to target ({target_num_prompts}). Keeping all."
+            f"Number of available new prompts ({len(stats_list)}) is less than or equal to target ({num_to_add}). Keeping all available."
         )
+        # Return the available stats, 0 sampled out
         return stats_list, 0
 
     # --- Targeted Sampling Logic ---
     items_to_keep = []
     available_items = list(stats_list)  # Create a mutable copy
-    num_to_sample = min(target_num_prompts, len(available_items))
+    # Sample exactly num_to_add items
+    num_to_sample = num_to_add
 
-    print(f"Sampling {num_to_sample} prompts from {len(available_items)} available...")
+    print(
+        f"Sampling {num_to_sample} prompts from {len(available_items)} new candidates..."
+    )
 
-    for i in tqdm(range(num_to_sample), desc="Sampling prompts"):
+    for i in tqdm(range(num_to_sample), desc="Sampling prompts to add"):
         if not available_items:
             print("\nWarning: Ran out of available items during sampling.")
             break
@@ -640,56 +649,157 @@ def copy_selected_files(
     #     print(f"Encountered errors with {error_count} benchmark sets.")
 
 
-def save_benchmark_metadata(final_stats_list: List[Dict[str, Any]], cfg: Config):
+def load_existing_metadata_and_prefixes(
+    output_dir: str,
+) -> Tuple[List[Dict[str, Any]], set[str]]:
     """
-    Saves the final benchmark structure and generation parameters to metadata.json.
+    Loads existing metadata and identifies all existing benchmark case prefixes.
 
     Args:
-        final_stats_list: List of statistics for the final sampled prompts.
-        cfg: The configuration object containing output_dir and other parameters.
+        output_dir: The directory where metadata and prompts are stored.
+
+    Returns:
+        A tuple containing:
+        - A list of previous generation run dictionaries loaded from metadata.json (or an empty list).
+        - A set of all unique benchmark_case_prefix strings found in the metadata and by scanning the output_dir.
     """
-    # Create generation_params dict from Config, excluding non-serializable fields
-    generation_params = asdict(cfg)
-    # Remove fields that are not JSON serializable or derived
-    generation_params.pop("encoder", None)
-    # Remove bucket related fields if they somehow lingered
-    generation_params.pop("buckets_str", None)
-    generation_params.pop("bucket_boundaries", None)
-    generation_params.pop("max_per_bucket", None)
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    existing_metadata_runs: List[Dict[str, Any]] = []
+    existing_prefixes: set[str] = set()
 
-    metadata = {
-        "generation_parameters": generation_params,
-        "benchmark_cases": [],  # Flat list of benchmark cases
-    }
+    # 1. Load from metadata.json
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as mf:
+                # Expect metadata to be a list of run dictionaries
+                loaded_data = json.load(mf)
+                if isinstance(loaded_data, list):
+                    existing_metadata_runs = loaded_data
+                    for run_data in existing_metadata_runs:
+                        if isinstance(run_data, dict) and "benchmark_cases" in run_data:
+                            if isinstance(run_data["benchmark_cases"], list):
+                                for case in run_data["benchmark_cases"]:
+                                    if (
+                                        isinstance(case, dict)
+                                        and "benchmark_case_prefix" in case
+                                    ):
+                                        existing_prefixes.add(
+                                            case["benchmark_case_prefix"]
+                                        )
+                            else:
+                                print(
+                                    f"Warning: 'benchmark_cases' in metadata run is not a list: {run_data}"
+                                )
+                        else:
+                            print(
+                                f"Warning: Invalid run structure in metadata: {run_data}"
+                            )
+                elif isinstance(loaded_data, dict):
+                    # Handle legacy format (single run object) gracefully
+                    print(
+                        "Warning: Found legacy metadata format (single object). Converting to list format."
+                    )
+                    # Check if it looks like the old format
+                    if (
+                        "generation_parameters" in loaded_data
+                        and "benchmark_cases" in loaded_data
+                    ):
+                        existing_metadata_runs = [loaded_data]  # Wrap it in a list
+                        if isinstance(loaded_data["benchmark_cases"], list):
+                            for case in loaded_data["benchmark_cases"]:
+                                if (
+                                    isinstance(case, dict)
+                                    and "benchmark_case_prefix" in case
+                                ):
+                                    existing_prefixes.add(case["benchmark_case_prefix"])
+                        else:
+                            print(
+                                "Warning: 'benchmark_cases' in legacy metadata is not a list."
+                            )
+                    else:
+                        print(
+                            "Warning: Legacy metadata format unrecognized. Starting fresh."
+                        )
 
-    # Collect all benchmark cases from the final list
-    for stats in final_stats_list:
-        # Store only the necessary info for analysis
-        metadata["benchmark_cases"].append(
+                else:
+                    print(
+                        f"Warning: Existing {metadata_path} is not a list or recognized legacy format. Starting fresh."
+                    )
+        except (json.JSONDecodeError, IOError) as e:
+            print(
+                f"Warning: Error reading or parsing existing {metadata_path}: {e}. Starting fresh."
+            )
+            existing_metadata_runs = []  # Reset on error
+
+    # 2. Scan output directory for existing prompt files
+    try:
+        prompt_files = glob.glob(os.path.join(output_dir, "*_prompt.txt"))
+        for f_path in prompt_files:
+            basename = os.path.basename(f_path)
+            prefix = basename[:-11]  # Remove '_prompt.txt'
+            existing_prefixes.add(prefix)
+    except OSError as e:
+        print(f"Warning: Error scanning output directory {output_dir}: {e}")
+
+    return existing_metadata_runs, existing_prefixes
+
+
+def save_benchmark_metadata(
+    existing_runs: List[Dict[str, Any]],
+    newly_added_stats: List[Dict[str, Any]],
+    cfg: Config,
+):
+    """
+    Appends the current generation run's metadata to the list of existing runs
+    and saves the updated list to metadata.json.
+
+    Args:
+        existing_runs: The list of run dictionaries loaded from the existing metadata.
+        newly_added_stats: List of statistics for the prompts added in *this* run.
+        cfg: The configuration object for the current run.
+    """
+    # Create generation_params dict for the current run
+    current_run_params = asdict(cfg)
+    current_run_params.pop("encoder", None)  # Exclude non-serializable encoder
+
+    # Create the list of benchmark cases for the current run
+    current_run_cases = []
+    for stats in newly_added_stats:
+        current_run_cases.append(
             {
                 "benchmark_case_prefix": stats["benchmark_case_prefix"],
                 "original_filename": stats["filename"],
                 "repo_name": stats["repo_name"],
                 "repo_commit_hash": stats["repo_commit_hash"],
                 "prompt_tokens": stats["prompt_tokens"],
-                # Optionally add other stats if needed for analysis later
                 "expected_tokens": stats["expected_tokens"],
                 "num_commits": stats["num_commits"],
             }
         )
 
+    # Create the dictionary for the current run
+    current_run_metadata = {
+        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "generation_parameters": current_run_params,
+        "benchmark_cases_added": current_run_cases,  # Store only newly added cases
+    }
+
+    # Append the current run's metadata to the list of existing runs
+    updated_metadata_runs = existing_runs + [current_run_metadata]
+
+    # Save the updated list back to metadata.json
     metadata_path = os.path.join(cfg.output_dir, "metadata.json")
     try:
+        # Ensure parent directory exists (though output_dir should already exist)
+        os.makedirs(cfg.output_dir, exist_ok=True)
         with open(metadata_path, "w", encoding="utf-8") as mf:
-            json.dump(metadata, mf, indent=4)
-        print(f"\nSaved final benchmark structure metadata to {metadata_path}")
-    except (
-        IOError,
-        TypeError,
-    ) as e:  # Catch specific errors related to writing/serialization
-        # Raise error instead of printing warning
+            json.dump(updated_metadata_runs, mf, indent=4)
+        print(
+            f"\nAppended current run metadata to {metadata_path} ({len(newly_added_stats)} cases added)."
+        )
+    except (IOError, TypeError) as e:
         raise RuntimeError(
-            f"Error: Failed to save metadata to {metadata_path}: {e}"
+            f"Error: Failed to save updated metadata to {metadata_path}: {e}"
         ) from e
 
 
@@ -748,10 +858,10 @@ def main():
         help="Maximum number of tokens (in thousands) allowed in the prompt file (default: 50).",
     )
     parser.add_argument(
-        "--num-prompts",
+        "--add-prompts",  # Renamed from num-prompts
         type=int,
-        default=100,
-        help="Target number of prompts to generate in the final set after sampling (default: 100).",
+        default=0,  # Default to 0, meaning only report existing count
+        help="Target number of *additional* prompts to generate and add to the existing set (default: 0).",
     )
     parser.add_argument(
         "--modified-within-months",
@@ -780,8 +890,9 @@ def main():
     if args.max_prompt_tokens <= args.min_prompt_tokens:
         print("Error: --max-prompt-tokens must be greater than --min-prompt-tokens.")
         return 1
-    if args.num_prompts <= 0:
-        print("Error: --num-prompts must be positive.")
+    # Allow add_prompts to be 0 (for reporting mode)
+    if args.add_prompts < 0:
+        print("Error: --add-prompts cannot be negative.")
         return 1
     # --- End argument validation ---
 
@@ -797,13 +908,27 @@ def main():
         # Convert k-tokens from args to absolute tokens for internal use
         min_prompt_tokens=args.min_prompt_tokens * 1000,
         max_prompt_tokens=args.max_prompt_tokens * 1000,
-        num_prompts=args.num_prompts,
+        add_prompts=args.add_prompts,  # Renamed from num_prompts
         modified_within_months=args.modified_within_months,
         max_expected_tokens=args.max_expected_tokens,
         encoder=tiktoken.get_encoding("cl100k_base"),  # Initialize encoder here
     )
     print(f"Configuration loaded: {cfg}")
     # --- End Config creation ---
+
+    # --- Load existing data ---
+    existing_metadata_runs, existing_prefixes = load_existing_metadata_and_prefixes(
+        cfg.output_dir
+    )
+    print(f"\nFound {len(existing_prefixes)} existing benchmark prompts.")
+    # --- End Load existing data ---
+
+    # --- Reporting Mode Check ---
+    if cfg.add_prompts == 0:
+        print("\n--add-prompts is 0. Running in reporting mode only. Exiting.")
+        # Optionally print summary of existing metadata here if desired
+        return 0
+    # --- End Reporting Mode Check ---
 
     repo_paths = find_repo_dirs(cfg.cache_dir)
 
@@ -812,9 +937,9 @@ def main():
         print("Please run the clone_repos.py script first.")
         return 1
 
-    print(f"Found {len(repo_paths)} repositories to process.")
+    print(f"Found {len(repo_paths)} repositories to process for potential new prompts.")
 
-    all_stats = []
+    all_candidate_stats = []  # Changed name from all_stats
     generation_errors = 0
     total_date_filtered_count = 0  # Initialize counter for date filtering
     total_expected_token_filtered_count = (
@@ -832,7 +957,7 @@ def main():
                 date_filtered_count,
                 expected_token_filtered_count,
             ) = generate_prompts_and_expected(repo_path, cfg)  # Pass cfg object
-            all_stats.extend(stats_list)
+            all_candidate_stats.extend(stats_list)  # Add to candidates
             total_date_filtered_count += date_filtered_count  # Accumulate date count
             total_expected_token_filtered_count += (
                 expected_token_filtered_count  # Accumulate token count
@@ -849,8 +974,8 @@ def main():
             f"\nWarning: Encountered errors during prompt generation for {generation_errors} repositories."
         )
 
-    if not all_stats:
-        print("\nError: No prompts were generated successfully.")
+    if not all_candidate_stats:
+        print("\nError: No potential prompt candidates were generated successfully.")
         return 1
 
     # Report total files filtered by date
@@ -866,31 +991,77 @@ def main():
 
     # --- Post-Generation Processing ---
 
-    # Print summary statistics for all generated prompts (before filtering/sampling)
+    # Print summary statistics for all potential candidates
     print_stats_summary(
-        all_stats, "Initial Generation Statistics (All Repos, Pre-Filtering/Sampling)"
+        all_candidate_stats, "Initial Candidate Statistics (All Repos, Pre-Filtering)"
     )
 
-    # 1. Filter prompts by token range
-    filtered_stats, _ = filter_prompts_by_token_range(all_stats, cfg)
-    print_stats_summary(filtered_stats, "Statistics After Token Range Filtering")
+    # 1. Filter candidates by token range
+    filtered_candidate_stats, _ = filter_prompts_by_token_range(
+        all_candidate_stats, cfg
+    )
+    print_stats_summary(
+        filtered_candidate_stats, "Statistics After Token Range Filtering"
+    )
 
-    # 2. Sample prompts from the filtered list
-    final_sampled_stats, _ = sample_prompts(filtered_stats, cfg)
-    print_stats_summary(final_sampled_stats, "Final Sampled Benchmark Set Statistics")
+    # 2. Filter out existing prompts
+    new_candidate_stats = [
+        stats
+        for stats in filtered_candidate_stats
+        if stats["benchmark_case_prefix"] not in existing_prefixes
+    ]
+    print(
+        f"\nFiltered out {len(filtered_candidate_stats) - len(new_candidate_stats)} candidates that already exist."
+    )
+    print_stats_summary(
+        new_candidate_stats, "Statistics of New Candidates (Non-Existing)"
+    )
 
-    # 3. Determine which files were kept after sampling and filtering
-    kept_prefixes = set()
-    for stats in final_sampled_stats:
-        kept_prefixes.add(stats["benchmark_case_prefix"])
+    if not new_candidate_stats:
+        print("\nNo new, valid candidates found to add. Exiting.")
+        # Clean up temp dir even if no files are added
+        if os.path.exists(cfg.temp_dir):
+            try:
+                shutil.rmtree(cfg.temp_dir)
+                print(f"Successfully removed temporary directory: {cfg.temp_dir}")
+            except OSError as e:
+                print(
+                    f"Warning: Failed to remove temporary directory {cfg.temp_dir}: {e}"
+                )
+        return 0
 
-    # 4. Copy selected files from temp directory to output directory
-    copy_selected_files(kept_prefixes, cfg.temp_dir, cfg.output_dir)
+    # 3. Sample prompts to add from the new candidates
+    prompts_to_add_stats, _ = sample_prompts(new_candidate_stats, cfg)
+    print_stats_summary(
+        prompts_to_add_stats,
+        f"Statistics of {len(prompts_to_add_stats)} Prompts Selected to Add",
+    )
 
-    # 5. Save the final benchmark structure metadata to the output directory
-    save_benchmark_metadata(final_sampled_stats, cfg)
+    if not prompts_to_add_stats:
+        print("\nNo prompts were selected during sampling. Exiting.")
+        # Clean up temp dir even if no files are added
+        if os.path.exists(cfg.temp_dir):
+            try:
+                shutil.rmtree(cfg.temp_dir)
+                print(f"Successfully removed temporary directory: {cfg.temp_dir}")
+            except OSError as e:
+                print(
+                    f"Warning: Failed to remove temporary directory {cfg.temp_dir}: {e}"
+                )
+        return 0
 
-    # 6. Clean up temporary directory
+    # 4. Determine prefixes of the prompts to add
+    prefixes_to_add = set()
+    for stats in prompts_to_add_stats:
+        prefixes_to_add.add(stats["benchmark_case_prefix"])
+
+    # 5. Copy the selected new files from temp directory to output directory
+    copy_selected_files(prefixes_to_add, cfg.temp_dir, cfg.output_dir)
+
+    # 6. Save the updated metadata (appending the new run)
+    save_benchmark_metadata(existing_metadata_runs, prompts_to_add_stats, cfg)
+
+    # 7. Clean up temporary directory
     print(f"\nCleaning up temporary directory: {cfg.temp_dir}")
     if os.path.exists(cfg.temp_dir):
         try:
