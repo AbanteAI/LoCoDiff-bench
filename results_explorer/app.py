@@ -284,8 +284,10 @@ def analyze_results(
     window_radius = 10000  # +/- 10k tokens window
 
     if not window_centers:
-         print("Warning: No window centers generated (max_token_limit might be too low). Skipping sliding window analysis.")
-         analysis["sliding_window"] = None
+        print(
+            "Warning: No window centers generated (max_token_limit might be too low). Skipping sliding window analysis."
+        )
+        analysis["sliding_window"] = None
     else:
         analysis["sliding_window"] = {
             "window_centers_k": [c // 1000 for c in window_centers],
