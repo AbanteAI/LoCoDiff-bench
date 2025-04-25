@@ -808,7 +808,29 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 
 @app.route("/api/sliding-plot-data")
 def get_sliding_plot_data():
-    """Returns the sliding window plot data as JSON for the chart."""
+    """
+    Returns the sliding window plot data as JSON for the chart.
+
+    First tries to load from a static preprocessed JSON file.
+    Falls back to dynamic calculation if the static file is not available.
+    """
+    # First try to load from static file if it exists
+    static_folder = app.static_folder
+    if static_folder:
+        static_data_path = os.path.join(static_folder, "sliding-plot-data.json")
+        if os.path.exists(static_data_path):
+            try:
+                with open(static_data_path, "r", encoding="utf-8") as f:
+                    print(
+                        f"Loading sliding plot data from static file: {static_data_path}"
+                    )
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Error loading static sliding plot data: {e}")
+                # Continue to dynamic calculation as fallback
+
+    # Fall back to dynamic calculation
+    print("Static sliding plot data not found, calculating dynamically...")
     analysis_results = current_app.config.get("ANALYSIS_RESULTS")
 
     if (
@@ -821,7 +843,6 @@ def get_sliding_plot_data():
     sliding_data = analysis_results["sliding_window"]
     # Labels are the window centers in k tokens
     labels = [f"{k}k" for k in sliding_data.get("window_centers_k", [])]
-    # Removed unused bucket_labels assignment (this comment might be redundant now)
     datasets = []
 
     # Sort models for consistent coloring
@@ -956,7 +977,13 @@ def open_browser(host, port):
 
 
 def run_data_analysis():
-    """Performs benchmark results analysis, storing results in app.config."""
+    """
+    Performs benchmark results analysis, storing results in app.config.
+
+    If a static sliding plot data file is available, this will still load the basic
+    analysis results for the model tables, but skip the intensive sliding window
+    calculations which have been preprocessed.
+    """
     # Use app context to access config
     with app.app_context():
         benchmark_run_dir_maybe_none = current_app.config.get("BENCHMARK_RUN_DIR")
@@ -970,6 +997,16 @@ def run_data_analysis():
         benchmark_run_dir: str = (
             benchmark_run_dir_maybe_none  # Explicitly typed after check
         )
+
+        # Check if we have a static sliding plot data file
+        static_folder = app.static_folder
+        has_static_sliding_data = False
+        if static_folder:
+            static_data_path = os.path.join(static_folder, "sliding-plot-data.json")
+            has_static_sliding_data = os.path.exists(static_data_path)
+            if has_static_sliding_data:
+                print(f"Found static sliding plot data at: {static_data_path}")
+                print("Will skip intensive sliding window calculations during startup.")
 
         prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
         results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
@@ -1000,11 +1037,48 @@ def run_data_analysis():
             }
             return
 
-        analysis_results = analyze_results(
-            benchmark_metadata, models_found, results_data
-        )
-        current_app.config["ANALYSIS_RESULTS"] = analysis_results  # Store results
+        # If we have static sliding data, we can do a more efficient analysis
+        # by skipping the sliding window calculations
+        if has_static_sliding_data:
+            print("Performing basic analysis (skipping sliding window calculations)...")
+            # Create a simplified analysis that doesn't include sliding window
+            analysis_results = {"models": {}}
 
+            # Calculate basic stats for each model
+            for model_name in models_found:
+                analysis_results["models"][model_name] = {
+                    "total_benchmarks": len(
+                        {k for d in results_data.values() for k in d}
+                    ),
+                    "runs_found": len(results_data.get(model_name, {})),
+                    "successful_runs": sum(
+                        1
+                        for meta in results_data.get(model_name, {}).values()
+                        if meta is not None and meta.get("success", False)
+                    ),
+                    "total_cost_usd": sum(
+                        float(meta.get("cost_usd", 0.0) or 0.0)
+                        for meta in results_data.get(model_name, {}).values()
+                        if meta is not None
+                    ),
+                }
+
+                # Calculate success rate
+                if analysis_results["models"][model_name]["runs_found"] > 0:
+                    analysis_results["models"][model_name]["success_rate"] = (
+                        analysis_results["models"][model_name]["successful_runs"]
+                        / analysis_results["models"][model_name]["runs_found"]
+                    )
+                else:
+                    analysis_results["models"][model_name]["success_rate"] = 0.0
+        else:
+            print("Performing full analysis including sliding window calculations...")
+            # Do the full analysis including sliding window
+            analysis_results = analyze_results(
+                benchmark_metadata, models_found, results_data
+            )
+
+        current_app.config["ANALYSIS_RESULTS"] = analysis_results  # Store results
         print("--- Finished Data Analysis ---\n")
 
 
