@@ -278,18 +278,15 @@ def analyze_results(
     # Use max_token_limit determined from metadata runs
     print(f"Using max token limit for sliding window: {max_token_limit}")
 
-    # Minimum token limit required to start the sliding window analysis
-    min_limit_for_window = 10000
-    if max_token_limit < min_limit_for_window:
-        print(
-            f"Warning: Max token limit ({max_token_limit}) is less than {min_limit_for_window}. Skipping sliding window analysis."
-        )
-        analysis["sliding_window"] = None
+    # Define x-axis points (centers of the sliding windows)
+    # Start centers at 0k, step by 1k
+    window_centers = list(range(0, max_token_limit + 1, 1000))
+    window_radius = 10000  # +/- 10k tokens window
+
+    if not window_centers:
+         print("Warning: No window centers generated (max_token_limit might be too low). Skipping sliding window analysis.")
+         analysis["sliding_window"] = None
     else:
-        # Define x-axis points (centers of the sliding windows)
-        # Start centers at the minimum limit, step by 1k
-        window_centers = list(range(min_limit_for_window, max_token_limit + 1, 1000))
-        window_radius = 10000  # +/- 10k tokens window
         analysis["sliding_window"] = {
             "window_centers_k": [c // 1000 for c in window_centers],
             "models": {},
