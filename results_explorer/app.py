@@ -6,6 +6,7 @@ import argparse
 import re
 import sys
 import math
+import typing # Added typing import
 from flask import (
     Flask,
     render_template,
@@ -1175,8 +1176,9 @@ def serve_file(filepath):
         # Use send_from_directory for safer serving
         # It requires the directory and the filename relative to that directory
         # print(f"Serving file: directory='{serving_directory}', filename='{filename}'") # Debugging
-        return send_from_directory( # type: ignore
-            serving_directory, filename, mimetype=mimetype, as_attachment=False
+        # Use typing.cast after the check before the try block guarantees non-None
+        return send_from_directory(
+            typing.cast(str, serving_directory), typing.cast(str, filename), mimetype=mimetype, as_attachment=False
         )
     except FileNotFoundError:
         abort(404, "File not found.")
@@ -1208,11 +1210,12 @@ def run_data_analysis():
             current_app.config["ANALYSIS_RESULTS"] = None
             return
         # If we reach here, benchmark_run_dir_maybe_none is guaranteed to be a string.
-        # Explicitly assign to a typed variable for pyright clarity.
-        benchmark_run_dir: str = benchmark_run_dir_maybe_none
+        # If we reach here, benchmark_run_dir_maybe_none is guaranteed to be a string.
+        # Use typing.cast for pyright clarity.
+        checked_benchmark_run_dir = typing.cast(str, benchmark_run_dir_maybe_none)
 
-        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR) # type: ignore
-        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR) # type: ignore
+        prompts_dir = os.path.join(checked_benchmark_run_dir, PROMPTS_SUBDIR)
+        results_dir = os.path.join(checked_benchmark_run_dir, RESULTS_SUBDIR)
 
         print("\n--- Running Benchmark Data Analysis ---")
         print(f"Using prompts dir: {prompts_dir}")
