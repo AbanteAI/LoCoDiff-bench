@@ -931,50 +931,86 @@ function initializeChart(chartData) {
                 }
             },
             plugins: {
+                legend: {
+                    labels: {
+                        // Custom filter function to exclude datasets with display: false from the legend
+                        filter: (legendItem, data) => {
+                            const dataset = data.datasets[legendItem.datasetIndex];
+                            return dataset && dataset.display !== false;
+                        }
+                    }
+                },
                 tooltip: {
                     callbacks: {
                         label: function(context) {
+                            // Safety check - make sure context and dataset exist
+                            if (!context || !context.dataset || !context.dataset.label) {
+                                return null;
+                            }
+                            
                             // Don't show tooltips for confidence interval datasets
                             if (context.dataset.label.includes('CI')) {
                                 return null;
                             }
                             
-                            const modelName = context.dataset.label;
-                            const bucketData = chartData.buckets[context.dataIndex];
-                            const modelData = bucketData.models[modelName];
-                            
-                            // Get basic stats
-                            const successRate = context.raw;
-                            const successful = modelData.overall.successful;
-                            const attempts = modelData.overall.attempts;
-                            
-                            // Get confidence interval (for selected languages)
-                            let ciInfo = '';
-                            if (document.getElementById('show-confidence-intervals').checked) {
-                                // Find if we have data to calculate CIs
-                                let langSuccessful = 0;
-                                let langAttempts = 0;
+                            try {
+                                const modelName = context.dataset.label;
                                 
-                                const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
-                                    .map(checkbox => checkbox.getAttribute('data-language'));
-                                
-                                selectedLanguages.forEach(language => {
-                                    if (modelData.languages[language]) {
-                                        langSuccessful += modelData.languages[language].successful;
-                                        langAttempts += modelData.languages[language].attempts;
-                                    }
-                                });
-                                
-                                if (langAttempts > 0) {
-                                    const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
-                                    ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
+                                // Safety check for dataIndex
+                                if (context.dataIndex === undefined || !chartData.buckets[context.dataIndex]) {
+                                    return [`${modelName}`];
                                 }
+                                
+                                const bucketData = chartData.buckets[context.dataIndex];
+                                
+                                // Safety check for model data
+                                if (!bucketData.models || !bucketData.models[modelName]) {
+                                    return [`${modelName}: No data available`];
+                                }
+                                
+                                const modelData = bucketData.models[modelName];
+                                
+                                // Get basic stats
+                                const successRate = context.raw;
+                                const successful = modelData.overall.successful;
+                                const attempts = modelData.overall.attempts;
+                                
+                                // Get confidence interval (for selected languages)
+                                let ciInfo = '';
+                                const ciElement = document.getElementById('show-confidence-intervals');
+                                if (ciElement && ciElement.checked) {
+                                    // Find if we have data to calculate CIs
+                                    let langSuccessful = 0;
+                                    let langAttempts = 0;
+                                    
+                                    const checkboxes = document.querySelectorAll('input[data-language]:checked');
+                                    if (checkboxes && checkboxes.length > 0) {
+                                        const selectedLanguages = Array.from(checkboxes)
+                                            .map(checkbox => checkbox.getAttribute('data-language'))
+                                            .filter(lang => lang); // Filter out any null/undefined values
+                                        
+                                        selectedLanguages.forEach(language => {
+                                            if (modelData.languages && modelData.languages[language]) {
+                                                langSuccessful += modelData.languages[language].successful;
+                                                langAttempts += modelData.languages[language].attempts;
+                                            }
+                                        });
+                                        
+                                        if (langAttempts > 0) {
+                                            const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                                            ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
+                                        }
+                                    }
+                                }
+                                
+                                return [
+                                    `${modelName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${attempts})`,
+                                    `Token Range: ${bucketData.bucket_range}${ciInfo}`
+                                ];
+                            } catch (error) {
+                                console.error('Error in tooltip callback:', error);
+                                return ['Error displaying tooltip'];
                             }
-                            
-                            return [
-                                `${modelName}: ${successRate?.toFixed(2) || 'N/A'}% (${successful}/${attempts})`,
-                                `Token Range: ${bucketData.bucket_range}${ciInfo}`
-                            ];
                         }
                     }
                 }
@@ -1089,22 +1125,8 @@ function initializeChart(chartData) {
             const showConfidenceIntervals = document.getElementById('show-confidence-intervals').checked;
             
             if (showConfidenceIntervals && selectedLanguages.length > 0) {
-                // Add confidence interval area as background
-                chart.data.datasets.push({
-                    label: `${model} (95% CI)`,
-                    data: upperBoundPoints,
-                    borderColor: 'transparent',
-                    backgroundColor: color + '22', // Very transparent version of the line color
-                    pointRadius: 0,
-                    tension: 0.1,
-                    hidden: true, // Hide from legend
-                    fill: {
-                        target: '+1', // Fill to the dataset below (which will be the lower bound)
-                        above: color + '22'
-                    }
-                });
-                
-                // Add lower bound line (this will be filled to from the dataset above)
+                // Add lower bound line first (needed for reference by the area dataset)
+                const lowerBoundIndex = chart.data.datasets.length;
                 chart.data.datasets.push({
                     label: `${model} (95% CI lower)`,
                     data: lowerBoundPoints,
@@ -1113,8 +1135,20 @@ function initializeChart(chartData) {
                     pointRadius: 0,
                     tension: 0.1,
                     fill: false,
-                    hidden: true, // Hide this dataset from the legend
-                    showLine: false // Don't draw a line for this dataset
+                    showLine: false, // Don't draw a line for this dataset
+                    display: false   // Completely exclude from legend
+                });
+                
+                // Add confidence interval area
+                chart.data.datasets.push({
+                    label: `${model} (95% CI)`,
+                    data: upperBoundPoints,
+                    borderColor: 'transparent',
+                    backgroundColor: color + '22', // Very transparent version of the line color
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: lowerBoundIndex, // Fill to the specific dataset index (the lower bound)
+                    display: false         // Completely exclude from legend
                 });
             }
         });
