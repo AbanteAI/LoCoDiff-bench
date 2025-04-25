@@ -75,10 +75,24 @@
     <div id="modelSelectionControls" style="margin-bottom: 15px;">
         <strong>Select Models:</strong>
         <div id="modelCheckboxes" style="margin-top: 8px;">
-            <!-- Checkboxes will be dynamically added here by JavaScript -->
+            <!-- Model checkboxes will be dynamically added here by JavaScript -->
         </div>
     </div>
-    
+
+    {% if available_languages %}
+    <div id="languageSelectionControls" style="margin-bottom: 20px;">
+        <strong>Filter by Language:</strong>
+        <div id="languageCheckboxes" style="margin-top: 8px;">
+            {% for lang in available_languages %}
+            <div style="display: inline-block; margin-right: 15px;">
+                <input type="checkbox" id="lang-checkbox-{{ loop.index0 }}" name="language" value="{{ lang }}" class="language-filter-checkbox" checked>
+                <label for="lang-checkbox-{{ loop.index0 }}" style="margin-left: 5px;">{{ lang|title }}</label>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
     <div class="chart-container">
         <canvas id="slidingSuccessRateChart"></canvas>
     </div>
@@ -89,14 +103,22 @@
 {% block scripts %}
 <script>
 document.addEventListener('DOMContentLoaded', function() {
-    // Only need context and chart variable for the sliding chart now
+    // Chart context and state variables
     const ctxSliding = document.getElementById('slidingSuccessRateChart').getContext('2d');
-    let slidingChart = null;
-    let chartData = null; // Store the chart data for manipulating later
-    let modelVisibility = {}; // Track which models are visible
-    const maxTokenLimit = {{ max_token_limit | default('null') }}; // Get max limit from backend
-    const maxTokenLimitK = maxTokenLimit !== null ? Math.ceil(maxTokenLimit / 1000) : null; // Convert to K for comparison
-    
+    let slidingChart = null; // Holds the Chart.js instance
+    let currentChartData = null; // Store the raw data used for the current chart
+    let modelVisibility = {}; // Track which models are visible via checkboxes
+    let selectedLanguages = []; // Track selected languages
+
+    // Constants from backend
+    const maxTokenLimit = {{ max_token_limit | default('null') }};
+    const maxTokenLimitK = maxTokenLimit !== null ? Math.ceil(maxTokenLimit / 1000) : null;
+    const availableLanguages = {{ available_languages | tojson | safe }}; // Get languages from backend
+
+    // UI Elements
+    const modelCheckboxesDiv = document.getElementById('modelCheckboxes');
+    const languageCheckboxesDiv = document.getElementById('languageCheckboxes');
+
     // Color palette for datasets - will be assigned to models in order
     const colorPalette = [
         'rgb(54, 162, 235)',   // blue
@@ -264,55 +286,247 @@ document.addEventListener('DOMContentLoaded', function() {
         
         console.log(`Created ${processedModels.size} model checkboxes`);
     }
-    
-    // Toggle visibility of a model and its CI bands
+
+    // Get currently selected languages from checkboxes
+    function getSelectedLanguages() {
+        const checkboxes = document.querySelectorAll('.language-filter-checkbox:checked');
+        return Array.from(checkboxes).map(cb => cb.value);
+    }
+
+    // Toggle visibility of a model and its CI bands IN THE CURRENT CHART
     function toggleModelVisibility(modelName, isVisible) {
         if (!slidingChart) {
             console.error("Chart not initialized when trying to toggle visibility");
             return;
         }
-        
-        // Update tracking
+
+        // Update tracking state
         modelVisibility[modelName] = isVisible;
-        
+
         let updatedAny = false;
-        
-        // Find corresponding datasets
+
+        // Find corresponding datasets in the current chart instance
         slidingChart.data.datasets.forEach((dataset, index) => {
-            // More precise matching - watch for spaces and special chars
-            // For main model line, compare the cleaned model name (without cost part)
             let datasetModelName = dataset.label || "";
             if (datasetModelName.includes('($')) {
                 datasetModelName = datasetModelName.split(' ($')[0];
             }
-            
+
             const isMainModelLine = datasetModelName === modelName;
-            const isCILower = (dataset.label && dataset.label.includes(`${modelName} CI Lower`));
-            const isCIUpper = (dataset.label && dataset.label.includes(`${modelName} CI Upper`));
-            
+            // Adjust CI label matching slightly for robustness
+            const isCILower = (dataset.label && dataset.label.startsWith(modelName) && dataset.label.endsWith('CI Lower'));
+            const isCIUpper = (dataset.label && dataset.label.startsWith(modelName) && dataset.label.endsWith('CI Upper'));
+
             if (isMainModelLine || isCILower || isCIUpper) {
-                dataset.hidden = !isVisible;
+                // Use Chart.js API to hide/show dataset
+                slidingChart.setDatasetVisibility(index, isVisible);
                 updatedAny = true;
-                console.log(`Set dataset ${index} (${dataset.label}) to hidden=${!isVisible}`);
+                // console.log(`Set dataset ${index} (${dataset.label}) visibility to ${isVisible}`);
             }
         });
-        
+
         if (!updatedAny) {
-            console.warn(`No datasets matched model name "${modelName}"`);
-            // Print all dataset labels for debugging
-            slidingChart.data.datasets.forEach((dataset, i) => {
-                console.log(`Dataset ${i}: ${dataset.label}`);
-            });
+            console.warn(`No datasets matched model name "${modelName}" for visibility toggle.`);
         }
-        
-        // Update the chart
+
+        // Update the chart to reflect visibility changes
         slidingChart.update();
     }
-    
-    // Function to create a chart
-    function createChart(ctx, apiUrl, chartTitle, xAxisLabel, tooltipCallback) { 
-        // Return the Promise to allow proper handling of the chart creation result
-        return fetch(apiUrl)
+
+    // Function to actually create/update the Chart.js instance with new data
+    function renderChart(ctx, chartData, chartTitle, xAxisLabel, tooltipCallback) {
+        if (!chartData || !chartData.labels || !chartData.datasets) {
+             console.error("Invalid chart data provided to renderChart");
+             // Optionally display an error message on the canvas
+             displayChartError(ctx, "Invalid data received from server.");
+             return null; // Indicate failure
+        }
+
+        // Destroy existing chart instance if it exists
+        if (slidingChart) {
+            slidingChart.destroy();
+            slidingChart = null;
+            console.log("Destroyed previous chart instance.");
+        }
+
+        // Adjust the x-axis range (same logic as before)
+        if (chartData.labels && chartData.labels.length > 0) {
+            const windowRadiusK = 10;
+            let cutoffIndex = -1;
+            try {
+                const lastLabel = chartData.labels[chartData.labels.length - 1];
+                const lastCenterK = parseInt(lastLabel.replace('k', ''), 10);
+                if (!isNaN(lastCenterK) && lastCenterK > windowRadiusK) {
+                    const cutoffK = lastCenterK - windowRadiusK;
+                    cutoffIndex = chartData.labels.findIndex(label => {
+                        const centerK = parseInt(label.replace('k', ''), 10);
+                        return centerK > cutoffK;
+                    });
+                }
+            } catch (e) { console.warn("Error parsing labels for cutoff:", e); }
+
+            if (cutoffIndex > 0) {
+                chartData.labels = chartData.labels.slice(0, cutoffIndex);
+                chartData.datasets.forEach(dataset => {
+                    if (dataset.data) dataset.data = dataset.data.slice(0, cutoffIndex);
+                    if (dataset.wilson_lower) dataset.wilson_lower = dataset.wilson_lower.slice(0, cutoffIndex);
+                    if (dataset.wilson_upper) dataset.wilson_upper = dataset.wilson_upper.slice(0, cutoffIndex);
+                    if (dataset.totals) dataset.totals = dataset.totals.slice(0, cutoffIndex);
+                    if (dataset.successes) dataset.successes = dataset.successes.slice(0, cutoffIndex);
+                });
+            }
+        }
+
+        let chartDatasets = [];
+        // Process the datasets and assign colors/structure
+        chartData.datasets.forEach((apiDataset, index) => {
+            const colorIndex = index % colorPalette.length;
+            const mainColor = colorPalette[colorIndex];
+            const transparentColor = mainColor.replace('rgb', 'rgba').replace(')', ', 0.2)');
+
+            // Main data line
+            const mainDataset = {
+                ...apiDataset,
+                borderColor: mainColor,
+                backgroundColor: mainColor,
+                pointBackgroundColor: mainColor,
+                pointHoverRadius: 6,
+                fill: false,
+                tension: 0.1,
+                order: 1,
+                spanGaps: true, // Always true for sliding chart
+                // Set initial visibility based on modelVisibility state
+                hidden: !modelVisibility[apiDataset.label.split(' ($')[0]]
+            };
+            chartDatasets.push(mainDataset);
+
+            // Add CI bands if data exists
+            if (apiDataset.wilson_lower && apiDataset.wilson_upper) {
+                chartDatasets.push({
+                    label: apiDataset.label + ' CI Lower',
+                    data: apiDataset.wilson_lower,
+                    borderColor: 'transparent',
+                    backgroundColor: transparentColor,
+                    pointRadius: 0,
+                    fill: '+1',
+                    hidden: !modelVisibility[apiDataset.label.split(' ($')[0]], // Match main line visibility
+                    showInLegend: false,
+                    order: 2,
+                    spanGaps: true,
+                });
+                chartDatasets.push({
+                    label: apiDataset.label + ' CI Upper',
+                    data: apiDataset.wilson_upper,
+                    borderColor: 'transparent',
+                    backgroundColor: 'transparent',
+                    pointRadius: 0,
+                    fill: false,
+                    hidden: !modelVisibility[apiDataset.label.split(' ($')[0]], // Match main line visibility
+                    showInLegend: false,
+                    order: 3,
+                    spanGaps: true,
+                });
+            }
+        });
+
+        // Create the new chart instance
+        const newChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: chartData.labels,
+                datasets: chartDatasets
+            },
+            options: { // Keep options mostly the same
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true, max: 1,
+                        ticks: { callback: value => (value * 100) + '%' },
+                        title: { display: true, text: 'Success Rate' },
+                        grid: { color: 'rgba(0, 0, 0, 0.1)' }
+                    },
+                    x: {
+                        title: { display: true, text: xAxisLabel },
+                        grid: { display: false }
+                    }
+                },
+                plugins: {
+                    tooltip: { callbacks: tooltipCallback },
+                    legend: {
+                        display: true, position: 'right',
+                        labels: {
+                            boxWidth: 12, padding: 15,
+                            filter: (legendItem, data) => {
+                                const txt = legendItem.text || '';
+                                // Filter out CI bands and hidden datasets
+                                return !txt.includes(' CI ') && !data.datasets[legendItem.datasetIndex].hidden;
+                            }
+                        },
+                        onClick: (e, legendItem, legend) => {
+                            let modelName = legendItem.text.split(' ($')[0];
+                            const isVisible = !modelVisibility[modelName]; // Toggle state
+
+                            // Update the corresponding checkbox
+                            const checkbox = document.querySelector(`.model-visibility-checkbox[value="${modelName}"]`);
+                            if (checkbox) checkbox.checked = isVisible;
+
+                            // Toggle visibility in the chart
+                            toggleModelVisibility(modelName, isVisible);
+
+                            // Prevent default behavior
+                            return false;
+                        }
+                    },
+                    title: {
+                        display: true, text: chartTitle,
+                        font: { size: 16 }, padding: 20
+                    }
+                }
+            }
+        });
+
+        console.log("Rendered new chart instance.");
+        return newChart; // Return the new instance
+    }
+
+    // Function to display errors on the chart canvas
+    function displayChartError(ctx, message) {
+        const errorContainer = ctx.canvas.closest('.chart-container');
+        if (errorContainer) {
+            const errorMsg = document.createElement('div');
+            errorMsg.style.textAlign = 'center';
+            errorMsg.style.paddingTop = '150px';
+            errorMsg.innerHTML = `
+                <p style="color: red; font-weight: bold;">Error loading chart data</p>
+                <p>${message}</p>
+                <p>Check browser console for details.</p>
+            `;
+            // Clear previous content (like the canvas) and add error message
+            while (errorContainer.firstChild) {
+                errorContainer.removeChild(errorContainer.firstChild);
+            }
+            // Re-add canvas in case we retry later? Or just show error. Let's just show error.
+            // errorContainer.appendChild(ctx.canvas); // Keep canvas element?
+            errorContainer.appendChild(errorMsg);
+        }
+         // Destroy chart instance if it exists and we hit an error
+        if (slidingChart) {
+            slidingChart.destroy();
+            slidingChart = null;
+        }
+    }
+
+
+    // Function to fetch data and update the chart
+    function fetchAndUpdateChart() {
+        const currentSelectedLangs = getSelectedLanguages();
+        const languagesParam = currentSelectedLangs.length > 0 ? currentSelectedLangs.join(',') : 'null'; // Use 'null' or empty string if none selected? API handles null/empty
+        const apiUrl = `/api/sliding-plot-data?languages=${languagesParam}`;
+
+        console.log(`Fetching chart data from: ${apiUrl}`);
+
+        fetch(apiUrl)
             .then(response => {
                 if (!response.ok) {
                     throw new Error(`API response was not ok (${response.status})`);
@@ -323,254 +537,56 @@ document.addEventListener('DOMContentLoaded', function() {
                 if (data.error) {
                     throw new Error(data.error);
                 }
-                
-                // Store chart data for later use
-                chartData = data;
-                
-                // Adjust the x-axis range to remove the last 10k tokens for better visualization
-                // (The window centered at max_tokens includes tokens up to max_tokens + 10k,
-                // but showing centers too close to the absolute max might be less informative
-                // if there are few data points contributing to those last windows).
-                // This crops the *display*, the backend calculation still uses the full range.
-                if (data.labels && data.labels.length > 0) {
-                    // Calculate cutoff point at max center - 10k
-                    const windowRadiusK = 10;
-                    let cutoffIndex = -1;
-                    try {
-                        const lastLabel = data.labels[data.labels.length - 1];
-                        const lastCenterK = parseInt(lastLabel.replace('k', ''), 10);
-                        // Only apply cutoff if the last center is significantly larger than the radius
-                        if (!isNaN(lastCenterK) && lastCenterK > windowRadiusK) {
-                            const cutoffK = lastCenterK - windowRadiusK;
-                            // Find the index of the first label *greater* than the cutoff point
-                            cutoffIndex = data.labels.findIndex(label => {
-                                const centerK = parseInt(label.replace('k', ''), 10);
-                                return centerK > cutoffK;
-                            });
-                        }
-                    } catch (e) {
-                        console.warn("Error parsing labels for cutoff:", e);
-                    }
-                    
-                    // If we found a valid cutoff, crop the data
-                    if (cutoffIndex > 0) {
-                        data.labels = data.labels.slice(0, cutoffIndex);
-                        data.datasets.forEach(dataset => {
-                            if (dataset.data) {
-                                dataset.data = dataset.data.slice(0, cutoffIndex);
-                            }
-                            if (dataset.wilson_lower) {
-                                dataset.wilson_lower = dataset.wilson_lower.slice(0, cutoffIndex);
-                            }
-                            if (dataset.wilson_upper) {
-                                dataset.wilson_upper = dataset.wilson_upper.slice(0, cutoffIndex);
-                            }
-                            if (dataset.totals) {
-                                dataset.totals = dataset.totals.slice(0, cutoffIndex);
-                            }
-                            if (dataset.successes) {
-                                dataset.successes = dataset.successes.slice(0, cutoffIndex);
-                            }
-                        });
-                    }
-                }
 
-                let chartDatasets = [];
-                const isSlidingChart = apiUrl.includes('sliding');
+                // Store the fetched data
+                currentChartData = data;
 
-                // Process the datasets and assign colors/structure
-                data.datasets.forEach((apiDataset, index) => {
-                    const colorIndex = index % colorPalette.length;
-                    const mainColor = colorPalette[colorIndex];
-                    const transparentColor = mainColor.replace('rgb', 'rgba').replace(')', ', 0.2)'); // Lighter fill for bands
-
-                    // Main data line
-                    const mainDataset = {
-                        ...apiDataset, // Includes label, data, wilson_lower, wilson_upper
-                        borderColor: mainColor,
-                        backgroundColor: mainColor, // For points
-                        pointBackgroundColor: mainColor,
-                        pointHoverRadius: 6,
-                        fill: false,
-                        tension: 0.1,
-                        order: 1, // Draw main line on top
-                        spanGaps: isSlidingChart, // Apply spanGaps if it's the sliding chart
-                    };
-                    chartDatasets.push(mainDataset);
-
-                    // Add datasets for confidence interval bands ONLY for the sliding chart
-                    if (isSlidingChart && apiDataset.wilson_lower && apiDataset.wilson_upper) {
-                        // Lower bound dataset (invisible line, fills up to upper bound)
-                        chartDatasets.push({
-                            label: apiDataset.label + ' CI Lower', // Internal label, not shown in legend
-                            data: apiDataset.wilson_lower,
-                            borderColor: 'transparent',
-                            backgroundColor: transparentColor, // Fill color
-                            pointRadius: 0,
-                            fill: '+1', // Fill to the next dataset (upper bound)
-                            hidden: false, // Ensure it's visible even if not in legend
-                            showInLegend: false, // Hide from legend
-                            order: 2, // Draw fill below main line
-                            spanGaps: true, // Connect gaps for fill
-                        });
-
-                        // Upper bound dataset (invisible line, defines top of fill)
-                        chartDatasets.push({
-                            label: apiDataset.label + ' CI Upper', // Internal label, not shown in legend
-                            data: apiDataset.wilson_upper,
-                            borderColor: 'transparent',
-                            backgroundColor: 'transparent', // No background for this line itself
-                            pointRadius: 0,
-                            fill: false, // Don't fill this line itself
-                            hidden: false, // Ensure it's visible even if not in legend
-                            showInLegend: false, // Hide from legend
-                            order: 3, // Draw below lower bound fill target
-                            spanGaps: true, // Connect gaps for fill boundary
-                        });
-                    }
-                });
-                
-                // Create the chart
-                const chart = new Chart(ctx, {
-                    type: 'line',
-                    data: { // Structure data for Chart.js
-                        labels: data.labels,
-                        datasets: chartDatasets // Use the structured datasets
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                max: 1,
-                                ticks: {
-                                    callback: function(value) {
-                                        return (value * 100) + '%';
-                                    }
-                                },
-                                title: {
-                                    display: true,
-                                    text: 'Success Rate'
-                                },
-                                grid: {
-                                    color: 'rgba(0, 0, 0, 0.1)'
-                                }
-                            },
-                            x: {
-                                title: {
-                                    display: true,
-                                    text: xAxisLabel // Use dynamic label
-                                },
-                                grid: {
-                                    display: false
-                                }
-                            }
-                        },
-                        plugins: {
-                            tooltip: {
-                                callbacks: tooltipCallback // Use the single passed callback object
-                            },
-                            legend: {
-                                display: true, // Re-enable legend
-                                position: 'right',
-                                labels: {
-                                    boxWidth: 12,
-                                    padding: 15,
-                                    filter: function(legendItem, data) {
-                                        const txt = legendItem.text || '';
-                                        
-                                        // 1. Keep the CI helper lines out of the legend
-                                        if (txt.includes('CI Lower') || txt.includes('CI Upper')) {
-                                            return false;
-                                        }
-                                        
-                                        // 2. Drop anything that is currently hidden
-                                        return !data.datasets[legendItem.datasetIndex].hidden;
-                                    }
-                                },
-                                onClick: function(e, legendItem, legend) {
-                                    // Get model name from legend item
-                                    let modelName = legendItem.text;
-                                    if (modelName.includes('($')) {
-                                        modelName = modelName.split(' ($')[0];
-                                    }
-
-                                    // Toggle visibility tracking
-                                    modelVisibility[modelName] = !modelVisibility[modelName];
-                                    
-                                    // Also update the checkbox
-                                    const checkbox = document.querySelector(`input[value="${modelName}"]`);
-                                    if (checkbox) {
-                                        checkbox.checked = modelVisibility[modelName];
-                                    }
-                                    
-                                    // Toggle visibility for all datasets related to this model
-                                    toggleModelVisibility(modelName, modelVisibility[modelName]);
-                                    
-                                    // Make sure legend is redrawn
-                                    legend.chart.update();
-                                    
-                                    // Prevent default legend click behavior
-                                    return false;
-                                }
-                            },
-                            title: {
-                                display: true,
-                                text: chartTitle, // Use dynamic title
-                                font: {
-                                    size: 16
-                                },
-                                padding: 20
-                            }
-                        }
-                    }
-                });
-                
-                // Create the model selection checkboxes
+                // Create model checkboxes based on the *new* data (models might change based on language filter)
+                // Preserve the checked state from modelVisibility
                 createModelCheckboxes(data);
-                
-                // Return the chart instance so it can be assigned to slidingChart
-                return chart;
+
+                // Render the chart with the new data
+                slidingChart = renderChart(
+                    ctxSliding,
+                    data,
+                    'Sliding Window Success Rate (+/- 10k Tokens)',
+                    'Window Center (k tokens)',
+                    slidingTooltipCallback
+                );
+                if (!slidingChart) {
+                     console.error("Chart rendering failed.");
+                     // Error message should already be displayed by renderChart
+                } else {
+                     console.log("Chart updated successfully.");
+                }
             })
             .catch(error => {
-                console.error(`Error fetching chart data from ${apiUrl}:`, error);
-                // Display error message in the canvas container
-                const errorContainer = ctx.canvas.closest('.chart-container'); // Find parent container
-                if (errorContainer) {
-                    const errorMsg = document.createElement('div');
-                    errorMsg.style.textAlign = 'center';
-                    errorMsg.style.paddingTop = '150px'; // Adjust as needed
-                    errorMsg.innerHTML = `
-                        <p style="color: red; font-weight: bold;">Error loading chart data</p>
-                        <p>${error.message}</p>
-                        <p>Check browser console for details.</p>
-                    `;
-                    // Clear previous content and add error message
-                    while (errorContainer.firstChild) {
-                        errorContainer.removeChild(errorContainer.firstChild);
-                    }
-                    errorContainer.appendChild(errorMsg);
-                }
-                // Re-throw the error to propagate it to the next catch handler
-                throw error;
+                console.error(`Error fetching or rendering chart data from ${apiUrl}:`, error);
+                displayChartError(ctxSliding, error.message); // Display error on canvas
             });
-    } // End of createChart function definition
+    }
 
-    // Create the Sliding Window Chart
-    // Use the more robust approach - get the chart from the Promise
-    createChart(
-        ctxSliding,
-        '/api/sliding-plot-data',
-        'Sliding Window Success Rate (+/- 10k Tokens)', // Updated Title
-        'Window Center (k tokens)',
-        slidingTooltipCallback
-    ).then(chart => {
-        console.log("Chart created successfully");
-        slidingChart = chart; // Now properly set the global variable
-    }).catch(error => {
-        console.error("Failed to create chart:", error);
-    });
+    // --- Initial Setup ---
+
+    // Initialize selected languages (all checked by default)
+    selectedLanguages = getSelectedLanguages();
+
+    // Add event listeners to language checkboxes
+    if (languageCheckboxesDiv) {
+        const langCheckboxes = document.querySelectorAll('.language-filter-checkbox');
+        langCheckboxes.forEach(checkbox => {
+            checkbox.addEventListener('change', function() {
+                console.log("Language selection changed.");
+                fetchAndUpdateChart(); // Refetch and redraw chart
+            });
+        });
+    } else {
+         console.log("No language checkboxes found to add listeners to.");
+    }
+
+    // Initial chart load
+    fetchAndUpdateChart();
+
 });
 </script>
 {% endblock %}

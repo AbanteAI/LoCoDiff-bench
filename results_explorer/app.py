@@ -12,6 +12,8 @@ from flask import (
     abort,
     send_from_directory,
     current_app,
+    request,  # Added request
+    jsonify,  # Added jsonify
 )
 from markupsafe import escape
 import webbrowser
@@ -42,6 +44,8 @@ app = Flask(__name__, template_folder="templates", static_folder=static_folder_p
 # BENCHMARK_RUN_DIR will be set in app.config when run directly via __main__
 # Placeholder for analysis results calculated at startup
 app.config["ANALYSIS_RESULTS"] = None
+app.config["AVAILABLE_LANGUAGES"] = []  # Add placeholder for languages
+app.config["BENCHMARK_METADATA"] = None  # Add placeholder for benchmark metadata
 
 
 # --- Helper Functions (Moved from analyze_results.py and app.py) ---
@@ -148,17 +152,31 @@ def analyze_results(
     benchmark_metadata: dict,
     models_found: List[str],
     results_data: Dict[str, Dict[str, Optional[Dict[str, Any]]]],
+    selected_languages: Optional[
+        List[str]
+    ] = None,  # Added selected_languages parameter
 ) -> dict:
     """
     Analyzes benchmark results using pre-scanned data.
-    (Directly from analyze_results.py)
+
+    Args:
+        benchmark_metadata: The loaded benchmark metadata.
+        models_found: A list of model names found in the results.
+        results_data: A nested dictionary containing the latest result metadata for each model/case.
+        selected_languages: An optional list of languages to filter the sliding window analysis by.
+                            If None or empty, all languages are included.
     """
     analysis: dict[str, Any] = {"models": {}}
     print(f"Analyzing results for models: {models_found}")
+    if selected_languages:
+        print(f"Filtering sliding window analysis by languages: {selected_languages}")
 
     # --- Aggregate All Benchmark Cases from Metadata ---
-    all_cases_info_dict: Dict[str, Dict[str, Any]] = {}  # prefix -> {token_count, etc.}
+    all_cases_info_dict: Dict[
+        str, Dict[str, Any]
+    ] = {}  # prefix -> {token_count, language, etc.}
     max_token_limit = 0  # Track max token limit across all runs for sliding window
+    available_languages_from_metadata = set()  # Track languages found in metadata
 
     if isinstance(benchmark_metadata, list):  # New format: list of runs
         print(f"Processing {len(benchmark_metadata)} runs from metadata...")
@@ -177,10 +195,33 @@ def analyze_results(
                     if isinstance(case, dict) and "benchmark_case_prefix" in case:
                         prefix = case["benchmark_case_prefix"]
                         # Store info, potentially overwriting older info if prefix repeats (unlikely but possible)
-                        all_cases_info_dict[prefix] = {
+                        case_info = {
                             "prompt_tokens": case.get("prompt_tokens"),
                             # Add other relevant case info if needed later
                         }
+                        # Extract language if available
+                        lang = case.get("language")
+                        if lang:
+                            case_info["language"] = lang
+                            available_languages_from_metadata.add(lang)
+                        else:
+                            # Attempt to infer language from prefix if not explicitly provided
+                            # Example: 'python_some_file_...' -> 'python'
+                            try:
+                                inferred_lang = prefix.split("_")[0]
+                                # Basic check if it looks like a language name (e.g., all lowercase letters)
+                                if inferred_lang.isalpha() and inferred_lang.islower():
+                                    case_info["language"] = inferred_lang
+                                    available_languages_from_metadata.add(inferred_lang)
+                                    # print(f"Inferred language '{inferred_lang}' for case {prefix}") # Optional debug log
+                                else:
+                                    # print(f"Warning: Could not infer language for case {prefix}") # Optional debug log
+                                    pass
+                            except IndexError:
+                                # print(f"Warning: Could not infer language for case {prefix}") # Optional debug log
+                                pass
+
+                        all_cases_info_dict[prefix] = case_info
             else:
                 print(
                     f"Warning: Skipping run {run_index} due to invalid structure or missing '{cases_key}'."
@@ -208,9 +249,23 @@ def analyze_results(
             for case in benchmark_metadata["benchmark_cases"]:
                 if isinstance(case, dict) and "benchmark_case_prefix" in case:
                     prefix = case["benchmark_case_prefix"]
-                    all_cases_info_dict[prefix] = {
-                        "prompt_tokens": case.get("prompt_tokens")
-                    }
+                    case_info = {"prompt_tokens": case.get("prompt_tokens")}
+                    # Extract language if available (also for legacy)
+                    lang = case.get("language")
+                    if lang:
+                        case_info["language"] = lang
+                        available_languages_from_metadata.add(lang)
+                    else:
+                        # Attempt inference for legacy too
+                        try:
+                            inferred_lang = prefix.split("_")[0]
+                            if inferred_lang.isalpha() and inferred_lang.islower():
+                                case_info["language"] = inferred_lang
+                                available_languages_from_metadata.add(inferred_lang)
+                        except IndexError:
+                            pass  # Ignore if inference fails
+
+                    all_cases_info_dict[prefix] = case_info
         # Try to get max token limit from legacy params
         try:
             gen_params = benchmark_metadata.get("generation_parameters", {})
@@ -241,6 +296,18 @@ def analyze_results(
     print(
         f"Found {total_unique_cases} total unique benchmark cases defined across all metadata runs."
     )
+    # Update global list of languages found in actual benchmark data
+    # Only update if this is the initial run (no language filter)
+    if selected_languages is None:
+        current_app.config["AVAILABLE_LANGUAGES"] = sorted(
+            list(available_languages_from_metadata)
+        )
+        print(
+            f"Available languages set to: {current_app.config['AVAILABLE_LANGUAGES']}"
+        )  # Log found languages
+    else:
+        print("Skipping update of AVAILABLE_LANGUAGES during filtered run.")
+
     if total_unique_cases == 0:
         analysis["sliding_window"] = None
         return analysis  # Cannot proceed without defined cases
@@ -314,12 +381,24 @@ def analyze_results(
         )
         for benchmark_case_prefix, case_info in all_cases_info_dict.items():
             prompt_tokens = case_info.get("prompt_tokens")
+            case_language = case_info.get("language")  # Get language for filtering
 
             if prompt_tokens is None:
                 print(
                     f"Warning: Missing prompt_tokens for case {benchmark_case_prefix}. Skipping for sliding window."
                 )
                 continue
+
+            # Filter by language if selected_languages is provided and not empty
+            # Also skip if the case doesn't have language info when filtering is active
+            if selected_languages:
+                if not case_language:
+                    # print(f"Skipping case {benchmark_case_prefix} (missing language info) due to active language filter.") # Debug log
+                    continue
+                if case_language not in selected_languages:
+                    # print(f"Skipping case {benchmark_case_prefix} (lang: {case_language}) due to language filter.") # Debug log
+                    continue
+                # If we reach here, the case language is in the selected list
 
             # Check results for each model for this specific case
             for model_name in models_found:
@@ -614,19 +693,106 @@ def index():
         benchmark_run_dir_maybe_none  # Explicitly typed after check
     )
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
+    results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)  # Needed for scanning
 
-    benchmark_metadata = load_benchmark_metadata(prompts_dir)
-    # Retrieve pre-calculated analysis results and models found
+    # Load benchmark metadata first (and store it)
+    # Use cached version if available
+    if current_app.config.get("BENCHMARK_METADATA") is None:
+        print("Loading benchmark metadata...")
+        current_app.config["BENCHMARK_METADATA"] = load_benchmark_metadata(prompts_dir)
+
+    benchmark_metadata = current_app.config["BENCHMARK_METADATA"]
+    if benchmark_metadata is None:
+        print("Warning: Could not load benchmark metadata. Analysis may be limited.")
+        # Allow rendering even without metadata, but show warnings/limited info
+
+    # Retrieve or run initial analysis results (unfiltered)
+    # This populates AVAILABLE_LANGUAGES
     analysis_results = current_app.config.get("ANALYSIS_RESULTS")
+    if analysis_results is None:
+        print("Running initial analysis (cached results not found)...")
+        models_found, results_data = scan_results_directory(results_dir)
+        if benchmark_metadata and models_found:
+            analysis_results = analyze_results(
+                benchmark_metadata, models_found, results_data, selected_languages=None
+            )
+            current_app.config["ANALYSIS_RESULTS"] = analysis_results  # Cache results
+        else:
+            current_app.config["ANALYSIS_RESULTS"] = None
+            current_app.config["AVAILABLE_LANGUAGES"] = []
+    else:
+        print("Using cached initial analysis results.")
+
+    # Get models from analysis results (either fresh or cached)
     models = (
         sorted(list(analysis_results["models"].keys()))
         if analysis_results and analysis_results.get("models")
         else []
     )
 
-    total_cases = 0
-    if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
-        total_cases = len(benchmark_metadata["benchmark_cases"])
+    # Get available languages determined during analysis
+    available_languages = current_app.config.get("AVAILABLE_LANGUAGES", [])
+
+    # Calculate total cases from metadata if possible, considering available languages
+    total_cases = None
+    if benchmark_metadata:
+        if isinstance(benchmark_metadata, list):  # New format
+            if available_languages:
+                total_cases = 0
+                for run in benchmark_metadata:
+                    if isinstance(run, dict):
+                        cases_key = (
+                            "benchmark_cases_added"
+                            if "benchmark_cases_added" in run
+                            else "benchmark_cases"
+                        )
+                        for case in run.get(cases_key, []):
+                            if isinstance(case, dict):
+                                lang = case.get("language")
+                                if not lang:  # Try inferring if missing
+                                    prefix = case.get("benchmark_case_prefix", "")
+                                    try:
+                                        inferred_lang = prefix.split("_")[0]
+                                        if (
+                                            inferred_lang.isalpha()
+                                            and inferred_lang.islower()
+                                        ):
+                                            lang = inferred_lang
+                                    except IndexError:
+                                        pass
+                                if (
+                                    not available_languages
+                                    or lang in available_languages
+                                ):
+                                    total_cases += 1
+            else:  # Fallback if no languages found
+                total_cases = sum(
+                    len(run.get("benchmark_cases_added", []))
+                    for run in benchmark_metadata
+                    if isinstance(run, dict)
+                )
+
+        elif (
+            isinstance(benchmark_metadata, dict)
+            and "benchmark_cases" in benchmark_metadata
+        ):  # Legacy
+            if available_languages:
+                total_cases = 0
+                for case in benchmark_metadata.get("benchmark_cases", []):
+                    if isinstance(case, dict):
+                        lang = case.get("language")
+                        if not lang:  # Try inferring if missing
+                            prefix = case.get("benchmark_case_prefix", "")
+                            try:
+                                inferred_lang = prefix.split("_")[0]
+                                if inferred_lang.isalpha() and inferred_lang.islower():
+                                    lang = inferred_lang
+                            except IndexError:
+                                pass
+                        if not available_languages or lang in available_languages:
+                            total_cases += 1
+            else:  # Fallback
+                total_cases = len(benchmark_metadata.get("benchmark_cases", []))
 
     # Extract max_token_limit for the template, default to None if not available
     max_token_limit_value = None
@@ -640,10 +806,11 @@ def index():
     return render_template(
         "index.html",
         models=models,
-        total_cases=total_cases,
+        total_cases=total_cases,  # Pass potentially language-aware count
         benchmark_metadata=benchmark_metadata,
-        analysis_results=analysis_results,  # Pass full analysis results
+        analysis_results=analysis_results,  # Pass initial analysis results
         max_token_limit=max_token_limit_value,  # Pass the limit to the template
+        available_languages=available_languages,  # Pass languages for checkboxes
     )
 
 
@@ -808,67 +975,132 @@ def case_details(benchmark_case_prefix, model_name, timestamp):
 
 @app.route("/api/sliding-plot-data")
 def get_sliding_plot_data():
-    """Returns the sliding window plot data as JSON for the chart."""
-    analysis_results = current_app.config.get("ANALYSIS_RESULTS")
+    """
+    Returns the sliding window plot data as JSON for the chart,
+    optionally filtered by language.
+    """
+    # Get selected languages from query parameters
+    languages_str = request.args.get("languages")
+    selected_languages = (
+        languages_str.split(",")
+        if languages_str and languages_str.lower() != "null" and languages_str != ""
+        else None
+    )  # Handle empty/null string
+
+    # We need benchmark metadata and results data to re-run analysis if filtered
+    benchmark_metadata = current_app.config.get("BENCHMARK_METADATA")
+    benchmark_run_dir = current_app.config.get("BENCHMARK_RUN_DIR")
+
+    # Ensure metadata is loaded (should be loaded by index route first)
+    if not benchmark_metadata:
+        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
+        current_app.config["BENCHMARK_METADATA"] = load_benchmark_metadata(prompts_dir)
+        benchmark_metadata = current_app.config["BENCHMARK_METADATA"]
+
+    if not benchmark_metadata or not benchmark_run_dir:
+        print("Error: Benchmark metadata or run directory not available for API.")
+        return jsonify({"error": "Benchmark data not loaded."}), 500
+
+    # Re-scan results directory to get models and latest results data
+    results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
+    models_found, results_data = scan_results_directory(results_dir)
+
+    if not models_found:
+        print("Error: No models found in results directory for API.")
+        return jsonify({"error": "No models found in results directory."}), 404
+
+    # Re-run analysis with the selected languages
+    try:
+        print(
+            f"Running filtered analysis for API with languages: {selected_languages}"
+        )  # Debug log
+        filtered_analysis = analyze_results(
+            benchmark_metadata, models_found, results_data, selected_languages
+        )
+    except Exception as e:
+        print(f"Error during filtered analysis for API: {e}")
+        return jsonify({"error": f"Error during analysis: {e}"}), 500
 
     if (
-        not analysis_results
-        or not analysis_results.get("sliding_window")
-        or not analysis_results["sliding_window"].get("models")
+        not filtered_analysis
+        or "sliding_window" not in filtered_analysis
+        or not filtered_analysis["sliding_window"]
     ):
-        return {"error": "No sliding window analysis results available"}, 404
+        # If filtering resulted in no data, return empty structure
+        print(
+            "Filtered analysis resulted in no sliding window data for API."
+        )  # Debug log
+        return jsonify({"labels": [], "datasets": []})
 
-    sliding_data = analysis_results["sliding_window"]
-    # Labels are the window centers in k tokens
-    labels = [f"{k}k" for k in sliding_data.get("window_centers_k", [])]
-    # Removed unused bucket_labels assignment (this comment might be redundant now)
+    sliding_data = filtered_analysis["sliding_window"]
+    models_data = sliding_data.get("models", {})
+    window_centers_k = sliding_data.get("window_centers_k", [])
+
+    # Format data for Chart.js
+    labels = [f"{center}k" for center in window_centers_k]
     datasets = []
 
-    # Sort models for consistent coloring
-    models = sorted(list(sliding_data["models"].keys()))
-    window_centers = [
-        c * 1000 for c in sliding_data.get("window_centers_k", [])
-    ]  # Get original centers
+    # Get overall model costs from the initial (unfiltered) analysis stored in config
+    # We show the *overall* cost, not cost filtered by language
+    initial_analysis_results = current_app.config.get("ANALYSIS_RESULTS", {})
+    overall_model_stats = (
+        initial_analysis_results.get("models", {}) if initial_analysis_results else {}
+    )
 
-    for model_name in models:
-        model_sliding_stats = sliding_data["models"][model_name]
-        success_rates = []
-        wilson_lower_bounds = []  # Initialize list for lower bounds
-        wilson_upper_bounds = []  # Initialize list for upper bounds
-        totals_in_window = []  # Initialize list for total counts
-        successes_in_window = []  # Initialize list for success counts
+    # Sort models for consistent coloring based on the filtered results
+    models_in_filtered_data = sorted(list(models_data.keys()))
 
-        for center in window_centers:
-            stats = model_sliding_stats.get(center, {})
-            success_rates.append(stats.get("rate"))  # Append rate (can be None)
-            wilson_lower_bounds.append(stats.get("wilson_lower"))  # Append lower bound
-            wilson_upper_bounds.append(stats.get("wilson_upper"))  # Append upper bound
-            totals_in_window.append(stats.get("total"))  # Append total count
-            successes_in_window.append(stats.get("successful"))  # Append success count
+    for model_name in models_in_filtered_data:
+        model_window_data = models_data[model_name]
+        rates = []
+        wilson_lowers = []
+        wilson_uppers = []
+        totals = []
+        successes = []
 
-        # Get overall cost for the label from the main analysis part
-        total_cost = (
-            analysis_results.get("models", {})
-            .get(model_name, {})
-            .get("total_cost_usd", 0.0)
+        # Ensure data aligns with window_centers_k
+        window_centers_abs = [
+            k * 1000 for k in window_centers_k
+        ]  # Convert back for lookup
+        for center_abs in window_centers_abs:
+            stats = model_window_data.get(center_abs)
+            if stats:
+                rates.append(stats.get("rate"))  # Can be None if total is 0
+                wilson_lowers.append(stats.get("wilson_lower"))
+                wilson_uppers.append(stats.get("wilson_upper"))
+                totals.append(stats.get("total"))
+                successes.append(stats.get("successful"))
+            else:
+                # Append placeholders if no data for this center
+                rates.append(None)
+                wilson_lowers.append(None)
+                wilson_uppers.append(None)
+                totals.append(0)
+                successes.append(0)
+
+        # Get total cost for this model from the overall stats
+        model_total_cost = overall_model_stats.get(model_name, {}).get(
+            "total_cost_usd", 0.0
         )
+        # Use .4f for cost precision as in the original unfiltered analysis display
+        cost_str = f"{model_total_cost:.4f}" if model_total_cost is not None else "N/A"
 
         datasets.append(
             {
-                "label": f"{model_name} (${total_cost:.2f})",
-                "data": success_rates,
-                "wilson_lower": wilson_lower_bounds,  # Add lower bounds to dataset
-                "wilson_upper": wilson_upper_bounds,  # Add upper bounds to dataset
-                "totals": totals_in_window,  # Add total counts to dataset
-                "successes": successes_in_window,  # Add success counts to dataset
-                "borderWidth": 2,
+                "label": f"{model_name} (${cost_str})",  # Include overall cost in label
+                "data": rates,
+                "wilson_lower": wilson_lowers,
+                "wilson_upper": wilson_uppers,
+                "totals": totals,  # Add total counts for tooltip
+                "successes": successes,  # Add success counts for tooltip
+                "borderWidth": 2,  # Keep styling consistent
                 "tension": 0.1,
                 "fill": False,
-                "spanGaps": True,  # Connect lines even if there are null data points
+                "spanGaps": True,
             }
         )
 
-    return {"labels": labels, "datasets": datasets}
+    return jsonify({"labels": labels, "datasets": datasets})
 
 
 @app.route("/files/<path:filepath>")
