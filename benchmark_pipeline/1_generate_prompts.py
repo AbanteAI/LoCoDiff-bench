@@ -76,9 +76,10 @@ import time
 from datetime import datetime, timezone
 import tiktoken
 import random
+import yaml
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Set
 from urllib.parse import urlparse
 
 
@@ -199,7 +200,6 @@ def get_repo_head_commit_hash(repo_path: str) -> str:
 class Config:
     """Configuration settings for the prompt generation script."""
 
-    extensions: List[str]
     benchmark_run_dir: str  # New required directory
     prompts_dir: str  # Derived: benchmark_run_dir / "prompts"
     temp_dir: str  # Derived: benchmark_run_dir / "prompts_temp"
@@ -379,11 +379,79 @@ print('Hello, world!')
 """
 
 
+# --- Language Configuration Loading ---
+
+DEFAULT_LANGUAGE_CONFIG_PATH = "benchmark_pipeline/languages.yaml"
+
+
+def load_language_config(
+    filepath: str = DEFAULT_LANGUAGE_CONFIG_PATH,
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Loads language configuration from a YAML file.
+
+    Args:
+        filepath: Path to the YAML configuration file.
+
+    Returns:
+        A dictionary mapping language names to their configuration
+        (e.g., {"python": {"extensions": [".py"]}}).
+
+    Raises:
+        FileNotFoundError: If the config file doesn't exist.
+        yaml.YAMLError: If the file cannot be parsed.
+        ValueError: If the config format is invalid.
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Language configuration file not found: {filepath}")
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise yaml.YAMLError(f"Error parsing language config file {filepath}: {e}")
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Invalid format in {filepath}: Top level must be a dictionary."
+        )
+
+    # Basic validation
+    for lang, settings in config.items():
+        if not isinstance(settings, dict) or "extensions" not in settings:
+            raise ValueError(
+                f"Invalid format for language '{lang}' in {filepath}: Must be a dict with 'extensions' key."
+            )
+        if not isinstance(settings["extensions"], list) or not all(
+            isinstance(ext, str) and ext.startswith(".")
+            for ext in settings["extensions"]
+        ):
+            raise ValueError(
+                f"Invalid 'extensions' list for language '{lang}' in {filepath}: Must be a list of strings starting with '.'."
+            )
+
+    print(f"Loaded language configuration from: {filepath}")
+    return config
+
+
+def get_all_extensions_from_config(
+    language_config: Dict[str, Dict[str, List[str]]],
+) -> Set[str]:
+    """Extracts a set of all unique extensions from the language config."""
+    all_extensions = set()
+    for lang_settings in language_config.values():
+        all_extensions.update(lang_settings.get("extensions", []))
+    return all_extensions
+
+
 # --- Core Generation Logic ---
 
 
 def generate_prompts_and_expected(
-    repo_path: str, cfg: Config, existing_prefixes: set[str]
+    repo_path: str,
+    cfg: Config,
+    existing_prefixes: set[str],
+    target_extensions: Set[str],  # Added: Set of extensions to process
 ) -> Tuple[List[Dict[str, Any]], int, int, int]:
     """
     Generates prompts and expected outputs for eligible files in a repository.
@@ -439,7 +507,8 @@ def generate_prompts_and_expected(
         if ".git" in root.split(os.sep):
             continue
         for filename in files:
-            if any(filename.endswith(ext) for ext in cfg.extensions):
+            # Use the target_extensions set derived from languages.yaml
+            if any(filename.endswith(ext) for ext in target_extensions):
                 full_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(full_path, repo_path)
                 files_to_process.append((full_path, rel_path))
@@ -812,6 +881,7 @@ def save_benchmark_metadata(
     existing_runs: List[Dict[str, Any]],
     newly_added_stats: List[Dict[str, Any]],
     cfg: Config,
+    language_config: Dict[str, Any],  # Added language config
 ):
     """
     Appends the current generation run's metadata to the list of existing runs
@@ -846,6 +916,8 @@ def save_benchmark_metadata(
     # Create the dictionary for the current run
     current_run_metadata = {
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        # "language_config_path": DEFAULT_LANGUAGE_CONFIG_PATH,  # Removed per review
+        "language_config_content": language_config,  # Store the actual config used
         "generation_parameters": current_run_params,
         "benchmark_cases_added": current_run_cases,  # Store only newly added cases
     }
@@ -884,13 +956,6 @@ def main():
         nargs="+",
         required=True,
         help="List of GitHub repositories to process (format: 'org/repo' or full URL).",
-    )
-    parser.add_argument(
-        "--extensions",
-        "-e",
-        type=str,
-        required=True,
-        help="Comma-separated list of file extensions to process (include the dot), e.g., .py,.txt,.js",
     )
     parser.add_argument(
         "--benchmark-run-dir",
@@ -949,17 +1014,27 @@ def main():
         return 1
     # --- End argument validation ---
 
-    # --- Create Config object ---
-    # Parse extensions from comma-separated string to list
-    extension_list = [ext.strip() for ext in args.extensions.split(",")]
+    # --- Load Language Config ---
+    try:
+        language_config = load_language_config()  # Uses default path
+        all_target_extensions = get_all_extensions_from_config(language_config)
+        if not all_target_extensions:
+            print("Error: No extensions found in language configuration. Exiting.")
+            return 1  # Use return inside main()
+        print(
+            f"Targeting extensions from {DEFAULT_LANGUAGE_CONFIG_PATH}: {', '.join(sorted(list(all_target_extensions)))}"
+        )
+    except (FileNotFoundError, yaml.YAMLError, ValueError) as e:
+        print(f"Error loading language configuration: {e}")
+        return 1  # Use return inside main()
 
+    # --- Create Config object ---
     # Define derived paths
     benchmark_run_dir = args.benchmark_run_dir
     prompts_dir = os.path.join(benchmark_run_dir, "prompts")
     temp_dir = os.path.join(benchmark_run_dir, "prompts_temp")
 
     cfg = Config(
-        extensions=extension_list,
         benchmark_run_dir=benchmark_run_dir,
         prompts_dir=prompts_dir,
         temp_dir=temp_dir,
@@ -989,9 +1064,65 @@ def main():
 
     # --- Reporting Mode Check ---
     if cfg.add_prompts == 0:
-        print("\n--add-prompts is 0. Running in reporting mode only. Exiting.")
-        # Optionally print summary of existing metadata here if desired
-        return 0
+        print(
+            "\n--add-prompts is 0. Counting existing prompts per configured language..."
+        )
+        if not os.path.exists(cfg.prompts_dir):
+            print(
+                f"Prompts directory '{cfg.prompts_dir}' does not exist. No prompts found."
+            )
+            return 0  # Use return inside main()
+
+        existing_prompt_files = glob(os.path.join(cfg.prompts_dir, "*_prompt.txt"))
+        print(f"Found {len(existing_prompt_files)} total existing prompt files.")
+
+        lang_counts = {lang: 0 for lang in language_config}
+        unknown_ext_count = 0
+
+        # Create a reverse map: extension -> language_name
+        ext_to_lang = {}
+        for lang, settings in language_config.items():
+            for ext in settings.get("extensions", []):
+                # Handle potential conflicts (e.g., if .js is in multiple groups) - last one wins here
+                ext_to_lang[ext] = lang
+
+        prompt_suffix = "_prompt.txt"
+        for prompt_file in existing_prompt_files:
+            basename = os.path.basename(prompt_file)
+            if not basename.endswith(prompt_suffix):
+                continue  # Should not happen with glob pattern
+
+            # Attempt to extract original extension from filename based on the generation format:
+            # Example: aider_aider_cli.py_prompt.txt
+            base_no_suffix = basename[: -len(prompt_suffix)]
+            inferred_ext = ""
+
+            # Extract extension: everything after the last dot in the base name
+            if "." in base_no_suffix:
+                potential_ext = (
+                    "." + base_no_suffix.rsplit(".", 1)[1]
+                )  # ".py", ".js", ...
+                # Check if this potential extension is defined in our config
+                if potential_ext in ext_to_lang:
+                    inferred_ext = potential_ext
+            else:
+                potential_ext = ""  # no dot found → leave blank
+
+            lang_found = ext_to_lang.get(inferred_ext)
+            if lang_found:
+                lang_counts[lang_found] += 1
+            else:
+                # This case means the inferred extension wasn't in our config map
+                # Or we couldn't infer an extension reliably from the filename parts
+                unknown_ext_count += 1
+
+        print("\nExisting prompts per language (based on filename inference):")
+        for lang, count in lang_counts.items():
+            print(f"- {lang}: {count}")
+        if unknown_ext_count > 0:
+            print(f"- Unknown/Unmatched: {unknown_ext_count}")
+        print("\nExiting as --add-prompts is 0.")
+        return 0  # Use return inside main()
     # --- End Reporting Mode Check ---
 
     # --- Clone repos if needed and build repo paths list ---
@@ -1044,8 +1175,11 @@ def main():
                 expected_token_filtered_count,
                 already_exists_count,
             ) = generate_prompts_and_expected(
-                repo_path, cfg, existing_prefixes
-            )  # Pass cfg object and existing prefixes
+                repo_path,
+                cfg,
+                existing_prefixes,
+                all_target_extensions,  # Pass the set of extensions derived from language config
+            )
             all_candidate_stats.extend(stats_list)  # Add to candidates
             total_date_filtered_count += date_filtered_count  # Accumulate date count
             total_expected_token_filtered_count += (
@@ -1158,7 +1292,12 @@ def main():
     )  # Changed output_dir to prompts_dir
 
     # 6. Save the updated metadata (appending the new run) to the prompts directory
-    save_benchmark_metadata(existing_metadata_runs, prompts_to_add_stats, cfg)
+    save_benchmark_metadata(
+        existing_metadata_runs,
+        prompts_to_add_stats,
+        cfg,
+        language_config,  # Pass language config here
+    )
 
     # 7. Clean up temporary directory
     print(f"\nCleaning up temporary directory: {cfg.temp_dir}")
