@@ -79,7 +79,7 @@ import random
 import yaml
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict, Any, Set
+from typing import List, Tuple, Dict, Any, Set, Optional
 from urllib.parse import urlparse
 
 
@@ -442,6 +442,306 @@ def get_all_extensions_from_config(
     for lang_settings in language_config.values():
         all_extensions.update(lang_settings.get("extensions", []))
     return all_extensions
+
+
+def build_extension_to_language_map(
+    language_config: Dict[str, Dict[str, List[str]]],
+) -> Dict[str, str]:
+    """Creates a reverse map from extension to language."""
+    ext_to_lang = {}
+    for lang, settings in language_config.items():
+        for ext in settings.get("extensions", []):
+            if ext in ext_to_lang:
+                print(
+                    f"Warning: Extension '{ext}' is mapped to multiple languages ('{ext_to_lang[ext]}' and '{lang}'). Using '{lang}'."
+                )
+            ext_to_lang[ext] = lang
+    return ext_to_lang
+
+
+# --- Statistics for Existing Prompts ---
+
+
+@dataclass
+class PromptInfo:
+    filepath: str
+    language: str
+    token_count: int
+
+
+def get_detailed_existing_prompt_info(
+    prompts_dir: str,
+    ext_to_lang_map: Dict[str, str],
+    encoder: tiktoken.Encoding,
+) -> List[PromptInfo]:
+    """
+    Scans the prompts directory, reads each prompt, counts tokens, and infers language.
+
+    Args:
+        prompts_dir: Directory containing the '*_prompt.txt' files.
+        ext_to_lang_map: Dictionary mapping file extensions (e.g., '.py') to language names.
+        encoder: The tiktoken encoder instance.
+
+    Returns:
+        A list of PromptInfo objects containing details for each found prompt.
+    """
+    prompt_infos = []
+    prompt_files = glob(os.path.join(prompts_dir, "*_prompt.txt"))
+
+    print(f"Analyzing {len(prompt_files)} existing prompt files in {prompts_dir}...")
+    if not prompt_files:
+        return []  # Return early if no files found
+
+    for filepath in tqdm(prompt_files, desc="Analyzing prompts"):
+        filename = os.path.basename(filepath)
+        # Attempt to extract the original extension
+        # Format: org_repo_path_with_underscores_ext_prompt.txt
+        base_name = filename.replace("_prompt.txt", "")
+        language = "unknown"
+        # found_ext = None # Unused variable
+
+        # Iterate through known extensions to find the longest match at the end
+        possible_exts = sorted(ext_to_lang_map.keys(), key=len, reverse=True)
+        for ext in possible_exts:
+            # Check for sanitized extension (e.g., _py)
+            sanitized_ext = ext.replace(".", "_")
+            if base_name.endswith(sanitized_ext):
+                # Check if the part before the extension looks like a path separator replacement
+                potential_path_part = base_name[: -len(sanitized_ext)]
+                if (
+                    potential_path_part.endswith("_") or not potential_path_part
+                ):  # Handle case where filename is just the extension
+                    # found_ext = ext # Unused variable
+                    language = ext_to_lang_map[ext]
+                    break
+            # Check for original extension (e.g., .py) just in case (less likely)
+            elif base_name.endswith(ext):
+                # Check if the part before the extension looks like a path separator replacement
+                potential_path_part = base_name[: -len(ext)]
+                if potential_path_part.endswith("_") or not potential_path_part:
+                    # found_ext = ext # Unused variable
+                    language = ext_to_lang_map[ext]
+                    break
+
+        if language == "unknown":
+            # Fallback: Check if any known extension is present *anywhere* after the last likely path separator '_'
+            # This is less precise but might catch cases missed by the endswith logic
+            last_underscore_idx = base_name.rfind("_")
+            if last_underscore_idx != -1:
+                potential_filename_part = base_name[last_underscore_idx + 1 :]
+                for ext in possible_exts:
+                    sanitized_ext = ext.replace(".", "_")
+                    if (
+                        sanitized_ext in potential_filename_part
+                        or ext in potential_filename_part
+                    ):
+                        language = ext_to_lang_map[ext]
+                        # Take the first match found in this fallback
+                        break
+
+            if language == "unknown":  # Still unknown after fallback
+                print(f"\nWarning: Could not determine language for {filename}")
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            token_count = count_tokens(content, encoder)
+            prompt_infos.append(PromptInfo(filepath, language, token_count))
+        except Exception as e:
+            print(f"\nError processing file {filepath}: {e}")
+
+    return prompt_infos
+
+
+@dataclass
+class LanguageStats:
+    count: int = 0
+    min_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+    quartile_counts: List[int] = lambda: [0, 0, 0, 0]  # type: ignore
+
+
+def calculate_prompt_statistics(
+    prompt_infos: List[PromptInfo],
+) -> Tuple[Dict[str, LanguageStats], List[float]]:
+    """
+    Calculates token statistics globally and per language, including quartile distribution.
+
+    Args:
+        prompt_infos: A list of PromptInfo objects.
+
+    Returns:
+        A tuple containing:
+        - A dictionary mapping language names (including "All") to LanguageStats objects.
+        - A list of 5 floats representing the quartile boundaries (min, q1, q2, q3, max).
+    """
+    if not prompt_infos:
+        return {}, [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    all_token_counts = [info.token_count for info in prompt_infos]
+    global_min = min(all_token_counts)
+    global_max = max(all_token_counts)
+
+    # Define quartile boundaries
+    if global_min == global_max:
+        # Handle edge case where all prompts have the same length
+        boundaries = [float(global_min)] * 5
+        quartile_ranges = [(global_min, global_min)] * 4
+    else:
+        q1 = global_min + (global_max - global_min) / 4.0
+        q2 = global_min + 2.0 * (global_max - global_min) / 4.0
+        q3 = global_min + 3.0 * (global_max - global_min) / 4.0
+        boundaries = [float(global_min), q1, q2, q3, float(global_max)]
+        # Define ranges carefully: [b0, b1], (b1, b2], (b2, b3], (b3, b4]
+        quartile_ranges = [
+            (boundaries[0], boundaries[1]),
+            (boundaries[1], boundaries[2]),
+            (boundaries[2], boundaries[3]),
+            (boundaries[3], boundaries[4]),
+        ]
+
+    stats: Dict[str, LanguageStats] = {"All": LanguageStats()}
+    stats["All"].quartile_counts = [0, 0, 0, 0]  # Ensure list is initialized
+
+    for info in prompt_infos:
+        # Update language stats
+        lang = info.language
+        if lang not in stats:
+            stats[lang] = LanguageStats()
+            stats[lang].quartile_counts = [0, 0, 0, 0]  # Ensure list is initialized
+
+        stats[lang].count += 1
+        # Handle None case for min/max update
+        current_min = stats[lang].min_tokens
+        stats[lang].min_tokens = (
+            info.token_count
+            if current_min is None
+            else min(current_min, info.token_count)
+        )
+        current_max = stats[lang].max_tokens
+        stats[lang].max_tokens = (
+            info.token_count
+            if current_max is None
+            else max(current_max, info.token_count)
+        )
+
+        # Update "All" stats
+        stats["All"].count += 1
+        # Handle None case for min/max update
+        all_current_min = stats["All"].min_tokens
+        stats["All"].min_tokens = (
+            info.token_count
+            if all_current_min is None
+            else min(all_current_min, info.token_count)
+        )
+        all_current_max = stats["All"].max_tokens
+        stats["All"].max_tokens = (
+            info.token_count
+            if all_current_max is None
+            else max(all_current_max, info.token_count)
+        )
+
+        # Assign to quartile
+        assigned = False
+        token_val = info.token_count
+        # Special case: if token_val is exactly the min, it goes in Q1
+        if token_val == boundaries[0]:
+            stats[lang].quartile_counts[0] += 1
+            stats["All"].quartile_counts[0] += 1
+            assigned = True
+        else:
+            for i, (q_min, q_max) in enumerate(quartile_ranges):
+                # Check if token falls into (q_min, q_max]
+                # For the last quartile, include the max value: (q3, q4]
+                # is_last_quartile = i == 3 # Unused variable
+                in_range = token_val > q_min and token_val <= q_max
+
+                if in_range:
+                    stats[lang].quartile_counts[i] += 1
+                    stats["All"].quartile_counts[i] += 1
+                    assigned = True
+                    break
+
+        # This should theoretically not happen if ranges cover min to max and edge cases handled
+        if not assigned:
+            # This case might happen if token_val == global_max and global_max was the upper bound of Q3 due to float precision.
+            # Assign such cases to the last quartile.
+            if token_val == global_max:
+                stats[lang].quartile_counts[3] += 1
+                stats["All"].quartile_counts[3] += 1
+            else:
+                print(
+                    f"\nWarning: Prompt {info.filepath} with {info.token_count} tokens did not fall into any quartile range based on boundaries {boundaries}."
+                )
+
+    return stats, boundaries
+
+
+def print_detailed_prompt_stats(
+    stats: Dict[str, LanguageStats], boundaries: List[float]
+):
+    """Prints the calculated prompt statistics in a formatted way."""
+    print("\n--- Existing Prompt Statistics ---")
+
+    # Define quartile labels based on boundaries
+    # Helper to format boundaries: show in thousands (k)
+    def format_boundary(x):
+        if x < 1000:
+            # For values less than 1000, show as is (integer)
+            return f"{x:.0f}"
+        else:
+            # For values 1000 or more, show in k
+            return f"{round(x / 1000):.0f}k"
+
+    q_labels = [
+        f"Q1 [{format_boundary(boundaries[0])} - {format_boundary(boundaries[1])}]",
+        f"Q2 ({format_boundary(boundaries[1])} - {format_boundary(boundaries[2])}]",
+        f"Q3 ({format_boundary(boundaries[2])} - {format_boundary(boundaries[3])}]",
+        f"Q4 ({format_boundary(boundaries[3])} - {format_boundary(boundaries[4])}]",
+    ]
+    # Handle edge case for labels where min == max
+    if boundaries[0] == boundaries[4]:
+        q_labels = [f"Q1-4 [{format_boundary(boundaries[0])}]"] * 4
+
+    # Sort languages, keeping "All" first, then alphabetically, "unknown" last
+    sorted_langs = sorted([lang for lang in stats if lang not in ["All", "unknown"]])
+    langs_to_print = ["All"] + sorted_langs
+    if "unknown" in stats and stats["unknown"].count > 0:
+        langs_to_print.append("unknown")
+
+    for lang in langs_to_print:
+        if lang not in stats:
+            continue  # Skip if somehow a lang is in the list but not stats
+        lang_stat = stats[lang]
+        title = lang if lang != "All" else "All Languages"
+        print(f"\n{title}")
+        print("-" * len(title))  # Separator matches title length
+
+        if lang_stat.count == 0:
+            print("  Number of prompts: 0")
+            continue
+
+        print(f"  Number of prompts: {lang_stat.count}")
+        min_t = lang_stat.min_tokens if lang_stat.min_tokens is not None else "N/A"
+        max_t = lang_stat.max_tokens if lang_stat.max_tokens is not None else "N/A"
+        print(f"  Shortest / Longest Prompts: {min_t} tokens / {max_t} tokens")
+        print("  Prompt count by Quartile:")
+
+        # Format quartile counts - adjust label width dynamically
+        max_label_len = 0
+        if boundaries[0] != boundaries[4]:
+            max_label_len = max(len(label) for label in q_labels)
+        else:
+            max_label_len = len(q_labels[0])  # Only one label in edge case
+
+        for i, count in enumerate(lang_stat.quartile_counts):
+            # Handle edge case display (only print first quartile)
+            if boundaries[0] == boundaries[4] and i > 0:
+                continue
+            label = q_labels[i]
+            print(f"    {label:<{max_label_len}} : {count}")
+
+    print("\n" + "-" * 30 + "\n")  # Final separator
 
 
 # --- Core Generation Logic ---
@@ -1028,6 +1328,9 @@ def main():
         print(f"Error loading language configuration: {e}")
         return 1  # Use return inside main()
 
+    # Build reverse map for language lookup later
+    ext_to_lang_map = build_extension_to_language_map(language_config)
+
     # --- Create Config object ---
     # Define derived paths
     benchmark_run_dir = args.benchmark_run_dir
@@ -1051,7 +1354,34 @@ def main():
     )
     # --- End Config creation ---
 
-    # --- Load existing data ---
+    # --- Handle add_prompts == 0 Case (Analyze and Exit) ---
+    if cfg.add_prompts == 0:
+        print("\nadd_prompts is 0. Analyzing existing prompts...")
+        if not os.path.exists(cfg.prompts_dir):
+            print(f"Prompts directory '{cfg.prompts_dir}' does not exist.")
+            print("Exiting.")
+            return 0  # Successful exit, nothing to do
+
+        # Perform detailed analysis
+        prompt_infos = get_detailed_existing_prompt_info(
+            cfg.prompts_dir, ext_to_lang_map, cfg.encoder
+        )
+
+        if not prompt_infos:
+            print(f"No prompt files found in '{cfg.prompts_dir}' to analyze.")
+            print("Exiting.")
+            return 0  # Successful exit, nothing to analyze
+
+        # Calculate statistics
+        stats, boundaries = calculate_prompt_statistics(prompt_infos)
+
+        # Print detailed statistics
+        print_detailed_prompt_stats(stats, boundaries)
+
+        print("Exiting without generating new prompts.")
+        return 0  # Successful exit after analysis
+
+    # --- Load existing data (Only if generating new prompts) ---
     # Ensure prompts directory exists before trying to load from it
     os.makedirs(cfg.prompts_dir, exist_ok=True)
     existing_metadata_runs, existing_prefixes = load_existing_metadata_and_prefixes(
@@ -1314,5 +1644,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # Example Usage:
+    # Generate 10 new prompts for python/tsx files from mentat repo:
+    #   ./benchmark_pipeline/1_generate_prompts.py -r AbanteAI/mentat -e .py .tsx --benchmark-run-dir ./benchmark_runs/mentat_dev --add-prompts 10
+    # Analyze existing prompts in a specific run directory:
+    #   ./benchmark_pipeline/1_generate_prompts.py --benchmark-run-dir ./benchmark_runs/mentat_dev --add-prompts 0
     exit_code = main()
     sys.exit(exit_code)
