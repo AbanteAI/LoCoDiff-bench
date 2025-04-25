@@ -895,9 +895,8 @@ function initializeChart(chartData) {
                 let attempts = 0;
                 
                 if (selectedLanguages.length === 0) {
-                    // No languages selected, use overall data
-                    successful = modelData.overall.successful;
-                    attempts = modelData.overall.attempts;
+                    // No languages selected, show empty chart (consistent with model selection behavior)
+                    return null;
                 } else {
                     // Use only selected languages
                     selectedLanguages.forEach(language => {
