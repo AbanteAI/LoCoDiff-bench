@@ -318,16 +318,31 @@ def create_html_header() -> str:
 """
 
 
-def create_html_footer() -> str:
-    """Creates the HTML footer."""
-    return """
+def create_html_footer(include_chart_js: bool = False) -> str:
+    """
+    Creates the HTML footer.
+
+    Args:
+        include_chart_js: Whether to include the chart JavaScript code.
+
+    Returns:
+        HTML string for the footer section
+    """
+    footer = """
     </main>
     <footer>
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
     </footer>
+    """
+
+    if include_chart_js:
+        footer += create_chart_javascript()
+
+    footer += """
 </body>
 </html>
 """
+    return footer
 
 
 def create_overall_stats_table(
@@ -600,6 +615,311 @@ def create_language_stats_table(
     return html
 
 
+def generate_chart_data(
+    results_metadata: Dict[Any, Dict[str, Any]],
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    all_models: Set[str],
+    case_languages: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    Generates data for the token-based chart.
+
+    Creates data points at 1k token increments from 0k to 75k,
+    with each point representing a +/- 10k token bucket.
+
+    Returns:
+        Dictionary containing the chart data
+    """
+    # Find min and max token counts
+    token_counts = [meta.get("prompt_tokens", 0) for meta in prompt_metadata.values()]
+    min_tokens = 0
+    max_tokens = 75000
+    if token_counts:
+        min_tokens = min(token_counts)
+        max_tokens = max(token_counts)
+
+    # Round to nearest thousand for display
+    min_tokens_k = min_tokens // 1000
+    max_tokens_k = (max_tokens + 999) // 1000
+
+    # Initialize data structure
+    buckets = []
+    for i in range(min_tokens_k, max_tokens_k + 1):
+        bucket_center = i * 1000
+        bucket_min = max(0, bucket_center - 10000)
+        bucket_max = bucket_center + 10000
+
+        # Initialize data for this bucket
+        bucket_data = {
+            "bucket_center": bucket_center,
+            "bucket_center_k": i,
+            "bucket_min": bucket_min,
+            "bucket_max": bucket_max,
+            "bucket_range": f"{bucket_min // 1000}k-{bucket_max // 1000}k",
+            "models": {},
+        }
+
+        # Initialize model data
+        for model in all_models:
+            bucket_data["models"][model] = {
+                "overall": {"attempts": 0, "successful": 0},
+                "languages": {},
+            }
+
+        buckets.append(bucket_data)
+
+    # Populate buckets with result data
+    for (case_prefix, model), result_metadata in results_metadata.items():
+        # Get token count for this case
+        token_count = prompt_metadata.get(case_prefix, {}).get("prompt_tokens", 0)
+
+        # Get language for this case
+        language = case_languages.get(case_prefix, "unknown")
+
+        # Find matching bucket
+        for bucket in buckets:
+            if bucket["bucket_min"] <= token_count <= bucket["bucket_max"]:
+                # Initialize language if needed
+                if language not in bucket["models"][model]["languages"]:
+                    bucket["models"][model]["languages"][language] = {
+                        "attempts": 0,
+                        "successful": 0,
+                    }
+
+                # Add to counts
+                bucket["models"][model]["overall"]["attempts"] += 1
+                bucket["models"][model]["languages"][language]["attempts"] += 1
+
+                if result_metadata.get("success", False):
+                    bucket["models"][model]["overall"]["successful"] += 1
+                    bucket["models"][model]["languages"][language]["successful"] += 1
+
+                break
+
+    # Calculate all unique languages across all data
+    all_languages = set()
+    for bucket in buckets:
+        for model_data in bucket["models"].values():
+            for language in model_data["languages"].keys():
+                all_languages.add(language)
+
+    # Create the chart data object
+    chart_data = {
+        "buckets": buckets,
+        "models": list(sorted(all_models)),
+        "languages": list(sorted(all_languages)),
+        "min_tokens_k": min_tokens_k,
+        "max_tokens_k": max_tokens_k,
+    }
+
+    return chart_data
+
+
+def write_chart_data_to_file(chart_data: Dict[str, Any], output_dir: Path) -> None:
+    """Writes chart data to a JSON file in the specified directory."""
+    output_path = output_dir / "chart_data.json"
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(chart_data, f)
+        print(f"Generated {output_path}")
+    except IOError as e:
+        print(f"Error writing chart data file: {e}")
+
+
+def create_token_chart_section() -> str:
+    """Creates an HTML section for the token-based chart."""
+    return """
+    <section id="token-chart">
+        <h2>Success Rate by Prompt Size</h2>
+        <div class="chart-controls">
+            <div class="model-selection">
+                <h3>Models</h3>
+                <div id="model-checkboxes"></div>
+            </div>
+            <div class="language-selection">
+                <h3>Languages</h3>
+                <div id="language-checkboxes"></div>
+            </div>
+        </div>
+        <div class="chart-container">
+            <canvas id="token-success-chart"></canvas>
+        </div>
+    </section>
+    """
+
+
+def create_chart_javascript() -> str:
+    """Creates JavaScript code for initializing and controlling the chart."""
+    return """
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+// Load chart data
+fetch('chart_data.json')
+    .then(response => response.json())
+    .then(data => {
+        initializeChart(data);
+    });
+
+function initializeChart(chartData) {
+    // Define chart colors
+    const colors = [
+        '#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f',
+        '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'
+    ];
+    
+    // Get canvas context
+    const ctx = document.getElementById('token-success-chart').getContext('2d');
+    
+    // Create model checkboxes
+    const modelCheckboxes = document.getElementById('model-checkboxes');
+    chartData.models.forEach((model, index) => {
+        const color = colors[index % colors.length];
+        const checkbox = document.createElement('div');
+        checkbox.className = 'checkbox-item';
+        checkbox.innerHTML = `
+            <label>
+                <input type="checkbox" data-model="${model}" checked>
+                <span class="checkbox-color" style="background-color: ${color};"></span>
+                ${model}
+            </label>
+        `;
+        modelCheckboxes.appendChild(checkbox);
+    });
+    
+    // Create language checkboxes
+    const languageCheckboxes = document.getElementById('language-checkboxes');
+    chartData.languages.forEach(language => {
+        const checkbox = document.createElement('div');
+        checkbox.className = 'checkbox-item';
+        checkbox.innerHTML = `
+            <label>
+                <input type="checkbox" data-language="${language}" checked>
+                ${language}
+            </label>
+        `;
+        languageCheckboxes.appendChild(checkbox);
+    });
+    
+    // Create chart
+    const chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: chartData.buckets.map(bucket => bucket.bucket_center_k + 'k'),
+            datasets: []
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Prompt Token Length (k)'
+                    }
+                },
+                y: {
+                    title: {
+                        display: true,
+                        text: 'Success Rate (%)'
+                    },
+                    min: 0,
+                    max: 100
+                }
+            },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const modelName = context.dataset.label;
+                            const bucketData = chartData.buckets[context.dataIndex];
+                            const modelData = bucketData.models[modelName];
+                            
+                            const successRate = context.raw;
+                            const successful = modelData.overall.successful;
+                            const attempts = modelData.overall.attempts;
+                            
+                            return [
+                                `${modelName}: ${successRate.toFixed(2)}% (${successful}/${attempts})`,
+                                `Token Range: ${bucketData.bucket_range}`
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
+    // Function to update chart based on selected models and languages
+    function updateChart() {
+        // Get selected models and languages
+        const selectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
+            .map(checkbox => checkbox.getAttribute('data-model'));
+        
+        const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
+            .map(checkbox => checkbox.getAttribute('data-language'));
+        
+        // Clear current datasets
+        chart.data.datasets = [];
+        
+        // Create datasets for each selected model
+        selectedModels.forEach((model, index) => {
+            const color = colors[index % colors.length];
+            
+            // Calculate data points
+            const dataPoints = chartData.buckets.map(bucket => {
+                const modelData = bucket.models[model];
+                
+                // Filter by selected languages
+                let successful = 0;
+                let attempts = 0;
+                
+                if (selectedLanguages.length === 0) {
+                    // No languages selected, use overall data
+                    successful = modelData.overall.successful;
+                    attempts = modelData.overall.attempts;
+                } else {
+                    // Use only selected languages
+                    selectedLanguages.forEach(language => {
+                        if (modelData.languages[language]) {
+                            successful += modelData.languages[language].successful;
+                            attempts += modelData.languages[language].attempts;
+                        }
+                    });
+                }
+                
+                // Calculate success rate
+                return attempts > 0 ? (successful / attempts * 100) : null;
+            });
+            
+            // Add dataset
+            chart.data.datasets.push({
+                label: model,
+                data: dataPoints,
+                borderColor: color,
+                backgroundColor: color + '33',
+                fill: false,
+                tension: 0.1,
+                pointRadius: 4,
+                pointHoverRadius: 6
+            });
+        });
+        
+        // Update chart
+        chart.update();
+    }
+    
+    // Add event listeners to checkboxes
+    document.querySelectorAll('input[data-model], input[data-language]').forEach(checkbox => {
+        checkbox.addEventListener('change', updateChart);
+    });
+    
+    // Initial chart update
+    updateChart();
+}
+</script>
+"""
+
+
 def create_cases_placeholder() -> str:
     """Creates a placeholder section for individual benchmark cases."""
     return """
@@ -751,6 +1071,30 @@ def main():
         f"Found results for {len(results_metadata)} case-model combinations across {len(all_models)} models"
     )
 
+    # Determine language for each case prefix
+    print("Determining languages for benchmark cases...")
+    case_languages = {}
+    for case_prefix, metadata in prompt_metadata.items():
+        # Try to get language from metadata
+        language = metadata.get("language")
+
+        # If not available, infer from filename
+        if not language:
+            filename = metadata.get("original_filename", case_prefix)
+            language = infer_language_from_filename(filename, ext_to_lang_map)
+
+        case_languages[case_prefix] = language
+
+    # Generate chart data
+    print("Generating chart data...")
+    chart_data = generate_chart_data(
+        results_metadata, prompt_metadata, all_models, case_languages
+    )
+
+    # Write chart data to file
+    print("Writing chart data file...")
+    write_chart_data_to_file(chart_data, docs_dir)
+
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
@@ -761,8 +1105,9 @@ def main():
     html_content += create_language_stats_table(
         results_metadata, prompt_metadata, all_models, ext_to_lang_map
     )
+    html_content += create_token_chart_section()
     html_content += create_cases_placeholder()
-    html_content += create_html_footer()
+    html_content += create_html_footer(include_chart_js=True)
 
     # Write HTML file
     index_path = docs_dir / "index.html"
