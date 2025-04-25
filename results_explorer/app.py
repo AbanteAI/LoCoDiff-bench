@@ -1175,7 +1175,7 @@ def serve_file(filepath):
         # Use send_from_directory for safer serving
         # It requires the directory and the filename relative to that directory
         # print(f"Serving file: directory='{serving_directory}', filename='{filename}'") # Debugging
-        return send_from_directory(
+        return send_from_directory( # type: ignore
             serving_directory, filename, mimetype=mimetype, as_attachment=False
         )
     except FileNotFoundError:
@@ -1211,8 +1211,8 @@ def run_data_analysis():
         # Explicitly assign to a typed variable for pyright clarity.
         benchmark_run_dir: str = benchmark_run_dir_maybe_none
 
-        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
-        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
+        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR) # type: ignore
+        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR) # type: ignore
 
         print("\n--- Running Benchmark Data Analysis ---")
         print(f"Using prompts dir: {prompts_dir}")
