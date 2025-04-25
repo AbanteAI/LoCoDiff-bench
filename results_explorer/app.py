@@ -1117,6 +1117,10 @@ def serve_file(filepath):
     benchmark_run_dir: str = (
         benchmark_run_dir_maybe_none  # Explicitly typed after check
     )
+    # Add assertion for pyright here as well
+    assert benchmark_run_dir is not None, (
+        "BENCHMARK_RUN_DIR cannot be None for file serving."
+    )
 
     # Get the absolute path to the benchmark run directory
     run_dir_abs = os.path.abspath(benchmark_run_dir)
@@ -1170,11 +1174,15 @@ def serve_file(filepath):
         )
         assert filename is not None, "Filename should not be None here."
 
+        # Explicit casting as belt-and-suspenders for pyright
+        serving_dir_str = str(serving_directory)
+        filename_str = str(filename)
+
         # Use send_from_directory for safer serving
         # It requires the directory and the filename relative to that directory
-        # print(f"Serving file: directory='{serving_directory}', filename='{filename}'") # Debugging
+        # print(f"Serving file: directory='{serving_dir_str}', filename='{filename_str}'") # Debugging
         return send_from_directory(
-            serving_directory, filename, mimetype=mimetype, as_attachment=False
+            serving_dir_str, filename_str, mimetype=mimetype, as_attachment=False
         )
     except FileNotFoundError:
         abort(404, "File not found.")
@@ -1205,14 +1213,11 @@ def run_data_analysis():
             )
             current_app.config["ANALYSIS_RESULTS"] = None
             return
-        benchmark_run_dir: str = (
-            benchmark_run_dir_maybe_none  # Explicitly typed after check
-        )
-        # Add assertion for pyright
-        assert benchmark_run_dir is not None, "BENCHMARK_RUN_DIR cannot be None here."
+        # If we reach here, benchmark_run_dir_maybe_none is guaranteed to be a string
+        # Use the checked variable directly; pyright should infer the type.
 
-        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
-        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
+        prompts_dir = os.path.join(benchmark_run_dir_maybe_none, PROMPTS_SUBDIR)
+        results_dir = os.path.join(benchmark_run_dir_maybe_none, RESULTS_SUBDIR)
 
         print("\n--- Running Benchmark Data Analysis ---")
         print(f"Using prompts dir: {prompts_dir}")
