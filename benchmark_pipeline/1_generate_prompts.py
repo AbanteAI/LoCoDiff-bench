@@ -818,83 +818,106 @@ def generate_prompts_and_expected(
     for full_path, rel_path in tqdm(
         files_to_process, desc=f"Generating prompts for {full_repo_name}"
     ):
-        # 1. Date Filter Check
-        try:
-            if not is_file_recently_modified(rel_path, repo_path, threshold_timestamp):
+        try:  # Wrap processing for a single file to catch tokenization errors
+            # 1. Date Filter Check
+            try:
+                if not is_file_recently_modified(
+                    rel_path, repo_path, threshold_timestamp
+                ):
+                    date_filtered_count += 1
+                    continue
+            except ValueError as e:
+                # Handle errors getting commit time (e.g., file not in git)
+                print(f"\nSkipping {rel_path}: Error checking modification date: {e}")
                 date_filtered_count += 1
                 continue
+
+            # 2. Read Final Content & Expected Token Filter Check
+            try:
+                with open(
+                    full_path, "r", encoding="utf-8", errors="ignore"
+                ) as original:
+                    final_content = original.read()
+            except Exception as e:
+                print(f"\nSkipping {rel_path}: Error reading file: {e}")
+                continue
+
+            # Calculate expected tokens (potential ValueError from count_tokens)
+            expected_tokens = count_tokens(final_content, cfg.encoder)
+            if (
+                cfg.max_expected_tokens > 0
+                and expected_tokens > cfg.max_expected_tokens
+            ):
+                expected_token_filtered_count += 1
+                continue
+
+            # 3. Prepare Filenames and Paths (write to temporary directory)
+            safe_rel = rel_path.replace(os.sep, "_")
+            repo_file_prefix = f"{repo_name}_{safe_rel}"
+            prompt_fname = f"{repo_file_prefix}_prompt.txt"
+            expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
+
+            # Check if this file already exists in the benchmark set (based on existing prefixes loaded from prompts_dir)
+            if repo_file_prefix in existing_prefixes:
+                already_exists_count += 1
+                continue
+
+            # Write to temp directory (e.g., <benchmark_run_dir>/prompts_temp/)
+            prompt_path = os.path.join(cfg.temp_dir, prompt_fname)
+            expected_path = os.path.join(cfg.temp_dir, expected_fname)
+
+            # 4. Get Git History
+            try:
+                git_history = get_git_history(rel_path, repo_path)
+            except RuntimeError as e:
+                # Handle errors getting git history (e.g., file deleted/renamed weirdly)
+                print(f"\nSkipping {rel_path}: Error getting git history: {e}")
+                continue
+
+            # 5. Construct and Write Prompt File
+            prompt_content = build_prompt_content(rel_path, git_history)
+            try:
+                write_output_files(
+                    prompt_path, expected_path, prompt_content, final_content
+                )
+            except Exception as e:
+                print(f"\nSkipping {rel_path}: Error writing output files: {e}")
+                continue
+
+            # 6. Calculate Statistics
+            # Calculate prompt tokens (potential ValueError from count_tokens)
+            prompt_tokens = count_tokens(prompt_content, cfg.encoder)
+            final_lines = len(final_content.splitlines())
+            num_commits = len(re.findall(r"^commit ", git_history, re.MULTILINE))
+            lines_added, lines_deleted = get_git_numstat(rel_path, repo_path)
+
+            # 7. Store Stats
+            file_stats = {
+                "filename": rel_path,
+                "prompt_tokens": prompt_tokens,
+                "expected_tokens": expected_tokens,
+                "num_commits": num_commits,
+                "lines_added": lines_added,
+                "lines_deleted": lines_deleted,
+                "final_lines": final_lines,
+                "repo_name": full_repo_name,
+                "repo_commit_hash": head_commit_hash,
+                "prompt_filename": prompt_fname,
+                "expected_filename": expected_fname,
+                "benchmark_case_prefix": repo_file_prefix,
+            }
+            stats_list.append(file_stats)
+
         except ValueError as e:
-            print(f"\nSkipping {rel_path}: {e}")
-            date_filtered_count += 1
-            continue
-
-        # 2. Read Final Content & Expected Token Filter Check
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="ignore") as original:
-                final_content = original.read()
-        except Exception as e:
-            print(f"\nSkipping {rel_path}: Error reading file: {e}")
-            continue
-
-        expected_tokens = count_tokens(final_content, cfg.encoder)
-        if cfg.max_expected_tokens > 0 and expected_tokens > cfg.max_expected_tokens:
-            expected_token_filtered_count += 1
-            continue
-
-        # 3. Prepare Filenames and Paths (write to temporary directory)
-        safe_rel = rel_path.replace(os.sep, "_")
-        repo_file_prefix = f"{repo_name}_{safe_rel}"
-        prompt_fname = f"{repo_file_prefix}_prompt.txt"
-        expected_fname = f"{repo_file_prefix}_expectedoutput.txt"
-
-        # Check if this file already exists in the benchmark set (based on existing prefixes loaded from prompts_dir)
-        if repo_file_prefix in existing_prefixes:
-            already_exists_count += 1
-            continue
-
-        # Write to temp directory (e.g., <benchmark_run_dir>/prompts_temp/)
-        prompt_path = os.path.join(cfg.temp_dir, prompt_fname)
-        expected_path = os.path.join(cfg.temp_dir, expected_fname)
-
-        # 4. Get Git History
-        try:
-            git_history = get_git_history(rel_path, repo_path)
-        except RuntimeError as e:
-            print(f"\n{e}")
-            continue
-
-        # 5. Construct and Write Prompt File
-        prompt_content = build_prompt_content(rel_path, git_history)
-        try:
-            write_output_files(
-                prompt_path, expected_path, prompt_content, final_content
-            )
-        except Exception as e:
-            print(f"\nError writing output files for {rel_path}: {e}")
-            continue
-
-        # 6. Calculate Statistics
-        prompt_tokens = count_tokens(prompt_content, cfg.encoder)
-        final_lines = len(final_content.splitlines())
-        num_commits = len(re.findall(r"^commit ", git_history, re.MULTILINE))
-        lines_added, lines_deleted = get_git_numstat(rel_path, repo_path)
-
-        # 7. Store Stats
-        file_stats = {
-            "filename": rel_path,
-            "prompt_tokens": prompt_tokens,
-            "expected_tokens": expected_tokens,
-            "num_commits": num_commits,
-            "lines_added": lines_added,
-            "lines_deleted": lines_deleted,
-            "final_lines": final_lines,
-            "repo_name": full_repo_name,
-            "repo_commit_hash": head_commit_hash,
-            "prompt_filename": prompt_fname,
-            "expected_filename": expected_fname,
-            "benchmark_case_prefix": repo_file_prefix,
-        }
-        stats_list.append(file_stats)
+            # Catch tokenization errors specifically
+            if "disallowed special token" in str(e):
+                print(f"\nSkipping {rel_path}: Contains disallowed special tokens.")
+                # Optionally, increment a dedicated counter for this skip reason
+                continue  # Skip to the next file
+            else:
+                # Handle other potential ValueErrors during processing
+                print(f"\nSkipping {rel_path}: Encountered unexpected ValueError: {e}")
+                continue  # Skip file on other ValueErrors too for robustness
 
     return (
         stats_list,
