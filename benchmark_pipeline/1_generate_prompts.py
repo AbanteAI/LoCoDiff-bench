@@ -625,15 +625,14 @@ def calculate_prompt_statistics(
             else max(current_max, info.token_count)
         )
 
-
         # Update "All" stats
         stats["All"].count += 1
         # Handle None case for min/max update
         all_current_min = stats["All"].min_tokens
         stats["All"].min_tokens = (
-             info.token_count
-             if all_current_min is None
-             else min(all_current_min, info.token_count)
+            info.token_count
+            if all_current_min is None
+            else min(all_current_min, info.token_count)
         )
         all_current_max = stats["All"].max_tokens
         stats["All"].max_tokens = (
@@ -688,11 +687,11 @@ def print_detailed_prompt_stats(
     # Helper to format boundaries: show in thousands (k)
     def format_boundary(x):
         if x < 1000:
-             # For values less than 1000, show as is (integer)
-             return f"{x:.0f}"
+            # For values less than 1000, show as is (integer)
+            return f"{x:.0f}"
         else:
-             # For values 1000 or more, show in k
-             return f"{round(x / 1000):.0f}k"
+            # For values 1000 or more, show in k
+            return f"{round(x / 1000):.0f}k"
 
     q_labels = [
         f"Q1 [{format_boundary(boundaries[0])} - {format_boundary(boundaries[1])}]",
