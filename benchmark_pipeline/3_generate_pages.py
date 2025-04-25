@@ -846,6 +846,24 @@ fetch('chart_data.json')
         initializeChart(wrapper.data);
     });
 
+// JavaScript implementation of Wilson score interval for confidence intervals
+function wilson_score_interval(successful, attempts, z = 1.96) {
+    if (attempts === 0) return [0.0, 0.0];
+    
+    // Observed proportion
+    const p_hat = successful / attempts;
+    
+    // Wilson score calculation
+    const denominator = 1 + (z * z / attempts);
+    const center = (p_hat + (z * z / (2 * attempts))) / denominator;
+    const interval = z * Math.sqrt((p_hat * (1 - p_hat) + (z * z / (4 * attempts))) / attempts) / denominator;
+    
+    const lower_bound = Math.max(0.0, center - interval);
+    const upper_bound = Math.min(1.0, center + interval);
+    
+    return [lower_bound, upper_bound];
+}
+
 function initializeChart(chartData) {
     // Define chart colors
     const colors = [
