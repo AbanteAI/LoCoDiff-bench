@@ -35,6 +35,7 @@ File Modifications:
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 import sys
@@ -619,6 +620,43 @@ def create_language_stats_table(
     return html
 
 
+def wilson_score_interval(
+    successful: int, attempts: int, z: float = 1.96
+) -> Tuple[float, float]:
+    """
+    Calculate Wilson score interval for a binomial proportion.
+
+    This is used to compute confidence intervals for success rates.
+
+    Args:
+        successful: Number of successful attempts
+        attempts: Total number of attempts
+        z: Z-score for desired confidence level (default: 1.96 for 95% confidence)
+
+    Returns:
+        Tuple of (lower_bound, upper_bound) as proportions (not percentages)
+    """
+    if attempts == 0:
+        return 0.0, 0.0
+
+    # Observed proportion
+    p_hat = successful / attempts
+
+    # Wilson score calculation
+    denominator = 1 + (z**2 / attempts)
+    center = (p_hat + (z**2 / (2 * attempts))) / denominator
+    interval = (
+        z
+        * math.sqrt((p_hat * (1 - p_hat) + (z**2 / (4 * attempts))) / attempts)
+        / denominator
+    )
+
+    lower_bound = max(0.0, center - interval)
+    upper_bound = min(1.0, center + interval)
+
+    return lower_bound, upper_bound
+
+
 def generate_chart_data(
     results_metadata: Dict[Any, Dict[str, Any]],
     prompt_metadata: Dict[str, Dict[str, Any]],
@@ -700,6 +738,24 @@ def generate_chart_data(
 
                 # Note: No break here, so we continue to add this case to all matching buckets
 
+    # Calculate confidence intervals for all data points
+    for bucket in buckets:
+        for model, model_data in bucket["models"].items():
+            # Calculate confidence intervals for overall data
+            successful = model_data["overall"]["successful"]
+            attempts = model_data["overall"]["attempts"]
+            lower, upper = wilson_score_interval(successful, attempts)
+            model_data["overall"]["lower_bound"] = lower
+            model_data["overall"]["upper_bound"] = upper
+
+            # Calculate confidence intervals for each language
+            for language_data in model_data["languages"].values():
+                successful = language_data["successful"]
+                attempts = language_data["attempts"]
+                lower, upper = wilson_score_interval(successful, attempts)
+                language_data["lower_bound"] = lower
+                language_data["upper_bound"] = upper
+
     # Calculate all unique languages across all data
     all_languages = set()
     for bucket in buckets:
@@ -758,6 +814,15 @@ def create_token_chart_section() -> str:
             <div class="language-selection">
                 <h3>Languages</h3>
                 <div id="language-checkboxes"></div>
+            </div>
+            <div class="display-options">
+                <h3>Display Options</h3>
+                <div class="checkbox-item">
+                    <label>
+                        <input type="checkbox" id="show-confidence-intervals" checked>
+                        Show 95% Confidence Intervals
+                    </label>
+                </div>
             </div>
         </div>
         <div class="chart-container">
@@ -851,17 +916,46 @@ function initializeChart(chartData) {
                 tooltip: {
                     callbacks: {
                         label: function(context) {
+                            // Don't show tooltips for confidence interval datasets
+                            if (context.dataset.label.includes('CI')) {
+                                return null;
+                            }
+                            
                             const modelName = context.dataset.label;
                             const bucketData = chartData.buckets[context.dataIndex];
                             const modelData = bucketData.models[modelName];
                             
+                            // Get basic stats
                             const successRate = context.raw;
                             const successful = modelData.overall.successful;
                             const attempts = modelData.overall.attempts;
                             
+                            // Get confidence interval (for selected languages)
+                            let ciInfo = '';
+                            if (document.getElementById('show-confidence-intervals').checked) {
+                                // Find if we have data to calculate CIs
+                                let langSuccessful = 0;
+                                let langAttempts = 0;
+                                
+                                const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
+                                    .map(checkbox => checkbox.getAttribute('data-language'));
+                                
+                                selectedLanguages.forEach(language => {
+                                    if (modelData.languages[language]) {
+                                        langSuccessful += modelData.languages[language].successful;
+                                        langAttempts += modelData.languages[language].attempts;
+                                    }
+                                });
+                                
+                                if (langAttempts > 0) {
+                                    const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                                    ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
+                                }
+                            }
+                            
                             return [
-                                `${modelName}: ${successRate.toFixed(2)}% (${successful}/${attempts})`,
-                                `Token Range: ${bucketData.bucket_range}`
+                                `${modelName}: ${successRate?.toFixed(2) || 'N/A'}% (${successful}/${attempts})`,
+                                `Token Range: ${bucketData.bucket_range}${ciInfo}`
                             ];
                         }
                     }
@@ -911,7 +1005,57 @@ function initializeChart(chartData) {
                 return attempts > 0 ? (successful / attempts * 100) : null;
             });
             
-            // Add dataset
+            // Calculate confidence interval data points if languages are selected
+            let lowerBoundPoints = null;
+            let upperBoundPoints = null;
+            
+            if (selectedLanguages.length > 0) {
+                lowerBoundPoints = chartData.buckets.map(bucket => {
+                    const modelData = bucket.models[model];
+                    
+                    // Use only selected languages
+                    let langSuccessful = 0;
+                    let langAttempts = 0;
+                    
+                    selectedLanguages.forEach(language => {
+                        if (modelData.languages[language]) {
+                            langSuccessful += modelData.languages[language].successful;
+                            langAttempts += modelData.languages[language].attempts;
+                        }
+                    });
+                    
+                    if (langAttempts > 0) {
+                        // Recalculate Wilson interval for the combined languages
+                        const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                        return lower * 100; // Convert to percentage
+                    }
+                    return null;
+                });
+                
+                upperBoundPoints = chartData.buckets.map(bucket => {
+                    const modelData = bucket.models[model];
+                    
+                    // Use only selected languages
+                    let langSuccessful = 0;
+                    let langAttempts = 0;
+                    
+                    selectedLanguages.forEach(language => {
+                        if (modelData.languages[language]) {
+                            langSuccessful += modelData.languages[language].successful;
+                            langAttempts += modelData.languages[language].attempts;
+                        }
+                    });
+                    
+                    if (langAttempts > 0) {
+                        // Recalculate Wilson interval for the combined languages
+                        const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                        return upper * 100; // Convert to percentage
+                    }
+                    return null;
+                });
+            }
+            
+            // Add main dataset
             chart.data.datasets.push({
                 label: model,
                 data: dataPoints,
@@ -922,16 +1066,50 @@ function initializeChart(chartData) {
                 pointRadius: 4,
                 pointHoverRadius: 6
             });
+            
+            // Add confidence interval datasets if enabled
+            const showConfidenceIntervals = document.getElementById('show-confidence-intervals').checked;
+            
+            if (showConfidenceIntervals && selectedLanguages.length > 0) {
+                // Add confidence interval area as background
+                chart.data.datasets.push({
+                    label: `${model} (95% CI)`,
+                    data: upperBoundPoints,
+                    borderColor: 'transparent',
+                    backgroundColor: color + '22', // Very transparent version of the line color
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: {
+                        target: '+1', // Fill to the dataset below (which will be the lower bound)
+                        above: color + '22'
+                    }
+                });
+                
+                // Add lower bound line (this will be filled to from the dataset above)
+                chart.data.datasets.push({
+                    label: `${model} (95% CI lower)`,
+                    data: lowerBoundPoints,
+                    borderColor: 'transparent',
+                    backgroundColor: 'transparent',
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: false,
+                    hidden: true // Hide this dataset from the legend
+                });
+            }
         });
         
         // Update chart
         chart.update();
     }
     
-    // Add event listeners to checkboxes
+    // Add event listeners to model and language checkboxes
     document.querySelectorAll('input[data-model], input[data-language]').forEach(checkbox => {
         checkbox.addEventListener('change', updateChart);
     });
+    
+    // Add event listener to confidence interval checkbox
+    document.getElementById('show-confidence-intervals').addEventListener('change', updateChart);
     
     // Initial chart update
     updateChart();
@@ -1044,7 +1222,7 @@ tbody tr:hover {
     gap: 30px;
 }
 
-.model-selection, .language-selection {
+.model-selection, .language-selection, .display-options {
     flex: 1;
     min-width: 200px;
 }
