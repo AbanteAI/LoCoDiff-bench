@@ -498,7 +498,7 @@ def get_detailed_existing_prompt_info(
         # Format: org_repo_path_with_underscores_ext_prompt.txt
         base_name = filename.replace("_prompt.txt", "")
         language = "unknown"
-        found_ext = None
+        # found_ext = None # Unused variable
 
         # Iterate through known extensions to find the longest match at the end
         possible_exts = sorted(ext_to_lang_map.keys(), key=len, reverse=True)
