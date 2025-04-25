@@ -290,6 +290,7 @@ def analyze_results(
         analysis["sliding_window"] = None
     else:
         analysis["sliding_window"] = {
+            "max_token_limit": max_token_limit,  # Store the calculated limit
             "window_centers_k": [c // 1000 for c in window_centers],
             "models": {},
         }
@@ -627,12 +628,22 @@ def index():
     if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
         total_cases = len(benchmark_metadata["benchmark_cases"])
 
+    # Extract max_token_limit for the template, default to None if not available
+    max_token_limit_value = None
+    if (
+        analysis_results
+        and analysis_results.get("sliding_window")
+        and "max_token_limit" in analysis_results["sliding_window"]
+    ):
+        max_token_limit_value = analysis_results["sliding_window"]["max_token_limit"]
+
     return render_template(
         "index.html",
         models=models,
         total_cases=total_cases,
         benchmark_metadata=benchmark_metadata,
         analysis_results=analysis_results,  # Pass full analysis results
+        max_token_limit=max_token_limit_value,  # Pass the limit to the template
     )
 
 
