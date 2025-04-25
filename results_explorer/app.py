@@ -875,8 +875,8 @@ def get_sliding_plot_data():
             with open(static_data_path, "r", encoding="utf-8") as f:
                 first_100_chars = f.read(100)
                 print(f"First 100 chars of file: {first_100_chars}")
-        except:
-            pass
+        except (IOError, OSError) as read_error:
+            print(f"Could not read file content for debugging: {read_error}")
         return {"error": f"Error parsing JSON data: {str(e)}"}, 500
     except IOError as e:
         print(f"Error reading static sliding plot data file: {e}")
