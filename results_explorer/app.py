@@ -278,16 +278,19 @@ def analyze_results(
     # Use max_token_limit determined from metadata runs
     print(f"Using max token limit for sliding window: {max_token_limit}")
 
-    if max_token_limit < 5000:
+    # Define x-axis points (centers of the sliding windows)
+    # Start centers at 0k, step by 1k
+    window_centers = list(range(0, max_token_limit + 1, 1000))
+    window_radius = 10000  # +/- 10k tokens window
+
+    if not window_centers:
         print(
-            f"Warning: Max token limit ({max_token_limit}) is less than 5000. Skipping sliding window analysis."
+            "Warning: No window centers generated (max_token_limit might be too low). Skipping sliding window analysis."
         )
         analysis["sliding_window"] = None
     else:
-        # Define x-axis points (centers of the sliding windows)
-        window_centers = list(range(5000, max_token_limit + 1, 1000))
-        window_radius = 5000
         analysis["sliding_window"] = {
+            "max_token_limit": max_token_limit,  # Store the calculated limit
             "window_centers_k": [c // 1000 for c in window_centers],
             "models": {},
         }
@@ -625,12 +628,22 @@ def index():
     if benchmark_metadata and "benchmark_cases" in benchmark_metadata:
         total_cases = len(benchmark_metadata["benchmark_cases"])
 
+    # Extract max_token_limit for the template, default to None if not available
+    max_token_limit_value = None
+    if (
+        analysis_results
+        and analysis_results.get("sliding_window")
+        and "max_token_limit" in analysis_results["sliding_window"]
+    ):
+        max_token_limit_value = analysis_results["sliding_window"]["max_token_limit"]
+
     return render_template(
         "index.html",
         models=models,
         total_cases=total_cases,
         benchmark_metadata=benchmark_metadata,
         analysis_results=analysis_results,  # Pass full analysis results
+        max_token_limit=max_token_limit_value,  # Pass the limit to the template
     )
 
 
