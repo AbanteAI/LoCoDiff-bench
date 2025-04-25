@@ -817,25 +817,73 @@ def get_sliding_plot_data():
     # Get the path to the static sliding plot data file
     static_folder = app.static_folder
     if not static_folder:
+        print("Error: Static folder not configured in Flask app")
         return {"error": "Static folder not configured."}, 500
 
     static_data_path = os.path.join(static_folder, "sliding-plot-data.json")
+    print(f"Looking for sliding plot data at: {static_data_path}")
 
     # Check if the file exists
     if not os.path.exists(static_data_path):
+        print(f"Error: Static data file not found at: {static_data_path}")
         return {
             "error": "Static sliding plot data not found. Run the preprocessing script first:\n"
             "python benchmark_pipeline/3_preprocess_sliding_data.py --benchmark-run-dir <directory>"
         }, 404
 
+    # Get file size for debugging
+    file_size = os.path.getsize(static_data_path)
+    print(f"Found static data file ({file_size} bytes)")
+
     # Load and return the data
     try:
         with open(static_data_path, "r", encoding="utf-8") as f:
             print(f"Loading sliding plot data from static file: {static_data_path}")
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"Error loading static sliding plot data: {e}")
+            data = json.load(f)
+
+            # Basic validation
+            if not isinstance(data, dict):
+                print(f"Error: Data is not a dictionary (type: {type(data)})")
+                return {
+                    "error": "Data loaded from file is not a valid JSON object"
+                }, 500
+
+            if "labels" not in data or "datasets" not in data:
+                print(
+                    f"Error: Missing required keys in data. Keys found: {list(data.keys())}"
+                )
+                return {
+                    "error": "Data is missing required keys (labels or datasets)"
+                }, 500
+
+            if not isinstance(data["labels"], list) or not isinstance(
+                data["datasets"], list
+            ):
+                print("Error: labels or datasets are not valid arrays")
+                return {
+                    "error": "Data structure invalid (labels or datasets are not arrays)"
+                }, 500
+
+            print(
+                f"Successfully loaded data with {len(data['labels'])} labels and {len(data['datasets'])} datasets"
+            )
+            return data
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON from static data file: {e}")
+        # Try to read the first part of the file to see what's wrong
+        try:
+            with open(static_data_path, "r", encoding="utf-8") as f:
+                first_100_chars = f.read(100)
+                print(f"First 100 chars of file: {first_100_chars}")
+        except:
+            pass
+        return {"error": f"Error parsing JSON data: {str(e)}"}, 500
+    except IOError as e:
+        print(f"Error reading static sliding plot data file: {e}")
         return {"error": f"Error reading sliding plot data: {str(e)}"}, 500
+    except Exception as e:
+        print(f"Unexpected error loading sliding plot data: {e}")
+        return {"error": f"Unexpected error: {str(e)}"}, 500
 
 
 @app.route("/files/<path:filepath>")
