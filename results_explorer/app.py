@@ -1164,6 +1164,12 @@ def serve_file(filepath):
     )
 
     try:
+        # Add assertions for pyright before using potentially None values
+        assert serving_directory is not None, (
+            "Serving directory should not be None here."
+        )
+        assert filename is not None, "Filename should not be None here."
+
         # Use send_from_directory for safer serving
         # It requires the directory and the filename relative to that directory
         # print(f"Serving file: directory='{serving_directory}', filename='{filename}'") # Debugging
@@ -1202,6 +1208,8 @@ def run_data_analysis():
         benchmark_run_dir: str = (
             benchmark_run_dir_maybe_none  # Explicitly typed after check
         )
+        # Add assertion for pyright
+        assert benchmark_run_dir is not None, "BENCHMARK_RUN_DIR cannot be None here."
 
         prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
         results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)
@@ -1270,6 +1278,8 @@ if __name__ == "__main__":
 
     # --- Configure App ---
     app.config["BENCHMARK_RUN_DIR"] = args.benchmark_run_dir
+    # Add assertion for pyright
+    assert app.config["BENCHMARK_RUN_DIR"] is not None, "BENCHMARK_RUN_DIR must be set."
     # Ensure the static directory exists (needed for Chart.js etc.)
     static_folder = app.static_folder
     if static_folder is None:
