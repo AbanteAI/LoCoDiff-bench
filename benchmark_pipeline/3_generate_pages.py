@@ -36,14 +36,13 @@ import argparse
 import glob
 import json
 import os
-import re
 import shutil
 import sys
 import yaml
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Set, Optional, Union
+from typing import Dict, List, Any, Tuple, Set
 
 
 # --- Helper Functions ---
@@ -164,8 +163,6 @@ def load_language_config(config_path: str) -> Dict[str, str]:
         Dictionary mapping file extensions to language names
     """
     try:
-        import yaml
-
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
