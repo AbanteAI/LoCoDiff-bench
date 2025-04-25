@@ -120,20 +120,48 @@ def main():
         default=None,
         help="Path where the output JSON file will be saved. Defaults to 'results_explorer/static/sliding-plot-data.json'.",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output for debugging.",
+    )
 
     args = parser.parse_args()
 
     # Set default output path if not provided
     if args.output is None:
+        # Make sure to get the absolute path to the repository root
         script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         static_dir = os.path.join(script_dir, "results_explorer", "static")
-        os.makedirs(static_dir, exist_ok=True)
+
+        print(f"Creating static directory at: {static_dir}")
+        try:
+            os.makedirs(static_dir, exist_ok=True)
+            if not os.path.exists(static_dir):
+                print(f"Error: Failed to create static directory: {static_dir}")
+                sys.exit(1)
+        except Exception as e:
+            print(f"Error creating static directory: {e}")
+            sys.exit(1)
+
         args.output = os.path.join(static_dir, "sliding-plot-data.json")
+        print(f"Using default output path: {args.output}")
     else:
         # Ensure the directory exists
         output_dir = os.path.dirname(args.output)
         if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
+            print(f"Creating output directory at: {output_dir}")
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                if not os.path.exists(output_dir):
+                    print(f"Error: Failed to create output directory: {output_dir}")
+                    sys.exit(1)
+            except Exception as e:
+                print(f"Error creating output directory: {e}")
+                sys.exit(1)
+
+        print(f"Using specified output path: {args.output}")
 
     benchmark_run_dir = args.benchmark_run_dir
     prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)
