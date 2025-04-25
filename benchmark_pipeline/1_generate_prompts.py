@@ -828,7 +828,9 @@ def generate_prompts_and_expected(
                     continue
             except ValueError as e:
                 # Handle errors getting commit time (e.g., file not in git)
-                print(f"\nSkipping {rel_path}: Error checking modification date: {e}")
+                tqdm.write(
+                    f"Skipping {rel_path}: Error checking modification date: {e}"
+                )
                 date_filtered_count += 1
                 continue
 
@@ -839,7 +841,7 @@ def generate_prompts_and_expected(
                 ) as original:
                     final_content = original.read()
             except Exception as e:
-                print(f"\nSkipping {rel_path}: Error reading file: {e}")
+                tqdm.write(f"Skipping {rel_path}: Error reading file: {e}")
                 continue
 
             # Calculate expected tokens (potential ValueError from count_tokens)
@@ -871,7 +873,7 @@ def generate_prompts_and_expected(
                 git_history = get_git_history(rel_path, repo_path)
             except RuntimeError as e:
                 # Handle errors getting git history (e.g., file deleted/renamed weirdly)
-                print(f"\nSkipping {rel_path}: Error getting git history: {e}")
+                tqdm.write(f"Skipping {rel_path}: Error getting git history: {e}")
                 continue
 
             # 5. Construct and Write Prompt File
@@ -881,7 +883,7 @@ def generate_prompts_and_expected(
                     prompt_path, expected_path, prompt_content, final_content
                 )
             except Exception as e:
-                print(f"\nSkipping {rel_path}: Error writing output files: {e}")
+                tqdm.write(f"Skipping {rel_path}: Error writing output files: {e}")
                 continue
 
             # 6. Calculate Statistics
@@ -911,12 +913,14 @@ def generate_prompts_and_expected(
         except ValueError as e:
             # Catch tokenization errors specifically
             if "disallowed special token" in str(e):
-                print(f"\nSkipping {rel_path}: Contains disallowed special tokens.")
+                tqdm.write(f"Skipping {rel_path}: Contains disallowed special tokens.")
                 # Optionally, increment a dedicated counter for this skip reason
                 continue  # Skip to the next file
             else:
                 # Handle other potential ValueErrors during processing
-                print(f"\nSkipping {rel_path}: Encountered unexpected ValueError: {e}")
+                tqdm.write(
+                    f"Skipping {rel_path}: Encountered unexpected ValueError: {e}"
+                )
                 continue  # Skip file on other ValueErrors too for robustness
 
     return (
