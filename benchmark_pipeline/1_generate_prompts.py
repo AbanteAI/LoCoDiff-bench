@@ -611,28 +611,35 @@ def calculate_prompt_statistics(
             stats[lang].quartile_counts = [0, 0, 0, 0]  # Ensure list is initialized
 
         stats[lang].count += 1
+        # Handle None case for min/max update
+        current_min = stats[lang].min_tokens
         stats[lang].min_tokens = (
-            min(stats[lang].min_tokens, info.token_count)
-            if stats[lang].min_tokens is not None
-            else info.token_count
+            info.token_count
+            if current_min is None
+            else min(current_min, info.token_count)
         )
+        current_max = stats[lang].max_tokens
         stats[lang].max_tokens = (
-            max(stats[lang].max_tokens, info.token_count)
-            if stats[lang].max_tokens is not None
-            else info.token_count
+            info.token_count
+            if current_max is None
+            else max(current_max, info.token_count)
         )
+
 
         # Update "All" stats
         stats["All"].count += 1
+        # Handle None case for min/max update
+        all_current_min = stats["All"].min_tokens
         stats["All"].min_tokens = (
-            min(stats["All"].min_tokens, info.token_count)
-            if stats["All"].min_tokens is not None
-            else info.token_count
+             info.token_count
+             if all_current_min is None
+             else min(all_current_min, info.token_count)
         )
+        all_current_max = stats["All"].max_tokens
         stats["All"].max_tokens = (
-            max(stats["All"].max_tokens, info.token_count)
-            if stats["All"].max_tokens is not None
-            else info.token_count
+            info.token_count
+            if all_current_max is None
+            else max(all_current_max, info.token_count)
         )
 
         # Assign to quartile
