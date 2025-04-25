@@ -685,9 +685,14 @@ def print_detailed_prompt_stats(
     print("\n--- Existing Prompt Statistics ---")
 
     # Define quartile labels based on boundaries
-    # Helper to format boundaries: avoid excessive decimals unless necessary
+    # Helper to format boundaries: show in thousands (k)
     def format_boundary(x):
-        return f"{x:.0f}" if x == int(x) else f"{x:.1f}"
+        if x < 1000:
+             # For values less than 1000, show as is (integer)
+             return f"{x:.0f}"
+        else:
+             # For values 1000 or more, show in k
+             return f"{round(x / 1000):.0f}k"
 
     q_labels = [
         f"Q1 [{format_boundary(boundaries[0])} - {format_boundary(boundaries[1])}]",
