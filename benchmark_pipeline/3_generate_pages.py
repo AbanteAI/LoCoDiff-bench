@@ -1097,6 +1097,7 @@ function initializeChart(chartData) {
                     backgroundColor: color + '22', // Very transparent version of the line color
                     pointRadius: 0,
                     tension: 0.1,
+                    hidden: true, // Hide from legend
                     fill: {
                         target: '+1', // Fill to the dataset below (which will be the lower bound)
                         above: color + '22'
@@ -1112,7 +1113,8 @@ function initializeChart(chartData) {
                     pointRadius: 0,
                     tension: 0.1,
                     fill: false,
-                    hidden: true // Hide this dataset from the legend
+                    hidden: true, // Hide this dataset from the legend
+                    showLine: false // Don't draw a line for this dataset
                 });
             }
         });
