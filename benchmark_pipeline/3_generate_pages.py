@@ -36,12 +36,14 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import sys
+import yaml
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Set
+from typing import Dict, List, Any, Tuple, Set, Optional, Union
 
 
 # --- Helper Functions ---
@@ -332,7 +334,7 @@ def create_html_footer() -> str:
 
 
 def create_overall_stats_table(
-    results_metadata: Dict[Tuple[str, str], Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
     all_models: Set[str],
     num_cases: int,
 ) -> str:
@@ -411,7 +413,7 @@ def create_overall_stats_table(
 
 
 def create_quartile_stats_table(
-    results_metadata: Dict[Tuple[str, str], Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
 ) -> str:
@@ -507,7 +509,7 @@ def create_quartile_stats_table(
 
 
 def create_language_stats_table(
-    results_metadata: Dict[Tuple[str, str], Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
     ext_to_lang_map: Dict[str, str],
