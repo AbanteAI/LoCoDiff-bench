@@ -1178,7 +1178,7 @@ def serve_file(filepath):
         # Use type: ignore as pyright persistently flags this line despite checks.
         return send_from_directory(
             serving_directory, filename, mimetype=mimetype, as_attachment=False
-        ) # type: ignore
+        )  # type: ignore
     except FileNotFoundError:
         abort(404, "File not found.")
     except Exception as e:
@@ -1213,8 +1213,8 @@ def run_data_analysis():
         benchmark_run_dir: str = benchmark_run_dir_maybe_none
 
         # Use type: ignore as pyright persistently flags these lines despite checks/hints.
-        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR) # type: ignore
-        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR) # type: ignore
+        prompts_dir = os.path.join(benchmark_run_dir, PROMPTS_SUBDIR)  # type: ignore
+        results_dir = os.path.join(benchmark_run_dir, RESULTS_SUBDIR)  # type: ignore
 
         print("\n--- Running Benchmark Data Analysis ---")
         print(f"Using prompts dir: {prompts_dir}")
