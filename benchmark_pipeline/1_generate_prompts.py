@@ -511,7 +511,7 @@ def get_detailed_existing_prompt_info(
                 if (
                     potential_path_part.endswith("_") or not potential_path_part
                 ):  # Handle case where filename is just the extension
-                    found_ext = ext
+                    # found_ext = ext # Unused variable
                     language = ext_to_lang_map[ext]
                     break
             # Check for original extension (e.g., .py) just in case (less likely)
@@ -519,7 +519,7 @@ def get_detailed_existing_prompt_info(
                 # Check if the part before the extension looks like a path separator replacement
                 potential_path_part = base_name[: -len(ext)]
                 if potential_path_part.endswith("_") or not potential_path_part:
-                    found_ext = ext
+                    # found_ext = ext # Unused variable
                     language = ext_to_lang_map[ext]
                     break
 
@@ -647,7 +647,7 @@ def calculate_prompt_statistics(
             for i, (q_min, q_max) in enumerate(quartile_ranges):
                 # Check if token falls into (q_min, q_max]
                 # For the last quartile, include the max value: (q3, q4]
-                is_last_quartile = i == 3
+                # is_last_quartile = i == 3 # Unused variable
                 in_range = token_val > q_min and token_val <= q_max
 
                 if in_range:
@@ -678,18 +678,19 @@ def print_detailed_prompt_stats(
     print("\n--- Existing Prompt Statistics ---")
 
     # Define quartile labels based on boundaries
-    # Format boundaries to avoid excessive decimals unless necessary
-    fmt = lambda x: f"{x:.0f}" if x == int(x) else f"{x:.1f}"
+    # Helper to format boundaries: avoid excessive decimals unless necessary
+    def format_boundary(x):
+        return f"{x:.0f}" if x == int(x) else f"{x:.1f}"
 
     q_labels = [
-        f"Q1 [{fmt(boundaries[0])} - {fmt(boundaries[1])}]",
-        f"Q2 ({fmt(boundaries[1])} - {fmt(boundaries[2])}]",
-        f"Q3 ({fmt(boundaries[2])} - {fmt(boundaries[3])}]",
-        f"Q4 ({fmt(boundaries[3])} - {fmt(boundaries[4])}]",
+        f"Q1 [{format_boundary(boundaries[0])} - {format_boundary(boundaries[1])}]",
+        f"Q2 ({format_boundary(boundaries[1])} - {format_boundary(boundaries[2])}]",
+        f"Q3 ({format_boundary(boundaries[2])} - {format_boundary(boundaries[3])}]",
+        f"Q4 ({format_boundary(boundaries[3])} - {format_boundary(boundaries[4])}]",
     ]
     # Handle edge case for labels where min == max
     if boundaries[0] == boundaries[4]:
-        q_labels = [f"Q1-4 [{fmt(boundaries[0])}]"] * 4
+        q_labels = [f"Q1-4 [{format_boundary(boundaries[0])}]"] * 4
 
     # Sort languages, keeping "All" first, then alphabetically, "unknown" last
     sorted_langs = sorted([lang for lang in stats if lang not in ["All", "unknown"]])
