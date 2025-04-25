@@ -630,33 +630,33 @@ def generate_chart_data(
 
     Creates data points at 1k token increments from 0k to 75k,
     with each point representing a +/- 10k token bucket.
+    Each prompt is included in all buckets whose range covers its length.
 
     Returns:
         Dictionary containing the chart data
     """
-    # Find min and max token counts
+    # Find max token count (min is always 0)
     token_counts = [meta.get("prompt_tokens", 0) for meta in prompt_metadata.values()]
-    min_tokens = 0
-    max_tokens = 75000
+    max_tokens = 75000  # Default max
     if token_counts:
-        min_tokens = min(token_counts)
-        max_tokens = max(token_counts)
+        max_tokens = max(
+            max(token_counts), max_tokens
+        )  # Use higher of actual max or default
 
-    # Round to nearest thousand for display
-    min_tokens_k = min_tokens // 1000
+    # Round max tokens up to the nearest thousand
     max_tokens_k = (max_tokens + 999) // 1000
 
-    # Initialize data structure
+    # Initialize data structure - start from 0k, go to max_tokens_k
     buckets = []
-    for i in range(min_tokens_k, max_tokens_k + 1):
-        bucket_center = i * 1000
-        bucket_min = max(0, bucket_center - 10000)
-        bucket_max = bucket_center + 10000
+    for i in range(0, max_tokens_k + 1):  # Start from 0k
+        bucket_location = i * 1000  # Renamed from bucket_center to bucket_location
+        bucket_min = max(0, bucket_location - 10000)
+        bucket_max = bucket_location + 10000
 
         # Initialize data for this bucket
         bucket_data = {
-            "bucket_center": bucket_center,
-            "bucket_center_k": i,
+            "bucket_location": bucket_location,  # Renamed from bucket_center
+            "bucket_location_k": i,  # Renamed from bucket_center_k
             "bucket_min": bucket_min,
             "bucket_max": bucket_max,
             "bucket_range": f"{bucket_min // 1000}k-{bucket_max // 1000}k",
@@ -680,7 +680,7 @@ def generate_chart_data(
         # Get language for this case
         language = case_languages.get(case_prefix, "unknown")
 
-        # Find matching bucket
+        # Add this case to all buckets that cover its token count
         for bucket in buckets:
             if bucket["bucket_min"] <= token_count <= bucket["bucket_max"]:
                 # Initialize language if needed
@@ -698,7 +698,7 @@ def generate_chart_data(
                     bucket["models"][model]["overall"]["successful"] += 1
                     bucket["models"][model]["languages"][language]["successful"] += 1
 
-                break
+                # Note: No break here, so we continue to add this case to all matching buckets
 
     # Calculate all unique languages across all data
     all_languages = set()
@@ -712,7 +712,7 @@ def generate_chart_data(
         "buckets": buckets,
         "models": list(sorted(all_models)),
         "languages": list(sorted(all_languages)),
-        "min_tokens_k": min_tokens_k,
+        "min_tokens_k": 0,  # Always start at 0k
         "max_tokens_k": max_tokens_k,
     }
 
@@ -825,7 +825,7 @@ function initializeChart(chartData) {
     const chart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: chartData.buckets.map(bucket => bucket.bucket_center_k + 'k'),
+            labels: chartData.buckets.map(bucket => bucket.bucket_location_k + 'k'),
             datasets: []
         },
         options: {
