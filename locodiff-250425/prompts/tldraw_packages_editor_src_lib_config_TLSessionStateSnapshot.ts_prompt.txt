@@ -1,0 +1,2055 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+
+commit f15a8797f04132dc21949f731894b0e2d97a3e14
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Jun 5 15:11:07 2023 +0100
+
+    Independent instance state persistence (#1493)
+    
+    This PR
+    
+    - Removes UserDocumentRecordType
+      - moving isSnapMode to user preferences
+      - moving isGridMode and isPenMode to InstanceRecordType
+      - deleting the other properties which are no longer needed.
+    
+    - Creates a separate pipeline for persisting instance state.
+    
+    Previously the instance state records were stored alongside the document
+    state records, and in order to load the state for a particular instance
+    (in our case, a particular tab) you needed to pass the 'instanceId'
+    prop. This prop ended up totally pervading the public API and people ran
+    into all kinds of issues with it, e.g. using the same instance id in
+    multiple editor instances.
+    
+    There was also an issue whereby it was hard for us to clean up old
+    instance state so the idb table ended up bloating over time.
+    
+    This PR makes it so that rather than passing an instanceId, you load the
+    instance state yourself while creating the store. It provides tools to
+    make that easy.
+    
+    - Undoes the assumption that we might have more than one instance's
+    state in the store.
+    
+    - Like `document`, `instance` now has a singleton id
+    `instance:instance`.
+    - Page state ids and camera ids are no longer random, but rather derive
+    from the page they belong to. This is like having a foreign primary key
+    in SQL databases. It's something i'd love to support fully as part of
+    the RecordType/Store api.
+    
+    Tests to do
+    
+    - [x] Test Migrations
+    - [x] Test Store.listen filtering
+    - [x] Make type sets in Store public and readonly
+    - [x] Test RecordType.createId
+    - [x] Test Instance state snapshot loading/exporting
+    - [x] Manual test File I/O
+    - [x] Manual test Vscode extension with multiple tabs
+    - [x] Audit usages of store.query
+    - [x] Audit usages of changed types: InstanceRecordType, 'instance',
+    InstancePageStateRecordType, 'instance_page_state', 'user_document',
+    'camera', CameraRecordType, InstancePresenceRecordType,
+    'instance_presence'
+    - [x] Test user preferences
+    - [x] Manual test isSnapMode and isGridMode and isPenMode
+    - [ ] Test indexedDb functions
+    - [x] Add instanceId stuff back
+    
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking Change
+    
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] Webdriver tests
+    
+    ### Release Notes
+    
+    - Add a brief release note for your PR here.
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+new file mode 100644
+index 000000000..482d95fdd
+--- /dev/null
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -0,0 +1,323 @@
++import {
++	RecordsDiff,
++	UnknownRecord,
++	defineMigrations,
++	migrate,
++	squashRecordDiffs,
++} from '@tldraw/store'
++import {
++	CameraRecordType,
++	InstancePageStateRecordType,
++	InstanceRecordType,
++	TLINSTANCE_ID,
++	TLPageId,
++	TLRecord,
++	TLShapeId,
++	TLStore,
++	pageIdValidator,
++	shapeIdValidator,
++} from '@tldraw/tlschema'
++import { objectMapFromEntries } from '@tldraw/utils'
++import { T } from '@tldraw/validate'
++import { Signal, computed, transact } from 'signia'
++import { uniqueId } from '../utils/data'
++
++const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
++
++const window = globalThis.window as
++	| {
++			navigator: Window['navigator']
++			localStorage: Window['localStorage']
++			sessionStorage: Window['sessionStorage']
++			addEventListener: Window['addEventListener']
++			TLDRAW_TAB_ID_v2?: string
++	  }
++	| undefined
++
++// https://stackoverflow.com/a/9039885
++function iOS() {
++	if (!window) return false
++	return (
++		['iPad Simulator', 'iPhone Simulator', 'iPod Simulator', 'iPad', 'iPhone', 'iPod'].includes(
++			window.navigator.platform
++		) ||
++		// iPad on iOS 13 detection
++		(window.navigator.userAgent.includes('Mac') && 'ontouchend' in document)
++	)
++}
++
++/**
++ * A string that is unique per browser tab
++ * @public
++ */
++export const TAB_ID: string =
++	window?.[tabIdKey] ?? window?.sessionStorage[tabIdKey] ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++if (window) {
++	window[tabIdKey] = TAB_ID
++	if (iOS()) {
++		// iOS does not trigger beforeunload
++		// so we need to keep the sessionStorage value around
++		// and hope the user doesn't figure out a way to duplicate their tab
++		// in which case they'll have two tabs with the same UI state.
++		// It's not a big deal, but it's not ideal.
++		// And anyway I can't see a way to duplicate a tab in iOS Safari.
++		window.sessionStorage[tabIdKey] = TAB_ID
++	} else {
++		delete window.sessionStorage[tabIdKey]
++	}
++}
++
++window?.addEventListener('beforeunload', () => {
++	window.sessionStorage[tabIdKey] = TAB_ID
++})
++
++const Versions = {
++	Initial: 0,
++} as const
++
++export const CURRENT_SESSION_STATE_SNAPSHOT_VERSION = Versions.Initial
++
++/**
++ * The state of the editor instance, not including any document state.
++ *
++ * @public
++ */
++export interface TLSessionStateSnapshot {
++	version: number
++	currentPageId: TLPageId
++	isFocusMode: boolean
++	exportBackground: boolean
++	isDebugMode: boolean
++	isToolLocked: boolean
++	isGridMode: boolean
++	pageStates: Array<{
++		pageId: TLPageId
++		camera: { x: number; y: number; z: number }
++		selectedIds: TLShapeId[]
++		focusLayerId: TLShapeId | null
++	}>
++}
++
++const sessionStateSnapshotValidator: T.Validator<TLSessionStateSnapshot> = T.object({
++	version: T.number,
++	currentPageId: pageIdValidator,
++	isFocusMode: T.boolean,
++	exportBackground: T.boolean,
++	isDebugMode: T.boolean,
++	isToolLocked: T.boolean,
++	isGridMode: T.boolean,
++	pageStates: T.arrayOf(
++		T.object({
++			pageId: pageIdValidator,
++			camera: T.object({
++				x: T.number,
++				y: T.number,
++				z: T.number,
++			}),
++			selectedIds: T.arrayOf(shapeIdValidator),
++			focusLayerId: shapeIdValidator.nullable(),
++		})
++	),
++})
++
++const sessionStateSnapshotMigrations = defineMigrations({
++	currentVersion: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
++})
++
++function migrateAndValidateSessionStateSnapshot(state: unknown): TLSessionStateSnapshot | null {
++	if (!state || typeof state !== 'object') {
++		console.warn('Invalid instance state')
++		return null
++	}
++	if (!('version' in state) || typeof state.version !== 'number') {
++		console.warn('No version in instance state')
++		return null
++	}
++	const result = migrate<TLSessionStateSnapshot>({
++		value: state,
++		fromVersion: state.version,
++		toVersion: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
++		migrations: sessionStateSnapshotMigrations,
++	})
++	if (result.type === 'error') {
++		console.warn(result.reason)
++		return null
++	}
++
++	const value = { ...result.value, version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION }
++
++	try {
++		sessionStateSnapshotValidator.validate(value)
++	} catch (e) {
++		console.warn(e)
++		return null
++	}
++
++	return value
++}
++
++/**
++ * Creates a signal of the instance state for a given store.
++ * @public
++ * @param store - The store to create the instance state snapshot signal for
++ * @returns
++ */
++export function createSessionStateSnapshotSignal(
++	store: TLStore
++): Signal<TLSessionStateSnapshot | null> {
++	const $allPageIds = store.query.ids('page')
++
++	return computed<TLSessionStateSnapshot | null>('sessionStateSnapshot', () => {
++		const instanceState = store.get(TLINSTANCE_ID)
++		if (!instanceState) return null
++
++		const allPageIds = [...$allPageIds.value]
++		return {
++			version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
++			currentPageId: instanceState.currentPageId,
++			exportBackground: instanceState.exportBackground,
++			isFocusMode: instanceState.isFocusMode,
++			isDebugMode: instanceState.isDebugMode,
++			isToolLocked: instanceState.isToolLocked,
++			isGridMode: instanceState.isGridMode,
++			pageStates: allPageIds.map((id) => {
++				const ps = store.get(InstancePageStateRecordType.createId(id))
++				const camera = store.get(CameraRecordType.createId(id))
++				return {
++					pageId: id,
++					camera: {
++						x: camera?.x ?? 0,
++						y: camera?.y ?? 0,
++						z: camera?.z ?? 1,
++					},
++					selectedIds: ps?.selectedIds ?? [],
++					focusLayerId: ps?.focusLayerId ?? null,
++				} satisfies TLSessionStateSnapshot['pageStates'][0]
++			}),
++		} satisfies TLSessionStateSnapshot
++	})
++}
++
++/**
++ * Loads a snapshot of the editor's instance state into the store of a new editor instance.
++ *
++ * @public
++ * @param store - The store to load the instance state into
++ * @param snapshot - The instance state snapshot to load
++ * @returns
++ */
++export function loadSessionStateSnapshotIntoStore(
++	store: TLStore,
++	snapshot: TLSessionStateSnapshot
++) {
++	const res = migrateAndValidateSessionStateSnapshot(snapshot)
++	if (!res) return
++
++	// remove all page states and cameras and the instance state
++	const allPageStatesAndCameras = store
++		.allRecords()
++		.filter((r) => r.typeName === 'instance_page_state' || r.typeName === 'camera')
++
++	const removeDiff: RecordsDiff<TLRecord> = {
++		added: {},
++		updated: {},
++		removed: {
++			...objectMapFromEntries(allPageStatesAndCameras.map((r) => [r.id, r])),
++		},
++	}
++	if (store.has(TLINSTANCE_ID)) {
++		removeDiff.removed[TLINSTANCE_ID] = store.get(TLINSTANCE_ID)!
++	}
++
++	const addDiff: RecordsDiff<TLRecord> = {
++		removed: {},
++		updated: {},
++		added: {
++			[TLINSTANCE_ID]: InstanceRecordType.create({
++				id: TLINSTANCE_ID,
++				currentPageId: res.currentPageId,
++				isDebugMode: res.isDebugMode,
++				isFocusMode: res.isFocusMode,
++				isToolLocked: res.isToolLocked,
++				isGridMode: res.isGridMode,
++				exportBackground: res.exportBackground,
++			}),
++		},
++	}
++
++	// replace them with new ones
++	for (const ps of res.pageStates) {
++		const cameraId = CameraRecordType.createId(ps.pageId)
++		const pageStateId = InstancePageStateRecordType.createId(ps.pageId)
++		addDiff.added[cameraId] = CameraRecordType.create({
++			id: CameraRecordType.createId(ps.pageId),
++			x: ps.camera.x,
++			y: ps.camera.y,
++			z: ps.camera.z,
++		})
++		addDiff.added[pageStateId] = InstancePageStateRecordType.create({
++			id: InstancePageStateRecordType.createId(ps.pageId),
++			pageId: ps.pageId,
++			selectedIds: ps.selectedIds,
++			focusLayerId: ps.focusLayerId,
++		})
++	}
++
++	transact(() => {
++		store.applyDiff(squashRecordDiffs([removeDiff, addDiff]))
++		store.ensureStoreIsUsable()
++	})
++}
++
++/**
++ * @internal
++ */
++export function extractSessionStateFromLegacySnapshot(
++	store: Record<string, UnknownRecord>
++): TLSessionStateSnapshot | null {
++	const instanceRecords = []
++	for (const record of Object.values(store)) {
++		if (record.typeName?.match(/^(instance.*|pointer|camera)$/)) {
++			instanceRecords.push(record)
++		}
++	}
++
++	// for scratch documents, we need to extract the most recently-used instance and it's associated page states
++	// but oops we don't have the concept of "most recently-used" so we'll just take the first one
++	const oldInstance = instanceRecords.filter(
++		(r) => r.typeName === 'instance' && r.id !== TLINSTANCE_ID
++	)[0] as any
++	if (!oldInstance) return null
++
++	const result: TLSessionStateSnapshot = {
++		version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
++		currentPageId: oldInstance.currentPageId,
++		exportBackground: !!oldInstance.exportBackground,
++		isFocusMode: !!oldInstance.isFocusMode,
++		isDebugMode: !!oldInstance.isDebugMode,
++		isToolLocked: !!oldInstance.isToolLocked,
++		isGridMode: false,
++		pageStates: instanceRecords
++			.filter((r: any) => r.typeName === 'instance_page_state' && r.instanceId === oldInstance.id)
++			.map((ps: any): TLSessionStateSnapshot['pageStates'][0] => {
++				const camera = (store[ps.cameraId] as any) ?? { x: 0, y: 0, z: 1 }
++				return {
++					pageId: ps.pageId,
++					camera: {
++						x: camera.x,
++						y: camera.y,
++						z: camera.z,
++					},
++					selectedIds: ps.selectedIds,
++					focusLayerId: ps.focusLayerId,
++				}
++			}),
++	}
++
++	try {
++		sessionStateSnapshotValidator.validate(result)
++		return result
++	} catch (e) {
++		return null
++	}
++}
+
+commit b88a2370b314855237774548d627ed4d3301a1ad
+Author: alex <alex@dytry.ch>
+Date:   Fri Jun 16 11:33:47 2023 +0100
+
+    Styles API (#1580)
+    
+    Removes `propsForNextShape` and replaces it with the new styles API.
+    
+    Changes in here:
+    - New custom style example
+    - `setProp` is now `setStyle` and takes a `StyleProp` instead of a
+    string
+    - `Editor.props` and `Editor.opacity` are now `Editor.sharedStyles` and
+    `Editor.sharedOpacity`
+    - They return an object that flags mixed vs shared types instead of
+    using null to signal mixed types
+    - `Editor.styles` returns a `SharedStyleMap` - keyed on `StyleProp`
+    instead of `string`
+    - `StateNode.shapeType` is now the shape util rather than just a string.
+    This lets us pull the styles from the shape type directly.
+    - `color` is no longer a core part of the editor set on the shape
+    parent. Individual child shapes have to use color directly.
+    - `propsForNextShape` is now `stylesForNextShape`
+    - `InstanceRecordType` is created at runtime in the same way
+    `ShapeRecordType` is. This is so it can pull style validators out of
+    shape defs for `stylesForNextShape`
+    - Shape type are now defined by their props rather than having separate
+    validators & type defs
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Test Plan
+    
+    1. Big time regression testing around styles!
+    2. Check UI works as intended for all shape/style/tool combos
+    
+    - [x] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    -
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 482d95fdd..ae1ac735c 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -8,7 +8,6 @@ import {
+ import {
+ 	CameraRecordType,
+ 	InstancePageStateRecordType,
+-	InstanceRecordType,
+ 	TLINSTANCE_ID,
+ 	TLPageId,
+ 	TLRecord,
+@@ -233,7 +232,7 @@ export function loadSessionStateSnapshotIntoStore(
+ 		removed: {},
+ 		updated: {},
+ 		added: {
+-			[TLINSTANCE_ID]: InstanceRecordType.create({
++			[TLINSTANCE_ID]: store.schema.types.instance.create({
+ 				id: TLINSTANCE_ID,
+ 				currentPageId: res.currentPageId,
+ 				isDebugMode: res.isDebugMode,
+
+commit 5cb08711c19c086a013b3a52b06b7cdcfd443fe5
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Jun 20 14:31:26 2023 +0100
+
+    Incorporate signia as @tldraw/state (#1620)
+    
+    It tried to get out but we're dragging it back in.
+    
+    This PR brings [signia](https://github.com/tldraw/signia) back into
+    tldraw as @tldraw/state.
+    
+    ### Change Type
+    
+    - [x] major
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index ae1ac735c..8ae4237d9 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -1,3 +1,4 @@
++import { Signal, computed, transact } from '@tldraw/state'
+ import {
+ 	RecordsDiff,
+ 	UnknownRecord,
+@@ -18,7 +19,6 @@ import {
+ } from '@tldraw/tlschema'
+ import { objectMapFromEntries } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+-import { Signal, computed, transact } from 'signia'
+ import { uniqueId } from '../utils/data'
+ 
+ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+
+commit b7d9c8684cb6cf7bd710af5420135ea3516cc3bf
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Mon Jul 17 22:22:34 2023 +0100
+
+    tldraw zero - package shuffle (#1710)
+    
+    This PR moves code between our packages so that:
+    - @tldraw/editor is a “core” library with the engine and canvas but no
+    shapes, tools, or other things
+    - @tldraw/tldraw contains everything particular to the experience we’ve
+    built for tldraw
+    
+    At first look, this might seem like a step away from customization and
+    configuration, however I believe it greatly increases the configuration
+    potential of the @tldraw/editor while also providing a more accurate
+    reflection of what configuration options actually exist for
+    @tldraw/tldraw.
+    
+    ## Library changes
+    
+    @tldraw/editor re-exports its dependencies and @tldraw/tldraw re-exports
+    @tldraw/editor.
+    
+    - users of @tldraw/editor WITHOUT @tldraw/tldraw should almost always
+    only import things from @tldraw/editor.
+    - users of @tldraw/tldraw should almost always only import things from
+    @tldraw/tldraw.
+    
+    - @tldraw/polyfills is merged into @tldraw/editor
+    - @tldraw/indices is merged into @tldraw/editor
+    - @tldraw/primitives is merged mostly into @tldraw/editor, partially
+    into @tldraw/tldraw
+    - @tldraw/file-format is merged into @tldraw/tldraw
+    - @tldraw/ui is merged into @tldraw/tldraw
+    
+    Many (many) utils and other code is moved from the editor to tldraw. For
+    example, embeds now are entirely an feature of @tldraw/tldraw. The only
+    big chunk of code left in core is related to arrow handling.
+    
+    ## API Changes
+    
+    The editor can now be used without tldraw's assets. We load them in
+    @tldraw/tldraw instead, so feel free to use whatever fonts or images or
+    whatever that you like with the editor.
+    
+    All tools and shapes (except for the `Group` shape) are moved to
+    @tldraw/tldraw. This includes the `select` tool.
+    
+    You should use the editor with at least one tool, however, so you now
+    also need to send in an `initialState` prop to the Editor /
+    <TldrawEditor> component indicating which state the editor should begin
+    in.
+    
+    The `components` prop now also accepts `SelectionForeground`.
+    
+    The complex selection component that we use for tldraw is moved to
+    @tldraw/tldraw. The default component is quite basic but can easily be
+    replaced via the `components` prop. We pass down our tldraw-flavored
+    SelectionFg via `components`.
+    
+    Likewise with the `Scribble` component: the `DefaultScribble` no longer
+    uses our freehand tech and is a simple path instead. We pass down the
+    tldraw-flavored scribble via `components`.
+    
+    The `ExternalContentManager` (`Editor.externalContentManager`) is
+    removed and replaced with a mapping of types to handlers.
+    
+    - Register new content handlers with
+    `Editor.registerExternalContentHandler`.
+    - Register new asset creation handlers (for files and URLs) with
+    `Editor.registerExternalAssetHandler`
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Test Plan
+    
+    - [x] Unit Tests
+    - [x] End to end tests
+    
+    ### Release Notes
+    
+    - [@tldraw/editor] lots, wip
+    - [@tldraw/ui] gone, merged to tldraw/tldraw
+    - [@tldraw/polyfills] gone, merged to tldraw/editor
+    - [@tldraw/primitives] gone, merged to tldraw/editor / tldraw/tldraw
+    - [@tldraw/indices] gone, merged to tldraw/editor
+    - [@tldraw/file-format] gone, merged to tldraw/tldraw
+    
+    ---------
+    
+    Co-authored-by: alex <alex@dytry.ch>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 8ae4237d9..7fc1fd002 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -19,7 +19,7 @@ import {
+ } from '@tldraw/tlschema'
+ import { objectMapFromEntries } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+-import { uniqueId } from '../utils/data'
++import { uniqueId } from '../utils/uniqueId'
+ 
+ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+ 
+
+commit d750da8f40efda4b011a91962ef8f30c63d1e5da
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Jul 25 17:10:15 2023 +0100
+
+    `ShapeUtil.getGeometry`, selection rewrite (#1751)
+    
+    This PR is a significant rewrite of our selection / hit testing logic.
+    
+    It
+    - replaces our current geometric helpers (`getBounds`, `getOutline`,
+    `hitTestPoint`, and `hitTestLineSegment`) with a new geometry API
+    - moves our hit testing entirely to JS using geometry
+    - improves selection logic, especially around editing shapes, groups and
+    frames
+    - fixes many minor selection bugs (e.g. shapes behind frames)
+    - removes hit-testing DOM elements from ShapeFill etc.
+    - adds many new tests around selection
+    - adds new tests around selection
+    - makes several superficial changes to surface editor APIs
+    
+    This PR is hard to evaluate. The `selection-omnibus` test suite is
+    intended to describe all of the selection behavior, however all existing
+    tests are also either here preserved and passing or (in a few cases
+    around editing shapes) are modified to reflect the new behavior.
+    
+    ## Geometry
+    
+    All `ShapeUtils` implement `getGeometry`, which returns a single
+    geometry primitive (`Geometry2d`). For example:
+    
+    ```ts
+    class BoxyShapeUtil {
+      getGeometry(shape: BoxyShape) {
+        return new Rectangle2d({
+            width: shape.props.width,
+            height: shape.props.height,
+            isFilled: true,
+            margin: shape.props.strokeWidth
+          })
+        }
+    }
+    ```
+    
+    This geometric primitive is used for all bounds calculation, hit
+    testing, intersection with arrows, etc.
+    
+    There are several geometric primitives that extend `Geometry2d`:
+    - `Arc2d`
+    - `Circle2d`
+    - `CubicBezier2d`
+    - `CubicSpline2d`
+    - `Edge2d`
+    - `Ellipse2d`
+    - `Group2d`
+    - `Polygon2d`
+    - `Rectangle2d`
+    - `Stadium2d`
+    
+    For shapes that have more complicated geometric representations, such as
+    an arrow with a label, the `Group2d` can accept other primitives as its
+    children.
+    
+    ## Hit testing
+    
+    Previously, we did all hit testing via events set on shapes and other
+    elements. In this PR, I've replaced those hit tests with our own
+    calculation for hit tests in JavaScript. This removed the need for many
+    DOM elements, such as hit test area borders and fills which only existed
+    to trigger pointer events.
+    
+    ## Selection
+    
+    We now support selecting "hollow" shapes by clicking inside of them.
+    This involves a lot of new logic but it should work intuitively. See
+    `Editor.getShapeAtPoint` for the (thoroughly commented) implementation.
+    
+    ![Kapture 2023-07-23 at 23 27
+    27](https://github.com/tldraw/tldraw/assets/23072548/a743275c-acdb-42d9-a3fe-b3e20dce86b6)
+    
+    every sunset is actually the sun hiding in fear and respect of tldraw's
+    quality of interactions
+    
+    This PR also fixes several bugs with scribble selection, in particular
+    around the shift key modifier.
+    
+    ![Kapture 2023-07-24 at 23 34
+    07](https://github.com/tldraw/tldraw/assets/23072548/871d67d0-8d06-42ae-a2b2-021effba37c5)
+    
+    ...as well as issues with labels and editing.
+    
+    There are **over 100 new tests** for selection covering groups, frames,
+    brushing, scribbling, hovering, and editing. I'll add a few more before
+    I feel comfortable merging this PR.
+    
+    ## Arrow binding
+    
+    Using the same "hollow shape" logic as selection, arrow binding is
+    significantly improved.
+    
+    ![Kapture 2023-07-22 at 07 46
+    25](https://github.com/tldraw/tldraw/assets/23072548/5aa724b3-b57d-4fb7-92d0-80e34246753c)
+    
+    a thousand wise men could not improve on this
+    
+    ## Moving focus between editing shapes
+    
+    Previously, this was handled in the `editing_shapes` state. This is
+    moved to `useEditableText`, and should generally be considered an
+    advanced implementation detail on a shape-by-shape basis. This addresses
+    a bug that I'd never noticed before, but which can be reproduced by
+    selecting an shape—but not focusing its input—while editing a different
+    shape. Previously, the new shape became the editing shape but its input
+    did not focus.
+    
+    ![Kapture 2023-07-23 at 23 19
+    09](https://github.com/tldraw/tldraw/assets/23072548/a5e157fb-24a8-42bd-a692-04ce769b1a9c)
+    
+    In this PR, you can select a shape by clicking on its edge or body, or
+    select its input to transfer editing / focus.
+    
+    ![Kapture 2023-07-23 at 23 22
+    21](https://github.com/tldraw/tldraw/assets/23072548/7384e7ea-9777-4e1a-8f63-15de2166a53a)
+    
+    tldraw, glorious tldraw
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Test Plan
+    
+    1. Erase shapes
+    2. Select shapes
+    3. Calculate their bounding boxes
+    
+    - [ ] Unit Tests // todo
+    - [ ] End to end tests // todo
+    
+    ### Release Notes
+    
+    - [editor] Remove `ShapeUtil.getBounds`, `ShapeUtil.getOutline`,
+    `ShapeUtil.hitTestPoint`, `ShapeUtil.hitTestLineSegment`
+    - [editor] Add `ShapeUtil.getGeometry`
+    - [editor] Add `Editor.getShapeGeometry`
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 7fc1fd002..d0fee1e12 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -92,8 +92,8 @@ export interface TLSessionStateSnapshot {
+ 	pageStates: Array<{
+ 		pageId: TLPageId
+ 		camera: { x: number; y: number; z: number }
+-		selectedIds: TLShapeId[]
+-		focusLayerId: TLShapeId | null
++		selectedShapeIds: TLShapeId[]
++		focusedGroupId: TLShapeId | null
+ 	}>
+ }
+ 
+@@ -113,8 +113,8 @@ const sessionStateSnapshotValidator: T.Validator<TLSessionStateSnapshot> = T.obj
+ 				y: T.number,
+ 				z: T.number,
+ 			}),
+-			selectedIds: T.arrayOf(shapeIdValidator),
+-			focusLayerId: shapeIdValidator.nullable(),
++			selectedShapeIds: T.arrayOf(shapeIdValidator),
++			focusedGroupId: shapeIdValidator.nullable(),
+ 		})
+ 	),
+ })
+@@ -189,8 +189,8 @@ export function createSessionStateSnapshotSignal(
+ 						y: camera?.y ?? 0,
+ 						z: camera?.z ?? 1,
+ 					},
+-					selectedIds: ps?.selectedIds ?? [],
+-					focusLayerId: ps?.focusLayerId ?? null,
++					selectedShapeIds: ps?.selectedShapeIds ?? [],
++					focusedGroupId: ps?.focusedGroupId ?? null,
+ 				} satisfies TLSessionStateSnapshot['pageStates'][0]
+ 			}),
+ 		} satisfies TLSessionStateSnapshot
+@@ -257,8 +257,8 @@ export function loadSessionStateSnapshotIntoStore(
+ 		addDiff.added[pageStateId] = InstancePageStateRecordType.create({
+ 			id: InstancePageStateRecordType.createId(ps.pageId),
+ 			pageId: ps.pageId,
+-			selectedIds: ps.selectedIds,
+-			focusLayerId: ps.focusLayerId,
++			selectedShapeIds: ps.selectedShapeIds,
++			focusedGroupId: ps.focusedGroupId,
+ 		})
+ 	}
+ 
+@@ -307,8 +307,8 @@ export function extractSessionStateFromLegacySnapshot(
+ 						y: camera.y,
+ 						z: camera.z,
+ 					},
+-					selectedIds: ps.selectedIds,
+-					focusLayerId: ps.focusLayerId,
++					selectedShapeIds: ps.selectedShapeIds,
++					focusedGroupId: ps.focusedGroupId,
+ 				}
+ 			}),
+ 	}
+
+commit 5db3c1553e14edd14aa5f7c0fc85fc5efc352335
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Mon Nov 13 11:51:22 2023 +0000
+
+    Replace Atom.value with Atom.get() (#2189)
+    
+    This PR replaces the `.value` getter for the atom with `.get()`
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index d0fee1e12..0b7216013 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -170,7 +170,7 @@ export function createSessionStateSnapshotSignal(
+ 		const instanceState = store.get(TLINSTANCE_ID)
+ 		if (!instanceState) return null
+ 
+-		const allPageIds = [...$allPageIds.value]
++		const allPageIds = [...$allPageIds.get()]
+ 		return {
+ 			version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
+ 			currentPageId: instanceState.currentPageId,
+
+commit 34cfb85169e02178a20dd9e7b7c0c4e48b1428c4
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Nov 16 15:34:56 2023 +0000
+
+    no impure getters pt 11 (#2236)
+    
+    follow up to #2189
+    
+    adds runtime warnings for deprecated fields. cleans up remaining fields
+    and usages. Adds a lint rule to prevent access to deprecated fields.
+    Adds a lint rule to prevent using getters.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 0b7216013..0d879f821 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -38,6 +38,7 @@ function iOS() {
+ 	if (!window) return false
+ 	return (
+ 		['iPad Simulator', 'iPhone Simulator', 'iPod Simulator', 'iPad', 'iPhone', 'iPod'].includes(
++			// eslint-disable-next-line deprecation/deprecation
+ 			window.navigator.platform
+ 		) ||
+ 		// iPad on iOS 13 detection
+
+commit 6b1005ef71a63613a09606310f666487547d5f23
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Wed Jan 3 12:13:15 2024 +0000
+
+    [tech debt] Primitives renaming party / cleanup (#2396)
+    
+    This PR:
+    - renames Vec2d to Vec
+    - renames Vec2dModel to VecModel
+    - renames Box2d to Box
+    - renames Box2dModel to BoxModel
+    - renames Matrix2d to Mat
+    - renames Matrix2dModel to MatModel
+    - removes unused primitive helpers
+    - removes unused exports
+    - removes a few redundant tests in dgreensp
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Release Notes
+    
+    - renames Vec2d to Vec
+    - renames Vec2dModel to VecModel
+    - renames Box2d to Box
+    - renames Box2dModel to BoxModel
+    - renames Matrix2d to Mat
+    - renames Matrix2dModel to MatModel
+    - removes unused primitive helpers
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 0d879f821..cd309f1d9 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -75,7 +75,7 @@ const Versions = {
+ 	Initial: 0,
+ } as const
+ 
+-export const CURRENT_SESSION_STATE_SNAPSHOT_VERSION = Versions.Initial
++const CURRENT_SESSION_STATE_SNAPSHOT_VERSION = Versions.Initial
+ 
+ /**
+  * The state of the editor instance, not including any document state.
+
+commit 1d5a9efa175bb5c8960c387442f4a7ce611a09b9
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Mar 1 15:34:16 2024 +0000
+
+    [bugfix] Avoid randomness at init time to allow running on cloudflare. (#3016)
+    
+    Describe what your pull request does. If appropriate, add GIFs or images
+    showing the before and after.
+    
+    Follow up to #2987
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+    
+    
+    ### Release Notes
+    
+    - Prevent using randomness API at init time, to allow importing the
+    tldraw package in a cloudflare worker.
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index cd309f1d9..a3315feda 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -50,8 +50,9 @@ function iOS() {
+  * A string that is unique per browser tab
+  * @public
+  */
+-export const TAB_ID: string =
+-	window?.[tabIdKey] ?? window?.sessionStorage[tabIdKey] ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++export const TAB_ID: string = window
++	? window[tabIdKey] ?? window.sessionStorage[tabIdKey] ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++	: '<error>'
+ if (window) {
+ 	window[tabIdKey] = TAB_ID
+ 	if (iOS()) {
+
+commit 2f28d7c6f82dc8e84d1db1e7f6328ff12b210300
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Mon Mar 4 13:37:09 2024 +0000
+
+    Protect local storage calls (#3043)
+    
+    This PR provides some safe wrappers for local storage calls. Local
+    storage is not available in all environments (for example, a React
+    Native web view). The PR also adds an eslint rule preventing direct
+    calls to local / session storage.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+    
+    ### Release Notes
+    
+    - Fixes a bug that could cause crashes in React Native webviews.
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index a3315feda..4dee1821b 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -17,7 +17,12 @@ import {
+ 	pageIdValidator,
+ 	shapeIdValidator,
+ } from '@tldraw/tlschema'
+-import { objectMapFromEntries } from '@tldraw/utils'
++import {
++	deleteFromSessionStorage,
++	getFromSessionStorage,
++	objectMapFromEntries,
++	setInSessionStorage,
++} from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+ import { uniqueId } from '../utils/uniqueId'
+ 
+@@ -26,7 +31,9 @@ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+ const window = globalThis.window as
+ 	| {
+ 			navigator: Window['navigator']
++			// eslint-disable-next-line no-storage/no-browser-storage
+ 			localStorage: Window['localStorage']
++			// eslint-disable-next-line no-storage/no-browser-storage
+ 			sessionStorage: Window['sessionStorage']
+ 			addEventListener: Window['addEventListener']
+ 			TLDRAW_TAB_ID_v2?: string
+@@ -51,7 +58,7 @@ function iOS() {
+  * @public
+  */
+ export const TAB_ID: string = window
+-	? window[tabIdKey] ?? window.sessionStorage[tabIdKey] ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++	? window[tabIdKey] ?? getFromSessionStorage(tabIdKey) ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
+ 	: '<error>'
+ if (window) {
+ 	window[tabIdKey] = TAB_ID
+@@ -62,14 +69,14 @@ if (window) {
+ 		// in which case they'll have two tabs with the same UI state.
+ 		// It's not a big deal, but it's not ideal.
+ 		// And anyway I can't see a way to duplicate a tab in iOS Safari.
+-		window.sessionStorage[tabIdKey] = TAB_ID
++		setInSessionStorage(tabIdKey, TAB_ID)
+ 	} else {
+-		delete window.sessionStorage[tabIdKey]
++		deleteFromSessionStorage(tabIdKey)
+ 	}
+ }
+ 
+ window?.addEventListener('beforeunload', () => {
+-	window.sessionStorage[tabIdKey] = TAB_ID
++	setInSessionStorage(tabIdKey, TAB_ID)
+ })
+ 
+ const Versions = {
+
+commit 8adaaf8e22dac29003d9bf63527f35abcb67560e
+Author: alex <alex@dytry.ch>
+Date:   Mon Mar 4 15:48:31 2024 +0000
+
+    Revert "Protect local storage calls (#3043)" (#3063)
+    
+    This reverts commit 2f28d7c6f82dc8e84d1db1e7f6328ff12b210300.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 4dee1821b..a3315feda 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -17,12 +17,7 @@ import {
+ 	pageIdValidator,
+ 	shapeIdValidator,
+ } from '@tldraw/tlschema'
+-import {
+-	deleteFromSessionStorage,
+-	getFromSessionStorage,
+-	objectMapFromEntries,
+-	setInSessionStorage,
+-} from '@tldraw/utils'
++import { objectMapFromEntries } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+ import { uniqueId } from '../utils/uniqueId'
+ 
+@@ -31,9 +26,7 @@ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+ const window = globalThis.window as
+ 	| {
+ 			navigator: Window['navigator']
+-			// eslint-disable-next-line no-storage/no-browser-storage
+ 			localStorage: Window['localStorage']
+-			// eslint-disable-next-line no-storage/no-browser-storage
+ 			sessionStorage: Window['sessionStorage']
+ 			addEventListener: Window['addEventListener']
+ 			TLDRAW_TAB_ID_v2?: string
+@@ -58,7 +51,7 @@ function iOS() {
+  * @public
+  */
+ export const TAB_ID: string = window
+-	? window[tabIdKey] ?? getFromSessionStorage(tabIdKey) ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++	? window[tabIdKey] ?? window.sessionStorage[tabIdKey] ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
+ 	: '<error>'
+ if (window) {
+ 	window[tabIdKey] = TAB_ID
+@@ -69,14 +62,14 @@ if (window) {
+ 		// in which case they'll have two tabs with the same UI state.
+ 		// It's not a big deal, but it's not ideal.
+ 		// And anyway I can't see a way to duplicate a tab in iOS Safari.
+-		setInSessionStorage(tabIdKey, TAB_ID)
++		window.sessionStorage[tabIdKey] = TAB_ID
+ 	} else {
+-		deleteFromSessionStorage(tabIdKey)
++		delete window.sessionStorage[tabIdKey]
+ 	}
+ }
+ 
+ window?.addEventListener('beforeunload', () => {
+-	setInSessionStorage(tabIdKey, TAB_ID)
++	window.sessionStorage[tabIdKey] = TAB_ID
+ })
+ 
+ const Versions = {
+
+commit ce782dc70b47880b4174f40c9b0a072d858ce90f
+Author: alex <alex@dytry.ch>
+Date:   Mon Mar 4 16:15:20 2024 +0000
+
+    Wrap local/session storage calls in try/catch (take 2) (#3066)
+    
+    Steve tried this in #3043, but we reverted it in #3063. Steve's version
+    added `JSON.parse`/`JSON.stringify` to the helpers without checking for
+    where we were already `JSON.parse`ing (or not). In some places we just
+    store strings directly rather than wanting them jsonified, so in this
+    version we leave the jsonification to the callers - the helpers just do
+    the reading/writing and return the string values.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index a3315feda..d98d87668 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -17,7 +17,12 @@ import {
+ 	pageIdValidator,
+ 	shapeIdValidator,
+ } from '@tldraw/tlschema'
+-import { objectMapFromEntries } from '@tldraw/utils'
++import {
++	deleteFromSessionStorage,
++	getFromSessionStorage,
++	objectMapFromEntries,
++	setInSessionStorage,
++} from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+ import { uniqueId } from '../utils/uniqueId'
+ 
+@@ -26,8 +31,6 @@ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+ const window = globalThis.window as
+ 	| {
+ 			navigator: Window['navigator']
+-			localStorage: Window['localStorage']
+-			sessionStorage: Window['sessionStorage']
+ 			addEventListener: Window['addEventListener']
+ 			TLDRAW_TAB_ID_v2?: string
+ 	  }
+@@ -51,7 +54,7 @@ function iOS() {
+  * @public
+  */
+ export const TAB_ID: string = window
+-	? window[tabIdKey] ?? window.sessionStorage[tabIdKey] ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++	? window[tabIdKey] ?? getFromSessionStorage(tabIdKey) ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
+ 	: '<error>'
+ if (window) {
+ 	window[tabIdKey] = TAB_ID
+@@ -62,14 +65,14 @@ if (window) {
+ 		// in which case they'll have two tabs with the same UI state.
+ 		// It's not a big deal, but it's not ideal.
+ 		// And anyway I can't see a way to duplicate a tab in iOS Safari.
+-		window.sessionStorage[tabIdKey] = TAB_ID
++		setInSessionStorage(tabIdKey, TAB_ID)
+ 	} else {
+-		delete window.sessionStorage[tabIdKey]
++		deleteFromSessionStorage(tabIdKey)
+ 	}
+ }
+ 
+ window?.addEventListener('beforeunload', () => {
+-	window.sessionStorage[tabIdKey] = TAB_ID
++	setInSessionStorage(tabIdKey, TAB_ID)
+ })
+ 
+ const Versions = {
+
+commit 4f70a4f4e85b278e79a4afadec2eeb08f26879a8
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Apr 15 13:53:42 2024 +0100
+
+    New migrations again (#3220)
+    
+    Describe what your pull request does. If appropriate, add GIFs or images
+    showing the before and after.
+    
+    ### Change Type
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `galaxy brain` — Architectural changes
+    
+    
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    #### BREAKING CHANGES
+    
+    - The `Migrations` type is now called `LegacyMigrations`.
+    - The serialized schema format (e.g. returned by
+    `StoreSchema.serialize()` and `Store.getSnapshot()`) has changed. You
+    don't need to do anything about it unless you were reading data directly
+    from the schema for some reason. In which case it'd be best to avoid
+    that in the future! We have no plans to change the schema format again
+    (this time was traumatic enough) but you never know.
+    - `compareRecordVersions` and the `RecordVersion` type have both
+    disappeared. There is no replacement. These were public by mistake
+    anyway, so hopefully nobody had been using it.
+    - `compareSchemas` is a bit less useful now. Our migrations system has
+    become a little fuzzy to allow for simpler UX when adding/removing
+    custom extensions and 3rd party dependencies, and as a result we can no
+    longer compare serialized schemas in any rigorous manner. You can rely
+    on this function to return `0` if the schemas are the same. Otherwise it
+    will return `-1` if the schema on the right _seems_ to be newer than the
+    schema on the left, but it cannot guarantee that in situations where
+    migration sequences have been removed over time (e.g. if you remove one
+    of the builtin tldraw shapes).
+    
+    Generally speaking, the best way to check schema compatibility now is to
+    call `store.schema.getMigrationsSince(persistedSchema)`. This will throw
+    an error if there is no upgrade path from the `persistedSchema` to the
+    current version.
+    
+    - `defineMigrations` has been deprecated and will be removed in a future
+    release. For upgrade instructions see
+    https://tldraw.dev/docs/persistence#Updating-legacy-shape-migrations-defineMigrations
+    
+    - `migrate` has been removed. Nobody should have been using this but if
+    you were you'll need to find an alternative. For migrating tldraw data,
+    you should stick to using `schema.migrateStoreSnapshot` and, if you are
+    building a nuanced sync engine that supports some amount of backwards
+    compatibility, also feel free to use `schema.migratePersistedRecord`.
+    - the `Migration` type has changed. If you need the old one for some
+    reason it has been renamed to `LegacyMigration`. It will be removed in a
+    future release.
+    - the `Migrations` type has been renamed to `LegacyMigrations` and will
+    be removed in a future release.
+    - the `SerializedSchema` type has been augmented. If you need the old
+    version specifically you can use `SerializedSchemaV1`
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index d98d87668..32479c1b9 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -1,11 +1,5 @@
+ import { Signal, computed, transact } from '@tldraw/state'
+-import {
+-	RecordsDiff,
+-	UnknownRecord,
+-	defineMigrations,
+-	migrate,
+-	squashRecordDiffs,
+-} from '@tldraw/store'
++import { RecordsDiff, UnknownRecord, squashRecordDiffs } from '@tldraw/store'
+ import {
+ 	CameraRecordType,
+ 	InstancePageStateRecordType,
+@@ -22,6 +16,7 @@ import {
+ 	getFromSessionStorage,
+ 	objectMapFromEntries,
+ 	setInSessionStorage,
++	structuredClone,
+ } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+ import { uniqueId } from '../utils/uniqueId'
+@@ -79,7 +74,18 @@ const Versions = {
+ 	Initial: 0,
+ } as const
+ 
+-const CURRENT_SESSION_STATE_SNAPSHOT_VERSION = Versions.Initial
++const CURRENT_SESSION_STATE_SNAPSHOT_VERSION = Math.max(...Object.values(Versions))
++
++function migrate(snapshot: any) {
++	if (snapshot.version < Versions.Initial) {
++		// initial version
++		// noop
++	}
++	// add further migrations down here. see TLUserPreferences.ts for an example.
++
++	// finally
++	snapshot.version = CURRENT_SESSION_STATE_SNAPSHOT_VERSION
++}
+ 
+ /**
+  * The state of the editor instance, not including any document state.
+@@ -124,10 +130,6 @@ const sessionStateSnapshotValidator: T.Validator<TLSessionStateSnapshot> = T.obj
+ 	),
+ })
+ 
+-const sessionStateSnapshotMigrations = defineMigrations({
+-	currentVersion: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
+-})
+-
+ function migrateAndValidateSessionStateSnapshot(state: unknown): TLSessionStateSnapshot | null {
+ 	if (!state || typeof state !== 'object') {
+ 		console.warn('Invalid instance state')
+@@ -137,27 +139,17 @@ function migrateAndValidateSessionStateSnapshot(state: unknown): TLSessionStateS
+ 		console.warn('No version in instance state')
+ 		return null
+ 	}
+-	const result = migrate<TLSessionStateSnapshot>({
+-		value: state,
+-		fromVersion: state.version,
+-		toVersion: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
+-		migrations: sessionStateSnapshotMigrations,
+-	})
+-	if (result.type === 'error') {
+-		console.warn(result.reason)
+-		return null
++	if (state.version !== CURRENT_SESSION_STATE_SNAPSHOT_VERSION) {
++		state = structuredClone(state)
++		migrate(state)
+ 	}
+ 
+-	const value = { ...result.value, version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION }
+-
+ 	try {
+-		sessionStateSnapshotValidator.validate(value)
++		return sessionStateSnapshotValidator.validate(state)
+ 	} catch (e) {
+ 		console.warn(e)
+ 		return null
+ 	}
+-
+-	return value
+ }
+ 
+ /**
+
+commit 19d051c188381e54d7f8a1fd90a2ccd247419909
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Jun 3 16:58:00 2024 +0100
+
+    Snapshots pit of success (#3811)
+    
+    Lots of people are having a bad time with loading/restoring snapshots
+    and there's a few reasons for that:
+    
+    - It's not clear how to preserve UI state independently of document
+    state.
+    - Loading a snapshot wipes the instance state, which means we almost
+    always need to
+      - update the viewport page bounds
+      - refocus the editor
+      - preserver some other sneaky properties of the `instance` record
+    
+    ### Change Type
+    
+    <!-- ❗ Please select a 'Scope' label ❗️ -->
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [ ] `dotcom` — Changes the tldraw.com web app
+    - [ ] `docs` — Changes to the documentation, examples, or templates.
+    - [ ] `vs code` — Changes to the vscode plugin
+    - [ ] `internal` — Does not affect user-facing stuff
+    
+    <!-- ❗ Please select a 'Type' label ❗️ -->
+    
+    - [ ] `bugfix` — Bug fix
+    - [ ] `feature` — New feature
+    - [ ] `improvement` — Improving existing features
+    - [ ] `chore` — Updating dependencies, other boring stuff
+    - [ ] `galaxy brain` — Architectural changes
+    - [ ] `tests` — Changes to any test code
+    - [ ] `tools` — Changes to infrastructure, CI, internal scripts,
+    debugging tools, etc.
+    - [ ] `dunno` — I don't know
+    
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    - Add a brief release note for your PR here.
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 32479c1b9..2da31c99e 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -1,20 +1,19 @@
+-import { Signal, computed, transact } from '@tldraw/state'
+-import { RecordsDiff, UnknownRecord, squashRecordDiffs } from '@tldraw/store'
++import { Signal, computed } from '@tldraw/state'
++import { UnknownRecord } from '@tldraw/store'
+ import {
+ 	CameraRecordType,
+ 	InstancePageStateRecordType,
+ 	TLINSTANCE_ID,
+ 	TLPageId,
+-	TLRecord,
+ 	TLShapeId,
+ 	TLStore,
+ 	pageIdValidator,
++	pluckPreservingValues,
+ 	shapeIdValidator,
+ } from '@tldraw/tlschema'
+ import {
+ 	deleteFromSessionStorage,
+ 	getFromSessionStorage,
+-	objectMapFromEntries,
+ 	setInSessionStorage,
+ 	structuredClone,
+ } from '@tldraw/utils'
+@@ -209,58 +208,43 @@ export function loadSessionStateSnapshotIntoStore(
+ 	const res = migrateAndValidateSessionStateSnapshot(snapshot)
+ 	if (!res) return
+ 
++	const instanceState = store.schema.types.instance.create({
++		id: TLINSTANCE_ID,
++		...pluckPreservingValues(store.get(TLINSTANCE_ID)),
++		currentPageId: res.currentPageId,
++		isDebugMode: res.isDebugMode,
++		isFocusMode: res.isFocusMode,
++		isToolLocked: res.isToolLocked,
++		isGridMode: res.isGridMode,
++		exportBackground: res.exportBackground,
++	})
++
+ 	// remove all page states and cameras and the instance state
+ 	const allPageStatesAndCameras = store
+ 		.allRecords()
+ 		.filter((r) => r.typeName === 'instance_page_state' || r.typeName === 'camera')
+ 
+-	const removeDiff: RecordsDiff<TLRecord> = {
+-		added: {},
+-		updated: {},
+-		removed: {
+-			...objectMapFromEntries(allPageStatesAndCameras.map((r) => [r.id, r])),
+-		},
+-	}
+-	if (store.has(TLINSTANCE_ID)) {
+-		removeDiff.removed[TLINSTANCE_ID] = store.get(TLINSTANCE_ID)!
+-	}
+-
+-	const addDiff: RecordsDiff<TLRecord> = {
+-		removed: {},
+-		updated: {},
+-		added: {
+-			[TLINSTANCE_ID]: store.schema.types.instance.create({
+-				id: TLINSTANCE_ID,
+-				currentPageId: res.currentPageId,
+-				isDebugMode: res.isDebugMode,
+-				isFocusMode: res.isFocusMode,
+-				isToolLocked: res.isToolLocked,
+-				isGridMode: res.isGridMode,
+-				exportBackground: res.exportBackground,
+-			}),
+-		},
+-	}
+-
+-	// replace them with new ones
+-	for (const ps of res.pageStates) {
+-		const cameraId = CameraRecordType.createId(ps.pageId)
+-		const pageStateId = InstancePageStateRecordType.createId(ps.pageId)
+-		addDiff.added[cameraId] = CameraRecordType.create({
+-			id: CameraRecordType.createId(ps.pageId),
+-			x: ps.camera.x,
+-			y: ps.camera.y,
+-			z: ps.camera.z,
+-		})
+-		addDiff.added[pageStateId] = InstancePageStateRecordType.create({
+-			id: InstancePageStateRecordType.createId(ps.pageId),
+-			pageId: ps.pageId,
+-			selectedShapeIds: ps.selectedShapeIds,
+-			focusedGroupId: ps.focusedGroupId,
+-		})
+-	}
++	store.atomic(() => {
++		store.remove(allPageStatesAndCameras.map((r) => r.id))
++		// replace them with new ones
++		for (const ps of res.pageStates) {
++			store.put([
++				CameraRecordType.create({
++					id: CameraRecordType.createId(ps.pageId),
++					x: ps.camera.x,
++					y: ps.camera.y,
++					z: ps.camera.z,
++				}),
++				InstancePageStateRecordType.create({
++					id: InstancePageStateRecordType.createId(ps.pageId),
++					pageId: ps.pageId,
++					selectedShapeIds: ps.selectedShapeIds,
++					focusedGroupId: ps.focusedGroupId,
++				}),
++			])
++		}
+ 
+-	transact(() => {
+-		store.applyDiff(squashRecordDiffs([removeDiff, addDiff]))
++		store.put([instanceState])
+ 		store.ensureStoreIsUsable()
+ 	})
+ }
+
+commit 8ab18776cd8e94312330e3ed8edb57fdad511793
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Aug 20 11:56:44 2024 +0100
+
+    [api] Widen snapshots pit of success (#4392)
+    
+    This PR makes the snapshot loader preserve page states that are not
+    explicitly overridden so that, e.g. you can load a previous snapshot
+    version of a document without switching page or resetting camera simply
+    by omitting the session state option.
+    
+    The goal is to provide a nice and robust version of the solution
+    mentioned in #4381
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [x] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    - [x] Unit tests
+    
+    
+    ### Release notes
+    
+    - Improved loadSnapshot to preserve page state like camera position and
+    current page if no session snapshot is provided.
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 2da31c99e..9500ba603 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -93,28 +93,28 @@ function migrate(snapshot: any) {
+  */
+ export interface TLSessionStateSnapshot {
+ 	version: number
+-	currentPageId: TLPageId
+-	isFocusMode: boolean
+-	exportBackground: boolean
+-	isDebugMode: boolean
+-	isToolLocked: boolean
+-	isGridMode: boolean
+-	pageStates: Array<{
++	currentPageId?: TLPageId
++	isFocusMode?: boolean
++	exportBackground?: boolean
++	isDebugMode?: boolean
++	isToolLocked?: boolean
++	isGridMode?: boolean
++	pageStates?: Array<{
+ 		pageId: TLPageId
+-		camera: { x: number; y: number; z: number }
+-		selectedShapeIds: TLShapeId[]
+-		focusedGroupId: TLShapeId | null
++		camera?: { x: number; y: number; z: number }
++		selectedShapeIds?: TLShapeId[]
++		focusedGroupId?: TLShapeId | null
+ 	}>
+ }
+ 
+ const sessionStateSnapshotValidator: T.Validator<TLSessionStateSnapshot> = T.object({
+ 	version: T.number,
+-	currentPageId: pageIdValidator,
+-	isFocusMode: T.boolean,
+-	exportBackground: T.boolean,
+-	isDebugMode: T.boolean,
+-	isToolLocked: T.boolean,
+-	isGridMode: T.boolean,
++	currentPageId: pageIdValidator.optional(),
++	isFocusMode: T.boolean.optional(),
++	exportBackground: T.boolean.optional(),
++	isDebugMode: T.boolean.optional(),
++	isToolLocked: T.boolean.optional(),
++	isGridMode: T.boolean.optional(),
+ 	pageStates: T.arrayOf(
+ 		T.object({
+ 			pageId: pageIdValidator,
+@@ -122,11 +122,11 @@ const sessionStateSnapshotValidator: T.Validator<TLSessionStateSnapshot> = T.obj
+ 				x: T.number,
+ 				y: T.number,
+ 				z: T.number,
+-			}),
+-			selectedShapeIds: T.arrayOf(shapeIdValidator),
+-			focusedGroupId: shapeIdValidator.nullable(),
++			}).optional(),
++			selectedShapeIds: T.arrayOf(shapeIdValidator).optional(),
++			focusedGroupId: shapeIdValidator.nullable().optional(),
+ 		})
+-	),
++	).optional(),
+ })
+ 
+ function migrateAndValidateSessionStateSnapshot(state: unknown): TLSessionStateSnapshot | null {
+@@ -187,12 +187,25 @@ export function createSessionStateSnapshotSignal(
+ 					},
+ 					selectedShapeIds: ps?.selectedShapeIds ?? [],
+ 					focusedGroupId: ps?.focusedGroupId ?? null,
+-				} satisfies TLSessionStateSnapshot['pageStates'][0]
++				} satisfies NonNullable<TLSessionStateSnapshot['pageStates']>[0]
+ 			}),
+ 		} satisfies TLSessionStateSnapshot
+ 	})
+ }
+ 
++/**
++ * Options for {@link loadSessionStateSnapshotIntoStore}
++ * @public
++ */
++export interface TLLoadSessionStateSnapshotOptions {
++	/**
++	 * By default, some session state flags like `isDebugMode` are not overwritten when loading a snapshot.
++	 * These are usually considered "sticky" by users while the document data is not.
++	 * If you want to overwrite these flags, set this to `true`.
++	 */
++	forceOverwrite?: boolean
++}
++
+ /**
+  * Loads a snapshot of the editor's instance state into the store of a new editor instance.
+  *
+@@ -203,43 +216,47 @@ export function createSessionStateSnapshotSignal(
+  */
+ export function loadSessionStateSnapshotIntoStore(
+ 	store: TLStore,
+-	snapshot: TLSessionStateSnapshot
++	snapshot: TLSessionStateSnapshot,
++	opts?: TLLoadSessionStateSnapshotOptions
+ ) {
+ 	const res = migrateAndValidateSessionStateSnapshot(snapshot)
+ 	if (!res) return
+ 
++	const preserved = pluckPreservingValues(store.get(TLINSTANCE_ID))
++	const primary = opts?.forceOverwrite ? res : preserved
++	const secondary = opts?.forceOverwrite ? preserved : res
++
+ 	const instanceState = store.schema.types.instance.create({
+ 		id: TLINSTANCE_ID,
+-		...pluckPreservingValues(store.get(TLINSTANCE_ID)),
++		...preserved,
++		// the integrity checker will ensure that the currentPageId is valid
+ 		currentPageId: res.currentPageId,
+-		isDebugMode: res.isDebugMode,
+-		isFocusMode: res.isFocusMode,
+-		isToolLocked: res.isToolLocked,
+-		isGridMode: res.isGridMode,
+-		exportBackground: res.exportBackground,
++		isDebugMode: primary?.isDebugMode ?? secondary?.isDebugMode,
++		isFocusMode: primary?.isFocusMode ?? secondary?.isFocusMode,
++		isToolLocked: primary?.isToolLocked ?? secondary?.isToolLocked,
++		isGridMode: primary?.isGridMode ?? secondary?.isGridMode,
++		exportBackground: primary?.exportBackground ?? secondary?.exportBackground,
+ 	})
+ 
+-	// remove all page states and cameras and the instance state
+-	const allPageStatesAndCameras = store
+-		.allRecords()
+-		.filter((r) => r.typeName === 'instance_page_state' || r.typeName === 'camera')
+-
+ 	store.atomic(() => {
+-		store.remove(allPageStatesAndCameras.map((r) => r.id))
+-		// replace them with new ones
+-		for (const ps of res.pageStates) {
++		for (const ps of res.pageStates ?? []) {
++			if (!store.has(ps.pageId)) continue
++			const cameraId = CameraRecordType.createId(ps.pageId)
++			const instancePageState = InstancePageStateRecordType.createId(ps.pageId)
++			const previousCamera = store.get(cameraId)
++			const previousInstanceState = store.get(instancePageState)
+ 			store.put([
+ 				CameraRecordType.create({
+-					id: CameraRecordType.createId(ps.pageId),
+-					x: ps.camera.x,
+-					y: ps.camera.y,
+-					z: ps.camera.z,
++					id: cameraId,
++					x: ps.camera?.x ?? previousCamera?.x,
++					y: ps.camera?.y ?? previousCamera?.y,
++					z: ps.camera?.z ?? previousCamera?.z,
+ 				}),
+ 				InstancePageStateRecordType.create({
+-					id: InstancePageStateRecordType.createId(ps.pageId),
++					id: instancePageState,
+ 					pageId: ps.pageId,
+-					selectedShapeIds: ps.selectedShapeIds,
+-					focusedGroupId: ps.focusedGroupId,
++					selectedShapeIds: ps.selectedShapeIds ?? previousInstanceState?.selectedShapeIds,
++					focusedGroupId: ps.focusedGroupId ?? previousInstanceState?.focusedGroupId,
+ 				}),
+ 			])
+ 		}
+@@ -279,7 +296,7 @@ export function extractSessionStateFromLegacySnapshot(
+ 		isGridMode: false,
+ 		pageStates: instanceRecords
+ 			.filter((r: any) => r.typeName === 'instance_page_state' && r.instanceId === oldInstance.id)
+-			.map((ps: any): TLSessionStateSnapshot['pageStates'][0] => {
++			.map((ps: any) => {
+ 				const camera = (store[ps.cameraId] as any) ?? { x: 0, y: 0, z: 1 }
+ 				return {
+ 					pageId: ps.pageId,
+@@ -290,7 +307,7 @@ export function extractSessionStateFromLegacySnapshot(
+ 					},
+ 					selectedShapeIds: ps.selectedShapeIds,
+ 					focusedGroupId: ps.focusedGroupId,
+-				}
++				} satisfies NonNullable<TLSessionStateSnapshot['pageStates']>[0]
+ 			}),
+ 	}
+ 
+
+commit fa9dbe131e949cd23d4c646eaa94a10b4efdf85d
+Author: alex <alex@dytry.ch>
+Date:   Thu Aug 22 15:37:21 2024 +0100
+
+    inline nanoid (#4410)
+    
+    We have a bunch of code working around the fact that nanoId is only
+    distributed as an ES module, but we run both as es and commonjs modules.
+    luckily, nanoid is nano! and even more so if you strip out the bits we
+    don't use. This replaces the nanoid library with a vendored version of
+    just the part we use.
+    
+    ### Change type
+    
+    - [x] `improvement`
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 9500ba603..974dc3aad 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -16,9 +16,9 @@ import {
+ 	getFromSessionStorage,
+ 	setInSessionStorage,
+ 	structuredClone,
++	uniqueId,
+ } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
+-import { uniqueId } from '../utils/uniqueId'
+ 
+ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+ 
+
+commit 4aeb1496b83a80d46c934931f23adb25ea9cf35c
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Thu Oct 3 20:59:09 2024 +0100
+
+    selection: allow cmd/ctrl to add to selection (#4570)
+    
+    In the How-To sesh, I noticed that using Shift of course lets you add to
+    a selection of shapes, but Cmd/Ctrl does not.
+    Typically, cmd/ctrl lets you do this in other contexts so some of that
+    muscle memory doesn't get allowed in tldraw currently.
+    This enables cmd/ctrl to have the same behavior as shift.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Selection: allow cmd/ctrl to add multiple shapes to the selection.
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 974dc3aad..5e3f77e4a 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -19,6 +19,7 @@ import {
+ 	uniqueId,
+ } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
++import { tlenv } from '../globals/environment'
+ 
+ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+ 
+@@ -39,7 +40,7 @@ function iOS() {
+ 			window.navigator.platform
+ 		) ||
+ 		// iPad on iOS 13 detection
+-		(window.navigator.userAgent.includes('Mac') && 'ontouchend' in document)
++		(tlenv.isDarwin && 'ontouchend' in document)
+ 	)
+ }
+ 
+
+commit b301aeb64e5ff7bcd55928d7200a39092da8c501
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Wed Oct 23 15:55:42 2024 +0100
+
+    npm: upgrade eslint v8 → v9 (#4757)
+    
+    As I worked on the i18n PR (https://github.com/tldraw/tldraw/pull/4719)
+    I noticed that `react-intl` required a new version of `eslint`. That led
+    me down a bit of a rabbit hole of upgrading v8 → v9. There were a couple
+    things to upgrade to make this work.
+    
+    - ran `npx @eslint/migrate-config .eslintrc.js` to upgrade to the new
+    `eslint.config.mjs`
+    - `.eslintignore` is now deprecated and part of `eslint.config.mjs`
+    - some packages are no longer relevant, of note: `eslint-plugin-local`
+    and `eslint-plugin-deprecation`
+    - the upgrade caught a couple bugs/dead code
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Upgrade eslint v8 → v9
+    
+    ---------
+    
+    Co-authored-by: alex <alex@dytry.ch>
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 5e3f77e4a..8c5b8d62b 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -36,7 +36,7 @@ function iOS() {
+ 	if (!window) return false
+ 	return (
+ 		['iPad Simulator', 'iPhone Simulator', 'iPod Simulator', 'iPad', 'iPhone', 'iPod'].includes(
+-			// eslint-disable-next-line deprecation/deprecation
++			// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 			window.navigator.platform
+ 		) ||
+ 		// iPad on iOS 13 detection
+@@ -315,7 +315,7 @@ export function extractSessionStateFromLegacySnapshot(
+ 	try {
+ 		sessionStateSnapshotValidator.validate(result)
+ 		return result
+-	} catch (e) {
++	} catch {
+ 		return null
+ 	}
+ }
+
+commit 275d500ca9eba0c9da632344a094e1c5b82d7ad4
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Oct 24 14:50:28 2024 +0100
+
+    [botcom] file state (#4766)
+    
+    This PR
+    
+    - Replaces the file-edit and file-view records with a single record
+    called `file-state` that has timestamps for first view and most recent
+    edit.
+    - Uses the above to simplify the recent files sorting (maintains the
+    same behaviour, just achieves it with simpler code)
+    - removes unused presence stuff (should have been removed back in that
+    burn-it-all-down pr after we merged the prototype), we can add the UI
+    bits back when we work on file-level presence.
+    - Stores the UI state in the db so you go back to where you were before
+    in the file next time you open the file
+    
+    implements INT-342
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 8c5b8d62b..5f4014a03 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -19,6 +19,7 @@ import {
+ 	uniqueId,
+ } from '@tldraw/utils'
+ import { T } from '@tldraw/validate'
++import isEqual from 'lodash.isequal'
+ import { tlenv } from '../globals/environment'
+ 
+ const tabIdKey = 'TLDRAW_TAB_ID_v2' as const
+@@ -163,35 +164,39 @@ export function createSessionStateSnapshotSignal(
+ ): Signal<TLSessionStateSnapshot | null> {
+ 	const $allPageIds = store.query.ids('page')
+ 
+-	return computed<TLSessionStateSnapshot | null>('sessionStateSnapshot', () => {
+-		const instanceState = store.get(TLINSTANCE_ID)
+-		if (!instanceState) return null
++	return computed<TLSessionStateSnapshot | null>(
++		'sessionStateSnapshot',
++		() => {
++			const instanceState = store.get(TLINSTANCE_ID)
++			if (!instanceState) return null
+ 
+-		const allPageIds = [...$allPageIds.get()]
+-		return {
+-			version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
+-			currentPageId: instanceState.currentPageId,
+-			exportBackground: instanceState.exportBackground,
+-			isFocusMode: instanceState.isFocusMode,
+-			isDebugMode: instanceState.isDebugMode,
+-			isToolLocked: instanceState.isToolLocked,
+-			isGridMode: instanceState.isGridMode,
+-			pageStates: allPageIds.map((id) => {
+-				const ps = store.get(InstancePageStateRecordType.createId(id))
+-				const camera = store.get(CameraRecordType.createId(id))
+-				return {
+-					pageId: id,
+-					camera: {
+-						x: camera?.x ?? 0,
+-						y: camera?.y ?? 0,
+-						z: camera?.z ?? 1,
+-					},
+-					selectedShapeIds: ps?.selectedShapeIds ?? [],
+-					focusedGroupId: ps?.focusedGroupId ?? null,
+-				} satisfies NonNullable<TLSessionStateSnapshot['pageStates']>[0]
+-			}),
+-		} satisfies TLSessionStateSnapshot
+-	})
++			const allPageIds = [...$allPageIds.get()]
++			return {
++				version: CURRENT_SESSION_STATE_SNAPSHOT_VERSION,
++				currentPageId: instanceState.currentPageId,
++				exportBackground: instanceState.exportBackground,
++				isFocusMode: instanceState.isFocusMode,
++				isDebugMode: instanceState.isDebugMode,
++				isToolLocked: instanceState.isToolLocked,
++				isGridMode: instanceState.isGridMode,
++				pageStates: allPageIds.map((id) => {
++					const ps = store.get(InstancePageStateRecordType.createId(id))
++					const camera = store.get(CameraRecordType.createId(id))
++					return {
++						pageId: id,
++						camera: {
++							x: camera?.x ?? 0,
++							y: camera?.y ?? 0,
++							z: camera?.z ?? 1,
++						},
++						selectedShapeIds: ps?.selectedShapeIds ?? [],
++						focusedGroupId: ps?.focusedGroupId ?? null,
++					} satisfies NonNullable<TLSessionStateSnapshot['pageStates']>[0]
++				}),
++			} satisfies TLSessionStateSnapshot
++		},
++		{ isEqual }
++	)
+ }
+ 
+ /**
+
+commit 9eec0b31251a46f0476813329e2f8a42a993b607
+Author: alex <alex@dytry.ch>
+Date:   Thu Jan 30 10:53:54 2025 +0000
+
+    support react 19 (#5293)
+    
+    This diff adds support for react 19. React 19 is backwards compatible
+    with react 18, excluding the removal of some deprecated APIs. React 18.3
+    (which we already use) warns when these APIs are used.
+    
+    "adding support" here involves two things:
+    1. upgrading our depenencies to ones that specify react 19 in their peer
+    deps array. I just upgraded everything that had a non-breaking upgrade
+    to go to.
+    2. adding react 19 to our own list of peer dependencies
+    
+    We want to make sure that we can still be used with react 18, so we're
+    not upgrading to react 19 internally because we don't want to make use
+    of any of the new APIs that aren't 18-compatible.
+    
+    I've made the decision here not to do anything like running tests
+    against both react versions. I think that this would be more effort to
+    set up (and have more on-going cost on CI times etc) than it would be
+    worth, and I trust react's guarantees about react 19's backwards
+    compatibility and the warnings in 18.3.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - tldraw now supports react 19
+    
+    ---------
+    
+    Co-authored-by: Mime Čuvalo <mimecuvalo@gmail.com>
+    Co-authored-by: huppy-bot[bot] <128400622+huppy-bot[bot]@users.noreply.github.com>
+
+diff --git a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+index 5f4014a03..4ef969446 100644
+--- a/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
++++ b/packages/editor/src/lib/config/TLSessionStateSnapshot.ts
+@@ -50,7 +50,9 @@ function iOS() {
+  * @public
+  */
+ export const TAB_ID: string = window
+-	? window[tabIdKey] ?? getFromSessionStorage(tabIdKey) ?? `TLDRAW_INSTANCE_STATE_V1_` + uniqueId()
++	? (window[tabIdKey] ??
++		getFromSessionStorage(tabIdKey) ??
++		`TLDRAW_INSTANCE_STATE_V1_` + uniqueId())
+ 	: '<error>'
+ if (window) {
+ 	window[tabIdKey] = TAB_ID
+

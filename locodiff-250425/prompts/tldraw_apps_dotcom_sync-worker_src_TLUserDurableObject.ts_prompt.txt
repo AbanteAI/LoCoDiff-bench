@@ -1,0 +1,5299 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+
+commit 51310c28a1933528586ca540c039289c3e7de496
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 11 11:10:41 2024 +0000
+
+    [wip] custom botcom backend (#4879)
+    
+    Describe what your pull request does. If you can, add GIFs or images
+    showing the before and after of your change.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+    
+    ---------
+    
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+new file mode 100644
+index 000000000..b4f11f3d3
+--- /dev/null
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -0,0 +1,406 @@
++import {
++	OptimisticAppStore,
++	ROOM_PREFIX,
++	TlaFile,
++	TlaFileState,
++	TlaUser,
++	ZClientSentMessage,
++	ZErrorCode,
++	ZEvent,
++	ZRowUpdate,
++	ZServerSentMessage,
++	ZTable,
++} from '@tldraw/dotcom-shared'
++import { assert } from '@tldraw/utils'
++import { createSentry } from '@tldraw/worker-shared'
++import { DurableObject } from 'cloudflare:workers'
++import { IRequest, Router } from 'itty-router'
++import postgres from 'postgres'
++import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
++import { type TLPostgresReplicator } from './TLPostgresReplicator'
++import { getR2KeyForRoom } from './r2'
++import { Environment } from './types'
++import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
++
++export class TLUserDurableObject extends DurableObject<Environment> {
++	db: ReturnType<typeof postgres>
++	replicator: TLPostgresReplicator
++	store = new OptimisticAppStore()
++
++	sentry
++	captureException(exception: unknown, eventHint?: EventHint) {
++		// eslint-disable-next-line @typescript-eslint/no-deprecated
++		this.sentry?.captureException(exception, eventHint) as any
++		if (!this.sentry) {
++			console.error(exception)
++		}
++	}
++
++	constructor(ctx: DurableObjectState, env: Environment) {
++		super(ctx, env)
++
++		this.sentry = createSentry(ctx, env)
++		this.replicator = this.env.TL_PG_REPLICATOR.get(
++			this.env.TL_PG_REPLICATOR.idFromName('0')
++		) as any as TLPostgresReplicator
++
++		this.db = postgres(env.BOTCOM_POSTGRES_CONNECTION_STRING)
++	}
++
++	userId: string | null = null
++
++	readonly router = Router()
++		.all('/app/:userId/*', async (req) => {
++			if (!this.userId) {
++				this.userId = req.params.userId
++			}
++			await this.ctx.blockConcurrencyWhile(async () => {
++				this.store.initialize(await this.replicator.fetchDataForUser(this.userId!))
++			})
++		})
++		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
++
++	// Handle a request to the Durable Object.
++	override async fetch(req: IRequest) {
++		const sentry = createSentry(this.ctx, this.env, req)
++		try {
++			return await this.router.fetch(req)
++		} catch (err) {
++			if (sentry) {
++				// eslint-disable-next-line @typescript-eslint/no-deprecated
++				sentry?.captureException(err)
++			} else {
++				console.error(err)
++			}
++			return new Response('Something went wrong', {
++				status: 500,
++				statusText: 'Internal Server Error',
++			})
++		}
++	}
++
++	async onRequest(req: IRequest) {
++		// handle legacy param names
++
++		const url = new URL(req.url)
++		const params = Object.fromEntries(url.searchParams.entries())
++		const { sessionId } = params
++
++		if (!this.userId) {
++			throw new Error('User data not initialized')
++		}
++		if (!sessionId) {
++			throw new Error('Session ID is required')
++		}
++
++		// Create the websocket pair for the client
++		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
++		this.ctx.acceptWebSocket(serverWebSocket)
++		const initialData = this.store.getCommitedData()
++		if (!initialData) {
++			throw new Error('Initial data not fetched')
++		}
++
++		// todo: sync
++		serverWebSocket.send(
++			JSON.stringify({
++				type: 'initial_data',
++				initialData,
++			} satisfies ZServerSentMessage)
++		)
++
++		return new Response(null, { status: 101, webSocket: clientWebSocket })
++	}
++
++	override async webSocketMessage(ws: WebSocket, message: string) {
++		const msg = JSON.parse(message) as any as ZClientSentMessage
++		switch (msg.type) {
++			case 'mutate':
++				await this.handleMutate(msg)
++				break
++			default:
++				this.captureException(new Error('Unhandled message'), { data: { message } })
++		}
++	}
++
++	async commitMutation(mutationNumber: number) {
++		const mutationIds = this.mutations
++			.filter((m) => m.mutationNumber <= mutationNumber)
++			.map((m) => m.mutationId)
++		this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
++		this.store.commitMutations(mutationIds)
++		for (const socket of this.ctx.getWebSockets()) {
++			socket.send(
++				JSON.stringify({
++					type: 'commit',
++					mutationIds,
++				} satisfies ZServerSentMessage)
++			)
++		}
++	}
++
++	async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
++		this.store.rejectMutation(mutationId)
++		for (const socket of this.ctx.getWebSockets()) {
++			socket.send(
++				JSON.stringify({
++					type: 'reject',
++					mutationId,
++					errorCode,
++				} satisfies ZServerSentMessage)
++			)
++		}
++	}
++
++	mutations: { mutationNumber: number; mutationId: string }[] = []
++
++	async assertValidMutation(update: ZRowUpdate) {
++		// s is the entire set of data that the user has access to
++		// and is up to date with all committed mutations so far.
++		// we commit each mutation one at a time before handling the next.
++		const s = this.store.getFullData()
++		if (!s) {
++			// This should never happen
++			throw new ZMutationError(ZErrorCode.unknown_error, 'Store data not fetched')
++		}
++		switch (update.table) {
++			case 'user': {
++				const isUpdatingSelf = (update.row as TlaUser).id === this.userId
++				if (!isUpdatingSelf)
++					throw new ZMutationError(
++						ZErrorCode.forbidden,
++						'Cannot update user record that is not our own'
++					)
++				// todo: prevent user from updating their email?
++				return
++			}
++			case 'file': {
++				const nextFile = update.row as TlaFile
++				const prevFile = s.files.find((f) => f.id === (update.row as any).id)
++				if (!prevFile) {
++					const isOwner = nextFile.ownerId === this.userId
++					if (isOwner) return
++					throw new ZMutationError(
++						ZErrorCode.forbidden,
++						`Cannot create a file for another user ${nextFile.id}`
++					)
++				}
++				if (nextFile.ownerId === this.userId) return
++				if (prevFile.shared && prevFile.sharedLinkType === 'edit') return
++				throw new ZMutationError(
++					ZErrorCode.forbidden,
++					'Cannot update file that is not our own and not shared in edit mode'
++				)
++			}
++			case 'file_state': {
++				const nextFileState = update.row as TlaFileState
++				let file = s.files.find((f) => f.id === nextFileState.fileId)
++				if (!file) {
++					// The user might not have access to this file yet, because they just followed a link
++					// let's allow them to create a file state for it if it exists and is shared.
++					file = (await this.replicator.getFileRecord(nextFileState.fileId)) ?? undefined
++				}
++				if (!file) {
++					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
++				}
++				if (file.ownerId === this.userId) return
++				if (file.shared) return
++
++				throw new ZMutationError(
++					ZErrorCode.forbidden,
++					"Cannot update file state of file we don't own and is not shared"
++				)
++			}
++		}
++	}
++
++	async handleMutate(msg: ZClientSentMessage) {
++		try {
++			;(await this.db.begin(async (sql) => {
++				for (const update of msg.updates) {
++					await this.assertValidMutation(update)
++					switch (update.event) {
++						case 'insert': {
++							if (update.table === 'file_state') {
++								const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
++								if (Object.keys(rest).length === 0) {
++									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO NOTHING`
++								} else {
++									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO UPDATE SET ${sql(rest)}`
++								}
++								break
++							} else {
++								const { id: _id, ...rest } = update.row as any
++								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("id") DO UPDATE SET ${sql(rest)}`
++								break
++							}
++						}
++						case 'update':
++							if (update.table === 'file_state') {
++								const { fileId, userId, ...rest } = update.row as any
++								await sql`update public.file_state set ${sql(rest)} where "fileId" = ${fileId} and "userId" = ${userId}`
++							} else {
++								const { id, ...rest } = update.row as any
++								await sql`update ${sql('public.' + update.table)} set ${sql(rest)} where id = ${id}`
++								if (update.table === 'file') {
++									const currentFile = this.store.getFullData()?.files.find((f) => f.id === id)
++									if (currentFile && currentFile.published !== rest.published) {
++										if (rest.published) {
++											await this.publishSnapshot(currentFile)
++										} else {
++											await this.unpublishSnapshot(currentFile)
++										}
++									} else if (
++										currentFile &&
++										currentFile.published &&
++										currentFile.lastPublished < rest.lastPublished
++									) {
++										await this.publishSnapshot(currentFile)
++									}
++								}
++							}
++							break
++						case 'delete':
++							if (update.table === 'file_state') {
++								const { fileId, userId } = update.row as any
++								await sql`delete from public.file_state where "fileId" = ${fileId} and "userId" = ${userId}`
++							} else {
++								const { id } = update.row as any
++								await sql`delete from ${sql('public.' + update.table)} where id = ${id}`
++							}
++							if (update.table === 'file') {
++								const { id } = update.row as TlaFile
++								await this.deleteFileStuff(id)
++							}
++							break
++					}
++					this.store.updateOptimisticData([update], msg.mutationId)
++				}
++			})) as any
++
++			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
++			const result = await this
++				.db`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
++			const mutationNumber = Number(result[0].mutationNumber)
++			const currentMutationNumber = this.mutations.at(-1)?.mutationNumber ?? 0
++			assert(
++				mutationNumber > currentMutationNumber,
++				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
++			)
++			this.mutations.push({ mutationNumber, mutationId: msg.mutationId })
++		} catch (e) {
++			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
++			this.captureException(e, {
++				data: { errorCode: code, reason: 'mutation failed' },
++			})
++			this.rejectMutation(msg.mutationId, code)
++		}
++	}
++
++	onRowChange(row: object, table: ZTable, event: ZEvent) {
++		this.store.updateCommittedData({ table, event, row })
++		for (const socket of this.ctx.getWebSockets()) {
++			socket.send(
++				JSON.stringify({
++					type: 'update',
++					update: {
++						table,
++						event,
++						row,
++					},
++				} satisfies ZServerSentMessage)
++			)
++		}
++	}
++
++	async deleteFileStuff(id: string) {
++		const fileRecord = await this.replicator.getFileRecord(id)
++		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
++		await room.appFileRecordDidDelete()
++		if (!fileRecord) {
++			throw new Error('file record not found')
++		}
++		const publishedSlug = fileRecord.publishedSlug
++
++		// Create a new slug for the published room
++		await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(publishedSlug)
++
++		// remove published files
++		const publishedPrefixKey = getR2KeyForRoom({
++			slug: `${id}/${publishedSlug}`,
++			isApp: true,
++		})
++		const publishedHistory = await listAllObjectKeys(this.env.ROOM_SNAPSHOTS, publishedPrefixKey)
++		await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
++		// remove edit history
++		const r2Key = getR2KeyForRoom({ slug: id, isApp: true })
++		const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, r2Key)
++		await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
++		// remove main file
++		await this.env.ROOMS.delete(r2Key)
++	}
++
++	async publishSnapshot(file: TlaFile) {
++		if (file.ownerId !== this.userId) {
++			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot publish file that is not our own')
++		}
++
++		try {
++			const serializedSnapshot = await getCurrentSerializedRoomSnapshot(file.id, this.env)
++
++			// Create a new slug for the published room
++			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.put(file.publishedSlug, file.id)
++
++			// Bang the snapshot into the database
++			await this.env.ROOM_SNAPSHOTS.put(
++				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true }),
++				serializedSnapshot
++			)
++			const currentTime = new Date().toISOString()
++			await this.env.ROOM_SNAPSHOTS.put(
++				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}|${currentTime}`, isApp: true }),
++				serializedSnapshot
++			)
++		} catch (e) {
++			throw new ZMutationError(ZErrorCode.publish_failed, 'Failed to publish snapshot', e)
++		}
++	}
++
++	async unpublishSnapshot(file: TlaFile) {
++		if (file.ownerId !== this.userId) {
++			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot unpublish file that is not our own')
++		}
++
++		try {
++			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(file.publishedSlug)
++			await this.env.ROOM_SNAPSHOTS.delete(
++				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true })
++			)
++		} catch (e) {
++			throw new ZMutationError(ZErrorCode.unpublish_failed, 'Failed to unpublish snapshot', e)
++		}
++	}
++}
++
++async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
++	const keys: string[] = []
++	let cursor: string | undefined
++
++	do {
++		const result = await bucket.list({ prefix, cursor })
++		keys.push(...result.objects.map((o) => o.key))
++		cursor = result.truncated ? result.cursor : undefined
++	} while (cursor)
++
++	return keys
++}
++
++class ZMutationError extends Error {
++	constructor(
++		public errorCode: ZErrorCode,
++		message: string,
++		public cause?: unknown
++	) {
++		super(message)
++	}
++}
+
+commit 2e534b6f70c2950a1b754e12359bd786a62890f3
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 11 11:39:22 2024 +0000
+
+    Revert "[wip] custom botcom backend" (#4883)
+    
+    Reverts tldraw/tldraw#487
+    
+    - [x] other
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+deleted file mode 100644
+index b4f11f3d3..000000000
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ /dev/null
+@@ -1,406 +0,0 @@
+-import {
+-	OptimisticAppStore,
+-	ROOM_PREFIX,
+-	TlaFile,
+-	TlaFileState,
+-	TlaUser,
+-	ZClientSentMessage,
+-	ZErrorCode,
+-	ZEvent,
+-	ZRowUpdate,
+-	ZServerSentMessage,
+-	ZTable,
+-} from '@tldraw/dotcom-shared'
+-import { assert } from '@tldraw/utils'
+-import { createSentry } from '@tldraw/worker-shared'
+-import { DurableObject } from 'cloudflare:workers'
+-import { IRequest, Router } from 'itty-router'
+-import postgres from 'postgres'
+-import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
+-import { type TLPostgresReplicator } from './TLPostgresReplicator'
+-import { getR2KeyForRoom } from './r2'
+-import { Environment } from './types'
+-import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+-
+-export class TLUserDurableObject extends DurableObject<Environment> {
+-	db: ReturnType<typeof postgres>
+-	replicator: TLPostgresReplicator
+-	store = new OptimisticAppStore()
+-
+-	sentry
+-	captureException(exception: unknown, eventHint?: EventHint) {
+-		// eslint-disable-next-line @typescript-eslint/no-deprecated
+-		this.sentry?.captureException(exception, eventHint) as any
+-		if (!this.sentry) {
+-			console.error(exception)
+-		}
+-	}
+-
+-	constructor(ctx: DurableObjectState, env: Environment) {
+-		super(ctx, env)
+-
+-		this.sentry = createSentry(ctx, env)
+-		this.replicator = this.env.TL_PG_REPLICATOR.get(
+-			this.env.TL_PG_REPLICATOR.idFromName('0')
+-		) as any as TLPostgresReplicator
+-
+-		this.db = postgres(env.BOTCOM_POSTGRES_CONNECTION_STRING)
+-	}
+-
+-	userId: string | null = null
+-
+-	readonly router = Router()
+-		.all('/app/:userId/*', async (req) => {
+-			if (!this.userId) {
+-				this.userId = req.params.userId
+-			}
+-			await this.ctx.blockConcurrencyWhile(async () => {
+-				this.store.initialize(await this.replicator.fetchDataForUser(this.userId!))
+-			})
+-		})
+-		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
+-
+-	// Handle a request to the Durable Object.
+-	override async fetch(req: IRequest) {
+-		const sentry = createSentry(this.ctx, this.env, req)
+-		try {
+-			return await this.router.fetch(req)
+-		} catch (err) {
+-			if (sentry) {
+-				// eslint-disable-next-line @typescript-eslint/no-deprecated
+-				sentry?.captureException(err)
+-			} else {
+-				console.error(err)
+-			}
+-			return new Response('Something went wrong', {
+-				status: 500,
+-				statusText: 'Internal Server Error',
+-			})
+-		}
+-	}
+-
+-	async onRequest(req: IRequest) {
+-		// handle legacy param names
+-
+-		const url = new URL(req.url)
+-		const params = Object.fromEntries(url.searchParams.entries())
+-		const { sessionId } = params
+-
+-		if (!this.userId) {
+-			throw new Error('User data not initialized')
+-		}
+-		if (!sessionId) {
+-			throw new Error('Session ID is required')
+-		}
+-
+-		// Create the websocket pair for the client
+-		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+-		this.ctx.acceptWebSocket(serverWebSocket)
+-		const initialData = this.store.getCommitedData()
+-		if (!initialData) {
+-			throw new Error('Initial data not fetched')
+-		}
+-
+-		// todo: sync
+-		serverWebSocket.send(
+-			JSON.stringify({
+-				type: 'initial_data',
+-				initialData,
+-			} satisfies ZServerSentMessage)
+-		)
+-
+-		return new Response(null, { status: 101, webSocket: clientWebSocket })
+-	}
+-
+-	override async webSocketMessage(ws: WebSocket, message: string) {
+-		const msg = JSON.parse(message) as any as ZClientSentMessage
+-		switch (msg.type) {
+-			case 'mutate':
+-				await this.handleMutate(msg)
+-				break
+-			default:
+-				this.captureException(new Error('Unhandled message'), { data: { message } })
+-		}
+-	}
+-
+-	async commitMutation(mutationNumber: number) {
+-		const mutationIds = this.mutations
+-			.filter((m) => m.mutationNumber <= mutationNumber)
+-			.map((m) => m.mutationId)
+-		this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
+-		this.store.commitMutations(mutationIds)
+-		for (const socket of this.ctx.getWebSockets()) {
+-			socket.send(
+-				JSON.stringify({
+-					type: 'commit',
+-					mutationIds,
+-				} satisfies ZServerSentMessage)
+-			)
+-		}
+-	}
+-
+-	async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
+-		this.store.rejectMutation(mutationId)
+-		for (const socket of this.ctx.getWebSockets()) {
+-			socket.send(
+-				JSON.stringify({
+-					type: 'reject',
+-					mutationId,
+-					errorCode,
+-				} satisfies ZServerSentMessage)
+-			)
+-		}
+-	}
+-
+-	mutations: { mutationNumber: number; mutationId: string }[] = []
+-
+-	async assertValidMutation(update: ZRowUpdate) {
+-		// s is the entire set of data that the user has access to
+-		// and is up to date with all committed mutations so far.
+-		// we commit each mutation one at a time before handling the next.
+-		const s = this.store.getFullData()
+-		if (!s) {
+-			// This should never happen
+-			throw new ZMutationError(ZErrorCode.unknown_error, 'Store data not fetched')
+-		}
+-		switch (update.table) {
+-			case 'user': {
+-				const isUpdatingSelf = (update.row as TlaUser).id === this.userId
+-				if (!isUpdatingSelf)
+-					throw new ZMutationError(
+-						ZErrorCode.forbidden,
+-						'Cannot update user record that is not our own'
+-					)
+-				// todo: prevent user from updating their email?
+-				return
+-			}
+-			case 'file': {
+-				const nextFile = update.row as TlaFile
+-				const prevFile = s.files.find((f) => f.id === (update.row as any).id)
+-				if (!prevFile) {
+-					const isOwner = nextFile.ownerId === this.userId
+-					if (isOwner) return
+-					throw new ZMutationError(
+-						ZErrorCode.forbidden,
+-						`Cannot create a file for another user ${nextFile.id}`
+-					)
+-				}
+-				if (nextFile.ownerId === this.userId) return
+-				if (prevFile.shared && prevFile.sharedLinkType === 'edit') return
+-				throw new ZMutationError(
+-					ZErrorCode.forbidden,
+-					'Cannot update file that is not our own and not shared in edit mode'
+-				)
+-			}
+-			case 'file_state': {
+-				const nextFileState = update.row as TlaFileState
+-				let file = s.files.find((f) => f.id === nextFileState.fileId)
+-				if (!file) {
+-					// The user might not have access to this file yet, because they just followed a link
+-					// let's allow them to create a file state for it if it exists and is shared.
+-					file = (await this.replicator.getFileRecord(nextFileState.fileId)) ?? undefined
+-				}
+-				if (!file) {
+-					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
+-				}
+-				if (file.ownerId === this.userId) return
+-				if (file.shared) return
+-
+-				throw new ZMutationError(
+-					ZErrorCode.forbidden,
+-					"Cannot update file state of file we don't own and is not shared"
+-				)
+-			}
+-		}
+-	}
+-
+-	async handleMutate(msg: ZClientSentMessage) {
+-		try {
+-			;(await this.db.begin(async (sql) => {
+-				for (const update of msg.updates) {
+-					await this.assertValidMutation(update)
+-					switch (update.event) {
+-						case 'insert': {
+-							if (update.table === 'file_state') {
+-								const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
+-								if (Object.keys(rest).length === 0) {
+-									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO NOTHING`
+-								} else {
+-									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO UPDATE SET ${sql(rest)}`
+-								}
+-								break
+-							} else {
+-								const { id: _id, ...rest } = update.row as any
+-								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("id") DO UPDATE SET ${sql(rest)}`
+-								break
+-							}
+-						}
+-						case 'update':
+-							if (update.table === 'file_state') {
+-								const { fileId, userId, ...rest } = update.row as any
+-								await sql`update public.file_state set ${sql(rest)} where "fileId" = ${fileId} and "userId" = ${userId}`
+-							} else {
+-								const { id, ...rest } = update.row as any
+-								await sql`update ${sql('public.' + update.table)} set ${sql(rest)} where id = ${id}`
+-								if (update.table === 'file') {
+-									const currentFile = this.store.getFullData()?.files.find((f) => f.id === id)
+-									if (currentFile && currentFile.published !== rest.published) {
+-										if (rest.published) {
+-											await this.publishSnapshot(currentFile)
+-										} else {
+-											await this.unpublishSnapshot(currentFile)
+-										}
+-									} else if (
+-										currentFile &&
+-										currentFile.published &&
+-										currentFile.lastPublished < rest.lastPublished
+-									) {
+-										await this.publishSnapshot(currentFile)
+-									}
+-								}
+-							}
+-							break
+-						case 'delete':
+-							if (update.table === 'file_state') {
+-								const { fileId, userId } = update.row as any
+-								await sql`delete from public.file_state where "fileId" = ${fileId} and "userId" = ${userId}`
+-							} else {
+-								const { id } = update.row as any
+-								await sql`delete from ${sql('public.' + update.table)} where id = ${id}`
+-							}
+-							if (update.table === 'file') {
+-								const { id } = update.row as TlaFile
+-								await this.deleteFileStuff(id)
+-							}
+-							break
+-					}
+-					this.store.updateOptimisticData([update], msg.mutationId)
+-				}
+-			})) as any
+-
+-			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+-			const result = await this
+-				.db`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
+-			const mutationNumber = Number(result[0].mutationNumber)
+-			const currentMutationNumber = this.mutations.at(-1)?.mutationNumber ?? 0
+-			assert(
+-				mutationNumber > currentMutationNumber,
+-				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+-			)
+-			this.mutations.push({ mutationNumber, mutationId: msg.mutationId })
+-		} catch (e) {
+-			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
+-			this.captureException(e, {
+-				data: { errorCode: code, reason: 'mutation failed' },
+-			})
+-			this.rejectMutation(msg.mutationId, code)
+-		}
+-	}
+-
+-	onRowChange(row: object, table: ZTable, event: ZEvent) {
+-		this.store.updateCommittedData({ table, event, row })
+-		for (const socket of this.ctx.getWebSockets()) {
+-			socket.send(
+-				JSON.stringify({
+-					type: 'update',
+-					update: {
+-						table,
+-						event,
+-						row,
+-					},
+-				} satisfies ZServerSentMessage)
+-			)
+-		}
+-	}
+-
+-	async deleteFileStuff(id: string) {
+-		const fileRecord = await this.replicator.getFileRecord(id)
+-		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
+-		await room.appFileRecordDidDelete()
+-		if (!fileRecord) {
+-			throw new Error('file record not found')
+-		}
+-		const publishedSlug = fileRecord.publishedSlug
+-
+-		// Create a new slug for the published room
+-		await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(publishedSlug)
+-
+-		// remove published files
+-		const publishedPrefixKey = getR2KeyForRoom({
+-			slug: `${id}/${publishedSlug}`,
+-			isApp: true,
+-		})
+-		const publishedHistory = await listAllObjectKeys(this.env.ROOM_SNAPSHOTS, publishedPrefixKey)
+-		await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
+-		// remove edit history
+-		const r2Key = getR2KeyForRoom({ slug: id, isApp: true })
+-		const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, r2Key)
+-		await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
+-		// remove main file
+-		await this.env.ROOMS.delete(r2Key)
+-	}
+-
+-	async publishSnapshot(file: TlaFile) {
+-		if (file.ownerId !== this.userId) {
+-			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot publish file that is not our own')
+-		}
+-
+-		try {
+-			const serializedSnapshot = await getCurrentSerializedRoomSnapshot(file.id, this.env)
+-
+-			// Create a new slug for the published room
+-			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.put(file.publishedSlug, file.id)
+-
+-			// Bang the snapshot into the database
+-			await this.env.ROOM_SNAPSHOTS.put(
+-				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true }),
+-				serializedSnapshot
+-			)
+-			const currentTime = new Date().toISOString()
+-			await this.env.ROOM_SNAPSHOTS.put(
+-				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}|${currentTime}`, isApp: true }),
+-				serializedSnapshot
+-			)
+-		} catch (e) {
+-			throw new ZMutationError(ZErrorCode.publish_failed, 'Failed to publish snapshot', e)
+-		}
+-	}
+-
+-	async unpublishSnapshot(file: TlaFile) {
+-		if (file.ownerId !== this.userId) {
+-			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot unpublish file that is not our own')
+-		}
+-
+-		try {
+-			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(file.publishedSlug)
+-			await this.env.ROOM_SNAPSHOTS.delete(
+-				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true })
+-			)
+-		} catch (e) {
+-			throw new ZMutationError(ZErrorCode.unpublish_failed, 'Failed to unpublish snapshot', e)
+-		}
+-	}
+-}
+-
+-async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
+-	const keys: string[] = []
+-	let cursor: string | undefined
+-
+-	do {
+-		const result = await bucket.list({ prefix, cursor })
+-		keys.push(...result.objects.map((o) => o.key))
+-		cursor = result.truncated ? result.cursor : undefined
+-	} while (cursor)
+-
+-	return keys
+-}
+-
+-class ZMutationError extends Error {
+-	constructor(
+-		public errorCode: ZErrorCode,
+-		message: string,
+-		public cause?: unknown
+-	) {
+-		super(message)
+-	}
+-}
+
+commit 8d8471f530a48377b3223b8cb64647ef3e590a36
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 11 11:49:21 2024 +0000
+
+    [botcom] New backend (again) (#4884)
+    
+    re-attempt at #4879
+    So it turns out you have to delete a durable object class in two
+    deploys:
+    
+    1. stop using it
+    2. add the 'delete' migration in wrangler.toml
+    
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+new file mode 100644
+index 000000000..b4f11f3d3
+--- /dev/null
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -0,0 +1,406 @@
++import {
++	OptimisticAppStore,
++	ROOM_PREFIX,
++	TlaFile,
++	TlaFileState,
++	TlaUser,
++	ZClientSentMessage,
++	ZErrorCode,
++	ZEvent,
++	ZRowUpdate,
++	ZServerSentMessage,
++	ZTable,
++} from '@tldraw/dotcom-shared'
++import { assert } from '@tldraw/utils'
++import { createSentry } from '@tldraw/worker-shared'
++import { DurableObject } from 'cloudflare:workers'
++import { IRequest, Router } from 'itty-router'
++import postgres from 'postgres'
++import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
++import { type TLPostgresReplicator } from './TLPostgresReplicator'
++import { getR2KeyForRoom } from './r2'
++import { Environment } from './types'
++import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
++
++export class TLUserDurableObject extends DurableObject<Environment> {
++	db: ReturnType<typeof postgres>
++	replicator: TLPostgresReplicator
++	store = new OptimisticAppStore()
++
++	sentry
++	captureException(exception: unknown, eventHint?: EventHint) {
++		// eslint-disable-next-line @typescript-eslint/no-deprecated
++		this.sentry?.captureException(exception, eventHint) as any
++		if (!this.sentry) {
++			console.error(exception)
++		}
++	}
++
++	constructor(ctx: DurableObjectState, env: Environment) {
++		super(ctx, env)
++
++		this.sentry = createSentry(ctx, env)
++		this.replicator = this.env.TL_PG_REPLICATOR.get(
++			this.env.TL_PG_REPLICATOR.idFromName('0')
++		) as any as TLPostgresReplicator
++
++		this.db = postgres(env.BOTCOM_POSTGRES_CONNECTION_STRING)
++	}
++
++	userId: string | null = null
++
++	readonly router = Router()
++		.all('/app/:userId/*', async (req) => {
++			if (!this.userId) {
++				this.userId = req.params.userId
++			}
++			await this.ctx.blockConcurrencyWhile(async () => {
++				this.store.initialize(await this.replicator.fetchDataForUser(this.userId!))
++			})
++		})
++		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
++
++	// Handle a request to the Durable Object.
++	override async fetch(req: IRequest) {
++		const sentry = createSentry(this.ctx, this.env, req)
++		try {
++			return await this.router.fetch(req)
++		} catch (err) {
++			if (sentry) {
++				// eslint-disable-next-line @typescript-eslint/no-deprecated
++				sentry?.captureException(err)
++			} else {
++				console.error(err)
++			}
++			return new Response('Something went wrong', {
++				status: 500,
++				statusText: 'Internal Server Error',
++			})
++		}
++	}
++
++	async onRequest(req: IRequest) {
++		// handle legacy param names
++
++		const url = new URL(req.url)
++		const params = Object.fromEntries(url.searchParams.entries())
++		const { sessionId } = params
++
++		if (!this.userId) {
++			throw new Error('User data not initialized')
++		}
++		if (!sessionId) {
++			throw new Error('Session ID is required')
++		}
++
++		// Create the websocket pair for the client
++		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
++		this.ctx.acceptWebSocket(serverWebSocket)
++		const initialData = this.store.getCommitedData()
++		if (!initialData) {
++			throw new Error('Initial data not fetched')
++		}
++
++		// todo: sync
++		serverWebSocket.send(
++			JSON.stringify({
++				type: 'initial_data',
++				initialData,
++			} satisfies ZServerSentMessage)
++		)
++
++		return new Response(null, { status: 101, webSocket: clientWebSocket })
++	}
++
++	override async webSocketMessage(ws: WebSocket, message: string) {
++		const msg = JSON.parse(message) as any as ZClientSentMessage
++		switch (msg.type) {
++			case 'mutate':
++				await this.handleMutate(msg)
++				break
++			default:
++				this.captureException(new Error('Unhandled message'), { data: { message } })
++		}
++	}
++
++	async commitMutation(mutationNumber: number) {
++		const mutationIds = this.mutations
++			.filter((m) => m.mutationNumber <= mutationNumber)
++			.map((m) => m.mutationId)
++		this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
++		this.store.commitMutations(mutationIds)
++		for (const socket of this.ctx.getWebSockets()) {
++			socket.send(
++				JSON.stringify({
++					type: 'commit',
++					mutationIds,
++				} satisfies ZServerSentMessage)
++			)
++		}
++	}
++
++	async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
++		this.store.rejectMutation(mutationId)
++		for (const socket of this.ctx.getWebSockets()) {
++			socket.send(
++				JSON.stringify({
++					type: 'reject',
++					mutationId,
++					errorCode,
++				} satisfies ZServerSentMessage)
++			)
++		}
++	}
++
++	mutations: { mutationNumber: number; mutationId: string }[] = []
++
++	async assertValidMutation(update: ZRowUpdate) {
++		// s is the entire set of data that the user has access to
++		// and is up to date with all committed mutations so far.
++		// we commit each mutation one at a time before handling the next.
++		const s = this.store.getFullData()
++		if (!s) {
++			// This should never happen
++			throw new ZMutationError(ZErrorCode.unknown_error, 'Store data not fetched')
++		}
++		switch (update.table) {
++			case 'user': {
++				const isUpdatingSelf = (update.row as TlaUser).id === this.userId
++				if (!isUpdatingSelf)
++					throw new ZMutationError(
++						ZErrorCode.forbidden,
++						'Cannot update user record that is not our own'
++					)
++				// todo: prevent user from updating their email?
++				return
++			}
++			case 'file': {
++				const nextFile = update.row as TlaFile
++				const prevFile = s.files.find((f) => f.id === (update.row as any).id)
++				if (!prevFile) {
++					const isOwner = nextFile.ownerId === this.userId
++					if (isOwner) return
++					throw new ZMutationError(
++						ZErrorCode.forbidden,
++						`Cannot create a file for another user ${nextFile.id}`
++					)
++				}
++				if (nextFile.ownerId === this.userId) return
++				if (prevFile.shared && prevFile.sharedLinkType === 'edit') return
++				throw new ZMutationError(
++					ZErrorCode.forbidden,
++					'Cannot update file that is not our own and not shared in edit mode'
++				)
++			}
++			case 'file_state': {
++				const nextFileState = update.row as TlaFileState
++				let file = s.files.find((f) => f.id === nextFileState.fileId)
++				if (!file) {
++					// The user might not have access to this file yet, because they just followed a link
++					// let's allow them to create a file state for it if it exists and is shared.
++					file = (await this.replicator.getFileRecord(nextFileState.fileId)) ?? undefined
++				}
++				if (!file) {
++					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
++				}
++				if (file.ownerId === this.userId) return
++				if (file.shared) return
++
++				throw new ZMutationError(
++					ZErrorCode.forbidden,
++					"Cannot update file state of file we don't own and is not shared"
++				)
++			}
++		}
++	}
++
++	async handleMutate(msg: ZClientSentMessage) {
++		try {
++			;(await this.db.begin(async (sql) => {
++				for (const update of msg.updates) {
++					await this.assertValidMutation(update)
++					switch (update.event) {
++						case 'insert': {
++							if (update.table === 'file_state') {
++								const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
++								if (Object.keys(rest).length === 0) {
++									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO NOTHING`
++								} else {
++									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO UPDATE SET ${sql(rest)}`
++								}
++								break
++							} else {
++								const { id: _id, ...rest } = update.row as any
++								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("id") DO UPDATE SET ${sql(rest)}`
++								break
++							}
++						}
++						case 'update':
++							if (update.table === 'file_state') {
++								const { fileId, userId, ...rest } = update.row as any
++								await sql`update public.file_state set ${sql(rest)} where "fileId" = ${fileId} and "userId" = ${userId}`
++							} else {
++								const { id, ...rest } = update.row as any
++								await sql`update ${sql('public.' + update.table)} set ${sql(rest)} where id = ${id}`
++								if (update.table === 'file') {
++									const currentFile = this.store.getFullData()?.files.find((f) => f.id === id)
++									if (currentFile && currentFile.published !== rest.published) {
++										if (rest.published) {
++											await this.publishSnapshot(currentFile)
++										} else {
++											await this.unpublishSnapshot(currentFile)
++										}
++									} else if (
++										currentFile &&
++										currentFile.published &&
++										currentFile.lastPublished < rest.lastPublished
++									) {
++										await this.publishSnapshot(currentFile)
++									}
++								}
++							}
++							break
++						case 'delete':
++							if (update.table === 'file_state') {
++								const { fileId, userId } = update.row as any
++								await sql`delete from public.file_state where "fileId" = ${fileId} and "userId" = ${userId}`
++							} else {
++								const { id } = update.row as any
++								await sql`delete from ${sql('public.' + update.table)} where id = ${id}`
++							}
++							if (update.table === 'file') {
++								const { id } = update.row as TlaFile
++								await this.deleteFileStuff(id)
++							}
++							break
++					}
++					this.store.updateOptimisticData([update], msg.mutationId)
++				}
++			})) as any
++
++			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
++			const result = await this
++				.db`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
++			const mutationNumber = Number(result[0].mutationNumber)
++			const currentMutationNumber = this.mutations.at(-1)?.mutationNumber ?? 0
++			assert(
++				mutationNumber > currentMutationNumber,
++				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
++			)
++			this.mutations.push({ mutationNumber, mutationId: msg.mutationId })
++		} catch (e) {
++			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
++			this.captureException(e, {
++				data: { errorCode: code, reason: 'mutation failed' },
++			})
++			this.rejectMutation(msg.mutationId, code)
++		}
++	}
++
++	onRowChange(row: object, table: ZTable, event: ZEvent) {
++		this.store.updateCommittedData({ table, event, row })
++		for (const socket of this.ctx.getWebSockets()) {
++			socket.send(
++				JSON.stringify({
++					type: 'update',
++					update: {
++						table,
++						event,
++						row,
++					},
++				} satisfies ZServerSentMessage)
++			)
++		}
++	}
++
++	async deleteFileStuff(id: string) {
++		const fileRecord = await this.replicator.getFileRecord(id)
++		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
++		await room.appFileRecordDidDelete()
++		if (!fileRecord) {
++			throw new Error('file record not found')
++		}
++		const publishedSlug = fileRecord.publishedSlug
++
++		// Create a new slug for the published room
++		await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(publishedSlug)
++
++		// remove published files
++		const publishedPrefixKey = getR2KeyForRoom({
++			slug: `${id}/${publishedSlug}`,
++			isApp: true,
++		})
++		const publishedHistory = await listAllObjectKeys(this.env.ROOM_SNAPSHOTS, publishedPrefixKey)
++		await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
++		// remove edit history
++		const r2Key = getR2KeyForRoom({ slug: id, isApp: true })
++		const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, r2Key)
++		await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
++		// remove main file
++		await this.env.ROOMS.delete(r2Key)
++	}
++
++	async publishSnapshot(file: TlaFile) {
++		if (file.ownerId !== this.userId) {
++			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot publish file that is not our own')
++		}
++
++		try {
++			const serializedSnapshot = await getCurrentSerializedRoomSnapshot(file.id, this.env)
++
++			// Create a new slug for the published room
++			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.put(file.publishedSlug, file.id)
++
++			// Bang the snapshot into the database
++			await this.env.ROOM_SNAPSHOTS.put(
++				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true }),
++				serializedSnapshot
++			)
++			const currentTime = new Date().toISOString()
++			await this.env.ROOM_SNAPSHOTS.put(
++				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}|${currentTime}`, isApp: true }),
++				serializedSnapshot
++			)
++		} catch (e) {
++			throw new ZMutationError(ZErrorCode.publish_failed, 'Failed to publish snapshot', e)
++		}
++	}
++
++	async unpublishSnapshot(file: TlaFile) {
++		if (file.ownerId !== this.userId) {
++			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot unpublish file that is not our own')
++		}
++
++		try {
++			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(file.publishedSlug)
++			await this.env.ROOM_SNAPSHOTS.delete(
++				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true })
++			)
++		} catch (e) {
++			throw new ZMutationError(ZErrorCode.unpublish_failed, 'Failed to unpublish snapshot', e)
++		}
++	}
++}
++
++async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
++	const keys: string[] = []
++	let cursor: string | undefined
++
++	do {
++		const result = await bucket.list({ prefix, cursor })
++		keys.push(...result.objects.map((o) => o.key))
++		cursor = result.truncated ? result.cursor : undefined
++	} while (cursor)
++
++	return keys
++}
++
++class ZMutationError extends Error {
++	constructor(
++		public errorCode: ZErrorCode,
++		message: string,
++		public cause?: unknown
++	) {
++		super(message)
++	}
++}
+
+commit db326b2b05a21e86ef8731f7a2337387a82a33ea
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Nov 12 09:22:40 2024 +0100
+
+    Pin DO and a small refactor (#4889)
+    
+    If I understood Sunil correctly even a simple read should pin the DO. If
+    I'm not mistaken then doing it in `fetch` should mean it comes from the
+    user and not from another DO
+    
+    Fixes INT-457
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Pin the DO to the user's location.
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index b4f11f3d3..f0047b3fb 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -64,6 +64,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	override async fetch(req: IRequest) {
+ 		const sentry = createSentry(this.ctx, this.env, req)
+ 		try {
++			// Using storage pins the location of the DO
++			this.ctx.storage.get('pin-the-do')
+ 			return await this.router.fetch(req)
+ 		} catch (err) {
+ 			if (sentry) {
+@@ -112,7 +114,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+-	override async webSocketMessage(ws: WebSocket, message: string) {
++	override async webSocketMessage(_ws: WebSocket, message: string) {
+ 		const msg = JSON.parse(message) as any as ZClientSentMessage
+ 		switch (msg.type) {
+ 			case 'mutate':
+
+commit da4f2e39e4b657827abb22747403fd1c8a281fc8
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Nov 12 13:36:51 2024 +0100
+
+    Make some keys not updatable. (#4890)
+    
+    Prevent changing of certain columns.
+    
+    Resolves INT-449
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Prevent the users from updating certain fields (like email for users,
+    createdAt for all records, ownerId for files).
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index f0047b3fb..7dc6d3ce0 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -1,4 +1,5 @@
+ import {
++	isColumnMutable,
+ 	OptimisticAppStore,
+ 	ROOM_PREFIX,
+ 	TlaFile,
+@@ -17,8 +18,8 @@ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import postgres from 'postgres'
+ import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
+-import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { getR2KeyForRoom } from './r2'
++import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { Environment } from './types'
+ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+ 
+@@ -237,13 +238,21 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 								break
+ 							}
+ 						}
+-						case 'update':
++						case 'update': {
++							const mutableColumns = Object.keys(update.row).filter((k) =>
++								isColumnMutable(update.table, k)
++							)
++							if (mutableColumns.length === 0) continue
++							const updates = Object.fromEntries(
++								mutableColumns.map((k) => [k, (update.row as any)[k]])
++							)
+ 							if (update.table === 'file_state') {
+-								const { fileId, userId, ...rest } = update.row as any
+-								await sql`update public.file_state set ${sql(rest)} where "fileId" = ${fileId} and "userId" = ${userId}`
++								const { fileId, userId } = update.row as any
++								await sql`update public.file_state set ${sql(updates)} where "fileId" = ${fileId} and "userId" = ${userId}`
+ 							} else {
+ 								const { id, ...rest } = update.row as any
+-								await sql`update ${sql('public.' + update.table)} set ${sql(rest)} where id = ${id}`
++
++								await sql`update ${sql('public.' + update.table)} set ${sql(updates)} where id = ${id}`
+ 								if (update.table === 'file') {
+ 									const currentFile = this.store.getFullData()?.files.find((f) => f.id === id)
+ 									if (currentFile && currentFile.published !== rest.published) {
+@@ -262,6 +271,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 								}
+ 							}
+ 							break
++						}
+ 						case 'delete':
+ 							if (update.table === 'file_state') {
+ 								const { fileId, userId } = update.row as any
+
+commit cb3d14da778b3949f6690fe75871b1ccf2917b25
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Nov 12 13:56:01 2024 +0100
+
+    Only send updates to active users (#4894)
+    
+    This adds user durable object registration so that we can track which
+    users are active and only send updates to them.
+    
+    The way it works:
+    1. When the user first connects we register register the user with the
+    replicator.
+    2. The replicator stores the data about active users in a new
+    `active_user` table.
+    3. When replicator receives postgres changes it now also looks into the
+    `active_user` table to get active impacted user ids.
+    4. It then forwards these updates to user DO. These forwards succeed
+    even if the user's DO was not active before. We can use the user DO's
+    state to check for whether it has active users connected. If it doesn't
+    then we unsubscribe it. This means that any further updates won't be
+    sent to it.
+    
+    Resolves INT-459
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Only send updates to active users.
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 7dc6d3ce0..994edd403 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -57,6 +57,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			}
+ 			await this.ctx.blockConcurrencyWhile(async () => {
+ 				this.store.initialize(await this.replicator.fetchDataForUser(this.userId!))
++				this.replicator.registerUser(this.userId!)
+ 			})
+ 		})
+ 		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
+@@ -126,22 +127,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	async commitMutation(mutationNumber: number) {
+-		const mutationIds = this.mutations
+-			.filter((m) => m.mutationNumber <= mutationNumber)
+-			.map((m) => m.mutationId)
+-		this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
+-		this.store.commitMutations(mutationIds)
+-		for (const socket of this.ctx.getWebSockets()) {
+-			socket.send(
+-				JSON.stringify({
+-					type: 'commit',
+-					mutationIds,
+-				} satisfies ZServerSentMessage)
+-			)
+-		}
+-	}
+-
+ 	async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
+ 		this.store.rejectMutation(mutationId)
+ 		for (const socket of this.ctx.getWebSockets()) {
+@@ -309,22 +294,54 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	onRowChange(row: object, table: ZTable, event: ZEvent) {
+-		this.store.updateCommittedData({ table, event, row })
+-		for (const socket of this.ctx.getWebSockets()) {
+-			socket.send(
+-				JSON.stringify({
+-					type: 'update',
+-					update: {
+-						table,
+-						event,
+-						row,
+-					},
+-				} satisfies ZServerSentMessage)
+-			)
++	/* ------- RPCs -------  */
++
++	requireUserId(cb: () => void, userId: string) {
++		if (!this.userId) {
++			this.replicator.unregisterUser(userId)
++			return
+ 		}
++		cb()
++	}
++
++	onRowChange(row: object, table: ZTable, event: ZEvent, userId: string) {
++		this.requireUserId(() => {
++			this.store.updateCommittedData({ table, event, row })
++			for (const socket of this.ctx.getWebSockets()) {
++				socket.send(
++					JSON.stringify({
++						type: 'update',
++						update: {
++							table,
++							event,
++							row,
++						},
++					} satisfies ZServerSentMessage)
++				)
++			}
++		}, userId)
++	}
++
++	commitMutation(mutationNumber: number, userId: string) {
++		this.requireUserId(() => {
++			const mutationIds = this.mutations
++				.filter((m) => m.mutationNumber <= mutationNumber)
++				.map((m) => m.mutationId)
++			this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
++			this.store.commitMutations(mutationIds)
++			for (const socket of this.ctx.getWebSockets()) {
++				socket.send(
++					JSON.stringify({
++						type: 'commit',
++						mutationIds,
++					} satisfies ZServerSentMessage)
++				)
++			}
++		}, userId)
+ 	}
+ 
++	/* --------------  */
++
+ 	async deleteFileStuff(id: string) {
+ 		const fileRecord = await this.replicator.getFileRecord(id)
+ 		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
+
+commit 28ffe3448065e85cacd4c20fe4ccb98918ce9b40
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Nov 13 14:17:00 2024 +0000
+
+    handle postgres failures in replicator (#4912)
+    
+    - each time the replicator reboots it gets a new random `bootId`
+    - each time the replicator sends a row update message to a user DO it
+    includes the boot id.
+    - if the boot id doesn't match the previous one, the user DO resets its
+    state and makes the sockets reconnect to ensure consistent data.
+    - each time the replicator's postgres subscription fails it tries to
+    reboot iself
+    - active user DOs ping the replicator every 10 seconds to make sure it
+    wakes up if it was put to sleep for whatever reason (I think this is
+    unlikely to happen, but cloudflare is technically allowed to stop DOs
+    for whatever reason and they won't start up again unless we perform a
+    fetch or RPC on them. Better safe than sorry)
+    - no longer using blockConcurrencyWhile in replicator init. Instead we
+    have a mechanism for the replicator RPCs (fetchDataForUser et al) to
+    wait for a 'connected' state to be achieved.
+    - gonna add a ticket to add timeouts for these so that we can handle
+    situations of low/zero availability more gracefully for end users.
+    
+    also
+    
+    - don't throw away the active_user table on sqlite init. This could lead
+    to zombie user DOs that are active but don't receive updates.
+    
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 994edd403..4d260e8a6 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -50,15 +50,21 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	userId: string | null = null
+ 
++	lastReplicatorBootId: string | null = null
++
+ 	readonly router = Router()
+ 		.all('/app/:userId/*', async (req) => {
+ 			if (!this.userId) {
+ 				this.userId = req.params.userId
+ 			}
+-			await this.ctx.blockConcurrencyWhile(async () => {
+-				this.store.initialize(await this.replicator.fetchDataForUser(this.userId!))
+-				this.replicator.registerUser(this.userId!)
+-			})
++			if (this.lastReplicatorBootId === null) {
++				await this.ctx.blockConcurrencyWhile(async () => {
++					const { data, bootId } = await this.replicator.fetchDataForUser(this.userId!)
++					this.lastReplicatorBootId = bootId
++					this.store.initialize(data)
++					this.replicator.registerUser(this.userId!)
++				})
++			}
+ 		})
+ 		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
+ 
+@@ -100,12 +106,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		// Create the websocket pair for the client
+ 		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+ 		this.ctx.acceptWebSocket(serverWebSocket)
+-		const initialData = this.store.getCommitedData()
++		const initialData = this.store.getCommittedData()
+ 		if (!initialData) {
+ 			throw new Error('Initial data not fetched')
+ 		}
+ 
+-		// todo: sync
+ 		serverWebSocket.send(
+ 			JSON.stringify({
+ 				type: 'initial_data',
+@@ -113,6 +118,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			} satisfies ZServerSentMessage)
+ 		)
+ 
++		this.alarm()
++
+ 		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+@@ -304,8 +311,26 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		cb()
+ 	}
+ 
+-	onRowChange(row: object, table: ZTable, event: ZEvent, userId: string) {
++	// to make sure the replicator wakes up if it went to sleep for whatever
++	// reason, we ping it every every once in a while from every actively connected user DO
++	override async alarm() {
++		this.replicator.ping()
++		const alarm = await this.ctx.storage.getAlarm()
++		if ((!alarm || alarm <= Date.now()) && this.ctx.getWebSockets().length > 0) {
++			this.ctx.storage.setAlarm(Date.now() + 1000 * 10)
++		}
++	}
++
++	onRowChange(bootId: string, row: object, table: ZTable, event: ZEvent, userId: string) {
+ 		this.requireUserId(() => {
++			if (bootId !== this.lastReplicatorBootId) {
++				// replicator rebooted, reset the state and force clients to reconnect
++				this.lastReplicatorBootId = null
++				for (const socket of this.ctx.getWebSockets()) {
++					socket.close()
++				}
++				return
++			}
+ 			this.store.updateCommittedData({ table, event, row })
+ 			for (const socket of this.ctx.getWebSockets()) {
+ 				socket.send(
+@@ -330,6 +355,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
+ 			this.store.commitMutations(mutationIds)
+ 			for (const socket of this.ctx.getWebSockets()) {
++				if (socket.readyState !== WebSocket.OPEN) continue
+ 				socket.send(
+ 					JSON.stringify({
+ 						type: 'commit',
+
+commit 509ccb3ce441011137c8fee9002ee3137e5beefa
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Nov 13 18:24:59 2024 +0100
+
+    Add rate limiting. (#4898)
+    
+    Should we rate limit something else? Used session id to rate limit no
+    auth users, I guess that should be ok.
+    
+    Resolves INT-458
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 4d260e8a6..ebf352e81 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -21,6 +21,7 @@ import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
+ import { getR2KeyForRoom } from './r2'
+ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { Environment } from './types'
++import { isRateLimited } from './utils/rateLimit'
+ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+ 
+ export class TLUserDurableObject extends DurableObject<Environment> {
+@@ -57,6 +58,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			if (!this.userId) {
+ 				this.userId = req.params.userId
+ 			}
++			const rateLimited = await isRateLimited(this.env, this.userId!)
++			if (rateLimited) {
++				throw new Error('Rate limited')
++			}
+ 			if (this.lastReplicatorBootId === null) {
+ 				await this.ctx.blockConcurrencyWhile(async () => {
+ 					const { data, bootId } = await this.replicator.fetchDataForUser(this.userId!)
+@@ -124,10 +129,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	override async webSocketMessage(_ws: WebSocket, message: string) {
++		const rateLimited = await isRateLimited(this.env, this.userId!)
+ 		const msg = JSON.parse(message) as any as ZClientSentMessage
+ 		switch (msg.type) {
+ 			case 'mutate':
+-				await this.handleMutate(msg)
++				if (rateLimited) {
++					this.rejectMutation(msg.mutationId, ZErrorCode.rate_limit_exceeded)
++				} else {
++					await this.handleMutate(msg)
++				}
+ 				break
+ 			default:
+ 				this.captureException(new Error('Unhandled message'), { data: { message } })
+
+commit 314d4eab1f9aa2040e20843172af0cb9cfd3aa14
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Nov 20 09:22:59 2024 +0000
+
+    Lazy replicator (#4926)
+    
+    - the pg replicator only stores data for the users who are currently
+    active
+    - even then it only stores the users' ids, along with any guest file ids
+    they have access to.
+    - each user DO fetches their replica directly from postgres, and syncs
+    via messages from the pg replicator
+    - user DOs keep their replica in memory rather than sqlite, since they
+    are so small.
+    
+    still need to debug and stress test this, but it should be a lot more
+    scalable than the current thing.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index ebf352e81..1f2eba734 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -1,16 +1,13 @@
+ import {
+ 	isColumnMutable,
+-	OptimisticAppStore,
+ 	ROOM_PREFIX,
+ 	TlaFile,
+ 	TlaFileState,
+ 	TlaUser,
+ 	ZClientSentMessage,
+ 	ZErrorCode,
+-	ZEvent,
+ 	ZRowUpdate,
+ 	ZServerSentMessage,
+-	ZTable,
+ } from '@tldraw/dotcom-shared'
+ import { assert } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+@@ -18,40 +15,41 @@ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import postgres from 'postgres'
+ import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
++import { getPostgres } from './getPostgres'
+ import { getR2KeyForRoom } from './r2'
+ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { Environment } from './types'
++import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
++import { getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+ 
+ export class TLUserDurableObject extends DurableObject<Environment> {
+-	db: ReturnType<typeof postgres>
+-	replicator: TLPostgresReplicator
+-	store = new OptimisticAppStore()
++	private readonly db: ReturnType<typeof postgres>
++	private readonly replicator: TLPostgresReplicator
+ 
+-	sentry
+-	captureException(exception: unknown, eventHint?: EventHint) {
++	private readonly sentry
++	private captureException(exception: unknown, eventHint?: EventHint) {
+ 		// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 		this.sentry?.captureException(exception, eventHint) as any
+ 		if (!this.sentry) {
+-			console.error(exception)
++			console.error(`[TLUserDurableObject]: `, exception)
+ 		}
+ 	}
+ 
++	cache: UserDataSyncer | null = null
++
+ 	constructor(ctx: DurableObjectState, env: Environment) {
+ 		super(ctx, env)
+ 
+ 		this.sentry = createSentry(ctx, env)
+-		this.replicator = this.env.TL_PG_REPLICATOR.get(
+-			this.env.TL_PG_REPLICATOR.idFromName('0')
+-		) as any as TLPostgresReplicator
++		this.replicator = getReplicator(env)
+ 
+-		this.db = postgres(env.BOTCOM_POSTGRES_CONNECTION_STRING)
++		this.db = getPostgres(env)
++		this.debug('created')
+ 	}
+ 
+-	userId: string | null = null
+-
+-	lastReplicatorBootId: string | null = null
++	private userId: string | null = null
+ 
+ 	readonly router = Router()
+ 		.all('/app/:userId/*', async (req) => {
+@@ -62,17 +60,24 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			if (rateLimited) {
+ 				throw new Error('Rate limited')
+ 			}
+-			if (this.lastReplicatorBootId === null) {
+-				await this.ctx.blockConcurrencyWhile(async () => {
+-					const { data, bootId } = await this.replicator.fetchDataForUser(this.userId!)
+-					this.lastReplicatorBootId = bootId
+-					this.store.initialize(data)
+-					this.replicator.registerUser(this.userId!)
+-				})
++			if (this.cache === null) {
++				await this.init()
++			} else {
++				await this.cache.waitUntilConnected()
+ 			}
+ 		})
+ 		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
+ 
++	private async init() {
++		assert(this.userId, 'User ID not set')
++		this.debug('init')
++		this.cache = new UserDataSyncer(this.ctx, this.env, this.userId, (message) =>
++			this.broadcast(message)
++		)
++		this.debug('cache', !!this.cache)
++		await this.cache.waitUntilConnected()
++	}
++
+ 	// Handle a request to the Durable Object.
+ 	override async fetch(req: IRequest) {
+ 		const sentry = createSentry(this.ctx, this.env, req)
+@@ -94,27 +99,51 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
++	private assertCache(): asserts this is { cache: UserDataSyncer } {
++		assert(this.cache, 'no cache')
++	}
++
++	private readonly sockets = new Set<WebSocket>()
++
++	broadcast(message: ZServerSentMessage) {
++		const msg = JSON.stringify(message)
++		for (const socket of this.sockets) {
++			if (socket.readyState === WebSocket.OPEN) {
++				socket.send(msg)
++			} else if (
++				socket.readyState === WebSocket.CLOSED ||
++				socket.readyState === WebSocket.CLOSING
++			) {
++				this.sockets.delete(socket)
++			}
++		}
++	}
++
+ 	async onRequest(req: IRequest) {
++		assert(this.userId, 'User ID not set')
+ 		// handle legacy param names
+ 
+ 		const url = new URL(req.url)
+ 		const params = Object.fromEntries(url.searchParams.entries())
+ 		const { sessionId } = params
+ 
+-		if (!this.userId) {
+-			throw new Error('User data not initialized')
+-		}
+-		if (!sessionId) {
+-			throw new Error('Session ID is required')
+-		}
++		assert(sessionId, 'Session ID is required')
++
++		this.assertCache()
+ 
+ 		// Create the websocket pair for the client
+ 		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+-		this.ctx.acceptWebSocket(serverWebSocket)
+-		const initialData = this.store.getCommittedData()
+-		if (!initialData) {
+-			throw new Error('Initial data not fetched')
+-		}
++		serverWebSocket.accept()
++		serverWebSocket.addEventListener('message', (e) => this.handleSocketMessage(e.data.toString()))
++		serverWebSocket.addEventListener('close', () => {
++			this.sockets.delete(serverWebSocket)
++		})
++		serverWebSocket.addEventListener('error', (e) => {
++			this.captureException(e)
++			this.sockets.delete(serverWebSocket)
++		})
++		const initialData = this.cache.store.getCommittedData()
++		assert(initialData, 'Initial data not fetched')
+ 
+ 		serverWebSocket.send(
+ 			JSON.stringify({
+@@ -123,13 +152,27 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			} satisfies ZServerSentMessage)
+ 		)
+ 
+-		this.alarm()
++		this.sockets.add(serverWebSocket)
+ 
+ 		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+-	override async webSocketMessage(_ws: WebSocket, message: string) {
++	private debug(...args: any[]) {
++		// uncomment for dev time debugging
++		// console.log('[TLUserDurableObject]: ', ...args)
++		if (this.sentry) {
++			// eslint-disable-next-line @typescript-eslint/no-deprecated
++			this.sentry.addBreadcrumb({
++				message: `[TLUserDurableObject]: ${args.join(' ')}`,
++			})
++		}
++	}
++
++	private async handleSocketMessage(message: string) {
+ 		const rateLimited = await isRateLimited(this.env, this.userId!)
++		this.assertCache()
++		await this.cache.waitUntilConnected()
++
+ 		const msg = JSON.parse(message) as any as ZClientSentMessage
+ 		switch (msg.type) {
+ 			case 'mutate':
+@@ -144,8 +187,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
+-		this.store.rejectMutation(mutationId)
++	private async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
++		this.assertCache()
++		await this.cache.waitUntilConnected()
++		this.cache.store.rejectMutation(mutationId)
+ 		for (const socket of this.ctx.getWebSockets()) {
+ 			socket.send(
+ 				JSON.stringify({
+@@ -157,13 +202,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	mutations: { mutationNumber: number; mutationId: string }[] = []
+-
+-	async assertValidMutation(update: ZRowUpdate) {
++	private async assertValidMutation(update: ZRowUpdate) {
+ 		// s is the entire set of data that the user has access to
+ 		// and is up to date with all committed mutations so far.
+ 		// we commit each mutation one at a time before handling the next.
+-		const s = this.store.getFullData()
++		const s = this.cache!.store.getFullData()
+ 		if (!s) {
+ 			// This should never happen
+ 			throw new ZMutationError(ZErrorCode.unknown_error, 'Store data not fetched')
+@@ -190,11 +233,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						`Cannot create a file for another user ${nextFile.id}`
+ 					)
+ 				}
+-				if (nextFile.ownerId === this.userId) return
++				if (prevFile.ownerId === this.userId) return
+ 				if (prevFile.shared && prevFile.sharedLinkType === 'edit') return
+ 				throw new ZMutationError(
+ 					ZErrorCode.forbidden,
+-					'Cannot update file that is not our own and not shared in edit mode'
++					'Cannot update file that is not our own and not shared in edit mode' +
++						` user id ${this.userId} ownerId ${prevFile.ownerId}`
+ 				)
+ 			}
+ 			case 'file_state': {
+@@ -219,7 +263,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	async handleMutate(msg: ZClientSentMessage) {
++	private async handleMutate(msg: ZClientSentMessage) {
++		this.assertCache()
+ 		try {
+ 			;(await this.db.begin(async (sql) => {
+ 				for (const update of msg.updates) {
+@@ -256,7 +301,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 								await sql`update ${sql('public.' + update.table)} set ${sql(updates)} where id = ${id}`
+ 								if (update.table === 'file') {
+-									const currentFile = this.store.getFullData()?.files.find((f) => f.id === id)
++									const currentFile = this.cache.store.getFullData()?.files.find((f) => f.id === id)
+ 									if (currentFile && currentFile.published !== rest.published) {
+ 										if (rest.published) {
+ 											await this.publishSnapshot(currentFile)
+@@ -288,7 +333,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 							}
+ 							break
+ 					}
+-					this.store.updateOptimisticData([update], msg.mutationId)
++					this.cache.store.updateOptimisticData([update], msg.mutationId)
+ 				}
+ 			})) as any
+ 
+@@ -296,12 +341,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			const result = await this
+ 				.db`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
+ 			const mutationNumber = Number(result[0].mutationNumber)
+-			const currentMutationNumber = this.mutations.at(-1)?.mutationNumber ?? 0
++			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+ 			assert(
+ 				mutationNumber > currentMutationNumber,
+ 				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+ 			)
+-			this.mutations.push({ mutationNumber, mutationId: msg.mutationId })
++			this.cache.mutations.push({ mutationNumber, mutationId: msg.mutationId })
+ 		} catch (e) {
+ 			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
+ 			this.captureException(e, {
+@@ -313,72 +358,20 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	/* ------- RPCs -------  */
+ 
+-	requireUserId(cb: () => void, userId: string) {
+-		if (!this.userId) {
+-			this.replicator.unregisterUser(userId)
+-			return
+-		}
+-		cb()
+-	}
+-
+-	// to make sure the replicator wakes up if it went to sleep for whatever
+-	// reason, we ping it every every once in a while from every actively connected user DO
+-	override async alarm() {
+-		this.replicator.ping()
+-		const alarm = await this.ctx.storage.getAlarm()
+-		if ((!alarm || alarm <= Date.now()) && this.ctx.getWebSockets().length > 0) {
+-			this.ctx.storage.setAlarm(Date.now() + 1000 * 10)
++	async handleReplicationEvent(event: ZReplicationEvent) {
++		this.debug('replication event', event, !!this.cache)
++		if (!this.cache) {
++			return 'unregister'
+ 		}
+-	}
+ 
+-	onRowChange(bootId: string, row: object, table: ZTable, event: ZEvent, userId: string) {
+-		this.requireUserId(() => {
+-			if (bootId !== this.lastReplicatorBootId) {
+-				// replicator rebooted, reset the state and force clients to reconnect
+-				this.lastReplicatorBootId = null
+-				for (const socket of this.ctx.getWebSockets()) {
+-					socket.close()
+-				}
+-				return
+-			}
+-			this.store.updateCommittedData({ table, event, row })
+-			for (const socket of this.ctx.getWebSockets()) {
+-				socket.send(
+-					JSON.stringify({
+-						type: 'update',
+-						update: {
+-							table,
+-							event,
+-							row,
+-						},
+-					} satisfies ZServerSentMessage)
+-				)
+-			}
+-		}, userId)
+-	}
++		this.cache.handleReplicationEvent(event)
+ 
+-	commitMutation(mutationNumber: number, userId: string) {
+-		this.requireUserId(() => {
+-			const mutationIds = this.mutations
+-				.filter((m) => m.mutationNumber <= mutationNumber)
+-				.map((m) => m.mutationId)
+-			this.mutations = this.mutations.filter((m) => m.mutationNumber > mutationNumber)
+-			this.store.commitMutations(mutationIds)
+-			for (const socket of this.ctx.getWebSockets()) {
+-				if (socket.readyState !== WebSocket.OPEN) continue
+-				socket.send(
+-					JSON.stringify({
+-						type: 'commit',
+-						mutationIds,
+-					} satisfies ZServerSentMessage)
+-				)
+-			}
+-		}, userId)
++		return 'ok'
+ 	}
+ 
+ 	/* --------------  */
+ 
+-	async deleteFileStuff(id: string) {
++	private async deleteFileStuff(id: string) {
+ 		const fileRecord = await this.replicator.getFileRecord(id)
+ 		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
+ 		await room.appFileRecordDidDelete()
+@@ -405,7 +398,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		await this.env.ROOMS.delete(r2Key)
+ 	}
+ 
+-	async publishSnapshot(file: TlaFile) {
++	private async publishSnapshot(file: TlaFile) {
+ 		if (file.ownerId !== this.userId) {
+ 			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot publish file that is not our own')
+ 		}
+@@ -431,7 +424,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	async unpublishSnapshot(file: TlaFile) {
++	private async unpublishSnapshot(file: TlaFile) {
+ 		if (file.ownerId !== this.userId) {
+ 			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot unpublish file that is not our own')
+ 		}
+
+commit bcec83df43974b4084e63289048fe526a6619991
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 25 09:28:16 2024 +0000
+
+    [botcom] simplify replicator dispatch logic (#4965)
+    
+    This stuff was a little bit of a mess. I made it synchronous again and
+    hopefully caught an extra edge case or two.
+    
+    - added a `isFileOwner` field to file_state, populated by triggers on
+    both the file table and the file_state table.
+    - used `isFileOwner` to avoid checking ownership while dispatching
+    events in the replicator
+    - simplified the event dispatching logic by moving it out into separate
+    methods for each table, so it's easier to follow what's happening.
+    - fixed the 'file deleting isn't working in prod' bug, that was to do
+    with r2 complaining about things it doesn't complain about in dev mode.
+    
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 1f2eba734..7a7f00bd7 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -163,7 +163,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		if (this.sentry) {
+ 			// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 			this.sentry.addBreadcrumb({
+-				message: `[TLUserDurableObject]: ${args.join(' ')}`,
++				message: `[TLUserDurableObject]: ${args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : a)).join(' ')}`,
+ 			})
+ 		}
+ 	}
+@@ -266,7 +266,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async handleMutate(msg: ZClientSentMessage) {
+ 		this.assertCache()
+ 		try {
+-			;(await this.db.begin(async (sql) => {
++			await this.db.begin(async (sql) => {
+ 				for (const update of msg.updates) {
+ 					await this.assertValidMutation(update)
+ 					switch (update.event) {
+@@ -335,7 +335,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					}
+ 					this.cache.store.updateOptimisticData([update], msg.mutationId)
+ 				}
+-			})) as any
++			})
+ 
+ 			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+ 			const result = await this
+@@ -389,11 +389,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			isApp: true,
+ 		})
+ 		const publishedHistory = await listAllObjectKeys(this.env.ROOM_SNAPSHOTS, publishedPrefixKey)
+-		await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
++		if (publishedHistory.length > 0) {
++			await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
++		}
+ 		// remove edit history
+ 		const r2Key = getR2KeyForRoom({ slug: id, isApp: true })
+ 		const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, r2Key)
+-		await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
++		if (editHistory.length > 0) {
++			await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
++		}
+ 		// remove main file
+ 		await this.env.ROOMS.delete(r2Key)
+ 	}
+
+commit 9211d3a8145f39241c3f4ef7f8f859195460c386
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Nov 25 10:40:31 2024 +0100
+
+    Fix an issue with rejections not getting sent. (#4968)
+    
+    Looks like we were using incorrect sockets. Also noticed we weren't
+    awaiting some async method calls.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Fix an issue with mutation rejections not being sent.
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 7a7f00bd7..2f5ccb6cc 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -177,7 +177,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		switch (msg.type) {
+ 			case 'mutate':
+ 				if (rateLimited) {
+-					this.rejectMutation(msg.mutationId, ZErrorCode.rate_limit_exceeded)
++					await this.rejectMutation(msg.mutationId, ZErrorCode.rate_limit_exceeded)
+ 				} else {
+ 					await this.handleMutate(msg)
+ 				}
+@@ -191,15 +191,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.assertCache()
+ 		await this.cache.waitUntilConnected()
+ 		this.cache.store.rejectMutation(mutationId)
+-		for (const socket of this.ctx.getWebSockets()) {
+-			socket.send(
+-				JSON.stringify({
+-					type: 'reject',
+-					mutationId,
+-					errorCode,
+-				} satisfies ZServerSentMessage)
+-			)
+-		}
++		this.broadcast({
++			type: 'reject',
++			mutationId,
++			errorCode,
++		} satisfies ZServerSentMessage)
+ 	}
+ 
+ 	private async assertValidMutation(update: ZRowUpdate) {
+@@ -352,7 +348,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.captureException(e, {
+ 				data: { errorCode: code, reason: 'mutation failed' },
+ 			})
+-			this.rejectMutation(msg.mutationId, code)
++			await this.rejectMutation(msg.mutationId, code)
+ 		}
+ 	}
+ 
+
+commit 8329c84b1049d98fd94d1ff46e29901205394fea
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Nov 28 10:17:27 2024 +0000
+
+    [botcom] auto migrations again (#5014)
+    
+    redoing #5005 with pooled postgres connections
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 2f5ccb6cc..f74a5a0f5 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -45,7 +45,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.sentry = createSentry(ctx, env)
+ 		this.replicator = getReplicator(env)
+ 
+-		this.db = getPostgres(env)
++		this.db = getPostgres(env, { pooled: true })
+ 		this.debug('created')
+ 	}
+ 
+@@ -71,7 +71,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async init() {
+ 		assert(this.userId, 'User ID not set')
+ 		this.debug('init')
+-		this.cache = new UserDataSyncer(this.ctx, this.env, this.userId, (message) =>
++		this.cache = new UserDataSyncer(this.ctx, this.env, this.db, this.userId, (message) =>
+ 			this.broadcast(message)
+ 		)
+ 		this.debug('cache', !!this.cache)
+
+commit 0bacaf109bfecc855b795bd672fc1fe6c9e19ec4
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Nov 29 12:09:46 2024 +0000
+
+    [botcom] add protocol version  (#5024)
+    
+    This enables selective backwards compatibility, i.e. knowing which
+    version of a client is running so we can accommodate them or force them
+    to upgrade.
+    
+    Here's what the latter looks like
+    <img width="973" alt="image"
+    src="https://github.com/user-attachments/assets/c16d3795-d8fa-4d47-ac71-d9d4b68a9ed9">
+    
+    You can click 'later' and finish up any drawing stuff but you will get
+    frequent toasts telling you to reload, and app mutations will not be
+    applied even locally, until you do eventually refresh.
+    
+    Hopefully this should only ever be seen by people who leave their tabs
+    running for months at a time. Not sure how we'll do this with zero.
+    
+    ### Change type
+    
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index f74a5a0f5..c894eba78 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -4,11 +4,13 @@ import {
+ 	TlaFile,
+ 	TlaFileState,
+ 	TlaUser,
++	Z_PROTOCOL_VERSION,
+ 	ZClientSentMessage,
+ 	ZErrorCode,
+ 	ZRowUpdate,
+ 	ZServerSentMessage,
+ } from '@tldraw/dotcom-shared'
++import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from '@tldraw/sync-core'
+ import { assert } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+@@ -127,13 +129,22 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		const params = Object.fromEntries(url.searchParams.entries())
+ 		const { sessionId } = params
+ 
++		const protocolVersion = params.protocolVersion ? Number(params.protocolVersion) : 1
++
+ 		assert(sessionId, 'Session ID is required')
++		assert(Number.isFinite(protocolVersion), `Invalid protocol version ${params.protocolVersion}`)
+ 
+ 		this.assertCache()
+ 
+ 		// Create the websocket pair for the client
+ 		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+ 		serverWebSocket.accept()
++
++		if (Number(protocolVersion) !== Z_PROTOCOL_VERSION || this.__test__isForceDowngraded) {
++			serverWebSocket.close(TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
++			return new Response(null, { status: 101, webSocket: clientWebSocket })
++		}
++
+ 		serverWebSocket.addEventListener('message', (e) => this.handleSocketMessage(e.data.toString()))
+ 		serverWebSocket.addEventListener('close', () => {
+ 			this.sockets.delete(serverWebSocket)
+@@ -438,6 +449,19 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			throw new ZMutationError(ZErrorCode.unpublish_failed, 'Failed to unpublish snapshot', e)
+ 		}
+ 	}
++
++	/** sneaky test stuff */
++	// this allows us to test the 'your client is out of date please refresh' flow
++	private __test__isForceDowngraded = false
++	async __test__downgradeClient(isDowngraded: boolean) {
++		if (this.env.IS_LOCAL !== 'true') {
++			return
++		}
++		this.__test__isForceDowngraded = isDowngraded
++		this.sockets.forEach((socket) => {
++			socket.close()
++		})
++	}
+ }
+ 
+ async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
+
+commit ca54db7c3c7a7c89f38b688254f69740893ec857
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Thu Dec 5 17:47:37 2024 +0100
+
+    Add gecko analytics (#5028)
+    
+    Adds basic analytics for our newly introduced durable objects.
+    
+    I also created a few more visualizations in our on our Events grafana
+    dashboard. You can now also choose which environment you want to look at
+    using the filter on the top left of the dashboard.
+    
+    Link to [check the
+    events](https://tldraw.grafana.net/d/adgumkhou3chsd/events?orgId=1&from=now-2d&to=now&timezone=browser&var-environment=pr-5028)
+    for this PR. Data is quite sparse now.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index c894eba78..0caee7544 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -20,8 +20,9 @@ import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
+ import { getPostgres } from './getPostgres'
+ import { getR2KeyForRoom } from './r2'
+ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+-import { Environment } from './types'
++import { Analytics, Environment, TLUserDurableObjectEvent } from './types'
+ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
++import { EventData, writeDataPoint } from './utils/analytics'
+ import { getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+@@ -29,6 +30,7 @@ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializ
+ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private readonly db: ReturnType<typeof postgres>
+ 	private readonly replicator: TLPostgresReplicator
++	private measure: Analytics | undefined
+ 
+ 	private readonly sentry
+ 	private captureException(exception: unknown, eventHint?: EventHint) {
+@@ -49,6 +51,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 		this.db = getPostgres(env, { pooled: true })
+ 		this.debug('created')
++		this.measure = env.MEASURE
+ 	}
+ 
+ 	private userId: string | null = null
+@@ -60,6 +63,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			}
+ 			const rateLimited = await isRateLimited(this.env, this.userId!)
+ 			if (rateLimited) {
++				this.logEvent({ type: 'rate_limited', id: this.userId })
+ 				throw new Error('Rate limited')
+ 			}
+ 			if (this.cache === null) {
+@@ -73,8 +77,13 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async init() {
+ 		assert(this.userId, 'User ID not set')
+ 		this.debug('init')
+-		this.cache = new UserDataSyncer(this.ctx, this.env, this.db, this.userId, (message) =>
+-			this.broadcast(message)
++		this.cache = new UserDataSyncer(
++			this.ctx,
++			this.env,
++			this.db,
++			this.userId,
++			(message) => this.broadcast(message),
++			this.logEvent.bind(this)
+ 		)
+ 		this.debug('cache', !!this.cache)
+ 		await this.cache.waitUntilConnected()
+@@ -108,6 +117,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private readonly sockets = new Set<WebSocket>()
+ 
+ 	broadcast(message: ZServerSentMessage) {
++		this.logEvent({ type: 'broadcast_message', id: this.userId! })
+ 		const msg = JSON.stringify(message)
+ 		for (const socket of this.sockets) {
+ 			if (socket.readyState === WebSocket.OPEN) {
+@@ -188,8 +198,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		switch (msg.type) {
+ 			case 'mutate':
+ 				if (rateLimited) {
++					this.logEvent({ type: 'rate_limited', id: this.userId! })
+ 					await this.rejectMutation(msg.mutationId, ZErrorCode.rate_limit_exceeded)
+ 				} else {
++					this.logEvent({ type: 'mutation', id: this.userId! })
+ 					await this.handleMutate(msg)
+ 				}
+ 				break
+@@ -200,6 +212,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
+ 		this.assertCache()
++		this.logEvent({ type: 'reject_mutation', id: this.userId! })
+ 		await this.cache.waitUntilConnected()
+ 		this.cache.store.rejectMutation(mutationId)
+ 		this.broadcast({
+@@ -366,6 +379,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	/* ------- RPCs -------  */
+ 
+ 	async handleReplicationEvent(event: ZReplicationEvent) {
++		this.logEvent({ type: 'replication_event', id: this.userId ?? 'anon' })
+ 		this.debug('replication event', event, !!this.cache)
+ 		if (!this.cache) {
+ 			return 'unregister'
+@@ -450,6 +464,24 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
++	private writeEvent(eventData: EventData) {
++		writeDataPoint(this.measure, this.env, 'user_durable_object', eventData)
++	}
++
++	logEvent(event: TLUserDurableObjectEvent) {
++		switch (event.type) {
++			case 'reboot_duration':
++				this.writeEvent({
++					blobs: [event.type, event.id],
++					doubles: [event.duration],
++				})
++				break
++
++			default:
++				this.writeEvent({ blobs: [event.type, event.id] })
++		}
++	}
++
+ 	/** sneaky test stuff */
+ 	// this allows us to test the 'your client is out of date please refresh' flow
+ 	private __test__isForceDowngraded = false
+
+commit f30a144383a12b372bf08b6eeb8ee64052f07d28
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Dec 6 13:27:05 2024 +0000
+
+    [botcom] retry user requests on connection failure (#5073)
+    
+    Added a retry helper to utils, and customized it for retrying postgres
+    stuff if there's a connection issue.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 0caee7544..e85e6eb8d 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -25,6 +25,7 @@ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
+ import { EventData, writeDataPoint } from './utils/analytics'
+ import { getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
++import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+ 
+ export class TLUserDurableObject extends DurableObject<Environment> {
+@@ -283,80 +284,91 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	private async handleMutate(msg: ZClientSentMessage) {
++	private async _doMutate(msg: ZClientSentMessage) {
+ 		this.assertCache()
+-		try {
+-			await this.db.begin(async (sql) => {
+-				for (const update of msg.updates) {
+-					await this.assertValidMutation(update)
+-					switch (update.event) {
+-						case 'insert': {
+-							if (update.table === 'file_state') {
+-								const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
+-								if (Object.keys(rest).length === 0) {
+-									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO NOTHING`
+-								} else {
+-									await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO UPDATE SET ${sql(rest)}`
+-								}
+-								break
++		await this.db.begin(async (sql) => {
++			for (const update of msg.updates) {
++				await this.assertValidMutation(update)
++				switch (update.event) {
++					case 'insert': {
++						if (update.table === 'file_state') {
++							const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
++							if (Object.keys(rest).length === 0) {
++								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO NOTHING`
+ 							} else {
+-								const { id: _id, ...rest } = update.row as any
+-								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("id") DO UPDATE SET ${sql(rest)}`
+-								break
++								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO UPDATE SET ${sql(rest)}`
+ 							}
++							break
++						} else {
++							const { id: _id, ...rest } = update.row as any
++							await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("id") DO UPDATE SET ${sql(rest)}`
++							break
+ 						}
+-						case 'update': {
+-							const mutableColumns = Object.keys(update.row).filter((k) =>
+-								isColumnMutable(update.table, k)
+-							)
+-							if (mutableColumns.length === 0) continue
+-							const updates = Object.fromEntries(
+-								mutableColumns.map((k) => [k, (update.row as any)[k]])
+-							)
+-							if (update.table === 'file_state') {
+-								const { fileId, userId } = update.row as any
+-								await sql`update public.file_state set ${sql(updates)} where "fileId" = ${fileId} and "userId" = ${userId}`
+-							} else {
+-								const { id, ...rest } = update.row as any
+-
+-								await sql`update ${sql('public.' + update.table)} set ${sql(updates)} where id = ${id}`
+-								if (update.table === 'file') {
+-									const currentFile = this.cache.store.getFullData()?.files.find((f) => f.id === id)
+-									if (currentFile && currentFile.published !== rest.published) {
+-										if (rest.published) {
+-											await this.publishSnapshot(currentFile)
+-										} else {
+-											await this.unpublishSnapshot(currentFile)
+-										}
+-									} else if (
+-										currentFile &&
+-										currentFile.published &&
+-										currentFile.lastPublished < rest.lastPublished
+-									) {
++					}
++					case 'update': {
++						const mutableColumns = Object.keys(update.row).filter((k) =>
++							isColumnMutable(update.table, k)
++						)
++						if (mutableColumns.length === 0) continue
++						const updates = Object.fromEntries(
++							mutableColumns.map((k) => [k, (update.row as any)[k]])
++						)
++						if (update.table === 'file_state') {
++							const { fileId, userId } = update.row as any
++							await sql`update public.file_state set ${sql(updates)} where "fileId" = ${fileId} and "userId" = ${userId}`
++						} else {
++							const { id, ...rest } = update.row as any
++
++							await sql`update ${sql('public.' + update.table)} set ${sql(updates)} where id = ${id}`
++							if (update.table === 'file') {
++								const currentFile = this.cache.store.getFullData()?.files.find((f) => f.id === id)
++								if (currentFile && currentFile.published !== rest.published) {
++									if (rest.published) {
+ 										await this.publishSnapshot(currentFile)
++									} else {
++										await this.unpublishSnapshot(currentFile)
+ 									}
++								} else if (
++									currentFile &&
++									currentFile.published &&
++									currentFile.lastPublished < rest.lastPublished
++								) {
++									await this.publishSnapshot(currentFile)
+ 								}
+ 							}
+-							break
+ 						}
+-						case 'delete':
+-							if (update.table === 'file_state') {
+-								const { fileId, userId } = update.row as any
+-								await sql`delete from public.file_state where "fileId" = ${fileId} and "userId" = ${userId}`
+-							} else {
+-								const { id } = update.row as any
+-								await sql`delete from ${sql('public.' + update.table)} where id = ${id}`
+-							}
+-							if (update.table === 'file') {
+-								const { id } = update.row as TlaFile
+-								await this.deleteFileStuff(id)
+-							}
+-							break
++						break
+ 					}
+-					this.cache.store.updateOptimisticData([update], msg.mutationId)
++					case 'delete':
++						if (update.table === 'file_state') {
++							const { fileId, userId } = update.row as any
++							await sql`delete from public.file_state where "fileId" = ${fileId} and "userId" = ${userId}`
++						} else {
++							const { id } = update.row as any
++							await sql`delete from ${sql('public.' + update.table)} where id = ${id}`
++						}
++						if (update.table === 'file') {
++							const { id } = update.row as TlaFile
++							await this.deleteFileStuff(id)
++						}
++						break
+ 				}
+-			})
++				this.cache.store.updateOptimisticData([update], msg.mutationId)
++			}
++		})
++	}
+ 
++	private async handleMutate(msg: ZClientSentMessage) {
++		this.assertCache()
++		try {
++			// we connect to pg via a pooler, so in the case that the pool is exhausted
++			// we need to retry the connection. (also in the case that a neon branch is asleep apparently?)
++			await retryOnConnectionFailure(
++				() => this._doMutate(msg),
++				() => {
++					this.logEvent({ type: 'connect_retry', id: this.userId! })
++				}
++			)
+ 			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+ 			const result = await this
+ 				.db`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
+
+commit 13ac3b31f5ab51e215e3cde7e92b809d87ec77be
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Dec 17 09:03:42 2024 +0000
+
+    [botcom] stress test fixes (#5126)
+    
+    This PR fixes two consistency issues we ran into while stress testing
+    
+    1. Send the messages to the user DOs in guaranteed order, using one
+    ExecutionQueue per user.
+    2. Update the mutation number in a transaction, to make sure the mutated
+    data is synced before the mutation number gets back.
+    
+    this involved doing a few extra bits
+    
+    - set up migrations for sqlite in the replicator
+    - add a per-user sequence id and sequence number, so that user DOs can
+    reboot if there's any weird issues that prevent things from arriving in
+    order despite the execution queues.
+    
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index e85e6eb8d..44024d935 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -370,15 +370,25 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 			)
+ 			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+-			const result = await this
+-				.db`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
+-			const mutationNumber = Number(result[0].mutationNumber)
+-			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+-			assert(
+-				mutationNumber > currentMutationNumber,
+-				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+-			)
+-			this.cache.mutations.push({ mutationNumber, mutationId: msg.mutationId })
++			this.debug('mutation success', this.userId)
++			await this.db
++				.begin(async (sql) => {
++					const result =
++						await sql`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
++					this.debug('mutation number success', this.userId)
++					const mutationNumber = Number(result[0].mutationNumber)
++					const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
++					assert(
++						mutationNumber > currentMutationNumber,
++						`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
++					)
++					this.debug('pushing mutation to cache', this.userId, mutationNumber)
++					this.cache.mutations.push({ mutationNumber, mutationId: msg.mutationId })
++				})
++				.catch((e) => {
++					this.cache.mutations = this.cache.mutations.filter((m) => m.mutationId !== msg.mutationId)
++					throw e
++				})
+ 		} catch (e) {
+ 			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
+ 			this.captureException(e, {
+
+commit de9694fbb08e31bc97f51721be5a8b0f8fb53ade
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Dec 17 13:26:31 2024 +0100
+
+    Add name and timeout params. (#5129)
+    
+    Improve `getPostgres` helper.:
+    - We can now pass in a name, which allows us to see the who is holding
+    an open connection in `pg_stat_activity`. See `application_name` column
+    below.
+    ![CleanShot 2024-12-16 at 15 47
+    58@2x](https://github.com/user-attachments/assets/a9f62e5c-4198-478d-9020-12a74841c48e)
+    - `idleTimeout` option with a default of 30.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 44024d935..0eeee9964 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -50,7 +50,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.sentry = createSentry(ctx, env)
+ 		this.replicator = getReplicator(env)
+ 
+-		this.db = getPostgres(env, { pooled: true })
++		this.db = getPostgres(env, { pooled: true, name: 'TLUserDurableObject' })
+ 		this.debug('created')
+ 		this.measure = env.MEASURE
+ 	}
+
+commit ae594c621212de1d5694b8ce17b2585f1dae1983
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Jan 8 10:22:26 2025 +0100
+
+    Move to kysely (#5140)
+    
+    Switches from using postgres js to kysely. We still use postgres js for
+    subscription to the db.
+    
+    During stress tests we noticed that postgres js was not good at managing
+    the connection pool. Kysely performed much better.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 0eeee9964..5d8ea1af3 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -1,4 +1,5 @@
+ import {
++	DB,
+ 	isColumnMutable,
+ 	ROOM_PREFIX,
+ 	TlaFile,
+@@ -15,9 +16,9 @@ import { assert } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+-import postgres from 'postgres'
++import { Kysely, sql } from 'kysely'
+ import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
+-import { getPostgres } from './getPostgres'
++import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { Analytics, Environment, TLUserDurableObjectEvent } from './types'
+@@ -29,7 +30,7 @@ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+ 
+ export class TLUserDurableObject extends DurableObject<Environment> {
+-	private readonly db: ReturnType<typeof postgres>
++	private readonly db: Kysely<DB>
+ 	private readonly replicator: TLPostgresReplicator
+ 	private measure: Analytics | undefined
+ 
+@@ -50,7 +51,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.sentry = createSentry(ctx, env)
+ 		this.replicator = getReplicator(env)
+ 
+-		this.db = getPostgres(env, { pooled: true, name: 'TLUserDurableObject' })
++		this.db = createPostgresConnectionPool(env, 'TLUserDurableObject')
+ 		this.debug('created')
+ 		this.measure = env.MEASURE
+ 	}
+@@ -286,22 +287,32 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private async _doMutate(msg: ZClientSentMessage) {
+ 		this.assertCache()
+-		await this.db.begin(async (sql) => {
++		await this.db.transaction().execute(async (tx) => {
+ 			for (const update of msg.updates) {
+ 				await this.assertValidMutation(update)
+ 				switch (update.event) {
+ 					case 'insert': {
+ 						if (update.table === 'file_state') {
+ 							const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
+-							if (Object.keys(rest).length === 0) {
+-								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO NOTHING`
+-							} else {
+-								await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("fileId", "userId") DO UPDATE SET ${sql(rest)}`
+-							}
++							await tx
++								.insertInto(update.table)
++								.values(update.row as TlaFileState)
++								.onConflict((oc) => {
++									if (Object.keys(rest).length === 0) {
++										return oc.columns(['fileId', 'userId']).doNothing()
++									} else {
++										return oc.columns(['fileId', 'userId']).doUpdateSet(rest)
++									}
++								})
++								.execute()
+ 							break
+ 						} else {
+ 							const { id: _id, ...rest } = update.row as any
+-							await sql`insert into ${sql('public.' + update.table)} ${sql(update.row)} ON CONFLICT ("id") DO UPDATE SET ${sql(rest)}`
++							await tx
++								.insertInto(update.table)
++								.values(update.row as any)
++								.onConflict((oc) => oc.column('id').doUpdateSet(rest))
++								.execute()
+ 							break
+ 						}
+ 					}
+@@ -315,11 +326,16 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						)
+ 						if (update.table === 'file_state') {
+ 							const { fileId, userId } = update.row as any
+-							await sql`update public.file_state set ${sql(updates)} where "fileId" = ${fileId} and "userId" = ${userId}`
++							await tx
++								.updateTable('file_state')
++								.set(updates)
++								.where('fileId', '=', fileId)
++								.where('userId', '=', userId)
++								.execute()
+ 						} else {
+ 							const { id, ...rest } = update.row as any
+ 
+-							await sql`update ${sql('public.' + update.table)} set ${sql(updates)} where id = ${id}`
++							await tx.updateTable(update.table).set(updates).where('id', '=', id).execute()
+ 							if (update.table === 'file') {
+ 								const currentFile = this.cache.store.getFullData()?.files.find((f) => f.id === id)
+ 								if (currentFile && currentFile.published !== rest.published) {
+@@ -342,10 +358,14 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					case 'delete':
+ 						if (update.table === 'file_state') {
+ 							const { fileId, userId } = update.row as any
+-							await sql`delete from public.file_state where "fileId" = ${fileId} and "userId" = ${userId}`
++							await tx
++								.deleteFrom('file_state')
++								.where('fileId', '=', fileId)
++								.where('userId', '=', userId)
++								.execute()
+ 						} else {
+ 							const { id } = update.row as any
+-							await sql`delete from ${sql('public.' + update.table)} where id = ${id}`
++							await tx.deleteFrom(update.table).where('id', '=', id).execute()
+ 						}
+ 						if (update.table === 'file') {
+ 							const { id } = update.row as TlaFile
+@@ -372,11 +392,23 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+ 			this.debug('mutation success', this.userId)
+ 			await this.db
+-				.begin(async (sql) => {
+-					const result =
+-						await sql`insert into public.user_mutation_number ("userId", "mutationNumber") values (${this.userId}, 1) on conflict ("userId") do update set "mutationNumber" = user_mutation_number."mutationNumber" + 1 returning "mutationNumber"`
++				.transaction()
++				.execute(async (tx) => {
++					const result = await tx
++						.insertInto('user_mutation_number')
++						.values({
++							userId: this.userId!,
++							mutationNumber: 1,
++						})
++						.onConflict((oc) =>
++							oc.column('userId').doUpdateSet({
++								mutationNumber: sql`user_mutation_number."mutationNumber" + 1`,
++							})
++						)
++						.returning('mutationNumber')
++						.executeTakeFirstOrThrow()
+ 					this.debug('mutation number success', this.userId)
+-					const mutationNumber = Number(result[0].mutationNumber)
++					const mutationNumber = Number(result.mutationNumber)
+ 					const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+ 					assert(
+ 						mutationNumber > currentMutationNumber,
+
+commit c44d4fee2684859bda323208ffc9a053256aa6de
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Jan 15 09:42:49 2025 +0000
+
+    send extra data to sentry properly (#5216)
+    
+    We were not doing this properly
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 5d8ea1af3..2d094f987 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -17,7 +17,6 @@ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { Kysely, sql } from 'kysely'
+-import type { EventHint } from 'toucan-js/node_modules/@sentry/types'
+ import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+@@ -35,9 +34,13 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private measure: Analytics | undefined
+ 
+ 	private readonly sentry
+-	private captureException(exception: unknown, eventHint?: EventHint) {
++	private captureException(exception: unknown, extras?: Record<string, unknown>) {
+ 		// eslint-disable-next-line @typescript-eslint/no-deprecated
+-		this.sentry?.captureException(exception, eventHint) as any
++		this.sentry?.withScope((scope) => {
++			if (extras) scope.setExtras(extras)
++			// eslint-disable-next-line @typescript-eslint/no-deprecated
++			this.sentry?.captureException(exception) as any
++		})
+ 		if (!this.sentry) {
+ 			console.error(`[TLUserDurableObject]: `, exception)
+ 		}
+@@ -162,7 +165,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.sockets.delete(serverWebSocket)
+ 		})
+ 		serverWebSocket.addEventListener('error', (e) => {
+-			this.captureException(e)
++			this.captureException(e, { source: 'serverWebSocket "error" event' })
+ 			this.sockets.delete(serverWebSocket)
+ 		})
+ 		const initialData = this.cache.store.getCommittedData()
+@@ -208,7 +211,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 				break
+ 			default:
+-				this.captureException(new Error('Unhandled message'), { data: { message } })
++				this.captureException(new Error('Unhandled message'), { message })
+ 		}
+ 	}
+ 
+@@ -421,10 +424,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					this.cache.mutations = this.cache.mutations.filter((m) => m.mutationId !== msg.mutationId)
+ 					throw e
+ 				})
+-		} catch (e) {
++		} catch (e: any) {
+ 			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
+ 			this.captureException(e, {
+-				data: { errorCode: code, reason: 'mutation failed' },
++				errorCode: code,
++				reason: e.cause ?? e.message ?? e.stack ?? JSON.stringify(e),
+ 			})
+ 			await this.rejectMutation(msg.mutationId, code)
+ 		}
+
+commit 7f52c1464bc4852837a8bccb1f4ad70117db32c9
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Jan 17 11:02:11 2025 +0000
+
+    worker debug logging (#5219)
+    
+    This PR begins to address some pains we've felt with regard to logging
+    on cloudflare workers:
+    
+    1. a console.log invocation is only flushed to the console (or cf
+    dashboard) once a request completes. so if a request hangs for some
+    reason you never see the log output.
+    2. logs are very eagerly sampled, which makes it hard to rely on them
+    for debugging because you never know whether a log statement wasn't
+    reached or whether it was just dropped.
+    
+    so this PR
+    
+    - adds a Logger durable object that you can connect to via a websocket
+    to get an instant stream of every log statement, no waiting for requests
+    to finish.
+    - wraps the Logger durable object with a Logger class to consolidate
+    code.
+    
+    The logger durable object is on in dev and preview envs, but is not
+    available in staging or production yet because that would require auth
+    and filtering user DO events by user.
+    
+    You can try it on this PR by going to
+    https://pr-5219-preview-deploy.tldraw.com/__debug-tail and then opening
+    the app in another tab
+    
+    also tackles
+    https://linear.app/tldraw/issue/INT-648/investigate-flaky-preview-deploys
+    somewhat
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 2d094f987..3fa6c88b8 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -17,6 +17,7 @@ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { Kysely, sql } from 'kysely'
++import { Logger } from './Logger'
+ import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+@@ -46,6 +47,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
++	private log
++
+ 	cache: UserDataSyncer | null = null
+ 
+ 	constructor(ctx: DurableObjectState, env: Environment) {
+@@ -55,8 +58,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.replicator = getReplicator(env)
+ 
+ 		this.db = createPostgresConnectionPool(env, 'TLUserDurableObject')
+-		this.debug('created')
+ 		this.measure = env.MEASURE
++
++		// debug logging in preview envs by default
++		this.log = new Logger(env, 'TLUserDurableObject', this.sentry)
+ 	}
+ 
+ 	private userId: string | null = null
+@@ -68,10 +73,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			}
+ 			const rateLimited = await isRateLimited(this.env, this.userId!)
+ 			if (rateLimited) {
++				this.log.debug('rate limited')
+ 				this.logEvent({ type: 'rate_limited', id: this.userId })
+ 				throw new Error('Rate limited')
+ 			}
+-			if (this.cache === null) {
++			if (!this.cache) {
+ 				await this.init()
+ 			} else {
+ 				await this.cache.waitUntilConnected()
+@@ -81,17 +87,19 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private async init() {
+ 		assert(this.userId, 'User ID not set')
+-		this.debug('init')
++		this.log.debug('init', this.userId)
+ 		this.cache = new UserDataSyncer(
+ 			this.ctx,
+ 			this.env,
+ 			this.db,
+ 			this.userId,
+ 			(message) => this.broadcast(message),
+-			this.logEvent.bind(this)
++			this.logEvent.bind(this),
++			this.log
+ 		)
+-		this.debug('cache', !!this.cache)
++		this.log.debug('cache', !!this.cache)
+ 		await this.cache.waitUntilConnected()
++		this.log.debug('cache connected')
+ 	}
+ 
+ 	// Handle a request to the Durable Object.
+@@ -183,17 +191,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+-	private debug(...args: any[]) {
+-		// uncomment for dev time debugging
+-		// console.log('[TLUserDurableObject]: ', ...args)
+-		if (this.sentry) {
+-			// eslint-disable-next-line @typescript-eslint/no-deprecated
+-			this.sentry.addBreadcrumb({
+-				message: `[TLUserDurableObject]: ${args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : a)).join(' ')}`,
+-			})
+-		}
+-	}
+-
+ 	private async handleSocketMessage(message: string) {
+ 		const rateLimited = await isRateLimited(this.env, this.userId!)
+ 		this.assertCache()
+@@ -393,7 +390,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 			)
+ 			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+-			this.debug('mutation success', this.userId)
++			this.log.debug('mutation success', this.userId)
+ 			await this.db
+ 				.transaction()
+ 				.execute(async (tx) => {
+@@ -410,14 +407,14 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						)
+ 						.returning('mutationNumber')
+ 						.executeTakeFirstOrThrow()
+-					this.debug('mutation number success', this.userId)
++					this.log.debug('mutation number success', this.userId)
+ 					const mutationNumber = Number(result.mutationNumber)
+ 					const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+ 					assert(
+ 						mutationNumber > currentMutationNumber,
+ 						`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+ 					)
+-					this.debug('pushing mutation to cache', this.userId, mutationNumber)
++					this.log.debug('pushing mutation to cache', this.userId, mutationNumber)
+ 					this.cache.mutations.push({ mutationNumber, mutationId: msg.mutationId })
+ 				})
+ 				.catch((e) => {
+@@ -438,7 +435,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	async handleReplicationEvent(event: ZReplicationEvent) {
+ 		this.logEvent({ type: 'replication_event', id: this.userId ?? 'anon' })
+-		this.debug('replication event', event, !!this.cache)
++		this.log.debug('replication event', event, !!this.cache)
+ 		if (!this.cache) {
+ 			return 'unregister'
+ 		}
+
+commit c45a05a15c4a073fd300fe0577aec59ac9246d98
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Jan 20 08:52:38 2025 +0000
+
+    [botcom] don't broadcast mutation rejections (#5230)
+    
+    Bad mutations that happen on one tab should not incur toasts on all
+    tabs.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 3fa6c88b8..a16a9d548 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -168,7 +168,9 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
+-		serverWebSocket.addEventListener('message', (e) => this.handleSocketMessage(e.data.toString()))
++		serverWebSocket.addEventListener('message', (e) =>
++			this.handleSocketMessage(serverWebSocket, e.data.toString())
++		)
+ 		serverWebSocket.addEventListener('close', () => {
+ 			this.sockets.delete(serverWebSocket)
+ 		})
+@@ -191,7 +193,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+-	private async handleSocketMessage(message: string) {
++	private async handleSocketMessage(socket: WebSocket, message: string) {
+ 		const rateLimited = await isRateLimited(this.env, this.userId!)
+ 		this.assertCache()
+ 		await this.cache.waitUntilConnected()
+@@ -201,10 +203,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			case 'mutate':
+ 				if (rateLimited) {
+ 					this.logEvent({ type: 'rate_limited', id: this.userId! })
+-					await this.rejectMutation(msg.mutationId, ZErrorCode.rate_limit_exceeded)
++					await this.rejectMutation(socket, msg.mutationId, ZErrorCode.rate_limit_exceeded)
+ 				} else {
+ 					this.logEvent({ type: 'mutation', id: this.userId! })
+-					await this.handleMutate(msg)
++					await this.handleMutate(socket, msg)
+ 				}
+ 				break
+ 			default:
+@@ -212,16 +214,18 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	private async rejectMutation(mutationId: string, errorCode: ZErrorCode) {
++	private async rejectMutation(socket: WebSocket, mutationId: string, errorCode: ZErrorCode) {
+ 		this.assertCache()
+ 		this.logEvent({ type: 'reject_mutation', id: this.userId! })
+ 		await this.cache.waitUntilConnected()
+ 		this.cache.store.rejectMutation(mutationId)
+-		this.broadcast({
+-			type: 'reject',
+-			mutationId,
+-			errorCode,
+-		} satisfies ZServerSentMessage)
++		socket?.send(
++			JSON.stringify({
++				type: 'reject',
++				mutationId,
++				errorCode,
++			} satisfies ZServerSentMessage)
++		)
+ 	}
+ 
+ 	private async assertValidMutation(update: ZRowUpdate) {
+@@ -378,7 +382,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		})
+ 	}
+ 
+-	private async handleMutate(msg: ZClientSentMessage) {
++	private async handleMutate(socket: WebSocket, msg: ZClientSentMessage) {
+ 		this.assertCache()
+ 		try {
+ 			// we connect to pg via a pooler, so in the case that the pool is exhausted
+@@ -427,7 +431,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				errorCode: code,
+ 				reason: e.cause ?? e.message ?? e.stack ?? JSON.stringify(e),
+ 			})
+-			await this.rejectMutation(msg.mutationId, code)
++			await this.rejectMutation(socket, msg.mutationId, code)
+ 		}
+ 	}
+ 
+
+commit ab782583b3ba03a5746828428a16d3ba7e05e5a9
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Jan 28 18:36:09 2025 +0000
+
+    post release backend error handling (#5306)
+    
+    we were getting a lot of these errors in sentry
+    https://tldraw.sentry.io/issues/6152025342/?environment=production&environment=production-tldraw-multiplayer&project=4503966963662848&query=is%3Aunresolved%20issue.priority%3A%5Bhigh%2C%20medium%5D&referrer=issue-stream&statsPeriod=14d&stream_index=1
+    which seemed to mostly the registerUser failing ?
+    
+    But I couldn't figure out why, so I fixed the error reporting for that
+    method, and added a bunch of debugs to add breadcrumb context on sentry.
+    
+    At the same time, I added a bunch of extra fail-safes to restart things
+    if the user durable objects are failing to connect to the replicator.
+    hopefully that will mitigate whatever is going on. this was causing the
+    durable object's in-memory cache to get stale and make it look like the
+    db writes were failing when in fact they were not.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index a16a9d548..4bbfbc567 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -144,6 +144,14 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
++	maybeClose() {
++		if (this.sockets.size === 0) {
++			this.cache?.close()
++			this.cache = null
++			// db will time out after 10 seconds of inactivity so no need to close it manually
++		}
++	}
++
+ 	async onRequest(req: IRequest) {
+ 		assert(this.userId, 'User ID not set')
+ 		// handle legacy param names
+@@ -173,10 +181,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		)
+ 		serverWebSocket.addEventListener('close', () => {
+ 			this.sockets.delete(serverWebSocket)
++			this.maybeClose()
+ 		})
+ 		serverWebSocket.addEventListener('error', (e) => {
+ 			this.captureException(e, { source: 'serverWebSocket "error" event' })
+ 			this.sockets.delete(serverWebSocket)
++			this.maybeClose()
+ 		})
+ 		const initialData = this.cache.store.getCommittedData()
+ 		assert(initialData, 'Initial data not fetched')
+@@ -419,7 +429,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+ 					)
+ 					this.log.debug('pushing mutation to cache', this.userId, mutationNumber)
+-					this.cache.mutations.push({ mutationNumber, mutationId: msg.mutationId })
++					this.cache.mutations.push({
++						mutationNumber,
++						mutationId: msg.mutationId,
++						timestamp: Date.now(),
++					})
+ 				})
+ 				.catch((e) => {
+ 					this.cache.mutations = this.cache.mutations.filter((m) => m.mutationId !== msg.mutationId)
+
+commit ff19d0d907b998b765b163aaefea85ddd1bc2449
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Jan 29 10:36:23 2025 +0000
+
+    Don't nullify cache (#5310)
+    
+    accidentally introduced a couple of minor bugs by nullifying the cache,
+    so in this PR i make it so that the interval just starts and stops
+    rather than completely getting rid of the cache.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 4bbfbc567..bd7456d83 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -125,6 +125,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private assertCache(): asserts this is { cache: UserDataSyncer } {
+ 		assert(this.cache, 'no cache')
++		this.cache.maybeStartInterval()
+ 	}
+ 
+ 	private readonly sockets = new Set<WebSocket>()
+@@ -146,9 +147,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	maybeClose() {
+ 		if (this.sockets.size === 0) {
+-			this.cache?.close()
+-			this.cache = null
+-			// db will time out after 10 seconds of inactivity so no need to close it manually
++			this.cache?.stopInterval()
+ 		}
+ 	}
+ 
+
+commit da8c7dd47ae25f45ca09626b173f75fcca4a0c8e
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Jan 31 11:24:17 2025 +0000
+
+    fix duplicating + publishing rooms with big snapshots (#5333)
+    
+    We had a bug where if the room snapshots were bigger than 1mb,
+    duplicating and publishing would fail.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index bd7456d83..9613a75b9 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -24,10 +24,9 @@ import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { Analytics, Environment, TLUserDurableObjectEvent } from './types'
+ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
+ import { EventData, writeDataPoint } from './utils/analytics'
+-import { getReplicator } from './utils/durableObjects'
++import { getReplicator, getRoomDurableObject } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+-import { getCurrentSerializedRoomSnapshot } from './utils/tla/getCurrentSerializedRoomSnapshot'
+ 
+ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private readonly db: Kysely<DB>
+@@ -501,7 +500,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 
+ 		try {
+-			const serializedSnapshot = await getCurrentSerializedRoomSnapshot(file.id, this.env)
++			// make sure the room's snapshot is up to date
++			await getRoomDurableObject(this.env, file.id).awaitPersist()
++			// and that it exists
++			const snapshot = await this.env.ROOMS.get(getR2KeyForRoom({ slug: file.id, isApp: true }))
++
++			if (!snapshot) {
++				throw new Error('Snapshot not found')
++			}
++			const blob = await snapshot.blob()
+ 
+ 			// Create a new slug for the published room
+ 			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.put(file.publishedSlug, file.id)
+@@ -509,12 +516,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			// Bang the snapshot into the database
+ 			await this.env.ROOM_SNAPSHOTS.put(
+ 				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true }),
+-				serializedSnapshot
++				blob
+ 			)
+ 			const currentTime = new Date().toISOString()
+ 			await this.env.ROOM_SNAPSHOTS.put(
+ 				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}|${currentTime}`, isApp: true }),
+-				serializedSnapshot
++				blob
+ 			)
+ 		} catch (e) {
+ 			throw new ZMutationError(ZErrorCode.publish_failed, 'Failed to publish snapshot', e)
+
+commit 86aae29d7f4a3bfb258730c51f051c8889e20e2c
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Feb 5 09:01:10 2025 +0100
+
+    Move to server side slurping. (#5348)
+    
+    This moves duplication and legacy room slurping to the backend:
+    * It removes the the file open mode logic (no more setting it when
+    navigating, no more sending search params to the backend).
+    * We now insert a file into the db with an additional column called
+    `createSource` which is in the form of `f/kZTr6Zdx6TClE6I4qExV4`. In
+    this case this means duplication of an existing app file. For legacy
+    files we'd similarly use `/r|ro|v|s/kZTr6Zdx6TClE6I4qExV4` to use that
+    existing legacy file as a starting point.
+    * Room DO then sees this column and reads the data from the appropriate
+    source and initializes the room.
+    * We now retry getting the file record from the db, because otherwise we
+    could still end up with a "Not found" issue since the navigation might
+    happen before the replicator tells the room DO about the file creation.
+    * Assets will get re-uploaded with our existing
+    `maybeAssociateFileAssets` logic, that makes sure all the assets are
+    associated with the file.
+    
+    We had to do this because in some cases the file got created in the db,
+    then an file update was dispatched to the replicator (due to the trigger
+    we have on the file table), which incorrectly the set room DO (its
+    document info was set to a non app file without the creation params). If
+    this happened before the user navigation hit the worker it would mean
+    that duplication as well as slurping legacy files end up in a "Not
+    found" error, even though the file was correctly inserted into the db.
+    
+    ### Change type
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Move duplicating and legacy file slurping to the server.
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 9613a75b9..56cf13d9f 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -299,7 +299,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private async _doMutate(msg: ZClientSentMessage) {
+ 		this.assertCache()
+-		await this.db.transaction().execute(async (tx) => {
++		const insertedFiles = await this.db.transaction().execute(async (tx) => {
++			const insertedFiles: TlaFile[] = []
+ 			for (const update of msg.updates) {
+ 				await this.assertValidMutation(update)
+ 				switch (update.event) {
+@@ -320,11 +321,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 							break
+ 						} else {
+ 							const { id: _id, ...rest } = update.row as any
+-							await tx
++							const result = await tx
+ 								.insertInto(update.table)
+ 								.values(update.row as any)
+ 								.onConflict((oc) => oc.column('id').doUpdateSet(rest))
++								.returningAll()
+ 								.execute()
++							if (update.table === 'file' && result.length > 0) {
++								insertedFiles.push(result[0] as any as TlaFile)
++							}
+ 							break
+ 						}
+ 					}
+@@ -387,7 +392,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 				this.cache.store.updateOptimisticData([update], msg.mutationId)
+ 			}
++			return insertedFiles
+ 		})
++		for (const file of insertedFiles) {
++			getRoomDurableObject(this.env, file.id).appFileRecordCreated(file)
++		}
+ 	}
+ 
+ 	private async handleMutate(socket: WebSocket, msg: ZClientSentMessage) {
+
+commit 0ec8b1ea659bfd77812979bc9757fc7ebb632536
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Feb 5 11:57:13 2025 +0000
+
+    make websocket bootstrap time much faster (#5351)
+    
+    This PR makes it return the user data early
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 56cf13d9f..1d97c4d4e 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -77,30 +77,20 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				throw new Error('Rate limited')
+ 			}
+ 			if (!this.cache) {
+-				await this.init()
+-			} else {
+-				await this.cache.waitUntilConnected()
++				this.log.debug('creating cache', this.userId)
++				this.cache = new UserDataSyncer(
++					this.ctx,
++					this.env,
++					this.db,
++					this.userId,
++					(message) => this.broadcast(message),
++					this.logEvent.bind(this),
++					this.log
++				)
+ 			}
+ 		})
+ 		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
+ 
+-	private async init() {
+-		assert(this.userId, 'User ID not set')
+-		this.log.debug('init', this.userId)
+-		this.cache = new UserDataSyncer(
+-			this.ctx,
+-			this.env,
+-			this.db,
+-			this.userId,
+-			(message) => this.broadcast(message),
+-			this.logEvent.bind(this),
+-			this.log
+-		)
+-		this.log.debug('cache', !!this.cache)
+-		await this.cache.waitUntilConnected()
+-		this.log.debug('cache connected')
+-	}
+-
+ 	// Handle a request to the Durable Object.
+ 	override async fetch(req: IRequest) {
+ 		const sentry = createSentry(this.ctx, this.env, req)
+@@ -186,15 +176,20 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.sockets.delete(serverWebSocket)
+ 			this.maybeClose()
+ 		})
+-		const initialData = this.cache.store.getCommittedData()
+-		assert(initialData, 'Initial data not fetched')
+-
+-		serverWebSocket.send(
+-			JSON.stringify({
+-				type: 'initial_data',
+-				initialData,
+-			} satisfies ZServerSentMessage)
+-		)
++		const initialData = this.cache.getInitialData()
++		if (initialData) {
++			this.log.debug('sending initial data')
++			serverWebSocket.send(
++				JSON.stringify({
++					type: 'initial_data',
++					initialData,
++				} satisfies ZServerSentMessage)
++			)
++		} else {
++			// the cache hasn't received the initial data yet, so we need to wait for it
++			// it will broadcast on its own ok
++			this.log.debug('waiting for initial data')
++		}
+ 
+ 		this.sockets.add(serverWebSocket)
+ 
+
+commit 591de9f2646471df062b7f10db3da168877ca6f1
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Feb 6 10:29:53 2025 +0000
+
+    Add 'report a problem' dialog (#5359)
+    
+    The current methods of giving product feedback are kinda rubbish. You
+    have to either know tldraw is a github project and have an account
+    there, or you need to dm steve on twitter, or you need to find the link
+    to discord somewhere and find the right channel and bug us in there.
+    
+    This PR aims to reduce the friction to providing feedback by supplying a
+    text box people can use to send us a message on discord, as well as
+    offering links to our github and discord. If people start abusing the
+    textbox we can disable it or add some abuse prevention beyond the rate
+    limiting I added here. Hopefully that won't happen for a while.
+    
+    
+    https://github.com/user-attachments/assets/d0cae3ef-cba4-45e0-a8d5-03918b23f433
+    
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 1d97c4d4e..0b04e7537 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -187,7 +187,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			)
+ 		} else {
+ 			// the cache hasn't received the initial data yet, so we need to wait for it
+-			// it will broadcast on its own ok
++			// it will broadcast on its own
+ 			this.log.debug('waiting for initial data')
+ 		}
+ 
+
+commit be65d368fd8b3aaa31b3d6a41b3f563f3312b379
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Fri Feb 7 14:00:14 2025 +0100
+
+    Track user do cold start time on server side replicator (#5380)
+    
+    Add some additional tracking (active users in replicator and cold start
+    time to used do). Added some additional panes to grafana, here's [the
+    view](https://tldraw.grafana.net/d/adgumkhou3chsd/events?orgId=1&from=now-12h&to=now&timezone=browser&var-environment=pr-5380)
+    for this pr.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Add some additional tracking (active users in replicator and cold
+    start time to used do).
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 0b04e7537..a6529a8a8 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -64,6 +64,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	private userId: string | null = null
++	private coldStartStartTime: number | null = null
+ 
+ 	readonly router = Router()
+ 		.all('/app/:userId/*', async (req) => {
+@@ -77,6 +78,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				throw new Error('Rate limited')
+ 			}
+ 			if (!this.cache) {
++				this.coldStartStartTime = Date.now()
+ 				this.log.debug('creating cache', this.userId)
+ 				this.cache = new UserDataSyncer(
+ 					this.ctx,
+@@ -119,8 +121,16 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private readonly sockets = new Set<WebSocket>()
+ 
++	maybeReportColdStartTime(type: ZServerSentMessage['type']) {
++		if (type !== 'initial_data' || !this.coldStartStartTime) return
++		const time = Date.now() - this.coldStartStartTime
++		this.coldStartStartTime = null
++		this.logEvent({ type: 'cold_start_time', id: this.userId!, duration: time })
++	}
++
+ 	broadcast(message: ZServerSentMessage) {
+ 		this.logEvent({ type: 'broadcast_message', id: this.userId! })
++		this.maybeReportColdStartTime(message.type)
+ 		const msg = JSON.stringify(message)
+ 		for (const socket of this.sockets) {
+ 			if (socket.readyState === WebSocket.OPEN) {
+@@ -559,6 +569,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					doubles: [event.duration],
+ 				})
+ 				break
++			case 'cold_start_time':
++				this.writeEvent({
++					blobs: [event.type, event.id],
++					doubles: [event.duration],
++				})
++				break
+ 
+ 			default:
+ 				this.writeEvent({ blobs: [event.type, event.id] })
+
+commit aa9a8742d222da1f8d5a298148bbb001e7ea16bf
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Feb 11 09:37:09 2025 +0100
+
+    Add more info to the log (#5403)
+    
+    Might help us solve [this
+    issue](https://tldraw.sentry.io/issues/6276188385/?project=4503966963662848&query=is%3Aunresolved%20issue.priority%3A%5Bhigh%2C%20medium%5D&referrer=issue-stream&statsPeriod=30d&stream_index=0).
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Add additional logging for an invalid mutation.
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index a6529a8a8..549b095b0 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -269,7 +269,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					if (isOwner) return
+ 					throw new ZMutationError(
+ 						ZErrorCode.forbidden,
+-						`Cannot create a file for another user ${nextFile.id}`
++						`Cannot create a file for another user. fileId: ${nextFile.id} file owner: ${nextFile.ownerId} current user: ${this.userId}`
+ 					)
+ 				}
+ 				if (prevFile.ownerId === this.userId) return
+
+commit 43410d64b5669563adba592ca1ab840faa3d763c
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Feb 11 10:45:18 2025 +0100
+
+    Fix file permissions (#5400)
+    
+    Fixes:
+    * File permissions for non owners.
+    * File state permissions.
+    * An issue with the published file logic.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+    
+    ### Test plan
+    
+    1. I tested this via `app.updateFile` since we don't expose UI elements
+    for this.
+    
+    ### Release notes
+    
+    - Fix a bug with changing files.
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 549b095b0..8c04c1301 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -3,7 +3,9 @@ import {
+ 	isColumnMutable,
+ 	ROOM_PREFIX,
+ 	TlaFile,
++	TlaFilePartial,
+ 	TlaFileState,
++	TlaFileStatePartial,
+ 	TlaUser,
+ 	Z_PROTOCOL_VERSION,
+ 	ZClientSentMessage,
+@@ -262,8 +264,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				return
+ 			}
+ 			case 'file': {
+-				const nextFile = update.row as TlaFile
+-				const prevFile = s.files.find((f) => f.id === (update.row as any).id)
++				const nextFile = update.row as TlaFilePartial
++				const prevFile = s.files.find((f) => f.id === nextFile.id)
+ 				if (!prevFile) {
+ 					const isOwner = nextFile.ownerId === this.userId
+ 					if (isOwner) return
+@@ -272,8 +274,18 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						`Cannot create a file for another user. fileId: ${nextFile.id} file owner: ${nextFile.ownerId} current user: ${this.userId}`
+ 					)
+ 				}
++				// Owners are allowed to make changes
+ 				if (prevFile.ownerId === this.userId) return
+-				if (prevFile.shared && prevFile.sharedLinkType === 'edit') return
++
++				// We can make changes to updatedAt field in a shared, editable file
++				if (prevFile.shared && prevFile.sharedLinkType === 'edit') {
++					const { id: _id, ...rest } = nextFile
++					if (Object.keys(rest).length === 1 && rest.updatedAt !== undefined) return
++					throw new ZMutationError(
++						ZErrorCode.forbidden,
++						'Cannot update fields other than updatedAt on a shared file'
++					)
++				}
+ 				throw new ZMutationError(
+ 					ZErrorCode.forbidden,
+ 					'Cannot update file that is not our own and not shared in edit mode' +
+@@ -281,7 +293,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				)
+ 			}
+ 			case 'file_state': {
+-				const nextFileState = update.row as TlaFileState
++				const nextFileState = update.row as TlaFileStatePartial
+ 				let file = s.files.find((f) => f.id === nextFileState.fileId)
+ 				if (!file) {
+ 					// The user might not have access to this file yet, because they just followed a link
+@@ -291,6 +303,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				if (!file) {
+ 					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
+ 				}
++				if (nextFileState.userId !== this.userId) {
++					throw new ZMutationError(
++						ZErrorCode.forbidden,
++						`Cannot update file state for another user ${nextFileState.userId}`
++					)
++				}
+ 				if (file.ownerId === this.userId) return
+ 				if (file.shared) return
+ 
+@@ -360,7 +378,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 							await tx.updateTable(update.table).set(updates).where('id', '=', id).execute()
+ 							if (update.table === 'file') {
+ 								const currentFile = this.cache.store.getFullData()?.files.find((f) => f.id === id)
+-								if (currentFile && currentFile.published !== rest.published) {
++								if (
++									currentFile &&
++									rest.published !== undefined &&
++									currentFile.published !== rest.published
++								) {
+ 									if (rest.published) {
+ 										await this.publishSnapshot(currentFile)
+ 									} else {
+@@ -369,6 +391,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 								} else if (
+ 									currentFile &&
+ 									currentFile.published &&
++									rest.lastPublished !== undefined &&
+ 									currentFile.lastPublished < rest.lastPublished
+ 								) {
+ 									await this.publishSnapshot(currentFile)
+
+commit 79362534f1d1dab0c85e3826467ec00604d45f04
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Feb 11 15:14:25 2025 +0100
+
+    Create a new stub each time (#5409)
+    
+    Read through [cloudflare
+    docs](https://developers.cloudflare.com/durable-objects/api/stub/) and
+    [cloudflare
+    discord](https://discord.com/channels/595317990191398933/1230421736286060584/1231228955357610115)
+    and came across the following:
+    
+    > Yes you should be obtaining a new stub instance. This isn't necessary
+    for every type of error, but is good practice nonetheless.
+    
+    > If an exception is thrown by a Durable Object stub all in-flight calls
+    and future calls will fail with
+    [exceptions](https://developers.cloudflare.com/durable-objects/observability/troubleshooting/).
+    To continue invoking methods on a remote Durable Object a Worker must
+    recreate the stub. There are no ordering guarantees between different
+    stubs.
+    
+    > Yeah, that's not entirely unexpected. Sometimes a network issue or
+    internal error will last for long enough to impact both your original
+    request and the retry. You could potentially try addressing this by
+    adding a delay between retries, but I would still advise against doing
+    so as it'll make an operation wait a lot longer to potentially still
+    fail at the end since it's hard to put bounds on how long that retry
+    wait time should be.
+    
+    Feels like it might be safer to always get a new stub. Checked our other
+    helpers for getting DO and they all seem to be used just in time and are
+    not stored and reused (except for logger).
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    
+    ### Release notes
+    
+    - Get a fresh stub each time.
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 8c04c1301..e12380f3c 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -22,7 +22,6 @@ import { Kysely, sql } from 'kysely'
+ import { Logger } from './Logger'
+ import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+-import { type TLPostgresReplicator } from './TLPostgresReplicator'
+ import { Analytics, Environment, TLUserDurableObjectEvent } from './types'
+ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
+ import { EventData, writeDataPoint } from './utils/analytics'
+@@ -32,7 +31,6 @@ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ 
+ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private readonly db: Kysely<DB>
+-	private readonly replicator: TLPostgresReplicator
+ 	private measure: Analytics | undefined
+ 
+ 	private readonly sentry
+@@ -56,7 +54,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		super(ctx, env)
+ 
+ 		this.sentry = createSentry(ctx, env)
+-		this.replicator = getReplicator(env)
+ 
+ 		this.db = createPostgresConnectionPool(env, 'TLUserDurableObject')
+ 		this.measure = env.MEASURE
+@@ -298,7 +295,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				if (!file) {
+ 					// The user might not have access to this file yet, because they just followed a link
+ 					// let's allow them to create a file state for it if it exists and is shared.
+-					file = (await this.replicator.getFileRecord(nextFileState.fileId)) ?? undefined
++					file = (await getReplicator(this.env).getFileRecord(nextFileState.fileId)) ?? undefined
+ 				}
+ 				if (!file) {
+ 					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
+@@ -501,7 +498,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	/* --------------  */
+ 
+ 	private async deleteFileStuff(id: string) {
+-		const fileRecord = await this.replicator.getFileRecord(id)
++		const fileRecord = await getReplicator(this.env).getFileRecord(id)
+ 		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
+ 		await room.appFileRecordDidDelete()
+ 		if (!fileRecord) {
+
+commit 115ffe542ddaeaba457b022203d3d4180b842d2d
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Thu Feb 13 13:25:03 2025 +0100
+
+    Actively prune users. (#5425)
+    
+    Track the time that users received their last updates then periodically
+    prune them.
+    
+    Resolves INT-748
+    
+    ### Change type
+    
+    - [x] `improvement`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index e12380f3c..8d3567607 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -486,15 +486,19 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	async handleReplicationEvent(event: ZReplicationEvent) {
+ 		this.logEvent({ type: 'replication_event', id: this.userId ?? 'anon' })
+ 		this.log.debug('replication event', event, !!this.cache)
+-		if (!this.cache) {
++		if (await this.notActive()) {
+ 			return 'unregister'
+ 		}
+ 
+-		this.cache.handleReplicationEvent(event)
++		this.cache?.handleReplicationEvent(event)
+ 
+ 		return 'ok'
+ 	}
+ 
++	async notActive() {
++		return !this.cache
++	}
++
+ 	/* --------------  */
+ 
+ 	private async deleteFileStuff(id: string) {
+
+commit 7507686e603e17f3b81d986adbd28c78dc3a3626
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Feb 19 14:57:40 2025 +0000
+
+    switch to pg-logical-replication (#5433)
+    
+    follow up to #5430
+    
+    This PR swaps out our postgres.js subscription with
+    pg-logical-replication, which allows us to use a persistent replication
+    slot. This in turn means that when the postgres connection breaks we can
+    reliably restart the replication slot from where we picked off with
+    guaranteed consistency, and therefore we won't need to force our user
+    durable objects to reboot.
+    
+    In the next PR I will make it so that the replicator keeps a log of
+    events so user DOs can resume via catch-up instead of doing a full
+    reboot.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 8d3567607..a2a80211b 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -208,7 +208,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async handleSocketMessage(socket: WebSocket, message: string) {
+ 		const rateLimited = await isRateLimited(this.env, this.userId!)
+ 		this.assertCache()
+-		await this.cache.waitUntilConnected()
+ 
+ 		const msg = JSON.parse(message) as any as ZClientSentMessage
+ 		switch (msg.type) {
+@@ -229,7 +228,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async rejectMutation(socket: WebSocket, mutationId: string, errorCode: ZErrorCode) {
+ 		this.assertCache()
+ 		this.logEvent({ type: 'reject_mutation', id: this.userId! })
+-		await this.cache.waitUntilConnected()
+ 		this.cache.store.rejectMutation(mutationId)
+ 		socket?.send(
+ 			JSON.stringify({
+
+commit 7087024ff8855e7ccc4cd4b677d29d73b6408612
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Feb 19 16:08:40 2025 +0100
+
+    Add backend check for max files (#5448)
+    
+    Enforce the max files limit on the backend.
+    
+    ### Change type
+    
+    - [x] `improvement`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index a2a80211b..b5a41d0b8 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -1,6 +1,7 @@
+ import {
+ 	DB,
+ 	isColumnMutable,
++	MAX_NUMBER_OF_FILES,
+ 	ROOM_PREFIX,
+ 	TlaFile,
+ 	TlaFilePartial,
+@@ -339,6 +340,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 							break
+ 						} else {
+ 							const { id: _id, ...rest } = update.row as any
++							if (update.table === 'file') {
++								const count = this.cache.store.getFullData()?.files.length ?? 0
++								if (count >= MAX_NUMBER_OF_FILES) {
++									throw new ZMutationError(
++										ZErrorCode.max_files_reached,
++										`Cannot create more than ${MAX_NUMBER_OF_FILES} files.`
++									)
++								}
++							}
+ 							const result = await tx
+ 								.insertInto(update.table)
+ 								.values(update.row as any)
+
+commit a8c23d7ebc6d6d3d9c269b84810c16b86ce52070
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Fri Feb 21 11:05:35 2025 +0100
+
+    Deleted files improvements (#5465)
+    
+    Don't fetch and send deleted files to the user. Disallow updates to
+    deleted files.
+    
+    ### Change type
+    
+    - [x] `improvement`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index b5a41d0b8..5e6df1f21 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -270,6 +270,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						`Cannot create a file for another user. fileId: ${nextFile.id} file owner: ${nextFile.ownerId} current user: ${this.userId}`
+ 					)
+ 				}
++				if (prevFile.isDeleted)
++					throw new ZMutationError(ZErrorCode.forbidden, 'Cannot update a deleted file')
+ 				// Owners are allowed to make changes
+ 				if (prevFile.ownerId === this.userId) return
+ 
+
+commit c83fea52c1367d5991569a24a19f47500645fb41
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Feb 28 08:57:04 2025 +0000
+
+    no reboot user data on deploy (#5497)
+    
+    Describe what your pull request does. If you can, add GIFs or images
+    showing the before and after of your change.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 5e6df1f21..bf8400690 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -15,7 +15,7 @@ import {
+ 	ZServerSentMessage,
+ } from '@tldraw/dotcom-shared'
+ import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from '@tldraw/sync-core'
+-import { assert } from '@tldraw/utils'
++import { assert, sleep } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+@@ -186,20 +186,14 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.sockets.delete(serverWebSocket)
+ 			this.maybeClose()
+ 		})
+-		const initialData = this.cache.getInitialData()
+-		if (initialData) {
+-			this.log.debug('sending initial data')
+-			serverWebSocket.send(
+-				JSON.stringify({
+-					type: 'initial_data',
+-					initialData,
+-				} satisfies ZServerSentMessage)
+-			)
+-		} else {
+-			// the cache hasn't received the initial data yet, so we need to wait for it
+-			// it will broadcast on its own
+-			this.log.debug('waiting for initial data')
+-		}
++		const initialData = await this.cache.getInitialData()
++		this.log.debug('sending initial data')
++		serverWebSocket.send(
++			JSON.stringify({
++				type: 'initial_data',
++				initialData,
++			} satisfies ZServerSentMessage)
++		)
+ 
+ 		this.sockets.add(serverWebSocket)
+ 
+@@ -254,7 +248,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				if (!isUpdatingSelf)
+ 					throw new ZMutationError(
+ 						ZErrorCode.forbidden,
+-						'Cannot update user record that is not our own'
++						'Cannot update user record that is not our own: ' + (update.row as TlaUser).id
+ 					)
+ 				// todo: prevent user from updating their email?
+ 				return
+@@ -320,14 +314,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private async _doMutate(msg: ZClientSentMessage) {
+ 		this.assertCache()
+-		const insertedFiles = await this.db.transaction().execute(async (tx) => {
++		const { insertedFiles, newGuestFiles } = await this.db.transaction().execute(async (tx) => {
+ 			const insertedFiles: TlaFile[] = []
++			const newGuestFiles: TlaFile[] = []
+ 			for (const update of msg.updates) {
+ 				await this.assertValidMutation(update)
+ 				switch (update.event) {
+ 					case 'insert': {
+ 						if (update.table === 'file_state') {
+-							const { fileId: _fileId, userId: _userId, ...rest } = update.row as any
++							const { fileId, userId, ...rest } = update.row as any
+ 							await tx
+ 								.insertInto(update.table)
+ 								.values(update.row as TlaFileState)
+@@ -339,6 +334,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 									}
+ 								})
+ 								.execute()
++							const guestFile = await tx
++								.selectFrom('file')
++								.where('id', '=', fileId)
++								.where('ownerId', '!=', userId)
++								.selectAll()
++								.executeTakeFirst()
++							if (guestFile) {
++								newGuestFiles.push(guestFile as any as TlaFile)
++							}
+ 							break
+ 						} else {
+ 							const { id: _id, ...rest } = update.row as any
+@@ -427,15 +431,23 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 				this.cache.store.updateOptimisticData([update], msg.mutationId)
+ 			}
+-			return insertedFiles
++			return { insertedFiles, newGuestFiles }
+ 		})
+ 		for (const file of insertedFiles) {
+ 			getRoomDurableObject(this.env, file.id).appFileRecordCreated(file)
+ 		}
++		for (const file of newGuestFiles) {
++			this.cache.addGuestFile(file)
++		}
+ 	}
+ 
+ 	private async handleMutate(socket: WebSocket, msg: ZClientSentMessage) {
+ 		this.assertCache()
++		while (!this.cache.store.getCommittedData()) {
++			// this could happen if the cache was cleared due to a full db reboot
++			await sleep(100)
++		}
++		this.log.debug('mutation', this.userId, msg)
+ 		try {
+ 			// we connect to pg via a pooler, so in the case that the pool is exhausted
+ 			// we need to retry the connection. (also in the case that a neon branch is asleep apparently?)
+@@ -446,7 +458,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 			)
+ 			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+-			this.log.debug('mutation success', this.userId)
++			this.log.debug('mutation success', this.userId, 'new guest files')
+ 			await this.db
+ 				.transaction()
+ 				.execute(async (tx) => {
+@@ -497,10 +509,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.logEvent({ type: 'replication_event', id: this.userId ?? 'anon' })
+ 		this.log.debug('replication event', event, !!this.cache)
+ 		if (await this.notActive()) {
++			this.log.debug('requesting to unregister')
+ 			return 'unregister'
+ 		}
+ 
+-		this.cache?.handleReplicationEvent(event)
++		try {
++			this.cache?.handleReplicationEvent(event)
++		} catch (e) {
++			this.captureException(e)
++		}
+ 
+ 		return 'ok'
+ 	}
+
+commit 58dea67c6f61819d53a15c55887ae81a0fa03515
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Feb 28 13:24:46 2025 +0000
+
+    Admin UI + backend fixes (#5520)
+    
+    Admin UI for inspecting user DO data and doing ad-hoc reboots, + a few
+    backend-related fixes. I recommend viewing each commit individually.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index bf8400690..122cc0090 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -186,17 +186,22 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.sockets.delete(serverWebSocket)
+ 			this.maybeClose()
+ 		})
+-		const initialData = await this.cache.getInitialData()
+-		this.log.debug('sending initial data')
+-		serverWebSocket.send(
+-			JSON.stringify({
+-				type: 'initial_data',
+-				initialData,
+-			} satisfies ZServerSentMessage)
+-		)
+ 
+ 		this.sockets.add(serverWebSocket)
+ 
++		const initialData = this.cache.store.getCommittedData()
++		if (initialData) {
++			this.log.debug('sending initial data on connect', this.userId)
++			serverWebSocket.send(
++				JSON.stringify({
++					type: 'initial_data',
++					initialData,
++				} satisfies ZServerSentMessage)
++			)
++		} else {
++			this.log.debug('no initial data to send, waiting for boot to finish', this.userId)
++		}
++
+ 		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+@@ -644,6 +649,32 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			socket.close()
+ 		})
+ 	}
++
++	async admin_forceHardReboot(userId: string) {
++		if (this.cache) {
++			await this.cache?.reboot({ hard: true, delay: false })
++		} else {
++			await this.env.USER_DO_SNAPSHOTS.delete(userId)
++		}
++	}
++
++	async admin_getData(userId: string) {
++		const cache =
++			this.cache ??
++			new UserDataSyncer(
++				this.ctx,
++				this.env,
++				this.db,
++				userId,
++				() => {},
++				() => {},
++				this.log
++			)
++		while (!cache.store.getCommittedData()) {
++			await sleep(100)
++		}
++		return cache.store.getCommittedData()
++	}
+ }
+ 
+ async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
+
+commit 74380a338ae9f9f7c191f482b37cb2b6dc715c99
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Feb 28 16:07:46 2025 +0000
+
+    Do hard deletes reactively (#5522)
+    
+    Before this PR the only path we had available for hard deletes was via
+    client-side mutations. If we deleted the row manually in the db (e.g.
+    because a user asked us to wipe their data) it would not result in the
+    R2/KV artefacts being cleaned up.
+    
+    Before this PR we also needed to get the publsihedSlug from the row
+    before deleting it so we could clean up the publishing artefacts.
+    
+    Now I added the publishedSlug to the file table primary key so we get it
+    in delete events. Then when we handle those delete events in the file
+    durable object, it does the cleanup there.
+    
+    We'd end up doing this during the switch to zero anyway I think.
+    
+    (note this wasn't totally safe to do before because file deletes may
+    have happened while the replicator didn't have an open subscription to
+    Postgres. But now we use a persistent replication slot this should
+    always work)
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 122cc0090..dfd1dd583 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -2,7 +2,6 @@ import {
+ 	DB,
+ 	isColumnMutable,
+ 	MAX_NUMBER_OF_FILES,
+-	ROOM_PREFIX,
+ 	TlaFile,
+ 	TlaFilePartial,
+ 	TlaFileState,
+@@ -26,7 +25,7 @@ import { getR2KeyForRoom } from './r2'
+ import { Analytics, Environment, TLUserDurableObjectEvent } from './types'
+ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
+ import { EventData, writeDataPoint } from './utils/analytics'
+-import { getReplicator, getRoomDurableObject } from './utils/durableObjects'
++import { getRoomDurableObject } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ 
+@@ -295,7 +294,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				if (!file) {
+ 					// The user might not have access to this file yet, because they just followed a link
+ 					// let's allow them to create a file state for it if it exists and is shared.
+-					file = (await getReplicator(this.env).getFileRecord(nextFileState.fileId)) ?? undefined
++					file = await this.db
++						.selectFrom('file')
++						.selectAll()
++						.where('id', '=', nextFileState.fileId)
++						.executeTakeFirst()
+ 				}
+ 				if (!file) {
+ 					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
+@@ -428,10 +431,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 							const { id } = update.row as any
+ 							await tx.deleteFrom(update.table).where('id', '=', id).execute()
+ 						}
+-						if (update.table === 'file') {
+-							const { id } = update.row as TlaFile
+-							await this.deleteFileStuff(id)
+-						}
+ 						break
+ 				}
+ 				this.cache.store.updateOptimisticData([update], msg.mutationId)
+@@ -533,37 +532,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	/* --------------  */
+ 
+-	private async deleteFileStuff(id: string) {
+-		const fileRecord = await getReplicator(this.env).getFileRecord(id)
+-		const room = this.env.TLDR_DOC.get(this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${id}`))
+-		await room.appFileRecordDidDelete()
+-		if (!fileRecord) {
+-			throw new Error('file record not found')
+-		}
+-		const publishedSlug = fileRecord.publishedSlug
+-
+-		// Create a new slug for the published room
+-		await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(publishedSlug)
+-
+-		// remove published files
+-		const publishedPrefixKey = getR2KeyForRoom({
+-			slug: `${id}/${publishedSlug}`,
+-			isApp: true,
+-		})
+-		const publishedHistory = await listAllObjectKeys(this.env.ROOM_SNAPSHOTS, publishedPrefixKey)
+-		if (publishedHistory.length > 0) {
+-			await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
+-		}
+-		// remove edit history
+-		const r2Key = getR2KeyForRoom({ slug: id, isApp: true })
+-		const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, r2Key)
+-		if (editHistory.length > 0) {
+-			await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
+-		}
+-		// remove main file
+-		await this.env.ROOMS.delete(r2Key)
+-	}
+-
+ 	private async publishSnapshot(file: TlaFile) {
+ 		if (file.ownerId !== this.userId) {
+ 			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot publish file that is not our own')
+@@ -677,19 +645,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ }
+ 
+-async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
+-	const keys: string[] = []
+-	let cursor: string | undefined
+-
+-	do {
+-		const result = await bucket.list({ prefix, cursor })
+-		keys.push(...result.objects.map((o) => o.key))
+-		cursor = result.truncated ? result.cursor : undefined
+-	} while (cursor)
+-
+-	return keys
+-}
+-
+ class ZMutationError extends Error {
+ 	constructor(
+ 		public errorCode: ZErrorCode,
+
+commit 62dce36fb020a910710f8fc08bbc0208d1400169
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Mar 3 09:00:10 2025 +0100
+
+    Fix guest files. (#5530)
+    
+    We did not correctly create file state when visiting guest files.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index dfd1dd583..351848ecd 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -18,7 +18,7 @@ import { assert, sleep } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+-import { Kysely, sql } from 'kysely'
++import { Kysely, sql, Transaction } from 'kysely'
+ import { Logger } from './Logger'
+ import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+@@ -237,7 +237,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		)
+ 	}
+ 
+-	private async assertValidMutation(update: ZRowUpdate) {
++	private async assertValidMutation(update: ZRowUpdate, tx: Transaction<DB>) {
+ 		// s is the entire set of data that the user has access to
+ 		// and is up to date with all committed mutations so far.
+ 		// we commit each mutation one at a time before handling the next.
+@@ -294,7 +294,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				if (!file) {
+ 					// The user might not have access to this file yet, because they just followed a link
+ 					// let's allow them to create a file state for it if it exists and is shared.
+-					file = await this.db
++					file = await tx
+ 						.selectFrom('file')
+ 						.selectAll()
+ 						.where('id', '=', nextFileState.fileId)
+@@ -326,7 +326,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			const insertedFiles: TlaFile[] = []
+ 			const newGuestFiles: TlaFile[] = []
+ 			for (const update of msg.updates) {
+-				await this.assertValidMutation(update)
++				await this.assertValidMutation(update, tx)
+ 				switch (update.event) {
+ 					case 'insert': {
+ 						if (update.table === 'file_state') {
+
+commit 8d62b8f5cf83a327e5c1c622095021d0b3e845e2
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Mar 3 09:06:30 2025 +0100
+
+    Filter out deleted files when doing the max file check on the BE (#5529)
+    
+    Noticed this [sentry
+    issue](https://tldraw.sentry.io/issues/6349570543/?environment=production-tldraw-multiplayer&project=4503966963662848&query=is%3Aunresolved%20issue.priority%3A%5Bhigh%2C%20medium%5D&referrer=issue-stream&statsPeriod=30d&stream_index=6).
+    This should (in general) not happen at all, our FE should prevent this
+    from reaching the BE. But in this case we didn't filter out the deleted
+    files.
+    
+    Think I missed this when I converted the check from a postgres query to
+    a local check.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 351848ecd..e99ad3a65 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -355,7 +355,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						} else {
+ 							const { id: _id, ...rest } = update.row as any
+ 							if (update.table === 'file') {
+-								const count = this.cache.store.getFullData()?.files.length ?? 0
++								const count =
++									this.cache.store
++										.getFullData()
++										?.files.filter((f) => f.ownerId === this.userId && !f.isDeleted).length ?? 0
+ 								if (count >= MAX_NUMBER_OF_FILES) {
+ 									throw new ZMutationError(
+ 										ZErrorCode.max_files_reached,
+
+commit 7df0a29a4c9f9977a2de5762e76ff48fe2e9adb5
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Mar 4 21:26:21 2025 +0000
+
+    Make better use of replicator history (#5532)
+    
+    After making a couple of deploys with the new backend this morning we
+    noticed that a large portion of user DOs still ended up doing a full db
+    reset and this seems to be for two reasons:
+    
+    1. we only stored about 10 minutes worth of history
+    2. a lot of users in our active_users table are idle at any given time
+    (maybe like 70-80% of them) so a lot of them will not have received
+    updates for more than 10 minutes.
+    
+    This PR makes it so that if a user hasn't done anything for 5 minutes
+    but their socket is still open, we execute a noop mutation number bump
+    so that they receive a new `lsn`.
+    
+    I also cleaned up the mutation handling logic so that it no longer does
+    two transactions per mutation. This was only required before because
+    postgres.js would not dispatch events grouped by transaction, and the
+    ordering was not maintained. wal2json guarantees changes to be grouped
+    by transaction with formatVersion: 1 (the default that we use) so as
+    long as we commit the mutations after handling any state updates it
+    should avoid data races.
+    
+    ### Change type
+    
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index e99ad3a65..a2b58a353 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -14,7 +14,7 @@ import {
+ 	ZServerSentMessage,
+ } from '@tldraw/dotcom-shared'
+ import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from '@tldraw/sync-core'
+-import { assert, sleep } from '@tldraw/utils'
++import { assert, ExecutionQueue, sleep } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+@@ -115,7 +115,38 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private assertCache(): asserts this is { cache: UserDataSyncer } {
+ 		assert(this.cache, 'no cache')
+-		this.cache.maybeStartInterval()
++	}
++
++	interval: NodeJS.Timeout | null = null
++	lastMutationTimestamp = Date.now()
++
++	private maybeStartInterval() {
++		if (!this.interval) {
++			this.interval = setInterval(() => {
++				// do cache persist + cleanup
++				this.cache?.onInterval()
++				// do a noop mutation every 5 minutes
++				if (Date.now() - this.lastMutationTimestamp > 5 * 60 * 1000) {
++					this.bumpMutationNumber(this.db)
++						.then(() => {
++							this.lastMutationTimestamp = Date.now()
++						})
++						.catch((e) => this.captureException(e, { source: 'noop mutation' }))
++				}
++
++				// clean up closed sockets if there are any
++				for (const socket of this.sockets) {
++					if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
++						this.sockets.delete(socket)
++					}
++				}
++
++				if (this.sockets.size === 0 && typeof this.interval === 'number') {
++					clearInterval(this.interval)
++					this.interval = null
++				}
++			}, 1000)
++		}
+ 	}
+ 
+ 	private readonly sockets = new Set<WebSocket>()
+@@ -142,12 +173,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			}
+ 		}
+ 	}
+-
+-	maybeClose() {
+-		if (this.sockets.size === 0) {
+-			this.cache?.stopInterval()
+-		}
+-	}
++	private readonly messageQueue = new ExecutionQueue()
+ 
+ 	async onRequest(req: IRequest) {
+ 		assert(this.userId, 'User ID not set')
+@@ -174,19 +200,18 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 
+ 		serverWebSocket.addEventListener('message', (e) =>
+-			this.handleSocketMessage(serverWebSocket, e.data.toString())
++			this.messageQueue.push(() => this.handleSocketMessage(serverWebSocket, e.data.toString()))
+ 		)
+ 		serverWebSocket.addEventListener('close', () => {
+ 			this.sockets.delete(serverWebSocket)
+-			this.maybeClose()
+ 		})
+ 		serverWebSocket.addEventListener('error', (e) => {
+ 			this.captureException(e, { source: 'serverWebSocket "error" event' })
+ 			this.sockets.delete(serverWebSocket)
+-			this.maybeClose()
+ 		})
+ 
+ 		this.sockets.add(serverWebSocket)
++		this.maybeStartInterval()
+ 
+ 		const initialData = this.cache.store.getCommittedData()
+ 		if (initialData) {
+@@ -224,10 +249,27 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
++	async bumpMutationNumber(db: Kysely<DB> | Transaction<DB>) {
++		return db
++			.insertInto('user_mutation_number')
++			.values({
++				userId: this.userId!,
++				mutationNumber: 1,
++			})
++			.onConflict((oc) =>
++				oc.column('userId').doUpdateSet({
++					mutationNumber: sql`user_mutation_number."mutationNumber" + 1`,
++				})
++			)
++			.returning('mutationNumber')
++			.executeTakeFirstOrThrow()
++	}
++
+ 	private async rejectMutation(socket: WebSocket, mutationId: string, errorCode: ZErrorCode) {
+ 		this.assertCache()
+ 		this.logEvent({ type: 'reject_mutation', id: this.userId! })
+ 		this.cache.store.rejectMutation(mutationId)
++		this.cache.mutations = this.cache.mutations.filter((m) => m.mutationId !== mutationId)
+ 		socket?.send(
+ 			JSON.stringify({
+ 				type: 'reject',
+@@ -438,8 +480,25 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 				this.cache.store.updateOptimisticData([update], msg.mutationId)
+ 			}
++			const result = await this.bumpMutationNumber(tx)
++
++			this.lastMutationTimestamp = Date.now()
++
++			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
++			const mutationNumber = result.mutationNumber
++			assert(
++				mutationNumber > currentMutationNumber,
++				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
++			)
++			this.log.debug('pushing mutation to cache', this.userId, mutationNumber)
++			this.cache.mutations.push({
++				mutationNumber,
++				mutationId: msg.mutationId,
++				timestamp: Date.now(),
++			})
+ 			return { insertedFiles, newGuestFiles }
+ 		})
++
+ 		for (const file of insertedFiles) {
+ 			getRoomDurableObject(this.env, file.id).appFileRecordCreated(file)
+ 		}
+@@ -464,42 +523,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					this.logEvent({ type: 'connect_retry', id: this.userId! })
+ 				}
+ 			)
+-			// TODO: We should probably handle a case where the above operation succeeds but the one below fails
+-			this.log.debug('mutation success', this.userId, 'new guest files')
+-			await this.db
+-				.transaction()
+-				.execute(async (tx) => {
+-					const result = await tx
+-						.insertInto('user_mutation_number')
+-						.values({
+-							userId: this.userId!,
+-							mutationNumber: 1,
+-						})
+-						.onConflict((oc) =>
+-							oc.column('userId').doUpdateSet({
+-								mutationNumber: sql`user_mutation_number."mutationNumber" + 1`,
+-							})
+-						)
+-						.returning('mutationNumber')
+-						.executeTakeFirstOrThrow()
+-					this.log.debug('mutation number success', this.userId)
+-					const mutationNumber = Number(result.mutationNumber)
+-					const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+-					assert(
+-						mutationNumber > currentMutationNumber,
+-						`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+-					)
+-					this.log.debug('pushing mutation to cache', this.userId, mutationNumber)
+-					this.cache.mutations.push({
+-						mutationNumber,
+-						mutationId: msg.mutationId,
+-						timestamp: Date.now(),
+-					})
+-				})
+-				.catch((e) => {
+-					this.cache.mutations = this.cache.mutations.filter((m) => m.mutationId !== msg.mutationId)
+-					throw e
+-				})
+ 		} catch (e: any) {
+ 			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
+ 			this.captureException(e, {
+
+commit fcd4fb26792d3ceced3e808051775d45ce7439e0
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Mar 6 08:49:01 2025 +0000
+
+    [dotcom] fix data leaking between preview branches (#5562)
+    
+    Our user DO snapshots were leaking between branches 😬
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index a2b58a353..261256913 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -22,7 +22,7 @@ import { Kysely, sql, Transaction } from 'kysely'
+ import { Logger } from './Logger'
+ import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+-import { Analytics, Environment, TLUserDurableObjectEvent } from './types'
++import { Analytics, Environment, getUserDoSnapshotKey, TLUserDurableObjectEvent } from './types'
+ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
+ import { EventData, writeDataPoint } from './utils/analytics'
+ import { getRoomDurableObject } from './utils/durableObjects'
+@@ -648,7 +648,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		if (this.cache) {
+ 			await this.cache?.reboot({ hard: true, delay: false })
+ 		} else {
+-			await this.env.USER_DO_SNAPSHOTS.delete(userId)
++			await this.env.USER_DO_SNAPSHOTS.delete(getUserDoSnapshotKey(this.env, userId))
+ 		}
+ 	}
+ 
+
+commit 12c0cb0549caaf75a6abab1f1b9ac2a3a69a6005
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Thu Mar 6 09:53:58 2025 +0100
+
+    Add some randomness to prevent this happening in sync for online users. (#5563)
+    
+    Should help with having spiky traffic like the one during the last
+    deploy:
+    
+    
+    ![image](https://github.com/user-attachments/assets/7dfb1279-2139-47ce-b78f-fd4de2540967)
+    
+    ### Change type
+    
+    - [x] `improvement`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 261256913..391614b06 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -29,6 +29,7 @@ import { getRoomDurableObject } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ 
++const ONE_MINUTE = 60 * 1000
+ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private readonly db: Kysely<DB>
+ 	private measure: Analytics | undefined
+@@ -118,7 +119,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	interval: NodeJS.Timeout | null = null
+-	lastMutationTimestamp = Date.now()
++	nextMutationTimestamp = Date.now() + 2 * ONE_MINUTE + 5 * ONE_MINUTE * Math.random()
+ 
+ 	private maybeStartInterval() {
+ 		if (!this.interval) {
+@@ -126,10 +127,10 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				// do cache persist + cleanup
+ 				this.cache?.onInterval()
+ 				// do a noop mutation every 5 minutes
+-				if (Date.now() - this.lastMutationTimestamp > 5 * 60 * 1000) {
++				if (Date.now() > this.nextMutationTimestamp) {
+ 					this.bumpMutationNumber(this.db)
+ 						.then(() => {
+-							this.lastMutationTimestamp = Date.now()
++							this.nextMutationTimestamp = Date.now() + 5 * ONE_MINUTE
+ 						})
+ 						.catch((e) => this.captureException(e, { source: 'noop mutation' }))
+ 				}
+@@ -482,7 +483,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			}
+ 			const result = await this.bumpMutationNumber(tx)
+ 
+-			this.lastMutationTimestamp = Date.now()
++			this.nextMutationTimestamp = Date.now() + 5 * ONE_MINUTE
+ 
+ 			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+ 			const mutationNumber = result.mutationNumber
+
+commit 283889799096b75e16d7a9ab38b1cd239d90790a
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Mar 11 12:17:56 2025 +0000
+
+    Add more postgres history, reduce ping overhead (#5604)
+    
+    Last time we did a dotcom release during working hours there were way
+    more User DO full postgres refetches than anticipated, which led to a
+    couple of minutes of slowness.
+    
+    Investigating this, I couldn't find a link in the chain that had failed,
+    so it seems likely that the history pruning was too aggressive and the
+    length of time between 'noop' mutations was too long. So in this PR I
+    tweak both of those variables, and make 'noop' mutations more efficient
+    by bypassing postgres and just asking the replicator for an lsn update
+    directly.
+    
+    If this doesn't work there is definitely something I'm missing about the
+    production env that makes this stuff fail. In this PR I also added a
+    bunch of extra analytics to maybe help narrow it down after the next
+    release.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 391614b06..b038ad4aa 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -29,7 +29,6 @@ import { getRoomDurableObject } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ 
+-const ONE_MINUTE = 60 * 1000
+ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private readonly db: Kysely<DB>
+ 	private measure: Analytics | undefined
+@@ -119,21 +118,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	interval: NodeJS.Timeout | null = null
+-	nextMutationTimestamp = Date.now() + 2 * ONE_MINUTE + 5 * ONE_MINUTE * Math.random()
+ 
+ 	private maybeStartInterval() {
+ 		if (!this.interval) {
+ 			this.interval = setInterval(() => {
+ 				// do cache persist + cleanup
+ 				this.cache?.onInterval()
+-				// do a noop mutation every 5 minutes
+-				if (Date.now() > this.nextMutationTimestamp) {
+-					this.bumpMutationNumber(this.db)
+-						.then(() => {
+-							this.nextMutationTimestamp = Date.now() + 5 * ONE_MINUTE
+-						})
+-						.catch((e) => this.captureException(e, { source: 'noop mutation' }))
+-				}
+ 
+ 				// clean up closed sockets if there are any
+ 				for (const socket of this.sockets) {
+@@ -483,8 +473,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			}
+ 			const result = await this.bumpMutationNumber(tx)
+ 
+-			this.nextMutationTimestamp = Date.now() + 5 * ONE_MINUTE
+-
+ 			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+ 			const mutationNumber = result.mutationNumber
+ 			assert(
+
+commit a6c2905c622f1b9ffca2aeda734782af93e67f1b
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Mar 21 09:25:04 2025 +0000
+
+    Use pg message bus for requesting lsn update (#5722)
+    
+    After the deploy this morning we started getting a lot of
+    
+    > Error: Subrequest depth limit exceeded. This request recursed through
+    Workers too many times. This can happen e.g. if you have a Worker or
+    Durable Object that calls other Workers or objects recursively.
+    
+    In sentry. All seeming to originate from the new RPC-based lsn update
+    mechanism. No idea why, there's a back and forth but no real chain of
+    recursion here, it's just running on a setInterval.
+    
+    Anyway this cuts one side of the RPC link out so it can't possibly think
+    there's a recursion chain.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index b038ad4aa..31ff1266a 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -136,7 +136,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					clearInterval(this.interval)
+ 					this.interval = null
+ 				}
+-			}, 1000)
++			}, 2000)
+ 		}
+ 	}
+ 
+
+commit 10d4563919ca3af6c0610f91357b5737c5885716
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Mar 24 14:08:57 2025 +0000
+
+    [dotcom backend] Wrap writeDataPoint in try/catch to make it safe (#5739)
+    
+    This seems to have been causing errors since the deploy yesterday
+    
+    We were disptaching more analytics events than normal it seems? And this
+    was throwing errors in our business logic and making things reset when
+    they shouldn't.
+    
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 31ff1266a..0afb2260b 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -597,7 +597,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	private writeEvent(eventData: EventData) {
+-		writeDataPoint(this.measure, this.env, 'user_durable_object', eventData)
++		writeDataPoint(this.sentry, this.measure, this.env, 'user_durable_object', eventData)
+ 	}
+ 
+ 	logEvent(event: TLUserDurableObjectEvent) {
+
+commit b1ca2fcd8c7dc5b8d079846cf24df5d860c29fbf
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Mar 25 09:46:35 2025 +0000
+
+    Copy changes from hotfixes branch (#5744)
+    
+    We pushed a bunch of hotfixes directly yesterday while trying to make
+    the backend behave itself.
+    
+    This PR collects all the changes and simplifies the concurrency
+    prevention bugfix.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 0afb2260b..29784a750 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -635,7 +635,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	async admin_forceHardReboot(userId: string) {
+ 		if (this.cache) {
+-			await this.cache?.reboot({ hard: true, delay: false })
++			await this.cache?.reboot({ hard: true, delay: false, source: 'admin' })
+ 		} else {
+ 			await this.env.USER_DO_SNAPSHOTS.delete(getUserDoSnapshotKey(this.env, userId))
+ 		}
+
+commit 21002dc7ca29a9de51c6f24676ba5812958a8248
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Apr 1 13:26:45 2025 +0200
+
+    Zero spike (#5551)
+    
+    Describe what your pull request does. If you can, add GIFs or images
+    showing the before and after of your change.
+    
+    ### Change type
+    
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+index 29784a750..ee497eede 100644
+--- a/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLUserDurableObject.ts
+@@ -21,7 +21,6 @@ import { IRequest, Router } from 'itty-router'
+ import { Kysely, sql, Transaction } from 'kysely'
+ import { Logger } from './Logger'
+ import { createPostgresConnectionPool } from './postgres'
+-import { getR2KeyForRoom } from './r2'
+ import { Analytics, Environment, getUserDoSnapshotKey, TLUserDurableObjectEvent } from './types'
+ import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
+ import { EventData, writeDataPoint } from './utils/analytics'
+@@ -428,30 +427,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 								.where('userId', '=', userId)
+ 								.execute()
+ 						} else {
+-							const { id, ...rest } = update.row as any
+-
++							const { id } = update.row as any
+ 							await tx.updateTable(update.table).set(updates).where('id', '=', id).execute()
+-							if (update.table === 'file') {
+-								const currentFile = this.cache.store.getFullData()?.files.find((f) => f.id === id)
+-								if (
+-									currentFile &&
+-									rest.published !== undefined &&
+-									currentFile.published !== rest.published
+-								) {
+-									if (rest.published) {
+-										await this.publishSnapshot(currentFile)
+-									} else {
+-										await this.unpublishSnapshot(currentFile)
+-									}
+-								} else if (
+-									currentFile &&
+-									currentFile.published &&
+-									rest.lastPublished !== undefined &&
+-									currentFile.lastPublished < rest.lastPublished
+-								) {
+-									await this.publishSnapshot(currentFile)
+-								}
+-							}
+ 						}
+ 						break
+ 					}
+@@ -547,55 +524,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	/* --------------  */
+ 
+-	private async publishSnapshot(file: TlaFile) {
+-		if (file.ownerId !== this.userId) {
+-			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot publish file that is not our own')
+-		}
+-
+-		try {
+-			// make sure the room's snapshot is up to date
+-			await getRoomDurableObject(this.env, file.id).awaitPersist()
+-			// and that it exists
+-			const snapshot = await this.env.ROOMS.get(getR2KeyForRoom({ slug: file.id, isApp: true }))
+-
+-			if (!snapshot) {
+-				throw new Error('Snapshot not found')
+-			}
+-			const blob = await snapshot.blob()
+-
+-			// Create a new slug for the published room
+-			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.put(file.publishedSlug, file.id)
+-
+-			// Bang the snapshot into the database
+-			await this.env.ROOM_SNAPSHOTS.put(
+-				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true }),
+-				blob
+-			)
+-			const currentTime = new Date().toISOString()
+-			await this.env.ROOM_SNAPSHOTS.put(
+-				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}|${currentTime}`, isApp: true }),
+-				blob
+-			)
+-		} catch (e) {
+-			throw new ZMutationError(ZErrorCode.publish_failed, 'Failed to publish snapshot', e)
+-		}
+-	}
+-
+-	private async unpublishSnapshot(file: TlaFile) {
+-		if (file.ownerId !== this.userId) {
+-			throw new ZMutationError(ZErrorCode.forbidden, 'Cannot unpublish file that is not our own')
+-		}
+-
+-		try {
+-			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(file.publishedSlug)
+-			await this.env.ROOM_SNAPSHOTS.delete(
+-				getR2KeyForRoom({ slug: `${file.id}/${file.publishedSlug}`, isApp: true })
+-			)
+-		} catch (e) {
+-			throw new ZMutationError(ZErrorCode.unpublish_failed, 'Failed to unpublish snapshot', e)
+-		}
+-	}
+-
+ 	private writeEvent(eventData: EventData) {
+ 		writeDataPoint(this.sentry, this.measure, this.env, 'user_durable_object', eventData)
+ 	}
+
