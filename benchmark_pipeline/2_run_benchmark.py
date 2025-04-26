@@ -95,7 +95,9 @@ from dotenv import load_dotenv
 
 # --- Benchmark Utilities ---
 
-from benchmark_pipeline.utils import log_script_run
+# Use path-based import to ensure it works regardless of how the script is invoked
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import log_script_run
 
 
 # --- Model Interaction ---
