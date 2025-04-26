@@ -35,6 +35,7 @@ File Modifications:
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 import sys
@@ -301,7 +302,11 @@ def collect_results_metadata(
 
 def create_html_header() -> str:
     """Creates the HTML header with basic metadata and CSS link."""
+    warning = get_auto_generation_warning()
     return f"""<!DOCTYPE html>
+<!--
+{warning}
+-->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -318,16 +323,31 @@ def create_html_header() -> str:
 """
 
 
-def create_html_footer() -> str:
-    """Creates the HTML footer."""
-    return """
+def create_html_footer(include_chart_js: bool = False) -> str:
+    """
+    Creates the HTML footer.
+
+    Args:
+        include_chart_js: Whether to include the chart JavaScript code.
+
+    Returns:
+        HTML string for the footer section
+    """
+    footer = """
     </main>
     <footer>
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
     </footer>
+    """
+
+    if include_chart_js:
+        footer += create_chart_javascript()
+
+    footer += """
 </body>
 </html>
 """
+    return footer
 
 
 def create_overall_stats_table(
@@ -600,6 +620,558 @@ def create_language_stats_table(
     return html
 
 
+def wilson_score_interval(
+    successful: int, attempts: int, z: float = 1.96
+) -> Tuple[float, float]:
+    """
+    Calculate Wilson score interval for a binomial proportion.
+
+    This is used to compute confidence intervals for success rates.
+
+    Args:
+        successful: Number of successful attempts
+        attempts: Total number of attempts
+        z: Z-score for desired confidence level (default: 1.96 for 95% confidence)
+
+    Returns:
+        Tuple of (lower_bound, upper_bound) as proportions (not percentages)
+    """
+    if attempts == 0:
+        return 0.0, 0.0
+
+    # Observed proportion
+    p_hat = successful / attempts
+
+    # Wilson score calculation
+    denominator = 1 + (z**2 / attempts)
+    center = (p_hat + (z**2 / (2 * attempts))) / denominator
+    interval = (
+        z
+        * math.sqrt((p_hat * (1 - p_hat) + (z**2 / (4 * attempts))) / attempts)
+        / denominator
+    )
+
+    lower_bound = max(0.0, center - interval)
+    upper_bound = min(1.0, center + interval)
+
+    return lower_bound, upper_bound
+
+
+def generate_chart_data(
+    results_metadata: Dict[Any, Dict[str, Any]],
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    all_models: Set[str],
+    case_languages: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    Generates data for the token-based chart.
+
+    Creates data points at 1k token increments from 0k to 75k,
+    with each point representing a +/- 10k token bucket.
+    Each prompt is included in all buckets whose range covers its length.
+
+    Returns:
+        Dictionary containing the chart data
+    """
+    # Find max token count (min is always 0)
+    token_counts = [meta.get("prompt_tokens", 0) for meta in prompt_metadata.values()]
+    max_tokens = 75000  # Default max
+    if token_counts:
+        max_tokens = max(
+            max(token_counts), max_tokens
+        )  # Use higher of actual max or default
+
+    # Round max tokens up to the nearest thousand
+    max_tokens_k = (max_tokens + 999) // 1000
+
+    # Initialize data structure - start from 0k, go to max_tokens_k
+    buckets = []
+    for i in range(0, max_tokens_k + 1):  # Start from 0k
+        bucket_location = i * 1000  # Renamed from bucket_center to bucket_location
+        bucket_min = max(0, bucket_location - 10000)
+        bucket_max = bucket_location + 10000
+
+        # Initialize data for this bucket
+        bucket_data = {
+            "bucket_location": bucket_location,  # Renamed from bucket_center
+            "bucket_location_k": i,  # Renamed from bucket_center_k
+            "bucket_min": bucket_min,
+            "bucket_max": bucket_max,
+            "bucket_range": f"{bucket_min // 1000}k-{bucket_max // 1000}k",
+            "models": {},
+        }
+
+        # Initialize model data
+        for model in all_models:
+            bucket_data["models"][model] = {
+                "overall": {"attempts": 0, "successful": 0},
+                "languages": {},
+            }
+
+        buckets.append(bucket_data)
+
+    # Populate buckets with result data
+    for (case_prefix, model), result_metadata in results_metadata.items():
+        # Get token count for this case
+        token_count = prompt_metadata.get(case_prefix, {}).get("prompt_tokens", 0)
+
+        # Get language for this case
+        language = case_languages.get(case_prefix, "unknown")
+
+        # Add this case to all buckets that cover its token count
+        for bucket in buckets:
+            if bucket["bucket_min"] <= token_count <= bucket["bucket_max"]:
+                # Initialize language if needed
+                if language not in bucket["models"][model]["languages"]:
+                    bucket["models"][model]["languages"][language] = {
+                        "attempts": 0,
+                        "successful": 0,
+                    }
+
+                # Add to counts
+                bucket["models"][model]["overall"]["attempts"] += 1
+                bucket["models"][model]["languages"][language]["attempts"] += 1
+
+                if result_metadata.get("success", False):
+                    bucket["models"][model]["overall"]["successful"] += 1
+                    bucket["models"][model]["languages"][language]["successful"] += 1
+
+                # Note: No break here, so we continue to add this case to all matching buckets
+
+    # Calculate confidence intervals for all data points
+    for bucket in buckets:
+        for model, model_data in bucket["models"].items():
+            # Calculate confidence intervals for overall data
+            successful = model_data["overall"]["successful"]
+            attempts = model_data["overall"]["attempts"]
+            lower, upper = wilson_score_interval(successful, attempts)
+            model_data["overall"]["lower_bound"] = lower
+            model_data["overall"]["upper_bound"] = upper
+
+            # Calculate confidence intervals for each language
+            for language_data in model_data["languages"].values():
+                successful = language_data["successful"]
+                attempts = language_data["attempts"]
+                lower, upper = wilson_score_interval(successful, attempts)
+                language_data["lower_bound"] = lower
+                language_data["upper_bound"] = upper
+
+    # Calculate all unique languages across all data
+    all_languages = set()
+    for bucket in buckets:
+        for model_data in bucket["models"].values():
+            for language in model_data["languages"].keys():
+                all_languages.add(language)
+
+    # Create the chart data object
+    chart_data = {
+        "buckets": buckets,
+        "models": list(sorted(all_models)),
+        "languages": list(sorted(all_languages)),
+        "min_tokens_k": 0,  # Always start at 0k
+        "max_tokens_k": max_tokens_k,
+    }
+
+    return chart_data
+
+
+def get_auto_generation_warning() -> str:
+    """Returns a standard warning about auto-generated files."""
+    return f"""
+THIS FILE IS AUTOMATICALLY GENERATED BY benchmark_pipeline/3_generate_pages.py
+DO NOT EDIT DIRECTLY - ANY CHANGES WILL BE OVERWRITTEN
+Last generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+
+
+def write_chart_data_to_file(chart_data: Dict[str, Any], output_dir: Path) -> None:
+    """Writes chart data to a JSON file in the specified directory."""
+    output_path = output_dir / "chart_data.json"
+    try:
+        # Create a wrapper object that includes the warning
+        wrapper = {
+            "_warning": get_auto_generation_warning().strip(),
+            "data": chart_data,
+        }
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(wrapper, f, indent=2)
+        print(f"Generated {output_path}")
+    except IOError as e:
+        print(f"Error writing chart data file: {e}")
+
+
+def create_token_chart_section() -> str:
+    """Creates an HTML section for the token-based chart."""
+    return """
+    <section id="token-chart">
+        <h2>Success Rate by Prompt Size</h2>
+        <div class="chart-controls">
+            <div class="model-selection">
+                <h3>Models</h3>
+                <div id="model-checkboxes"></div>
+            </div>
+            <div class="language-selection">
+                <h3>Languages</h3>
+                <div id="language-checkboxes"></div>
+            </div>
+            <div class="display-options">
+                <h3>Display Options</h3>
+                <div class="checkbox-item">
+                    <label>
+                        <input type="checkbox" id="show-confidence-intervals" checked>
+                        Show 95% Confidence Intervals
+                    </label>
+                </div>
+            </div>
+        </div>
+        <div class="chart-container">
+            <canvas id="token-success-chart"></canvas>
+        </div>
+    </section>
+    """
+
+
+def create_chart_javascript() -> str:
+    """Creates JavaScript code for initializing and controlling the chart."""
+    return """
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+// Load chart data
+fetch('chart_data.json')
+    .then(response => response.json())
+    .then(wrapper => {
+        // Use the data property which contains the actual chart data
+        // The _warning property contains the auto-generation warning
+        initializeChart(wrapper.data);
+    });
+
+// JavaScript implementation of Wilson score interval for confidence intervals
+function wilson_score_interval(successful, attempts, z = 1.96) {
+    if (attempts === 0) return [0.0, 0.0];
+    
+    // Observed proportion
+    const p_hat = successful / attempts;
+    
+    // Wilson score calculation
+    const denominator = 1 + (z * z / attempts);
+    const center = (p_hat + (z * z / (2 * attempts))) / denominator;
+    const interval = z * Math.sqrt((p_hat * (1 - p_hat) + (z * z / (4 * attempts))) / attempts) / denominator;
+    
+    const lower_bound = Math.max(0.0, center - interval);
+    const upper_bound = Math.min(1.0, center + interval);
+    
+    return [lower_bound, upper_bound];
+}
+
+function initializeChart(chartData) {
+    // Define chart colors
+    const colors = [
+        '#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f',
+        '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'
+    ];
+    
+    // Get canvas context
+    const ctx = document.getElementById('token-success-chart').getContext('2d');
+    
+    // Create model checkboxes
+    const modelCheckboxes = document.getElementById('model-checkboxes');
+    chartData.models.forEach((model, index) => {
+        const color = colors[index % colors.length];
+        const checkbox = document.createElement('div');
+        checkbox.className = 'checkbox-item';
+        checkbox.innerHTML = `
+            <label>
+                <input type="checkbox" data-model="${model}" checked>
+                <span class="checkbox-color" style="background-color: ${color};"></span>
+                ${model}
+            </label>
+        `;
+        modelCheckboxes.appendChild(checkbox);
+    });
+    
+    // Create language checkboxes
+    const languageCheckboxes = document.getElementById('language-checkboxes');
+    chartData.languages.forEach(language => {
+        const checkbox = document.createElement('div');
+        checkbox.className = 'checkbox-item';
+        checkbox.innerHTML = `
+            <label>
+                <input type="checkbox" data-language="${language}" checked>
+                ${language}
+            </label>
+        `;
+        languageCheckboxes.appendChild(checkbox);
+    });
+    
+    // Create chart
+    const chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: chartData.buckets.map(bucket => bucket.bucket_location_k + 'k'),
+            datasets: []
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Prompt Token Length (k)'
+                    }
+                },
+                y: {
+                    title: {
+                        display: true,
+                        text: 'Success Rate (%)'
+                    },
+                    min: 0,
+                    max: 100
+                }
+            },
+            plugins: {
+                legend: {
+                    labels: {
+                        // Custom filter function to exclude datasets with display: false from the legend
+                        filter: (legendItem, data) => {
+                            const dataset = data.datasets[legendItem.datasetIndex];
+                            return dataset && dataset.display !== false;
+                        }
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            // Safety check - make sure context and dataset exist
+                            if (!context || !context.dataset || !context.dataset.label) {
+                                return null;
+                            }
+                            
+                            // Don't show tooltips for confidence interval datasets
+                            if (context.dataset.label.includes('CI')) {
+                                return null;
+                            }
+                            
+                            try {
+                                const modelName = context.dataset.label;
+                                
+                                // Safety check for dataIndex
+                                if (context.dataIndex === undefined || !chartData.buckets[context.dataIndex]) {
+                                    return [`${modelName}`];
+                                }
+                                
+                                const bucketData = chartData.buckets[context.dataIndex];
+                                
+                                // Safety check for model data
+                                if (!bucketData.models || !bucketData.models[modelName]) {
+                                    return [`${modelName}: No data available`];
+                                }
+                                
+                                const modelData = bucketData.models[modelName];
+                                
+                                // Get basic stats
+                                const successRate = context.raw;
+                                const successful = modelData.overall.successful;
+                                const attempts = modelData.overall.attempts;
+                                
+                                // Get confidence interval (for selected languages)
+                                let ciInfo = '';
+                                const ciElement = document.getElementById('show-confidence-intervals');
+                                if (ciElement && ciElement.checked) {
+                                    // Find if we have data to calculate CIs
+                                    let langSuccessful = 0;
+                                    let langAttempts = 0;
+                                    
+                                    const checkboxes = document.querySelectorAll('input[data-language]:checked');
+                                    if (checkboxes && checkboxes.length > 0) {
+                                        const selectedLanguages = Array.from(checkboxes)
+                                            .map(checkbox => checkbox.getAttribute('data-language'))
+                                            .filter(lang => lang); // Filter out any null/undefined values
+                                        
+                                        selectedLanguages.forEach(language => {
+                                            if (modelData.languages && modelData.languages[language]) {
+                                                langSuccessful += modelData.languages[language].successful;
+                                                langAttempts += modelData.languages[language].attempts;
+                                            }
+                                        });
+                                        
+                                        if (langAttempts > 0) {
+                                            const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                                            ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
+                                        }
+                                    }
+                                }
+                                
+                                return [
+                                    `${modelName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${attempts})`,
+                                    `Token Range: ${bucketData.bucket_range}${ciInfo}`
+                                ];
+                            } catch (error) {
+                                console.error('Error in tooltip callback:', error);
+                                return ['Error displaying tooltip'];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
+    // Function to update chart based on selected models and languages
+    function updateChart() {
+        // Get selected models and languages
+        const selectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
+            .map(checkbox => checkbox.getAttribute('data-model'));
+        
+        const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
+            .map(checkbox => checkbox.getAttribute('data-language'));
+        
+        // Clear current datasets
+        chart.data.datasets = [];
+        
+        // Create datasets for each selected model
+        selectedModels.forEach((model, index) => {
+            const color = colors[index % colors.length];
+            
+            // Calculate data points
+            const dataPoints = chartData.buckets.map(bucket => {
+                const modelData = bucket.models[model];
+                
+                // Filter by selected languages
+                let successful = 0;
+                let attempts = 0;
+                
+                if (selectedLanguages.length === 0) {
+                    // No languages selected, show empty chart (consistent with model selection behavior)
+                    return null;
+                } else {
+                    // Use only selected languages
+                    selectedLanguages.forEach(language => {
+                        if (modelData.languages[language]) {
+                            successful += modelData.languages[language].successful;
+                            attempts += modelData.languages[language].attempts;
+                        }
+                    });
+                }
+                
+                // Calculate success rate
+                return attempts > 0 ? (successful / attempts * 100) : null;
+            });
+            
+            // Calculate confidence interval data points if languages are selected
+            let lowerBoundPoints = null;
+            let upperBoundPoints = null;
+            
+            if (selectedLanguages.length > 0) {
+                lowerBoundPoints = chartData.buckets.map(bucket => {
+                    const modelData = bucket.models[model];
+                    
+                    // Use only selected languages
+                    let langSuccessful = 0;
+                    let langAttempts = 0;
+                    
+                    selectedLanguages.forEach(language => {
+                        if (modelData.languages[language]) {
+                            langSuccessful += modelData.languages[language].successful;
+                            langAttempts += modelData.languages[language].attempts;
+                        }
+                    });
+                    
+                    if (langAttempts > 0) {
+                        // Recalculate Wilson interval for the combined languages
+                        const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                        return lower * 100; // Convert to percentage
+                    }
+                    return null;
+                });
+                
+                upperBoundPoints = chartData.buckets.map(bucket => {
+                    const modelData = bucket.models[model];
+                    
+                    // Use only selected languages
+                    let langSuccessful = 0;
+                    let langAttempts = 0;
+                    
+                    selectedLanguages.forEach(language => {
+                        if (modelData.languages[language]) {
+                            langSuccessful += modelData.languages[language].successful;
+                            langAttempts += modelData.languages[language].attempts;
+                        }
+                    });
+                    
+                    if (langAttempts > 0) {
+                        // Recalculate Wilson interval for the combined languages
+                        const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
+                        return upper * 100; // Convert to percentage
+                    }
+                    return null;
+                });
+            }
+            
+            // Add main dataset
+            chart.data.datasets.push({
+                label: model,
+                data: dataPoints,
+                borderColor: color,
+                backgroundColor: color + '33',
+                fill: false,
+                tension: 0.1,
+                pointRadius: 4,
+                pointHoverRadius: 6
+            });
+            
+            // Add confidence interval datasets if enabled
+            const showConfidenceIntervals = document.getElementById('show-confidence-intervals').checked;
+            
+            if (showConfidenceIntervals && selectedLanguages.length > 0) {
+                // Add lower bound line first (needed for reference by the area dataset)
+                const lowerBoundIndex = chart.data.datasets.length;
+                chart.data.datasets.push({
+                    label: `${model} (95% CI lower)`,
+                    data: lowerBoundPoints,
+                    borderColor: 'transparent',
+                    backgroundColor: 'transparent',
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: false,
+                    showLine: false, // Don't draw a line for this dataset
+                    display: false   // Completely exclude from legend
+                });
+                
+                // Add confidence interval area
+                chart.data.datasets.push({
+                    label: `${model} (95% CI)`,
+                    data: upperBoundPoints,
+                    borderColor: 'transparent',
+                    backgroundColor: color + '22', // Very transparent version of the line color
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: lowerBoundIndex, // Fill to the specific dataset index (the lower bound)
+                    display: false         // Completely exclude from legend
+                });
+            }
+        });
+        
+        // Update chart
+        chart.update();
+    }
+    
+    // Add event listeners to model and language checkboxes
+    document.querySelectorAll('input[data-model], input[data-language]').forEach(checkbox => {
+        checkbox.addEventListener('change', updateChart);
+    });
+    
+    // Add event listener to confidence interval checkbox
+    document.getElementById('show-confidence-intervals').addEventListener('change', updateChart);
+    
+    // Initial chart update
+    updateChart();
+}
+</script>
+"""
+
+
 def create_cases_placeholder() -> str:
     """Creates a placeholder section for individual benchmark cases."""
     return """
@@ -612,7 +1184,10 @@ def create_cases_placeholder() -> str:
 
 def create_css_file() -> str:
     """Creates a basic CSS stylesheet for the GitHub Pages site."""
-    return """/* Basic Reset */
+    warning = get_auto_generation_warning()
+    warning_comment = f"/*\n{warning}\n*/\n\n"
+
+    css_content = """/* Basic Reset */
 * {
     margin: 0;
     padding: 0;
@@ -661,6 +1236,11 @@ section h2 {
     padding-bottom: 5px;
 }
 
+section h3 {
+    margin-bottom: 10px;
+    font-size: 18px;
+}
+
 /* Tables */
 table {
     width: 100%;
@@ -688,6 +1268,47 @@ tbody tr:hover {
     background-color: #f0f4f8;
 }
 
+/* Chart Section */
+.chart-controls {
+    display: flex;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    gap: 30px;
+}
+
+.model-selection, .language-selection, .display-options {
+    flex: 1;
+    min-width: 200px;
+}
+
+.checkbox-item {
+    margin-bottom: 8px;
+}
+
+.checkbox-item label {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.checkbox-item input[type="checkbox"] {
+    margin-right: 8px;
+}
+
+.checkbox-color {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-right: 8px;
+    border-radius: 2px;
+}
+
+.chart-container {
+    width: 100%;
+    height: 400px;
+    margin-bottom: 30px;
+}
+
 /* Footer */
 footer {
     margin-top: 40px;
@@ -696,8 +1317,9 @@ footer {
     color: #586069;
     font-size: 14px;
     text-align: center;
-}
-"""
+}"""
+
+    return warning_comment + css_content
 
 
 # --- Main Function ---
@@ -751,6 +1373,30 @@ def main():
         f"Found results for {len(results_metadata)} case-model combinations across {len(all_models)} models"
     )
 
+    # Determine language for each case prefix
+    print("Determining languages for benchmark cases...")
+    case_languages = {}
+    for case_prefix, metadata in prompt_metadata.items():
+        # Try to get language from metadata
+        language = metadata.get("language")
+
+        # If not available, infer from filename
+        if not language:
+            filename = metadata.get("original_filename", case_prefix)
+            language = infer_language_from_filename(filename, ext_to_lang_map)
+
+        case_languages[case_prefix] = language
+
+    # Generate chart data
+    print("Generating chart data...")
+    chart_data = generate_chart_data(
+        results_metadata, prompt_metadata, all_models, case_languages
+    )
+
+    # Write chart data to file
+    print("Writing chart data file...")
+    write_chart_data_to_file(chart_data, docs_dir)
+
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
@@ -761,8 +1407,9 @@ def main():
     html_content += create_language_stats_table(
         results_metadata, prompt_metadata, all_models, ext_to_lang_map
     )
+    html_content += create_token_chart_section()
     html_content += create_cases_placeholder()
-    html_content += create_html_footer()
+    html_content += create_html_footer(include_chart_js=True)
 
     # Write HTML file
     index_path = docs_dir / "index.html"
