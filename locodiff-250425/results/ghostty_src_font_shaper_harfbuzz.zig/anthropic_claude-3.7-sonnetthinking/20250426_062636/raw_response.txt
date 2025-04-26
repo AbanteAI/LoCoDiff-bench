@@ -1,0 +1,208 @@
+```zig
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const harfbuzz = @import("harfbuzz");
+const font = @import("../main.zig");
+const terminal = @import("../../terminal/main.zig");
+const Feature = font.shape.Feature;
+const FeatureList = font.shape.FeatureList;
+const default_features = font.shape.default_features;
+const Face = font.Face;
+const Collection = font.Collection;
+const DeferredFace = font.DeferredFace;
+const Library = font.Library;
+const SharedGrid = font.SharedGrid;
+const Style = font.Style;
+const Presentation = font.Presentation;
+
+const log = std.log.scoped(.font_shaper);
+
+/// Shaper that uses Harfbuzz.
+pub const Shaper = struct {
+    /// The allocated used for the feature list and cell buf.
+    alloc: Allocator,
+
+    /// The buffer used for text shaping. We reuse it across multiple shaping
+    /// calls to prevent allocations.
+    hb_buf: harfbuzz.Buffer,
+
+    /// The shared memory used for shaping results.
+    cell_buf: CellBuf,
+
+    /// The features to use for shaping.
+    hb_feats: []harfbuzz.Feature,
+
+    const CellBuf = std.ArrayListUnmanaged(font.shape.Cell);
+
+    /// The cell_buf argument is the buffer to use for storing shaped results.
+    /// This should be at least the number of columns in the terminal.
+    pub fn init(alloc: Allocator, opts: font.shape.Options) !Shaper {
+        // Parse all the features we want to use.
+        const hb_feats = hb_feats: {
+            var feature_list: FeatureList = .{};
+            defer feature_list.deinit(alloc);
+            try feature_list.features.appendSlice(alloc, &default_features);
+            for (opts.features) |feature_str| {
+                try feature_list.appendFromString(alloc, feature_str);
+            }
+
+            var list = try alloc.alloc(harfbuzz.Feature, feature_list.features.items.len);
+            errdefer alloc.free(list);
+
+            for (feature_list.features.items, 0..) |feature, i| {
+                list[i] = .{
+                    .tag = std.mem.nativeToBig(u32, @bitCast(feature.tag)),
+                    .value = feature.value,
+                    .start = harfbuzz.c.HB_FEATURE_GLOBAL_START,
+                    .end = harfbuzz.c.HB_FEATURE_GLOBAL_END,
+                };
+            }
+
+            break :hb_feats list;
+        };
+        errdefer alloc.free(hb_feats);
+
+        return Shaper{
+            .alloc = alloc,
+            .hb_buf = try harfbuzz.Buffer.create(),
+            .cell_buf = .{},
+            .hb_feats = hb_feats,
+        };
+    }
+
+    pub fn deinit(self: *Shaper) void {
+        self.hb_buf.destroy();
+        self.cell_buf.deinit(self.alloc);
+        self.alloc.free(self.hb_feats);
+    }
+
+    pub fn endFrame(self: *const Shaper) void {
+        _ = self;
+    }
+
+    /// Returns an iterator that returns one text run at a time for the
+    /// given terminal row. Note that text runs are are only valid one at a time
+    /// for a Shaper struct since they share state.
+    ///
+    /// The selection must be a row-only selection (height = 1). See
+    /// Selection.containedRow. The run iterator will ONLY look at X values
+    /// and assume the y value matches.
+    pub fn runIterator(
+        self: *Shaper,
+        grid: *SharedGrid,
+        screen: *const terminal.Screen,
+        row: terminal.Pin,
+        selection: ?terminal.Selection,
+        cursor_x: ?usize,
+    ) font.shape.RunIterator {
+        return .{
+            .hooks = .{ .shaper = self },
+            .grid = grid,
+            .screen = screen,
+            .row = row,
+            .selection = selection,
+            .cursor_x = cursor_x,
+        };
+    }
+
+    /// Shape the given text run. The text run must be the immediately previous
+    /// text run that was iterated since the text run does share state with the
+    /// Shaper struct.
+    ///
+    /// The return value is only valid until the next shape call is called.
+    ///
+    /// If there is not enough space in the cell buffer, an error is returned.
+    pub fn shape(self: *Shaper, run: font.shape.TextRun) ![]const font.shape.Cell {
+        // We only do shaping if the font is not a special-case. For special-case
+        // fonts, the codepoint == glyph_index so we don't need to run any shaping.
+        if (run.font_index.special() == null) {
+            // We have to lock the grid to get the face and unfortunately
+            // freetype faces (typically used with harfbuzz) are not thread
+            // safe so this has to be an exclusive lock.
+            run.grid.lock.lock();
+            defer run.grid.lock.unlock();
+
+            const face = try run.grid.resolver.collection.getFace(run.font_index);
+            const i = if (!face.quirks_disable_default_font_features) 0 else i: {
+                // If we are disabling default font features we just offset
+                // our features by the hardcoded items because always
+                // add those at the beginning.
+                break :i default_features.len;
+            };
+
+            harfbuzz.shape(face.hb_font, self.hb_buf, self.hb_feats[i..]);
+        }
+
+        // If our buffer is empty, we short-circuit the rest of the work
+        // return nothing.
+        if (self.hb_buf.getLength() == 0) return self.cell_buf.items[0..0];
+        const info = self.hb_buf.getGlyphInfos();
+        const pos = self.hb_buf.getGlyphPositions() orelse return error.HarfbuzzFailed;
+
+        // This is perhaps not true somewhere, but we currently assume it is true.
+        // If it isn't true, I'd like to catch it and learn more.
+        assert(info.len == pos.len);
+
+        // This keeps track of the current offsets within a single cell.
+        var cell_offset: struct {
+            cluster: u32 = 0,
+            x: i32 = 0,
+            y: i32 = 0,
+        } = .{};
+
+        // Convert all our info/pos to cells and set it.
+        self.cell_buf.clearRetainingCapacity();
+        for (info, pos) |info_v, pos_v| {
+            // If our cluster changed then we've moved to a new cell.
+            if (info_v.cluster != cell_offset.cluster) cell_offset = .{
+                .cluster = info_v.cluster,
+            };
+
+            try self.cell_buf.append(self.alloc, .{
+                .x = @intCast(info_v.cluster),
+                .x_offset = @intCast(cell_offset.x),
+                .y_offset = @intCast(cell_offset.y),
+                .glyph_index = info_v.codepoint,
+            });
+
+            if (font.options.backend.hasFreetype()) {
+                // Freetype returns 26.6 fixed point values, so we need to
+                // divide by 64 to get the actual value. I can't find any
+                // HB API to stop this.
+                cell_offset.x += pos_v.x_advance >> 6;
+                cell_offset.y += pos_v.y_advance >> 6;
+            } else {
+                cell_offset.x += pos_v.x_advance;
+                cell_offset.y += pos_v.y_advance;
+            }
+        }
+
+        return self.cell_buf.items;
+    }
+
+    /// The hooks for RunIterator.
+    pub const RunIteratorHook = struct {
+        shaper: *Shaper,
+
+        pub fn prepare(self: RunIteratorHook) !void {
+            // Reset the buffer for our current run
+            self.shaper.hb_buf.reset();
+            self.shaper.hb_buf.setContentType(.unicode);
+
+            // We don't support RTL text because RTL in terminals is messy.
+            // Its something we want to improve. For now, we force LTR because
+            // our renderers assume a strictly increasing X value.
+            self.shaper.hb_buf.setDirection(.ltr);
+        }
+
+        pub fn addCodepoint(self: RunIteratorHook, cp: u32, cluster: u32) !void {
+            self.shaper.hb_buf.add(cp, cluster);
+        }
+
+        pub fn finalize(self: RunIteratorHook) !void {
+            self.shaper.hb_buf.guessSegmentProperties();
+        }
+    };
+};
+```
