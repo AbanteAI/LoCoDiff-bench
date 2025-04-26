@@ -22,12 +22,12 @@ When you're asked to run a benchmark, follow these steps:
    - `--model MODEL_NAME`: The model identifier to benchmark (e.g., `anthropic/claude-3.7-sonnet:thinking`)
    - `--benchmark-run-dir BENCHMARK_DIR`: The benchmark directory (e.g., `locodiff-250425`)
 
-3. **Handling API errors**: If any benchmarks encounter API errors, rerun the script after completion:
+3. **Handling API errors**: If any benchmarks encounter API errors or technical failures (not model output failures), rerun the script after completion:
    ```
    python benchmark_pipeline/2_run_benchmark.py --concurrency 1 --num-runs -1 --model MODEL_NAME --benchmark-run-dir BENCHMARK_DIR
    ```
    
-   It will automatically retry only the failed benchmarks.
+   The script will automatically detect and retry only the benchmarks that had API errors or were not completed due to technical issues. It will NOT retry benchmarks where the model produced incorrect output (those are considered completed runs with failed results).
 
 4. **Generate visualization pages** (step 3 in the pipeline) after the benchmark is complete:
    ```
