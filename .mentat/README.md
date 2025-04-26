@@ -60,6 +60,7 @@ When you're asked to run a benchmark, follow these steps:
 - Always run the 3rd script (generate_pages.py) after completing benchmarks to update visualizations.
 - Include key metrics in your PR description (success rate, costs, comparison to other models).
 - The benchmark script handles sanitizing model names in directories (replacing `/` with `_`).
+- **Never manually modify** the files created by running the benchmark, as this would compromise the integrity of the results. All benchmark files should be the direct, unmodified output of the benchmark scripts.
 
 ## Example Benchmark Run
 
