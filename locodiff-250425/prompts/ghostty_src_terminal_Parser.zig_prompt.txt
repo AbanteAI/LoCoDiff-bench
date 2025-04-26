@@ -1,0 +1,3366 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/terminal/Parser.zig
+
+commit 8d389b4ea9263930a8aa8e7a9d2081d9894a52b1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Apr 18 09:38:52 2022 -0700
+
+    initial VT emulation table
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+new file mode 100644
+index 00000000..0272dc86
+--- /dev/null
++++ b/src/terminal/Parser.zig
+@@ -0,0 +1,107 @@
++//! VT-series parser for escape and control sequences.
++//!
++//! This is implemented directly as the state machine described on
++//! vt100.net: https://vt100.net/emu/dec_ansi_parser
++const Parser = @This();
++
++const std = @import("std");
++const testing = std.testing;
++const table = @import("parse_table.zig").table;
++
++/// States for the state machine
++pub const State = enum {
++    anywhere,
++    ground,
++    escape,
++    escape_intermediate,
++    csi_entry,
++    csi_intermediate,
++    csi_param,
++    csi_ignore,
++    dcs_entry,
++    dcs_param,
++    dcs_intermediate,
++    dcs_passthrough,
++    dcs_ignore,
++    osc_string,
++    sos_pm_apc_string,
++};
++
++pub const Action = enum {
++    none,
++    ignore,
++    print,
++    execute,
++    clear,
++    collect,
++    param,
++    esc_dispatch,
++    csi_dispatch,
++    hook,
++    put,
++    unhook,
++    osc_start,
++    osc_put,
++    osc_end,
++};
++
++/// Current state of the state machine
++state: State = .ground,
++
++pub fn init() Parser {
++    return .{};
++}
++
++pub fn next(self: *Parser, c: u8) void {
++    const effect = effect: {
++        // First look up the transition in the anywhere table.
++        const anywhere = table[c][@enumToInt(State.anywhere)];
++        if (anywhere.state != .anywhere) break :effect anywhere;
++
++        // If we don't have any transition from anywhere, use our state.
++        break :effect table[c][@enumToInt(self.state)];
++    };
++
++    const next_state = effect.state;
++    const action = effect.action;
++
++    // When going from one state to another, the actions take place in this order:
++    //
++    // 1. exit action from old state
++    // 2. transition action
++    // 3. entry action to new state
++
++    // Perform exit actions. "The action associated with the exit event happens
++    // when an incoming symbol causes a transition from this state to another
++    // state (or even back to the same state)."
++    switch (self.state) {
++        .osc_string => {}, // TODO: osc_end
++        .dcs_passthrough => {}, // TODO: unhook
++        else => {},
++    }
++
++    // Perform the transition action
++    self.doAction(action);
++
++    // Perform the entry action
++    // TODO: when _first_ entered only?
++    switch (self.state) {
++        .escape, .dcs_entry, .csi_entry => {}, // TODO: clear
++        .osc_string => {}, // TODO: osc_start
++        .dcs_passthrough => {}, // TODO: hook
++        else => {},
++    }
++
++    self.state = next_state;
++}
++
++fn doAction(self: *Parser, action: Action) void {
++    _ = self;
++    _ = action;
++}
++
++test {
++    var p = init();
++    p.next(0x9E);
++    try testing.expect(p.state == .sos_pm_apc_string);
++}
+
+commit 20f9ad3f551b1060be05105118412dc5687fdf21
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Apr 18 11:01:47 2022 -0700
+
+    implement basic VT parser -- only print/execute handled
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 0272dc86..47d65c07 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -27,7 +27,10 @@ pub const State = enum {
+     sos_pm_apc_string,
+ };
+ 
+-pub const Action = enum {
++/// Transition action is an action that can be taken during a state
++/// transition. This is more of an internal action, not one used by
++/// end users, typically.
++pub const TransitionAction = enum {
+     none,
+     ignore,
+     print,
+@@ -45,6 +48,16 @@ pub const Action = enum {
+     osc_end,
+ };
+ 
++/// Action is the action that a caller of the parser is expected to
++/// take as a result of some input character.
++pub const Action = union(enum) {
++    /// Draw character to the screen.
++    print: u8,
++
++    /// Execute the C0 or C1 function.
++    execute: u8,
++};
++
+ /// Current state of the state machine
+ state: State = .ground,
+ 
+@@ -52,7 +65,10 @@ pub fn init() Parser {
+     return .{};
+ }
+ 
+-pub fn next(self: *Parser, c: u8) void {
++/// Next consums the next character c and returns the actions to execute.
++/// Up to 3 actions may need to be exected -- in order -- representing
++/// the state exit, transition, and entry actions.
++pub fn next(self: *Parser, c: u8) [3]?Action {
+     const effect = effect: {
+         // First look up the transition in the anywhere table.
+         const anywhere = table[c][@enumToInt(State.anywhere)];
+@@ -65,43 +81,62 @@ pub fn next(self: *Parser, c: u8) void {
+     const next_state = effect.state;
+     const action = effect.action;
+ 
++    // After generating the actions, we set our next state.
++    defer self.state = next_state;
++
+     // When going from one state to another, the actions take place in this order:
+     //
+     // 1. exit action from old state
+     // 2. transition action
+     // 3. entry action to new state
++    return [3]?Action{
++        switch (self.state) {
++            .osc_string => @panic("TODO"), // TODO: osc_end
++            .dcs_passthrough => @panic("TODO"), // TODO: unhook
++            else => null,
++        },
+ 
+-    // Perform exit actions. "The action associated with the exit event happens
+-    // when an incoming symbol causes a transition from this state to another
+-    // state (or even back to the same state)."
+-    switch (self.state) {
+-        .osc_string => {}, // TODO: osc_end
+-        .dcs_passthrough => {}, // TODO: unhook
+-        else => {},
+-    }
+-
+-    // Perform the transition action
+-    self.doAction(action);
+-
+-    // Perform the entry action
+-    // TODO: when _first_ entered only?
+-    switch (self.state) {
+-        .escape, .dcs_entry, .csi_entry => {}, // TODO: clear
+-        .osc_string => {}, // TODO: osc_start
+-        .dcs_passthrough => {}, // TODO: hook
+-        else => {},
+-    }
++        self.doAction(action, c),
+ 
+-    self.state = next_state;
++        switch (self.state) {
++            .escape, .dcs_entry, .csi_entry => @panic("TODO"), // TODO: clear
++            .osc_string => @panic("TODO"), // TODO: osc_start
++            .dcs_passthrough => @panic("TODO"), // TODO: hook
++            else => null,
++        },
++    };
+ }
+ 
+-fn doAction(self: *Parser, action: Action) void {
++fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+     _ = self;
+-    _ = action;
++    return switch (action) {
++        .none, .ignore => null,
++        .print => return Action{ .print = c },
++        .execute => return Action{ .execute = c },
++        else => @panic("TODO"),
++    };
+ }
+ 
+ test {
+     var p = init();
+-    p.next(0x9E);
++    _ = p.next(0x9E);
+     try testing.expect(p.state == .sos_pm_apc_string);
++    _ = p.next(0x9C);
++    try testing.expect(p.state == .ground);
++
++    {
++        const a = p.next('a');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .print);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next(0x19);
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .execute);
++        try testing.expect(a[2] == null);
++    }
+ }
+
+commit 468f6e2b515a374e8c04be1122302984275d81e3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun May 8 14:44:47 2022 -0700
+
+    implement basic CSI dispatch action
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 47d65c07..1f74c0e0 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -8,6 +8,8 @@ const std = @import("std");
+ const testing = std.testing;
+ const table = @import("parse_table.zig").table;
+ 
++const log = std.log.scoped(.parser);
++
+ /// States for the state machine
+ pub const State = enum {
+     anywhere,
+@@ -56,11 +58,34 @@ pub const Action = union(enum) {
+ 
+     /// Execute the C0 or C1 function.
+     execute: u8,
++
++    /// Execute the CSI command. Note that pointers within this
++    /// structure are only valid until the next call to "next".
++    csi_dispatch: CSI,
++
++    pub const CSI = struct {
++        params: []u16,
++        final: u8,
++    };
+ };
+ 
++/// Maximum number of intermediate characters during parsing.
++const MAX_INTERMEDIATE = 2;
++const MAX_PARAMS = 16;
++
+ /// Current state of the state machine
+ state: State = .ground,
+ 
++/// Intermediate tracking.
++intermediate: [MAX_INTERMEDIATE]u8 = undefined,
++intermediate_idx: u8 = 0,
++
++/// Param tracking, building
++params: [MAX_PARAMS]u16 = undefined,
++params_idx: u8 = 0,
++param_acc: u16 = 0,
++param_acc_idx: u8 = 0,
++
+ pub fn init() Parser {
+     return .{};
+ }
+@@ -78,6 +103,8 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+         break :effect table[c][@enumToInt(self.state)];
+     };
+ 
++    log.info("next: {x}", .{c});
++
+     const next_state = effect.state;
+     const action = effect.action;
+ 
+@@ -98,8 +125,11 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+ 
+         self.doAction(action, c),
+ 
+-        switch (self.state) {
+-            .escape, .dcs_entry, .csi_entry => @panic("TODO"), // TODO: clear
++        switch (next_state) {
++            .escape, .dcs_entry, .csi_entry => clear: {
++                self.clear();
++                break :clear null;
++            },
+             .osc_string => @panic("TODO"), // TODO: osc_start
+             .dcs_passthrough => @panic("TODO"), // TODO: hook
+             else => null,
+@@ -111,12 +141,69 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+     _ = self;
+     return switch (action) {
+         .none, .ignore => null,
+-        .print => return Action{ .print = c },
+-        .execute => return Action{ .execute = c },
+-        else => @panic("TODO"),
++        .print => Action{ .print = c },
++        .execute => Action{ .execute = c },
++        .collect => collect: {
++            self.intermediate[self.intermediate_idx] = c;
++            // TODO: incr, bounds check
++
++            // The client is expected to perform no action.
++            break :collect null;
++        },
++        .param => param: {
++            // TODO: bounds check
++
++            // Semicolon separates parameters. If we encounter a semicolon
++            // we need to store and move on to the next parameter.
++            if (c == ';') {
++                // Set param final value
++                self.params[self.params_idx] = self.param_acc;
++                self.params_idx += 1;
++
++                // Reset current param value to 0
++                self.param_acc = 0;
++                self.param_acc_idx = 0;
++                break :param null;
++            }
++
++            // A numeric value. Add it to our accumulator.
++            if (self.param_acc_idx > 0) {
++                self.param_acc *|= 10;
++            }
++            self.param_acc +|= c - '0';
++            self.param_acc_idx += 1;
++
++            // The client is expected to perform no action.
++            break :param null;
++        },
++        .csi_dispatch => csi_dispatch: {
++            // Finalize parameters if we have one
++            if (self.param_acc_idx > 0) {
++                self.params[self.params_idx] = self.param_acc;
++                self.params_idx += 1;
++            }
++
++            break :csi_dispatch Action{
++                .csi_dispatch = .{
++                    .params = self.params[0..self.params_idx],
++                    .final = c,
++                },
++            };
++        },
++        else => {
++            std.log.err("unimplemented action: {}", .{action});
++            @panic("TODO");
++        },
+     };
+ }
+ 
++fn clear(self: *Parser) void {
++    self.intermediate_idx = 0;
++    self.params_idx = 0;
++    self.param_acc = 0;
++    self.param_acc_idx = 0;
++}
++
+ test {
+     var p = init();
+     _ = p.next(0x9E);
+@@ -140,3 +227,44 @@ test {
+         try testing.expect(a[2] == null);
+     }
+ }
++
++test "csi: ESC [ H" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next(0x5B);
++
++    {
++        const a = p.next(0x48);
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 0x48);
++        try testing.expect(d.params.len == 0);
++    }
++}
++
++test "csi: ESC [ 1 ; 4 H" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next(0x5B);
++    _ = p.next(0x31); // 1
++    _ = p.next(0x3B); // ;
++    _ = p.next(0x34); // 4
++    //
++    {
++        const a = p.next(0x48); // H
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'H');
++        try testing.expect(d.params.len == 2);
++        try testing.expectEqual(@as(u16, 1), d.params[0]);
++        try testing.expectEqual(@as(u16, 4), d.params[1]);
++    }
++}
+
+commit 8e907a352239c473eafa1d89b88361026c56d862
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun May 8 15:02:24 2022 -0700
+
+    terminal: pass intermediates through to CSI, ignore NUL
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 1f74c0e0..8900b856 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -64,6 +64,7 @@ pub const Action = union(enum) {
+     csi_dispatch: CSI,
+ 
+     pub const CSI = struct {
++        intermediates: []u8,
+         params: []u16,
+         final: u8,
+     };
+@@ -77,8 +78,8 @@ const MAX_PARAMS = 16;
+ state: State = .ground,
+ 
+ /// Intermediate tracking.
+-intermediate: [MAX_INTERMEDIATE]u8 = undefined,
+-intermediate_idx: u8 = 0,
++intermediates: [MAX_INTERMEDIATE]u8 = undefined,
++intermediates_idx: u8 = 0,
+ 
+ /// Param tracking, building
+ params: [MAX_PARAMS]u16 = undefined,
+@@ -144,7 +145,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+         .print => Action{ .print = c },
+         .execute => Action{ .execute = c },
+         .collect => collect: {
+-            self.intermediate[self.intermediate_idx] = c;
++            self.intermediates[self.intermediates_idx] = c;
+             // TODO: incr, bounds check
+ 
+             // The client is expected to perform no action.
+@@ -185,6 +186,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+ 
+             break :csi_dispatch Action{
+                 .csi_dispatch = .{
++                    .intermediates = self.intermediates[0..self.intermediates_idx],
+                     .params = self.params[0..self.params_idx],
+                     .final = c,
+                 },
+@@ -198,7 +200,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+ }
+ 
+ fn clear(self: *Parser) void {
+-    self.intermediate_idx = 0;
++    self.intermediates_idx = 0;
+     self.params_idx = 0;
+     self.param_acc = 0;
+     self.param_acc_idx = 0;
+@@ -253,7 +255,7 @@ test "csi: ESC [ 1 ; 4 H" {
+     _ = p.next(0x31); // 1
+     _ = p.next(0x3B); // ;
+     _ = p.next(0x34); // 4
+-    //
++
+     {
+         const a = p.next(0x48); // H
+         try testing.expect(p.state == .ground);
+
+commit fd0fa1d08b65c4d1d55f9ce52fd577dae1c1b6b5
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun May 8 20:20:21 2022 -0700
+
+    implement erase line (EL) CSI
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 8900b856..0615714a 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -104,7 +104,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+         break :effect table[c][@enumToInt(self.state)];
+     };
+ 
+-    log.info("next: {x}", .{c});
++    // log.info("next: {x}", .{c});
+ 
+     const next_state = effect.state;
+     const action = effect.action;
+
+commit 86ab28cf1050f000483519f2a61ceda67849f84c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun May 8 20:52:15 2022 -0700
+
+    esc dispatch is handled in parser
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 0615714a..3c7b5bd6 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -63,11 +63,19 @@ pub const Action = union(enum) {
+     /// structure are only valid until the next call to "next".
+     csi_dispatch: CSI,
+ 
++    /// Execute the ESC command.
++    esc_dispatch: ESC,
++
+     pub const CSI = struct {
+         intermediates: []u8,
+         params: []u16,
+         final: u8,
+     };
++
++    pub const ESC = struct {
++        intermediates: []u8,
++        final: u8,
++    };
+ };
+ 
+ /// Maximum number of intermediate characters during parsing.
+@@ -192,6 +200,12 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 },
+             };
+         },
++        .esc_dispatch => Action{
++            .esc_dispatch = .{
++                .intermediates = self.intermediates[0..self.intermediates_idx],
++                .final = c,
++            },
++        },
+         else => {
+             std.log.err("unimplemented action: {}", .{action});
+             @panic("TODO");
+
+commit c0c034af68b380c775d5536e2122b32731413c43
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon May 9 12:55:09 2022 -0700
+
+    terminal: collect intermediates properly
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 3c7b5bd6..cee84637 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -153,18 +153,24 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+         .print => Action{ .print = c },
+         .execute => Action{ .execute = c },
+         .collect => collect: {
++            if (self.intermediates_idx >= MAX_INTERMEDIATE) {
++                log.warn("invalid intermediates count", .{});
++                break :collect null;
++            }
++
+             self.intermediates[self.intermediates_idx] = c;
+-            // TODO: incr, bounds check
++            self.intermediates_idx += 1;
+ 
+             // The client is expected to perform no action.
+             break :collect null;
+         },
+         .param => param: {
+-            // TODO: bounds check
+-
+             // Semicolon separates parameters. If we encounter a semicolon
+             // we need to store and move on to the next parameter.
+             if (c == ';') {
++                // Ignore too many parameters
++                if (self.params_idx >= MAX_PARAMS) break :param null;
++
+                 // Set param final value
+                 self.params[self.params_idx] = self.param_acc;
+                 self.params_idx += 1;
+@@ -244,6 +250,25 @@ test {
+     }
+ }
+ 
++test "esc: ESC ( B" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next('(');
++
++    {
++        const a = p.next('B');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .esc_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.esc_dispatch;
++        try testing.expect(d.final == 'B');
++        try testing.expect(d.intermediates.len == 1);
++        try testing.expect(d.intermediates[0] == '(');
++    }
++}
++
+ test "csi: ESC [ H" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit bb4332ac38221e2fc7353eda0455d761c06a0fb2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue May 10 09:27:29 2022 -0700
+
+    terminal: OSC parser
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index cee84637..26ddc123 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -7,6 +7,7 @@ const Parser = @This();
+ const std = @import("std");
+ const testing = std.testing;
+ const table = @import("parse_table.zig").table;
++const osc = @import("osc.zig");
+ 
+ const log = std.log.scoped(.parser);
+ 
+@@ -66,6 +67,9 @@ pub const Action = union(enum) {
+     /// Execute the ESC command.
+     esc_dispatch: ESC,
+ 
++    /// Execute the OSC command.
++    osc_dispatch: osc.Command,
++
+     pub const CSI = struct {
+         intermediates: []u8,
+         params: []u16,
+@@ -95,6 +99,9 @@ params_idx: u8 = 0,
+ param_acc: u16 = 0,
+ param_acc_idx: u8 = 0,
+ 
++/// Parser for OSC sequences
++osc_parser: osc.Parser = .{},
++
+ pub fn init() Parser {
+     return .{};
+ }
+@@ -126,20 +133,28 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     // 2. transition action
+     // 3. entry action to new state
+     return [3]?Action{
+-        switch (self.state) {
+-            .osc_string => @panic("TODO"), // TODO: osc_end
++        // Exit depends on current state
++        if (self.state == next_state) null else switch (self.state) {
++            .osc_string => if (self.osc_parser.end()) |cmd|
++                Action{ .osc_dispatch = cmd }
++            else
++                null,
+             .dcs_passthrough => @panic("TODO"), // TODO: unhook
+             else => null,
+         },
+ 
+         self.doAction(action, c),
+ 
+-        switch (next_state) {
++        // Entry depends on new state
++        if (self.state == next_state) null else switch (next_state) {
+             .escape, .dcs_entry, .csi_entry => clear: {
+                 self.clear();
+                 break :clear null;
+             },
+-            .osc_string => @panic("TODO"), // TODO: osc_start
++            .osc_string => osc_string: {
++                self.osc_parser.reset();
++                break :osc_string null;
++            },
+             .dcs_passthrough => @panic("TODO"), // TODO: hook
+             else => null,
+         },
+@@ -147,7 +162,6 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+ }
+ 
+ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+-    _ = self;
+     return switch (action) {
+         .none, .ignore => null,
+         .print => Action{ .print = c },
+@@ -191,6 +205,10 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+             // The client is expected to perform no action.
+             break :param null;
+         },
++        .osc_put => osc_put: {
++            self.osc_parser.next(c);
++            break :osc_put null;
++        },
+         .csi_dispatch => csi_dispatch: {
+             // Finalize parameters if we have one
+             if (self.param_acc_idx > 0) {
+@@ -309,3 +327,25 @@ test "csi: ESC [ 1 ; 4 H" {
+         try testing.expectEqual(@as(u16, 4), d.params[1]);
+     }
+ }
++
++test "osc: change window title" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next(']');
++    _ = p.next('0');
++    _ = p.next(';');
++    _ = p.next('a');
++    _ = p.next('b');
++    _ = p.next('c');
++
++    {
++        const a = p.next(0x07); // BEL
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0].? == .osc_dispatch);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++
++        const cmd = a[0].?.osc_dispatch;
++        try testing.expect(cmd == .change_window_title);
++    }
++}
+
+commit daa03683199e72375a842e3181079ab9d4cd5384
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue May 10 14:09:24 2022 -0700
+
+    parse DCS sequences (but do nothing)
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 26ddc123..5f580d44 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -38,17 +38,12 @@ pub const TransitionAction = enum {
+     ignore,
+     print,
+     execute,
+-    clear,
+     collect,
+     param,
+     esc_dispatch,
+     csi_dispatch,
+-    hook,
+     put,
+-    unhook,
+-    osc_start,
+     osc_put,
+-    osc_end,
+ };
+ 
+ /// Action is the action that a caller of the parser is expected to
+@@ -70,6 +65,11 @@ pub const Action = union(enum) {
+     /// Execute the OSC command.
+     osc_dispatch: osc.Command,
+ 
++    /// DCS-related events.
++    dcs_hook: DCS,
++    dcs_put: u8,
++    dcs_unhook: void,
++
+     pub const CSI = struct {
+         intermediates: []u8,
+         params: []u16,
+@@ -80,6 +80,12 @@ pub const Action = union(enum) {
+         intermediates: []u8,
+         final: u8,
+     };
++
++    pub const DCS = struct {
++        intermediates: []u8,
++        params: []u16,
++        final: u8,
++    };
+ };
+ 
+ /// Maximum number of intermediate characters during parsing.
+@@ -139,7 +145,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+                 Action{ .osc_dispatch = cmd }
+             else
+                 null,
+-            .dcs_passthrough => @panic("TODO"), // TODO: unhook
++            .dcs_passthrough => Action{ .dcs_unhook = {} },
+             else => null,
+         },
+ 
+@@ -155,7 +161,13 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+                 self.osc_parser.reset();
+                 break :osc_string null;
+             },
+-            .dcs_passthrough => @panic("TODO"), // TODO: hook
++            .dcs_passthrough => Action{
++                .dcs_hook = .{
++                    .intermediates = self.intermediates[0..self.intermediates_idx],
++                    .params = self.params[0..self.params_idx],
++                    .final = c,
++                },
++            },
+             else => null,
+         },
+     };
+@@ -230,9 +242,8 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 .final = c,
+             },
+         },
+-        else => {
+-            std.log.err("unimplemented action: {}", .{action});
+-            @panic("TODO");
++        .put => Action{
++            .dcs_put = c,
+         },
+     };
+ }
+
+commit 21be62f780a3aace377d36eb240ffd942ff33d8f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed May 11 21:20:04 2022 -0700
+
+    terminal parser allows colons for SGR
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 5f580d44..98290b58 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -88,6 +88,15 @@ pub const Action = union(enum) {
+     };
+ };
+ 
++/// Keeps track of the parameter sep used for CSI params. We allow colons
++/// to be used ONLY by the 'm' CSI action.
++const ParamSepState = enum(u8) {
++    none = 0,
++    semicolon = ';',
++    colon = ':',
++    mixed = 1,
++};
++
+ /// Maximum number of intermediate characters during parsing.
+ const MAX_INTERMEDIATE = 2;
+ const MAX_PARAMS = 16;
+@@ -102,6 +111,7 @@ intermediates_idx: u8 = 0,
+ /// Param tracking, building
+ params: [MAX_PARAMS]u16 = undefined,
+ params_idx: u8 = 0,
++params_sep: ParamSepState = .none,
+ param_acc: u16 = 0,
+ param_acc_idx: u8 = 0,
+ 
+@@ -193,10 +203,15 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+         .param => param: {
+             // Semicolon separates parameters. If we encounter a semicolon
+             // we need to store and move on to the next parameter.
+-            if (c == ';') {
++            if (c == ';' or c == ':') {
+                 // Ignore too many parameters
+                 if (self.params_idx >= MAX_PARAMS) break :param null;
+ 
++                // If this is our first time seeing a parameter, we track
++                // the separator used so that we can't mix separators later.
++                if (self.params_idx == 0) self.params_sep = @intToEnum(ParamSepState, c);
++                if (@intToEnum(ParamSepState, c) != self.params_sep) self.params_sep = .mixed;
++
+                 // Set param final value
+                 self.params[self.params_idx] = self.param_acc;
+                 self.params_idx += 1;
+@@ -228,6 +243,14 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 self.params_idx += 1;
+             }
+ 
++            // We only allow the colon separator for the 'm' command.
++            switch (self.params_sep) {
++                .none => {},
++                .semicolon => {},
++                .colon => if (c != 'm') break :csi_dispatch null,
++                .mixed => break :csi_dispatch null,
++            }
++
+             break :csi_dispatch Action{
+                 .csi_dispatch = .{
+                     .intermediates = self.intermediates[0..self.intermediates_idx],
+@@ -339,6 +362,56 @@ test "csi: ESC [ 1 ; 4 H" {
+     }
+ }
+ 
++test "csi: SGR ESC [ 38 : 2 m" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next('[');
++    _ = p.next('3');
++    _ = p.next('8');
++    _ = p.next(':');
++    _ = p.next('2');
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'm');
++        try testing.expect(d.params.len == 2);
++        try testing.expectEqual(@as(u16, 38), d.params[0]);
++        try testing.expectEqual(@as(u16, 2), d.params[1]);
++    }
++}
++
++test "csi: mixing semicolon/colon" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[38:2;4m") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    try testing.expect(p.state == .ground);
++}
++
++test "csi: colon for non-m final" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[38:2h") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    try testing.expect(p.state == .ground);
++}
++
+ test "osc: change window title" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit ead4cec1593246d17eb5305ed8cef8a81b2bee16
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon May 16 09:31:07 2022 -0700
+
+    terminal: utf-8 decoding
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 98290b58..ecdcfff0 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -5,6 +5,7 @@
+ const Parser = @This();
+ 
+ const std = @import("std");
++const builtin = @import("builtin");
+ const testing = std.testing;
+ const table = @import("parse_table.zig").table;
+ const osc = @import("osc.zig");
+@@ -28,6 +29,9 @@ pub const State = enum {
+     dcs_ignore,
+     osc_string,
+     sos_pm_apc_string,
++
++    // Custom states added that aren't present on vt100.net
++    utf8,
+ };
+ 
+ /// Transition action is an action that can be taken during a state
+@@ -49,8 +53,8 @@ pub const TransitionAction = enum {
+ /// Action is the action that a caller of the parser is expected to
+ /// take as a result of some input character.
+ pub const Action = union(enum) {
+-    /// Draw character to the screen.
+-    print: u8,
++    /// Draw character to the screen. This is a unicode codepoint.
++    print: u21,
+ 
+     /// Execute the C0 or C1 function.
+     execute: u8,
+@@ -97,8 +101,10 @@ const ParamSepState = enum(u8) {
+     mixed = 1,
+ };
+ 
+-/// Maximum number of intermediate characters during parsing.
+-const MAX_INTERMEDIATE = 2;
++/// Maximum number of intermediate characters during parsing. This is
++/// 4 because we also use the intermediates array for UTF8 decoding which
++/// can be at most 4 bytes.
++const MAX_INTERMEDIATE = 4;
+ const MAX_PARAMS = 16;
+ 
+ /// Current state of the state machine
+@@ -126,6 +132,11 @@ pub fn init() Parser {
+ /// Up to 3 actions may need to be exected -- in order -- representing
+ /// the state exit, transition, and entry actions.
+ pub fn next(self: *Parser, c: u8) [3]?Action {
++    // If we're processing UTF-8, we handle this manually.
++    if (self.state == .utf8) {
++        return .{ self.next_utf8(c), null, null };
++    }
++
+     const effect = effect: {
+         // First look up the transition in the anywhere table.
+         const anywhere = table[c][@enumToInt(State.anywhere)];
+@@ -143,6 +154,13 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     // After generating the actions, we set our next state.
+     defer self.state = next_state;
+ 
++    // In debug mode, we log bad state transitions.
++    if (builtin.mode == .Debug) {
++        if (next_state == .anywhere) {
++            log.warn("state transition to 'anywhere', likely bug: {x}", .{c});
++        }
++    }
++
+     // When going from one state to another, the actions take place in this order:
+     //
+     // 1. exit action from old state
+@@ -183,21 +201,55 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     };
+ }
+ 
++/// Processes the next byte in a UTF8 sequence. It is assumed that
++/// intermediates[0] already has the first byte of a UTF8 sequence
++/// (triggered via the state machine).
++fn next_utf8(self: *Parser, c: u8) ?Action {
++    // Collect the byte into the intermediates array
++    self.collect(c);
++
++    // Error is unreachable because the first byte comes from the state machine.
++    // If we get an error here, it is a bug in the state machine that we want
++    // to chase down.
++    const len = std.unicode.utf8ByteSequenceLength(self.intermediates[0]) catch unreachable;
++
++    // We need to collect more
++    if (self.intermediates_idx < len) return null;
++
++    // No matter what happens, we go back to ground since we know we have
++    // enough bytes for the UTF8 sequence.
++    defer {
++        self.state = .ground;
++        self.intermediates_idx = 0;
++    }
++
++    // We have enough bytes, decode!
++    const bytes = self.intermediates[0..len];
++    const rune = std.unicode.utf8Decode(bytes) catch {
++        log.warn("invalid UTF-8 sequence: {any}", .{bytes});
++        return null;
++    };
++
++    return Action{ .print = rune };
++}
++
++fn collect(self: *Parser, c: u8) void {
++    if (self.intermediates_idx >= MAX_INTERMEDIATE) {
++        log.warn("invalid intermediates count", .{});
++        return;
++    }
++
++    self.intermediates[self.intermediates_idx] = c;
++    self.intermediates_idx += 1;
++}
++
+ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+     return switch (action) {
+         .none, .ignore => null,
+         .print => Action{ .print = c },
+         .execute => Action{ .execute = c },
+         .collect => collect: {
+-            if (self.intermediates_idx >= MAX_INTERMEDIATE) {
+-                log.warn("invalid intermediates count", .{});
+-                break :collect null;
+-            }
+-
+-            self.intermediates[self.intermediates_idx] = c;
+-            self.intermediates_idx += 1;
+-
+-            // The client is expected to perform no action.
++            self.collect(c);
+             break :collect null;
+         },
+         .param => param: {
+@@ -433,3 +485,56 @@ test "osc: change window title" {
+         try testing.expect(cmd == .change_window_title);
+     }
+ }
++
++test "print: utf8 2 byte" {
++    var p = init();
++    var a: [3]?Action = undefined;
++    for ("£") |c| a = p.next(c);
++
++    try testing.expect(p.state == .ground);
++    try testing.expect(a[0].? == .print);
++    try testing.expect(a[1] == null);
++    try testing.expect(a[2] == null);
++
++    const rune = a[0].?.print;
++    try testing.expectEqual(try std.unicode.utf8Decode("£"), rune);
++}
++
++test "print: utf8 3 byte" {
++    var p = init();
++    var a: [3]?Action = undefined;
++    for ("€") |c| a = p.next(c);
++
++    try testing.expect(p.state == .ground);
++    try testing.expect(a[0].? == .print);
++    try testing.expect(a[1] == null);
++    try testing.expect(a[2] == null);
++
++    const rune = a[0].?.print;
++    try testing.expectEqual(try std.unicode.utf8Decode("€"), rune);
++}
++
++test "print: utf8 4 byte" {
++    var p = init();
++    var a: [3]?Action = undefined;
++    for ("𐍈") |c| a = p.next(c);
++
++    try testing.expect(p.state == .ground);
++    try testing.expect(a[0].? == .print);
++    try testing.expect(a[1] == null);
++    try testing.expect(a[2] == null);
++
++    const rune = a[0].?.print;
++    try testing.expectEqual(try std.unicode.utf8Decode("𐍈"), rune);
++}
++
++test "print: utf8 invalid" {
++    var p = init();
++    var a: [3]?Action = undefined;
++    for ("\xC3\x28") |c| a = p.next(c);
++
++    try testing.expect(p.state == .ground);
++    try testing.expect(a[0] == null);
++    try testing.expect(a[1] == null);
++    try testing.expect(a[2] == null);
++}
+
+commit 421a1c3039ed7b75014278fc16269825e7ff1688
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon May 16 09:34:34 2022 -0700
+
+    invalid utf8 turns into �
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index ecdcfff0..30fe5259 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -225,9 +225,9 @@ fn next_utf8(self: *Parser, c: u8) ?Action {
+ 
+     // We have enough bytes, decode!
+     const bytes = self.intermediates[0..len];
+-    const rune = std.unicode.utf8Decode(bytes) catch {
++    const rune = std.unicode.utf8Decode(bytes) catch rune: {
+         log.warn("invalid UTF-8 sequence: {any}", .{bytes});
+-        return null;
++        break :rune 0xFFFD; // �
+     };
+ 
+     return Action{ .print = rune };
+@@ -534,7 +534,10 @@ test "print: utf8 invalid" {
+     for ("\xC3\x28") |c| a = p.next(c);
+ 
+     try testing.expect(p.state == .ground);
+-    try testing.expect(a[0] == null);
++    try testing.expect(a[0].? == .print);
+     try testing.expect(a[1] == null);
+     try testing.expect(a[2] == null);
++
++    const rune = a[0].?.print;
++    try testing.expectEqual(try std.unicode.utf8Decode("�"), rune);
+ }
+
+commit 4a9b8ea187c8abf303f409c7637b1d38cb55a65f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jul 23 18:13:37 2022 -0700
+
+    add a formatter for CSI logs so that they're more easy to read
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 30fe5259..b3b8b84b 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -78,6 +78,22 @@ pub const Action = union(enum) {
+         intermediates: []u8,
+         params: []u16,
+         final: u8,
++
++        // Implement formatter for logging
++        pub fn format(
++            self: CSI,
++            comptime layout: []const u8,
++            opts: std.fmt.FormatOptions,
++            writer: anytype,
++        ) !void {
++            _ = layout;
++            _ = opts;
++            try std.fmt.format(writer, "ESC [ {s} {any} {c}", .{
++                self.intermediates,
++                self.params,
++                self.final,
++            });
++        }
+     };
+ 
+     pub const ESC = struct {
+
+commit 6369f1f2f9290b6142788ec1e3971604673e61db
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jul 24 09:20:02 2022 -0700
+
+    big improvements in action logging
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index b3b8b84b..cd77007e 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -99,6 +99,21 @@ pub const Action = union(enum) {
+     pub const ESC = struct {
+         intermediates: []u8,
+         final: u8,
++
++        // Implement formatter for logging
++        pub fn format(
++            self: ESC,
++            comptime layout: []const u8,
++            opts: std.fmt.FormatOptions,
++            writer: anytype,
++        ) !void {
++            _ = layout;
++            _ = opts;
++            try std.fmt.format(writer, "ESC {s} {c}", .{
++                self.intermediates,
++                self.final,
++            });
++        }
+     };
+ 
+     pub const DCS = struct {
+@@ -106,6 +121,55 @@ pub const Action = union(enum) {
+         params: []u16,
+         final: u8,
+     };
++
++    // Implement formatter for logging. This is mostly copied from the
++    // std.fmt implementation, but we modify it slightly so that we can
++    // print out custom formats for some of our primitives.
++    pub fn format(
++        self: Action,
++        comptime layout: []const u8,
++        opts: std.fmt.FormatOptions,
++        writer: anytype,
++    ) !void {
++        _ = layout;
++        const T = Action;
++        const info = @typeInfo(T).Union;
++
++        try writer.writeAll(@typeName(T));
++        if (info.tag_type) |TagType| {
++            try writer.writeAll("{ .");
++            try writer.writeAll(@tagName(@as(TagType, self)));
++            try writer.writeAll(" = ");
++
++            inline for (info.fields) |u_field| {
++                // If this is the active field...
++                if (self == @field(TagType, u_field.name)) {
++                    const value = @field(self, u_field.name);
++                    switch (@TypeOf(value)) {
++                        // Unicode
++                        u21 => try std.fmt.format(writer, "'{u}'", .{value}),
++
++                        // Note: we don't do ASCII (u8) because there are a lot
++                        // of invisible characters we don't want to handle right
++                        // now.
++
++                        // All others do the default behavior
++                        else => try std.fmt.formatType(
++                            @field(self, u_field.name),
++                            "any",
++                            opts,
++                            writer,
++                            3,
++                        ),
++                    }
++                }
++            }
++
++            try writer.writeAll(" }");
++        } else {
++            try format(writer, "@{x}", .{@ptrToInt(&self)});
++        }
++    }
+ };
+ 
+ /// Keeps track of the parameter sep used for CSI params. We allow colons
+
+commit 30a14d230ed118363650259aca953474cd3681ed
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Sep 1 17:53:40 2022 -0700
+
+    process ASCII events manually to avoid function call overhead
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index cd77007e..032fa42d 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -6,6 +6,7 @@ const Parser = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const trace = @import("tracy").trace;
+ const testing = std.testing;
+ const table = @import("parse_table.zig").table;
+ const osc = @import("osc.zig");
+@@ -212,6 +213,9 @@ pub fn init() Parser {
+ /// Up to 3 actions may need to be exected -- in order -- representing
+ /// the state exit, transition, and entry actions.
+ pub fn next(self: *Parser, c: u8) [3]?Action {
++    const tracy = trace(@src());
++    defer tracy.end();
++
+     // If we're processing UTF-8, we handle this manually.
+     if (self.state == .utf8) {
+         return .{ self.next_utf8(c), null, null };
+
+commit 56de5846f45b08e2d8ff67e62d96fd88ea629bd9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Nov 21 15:12:00 2022 -0800
+
+    OSC 52: Clipboard Control (#52)
+    
+    This adds support for OSC 52 -- applications can read/write the clipboard. Due to the security risk of this, the default configuration allows for writing but _not reading_. This is configurable using two new settings: `clipboard-read` and `clipboard-write` (both booleans).
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 032fa42d..9773da63 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -567,6 +567,31 @@ test "osc: change window title" {
+ 
+         const cmd = a[0].?.osc_dispatch;
+         try testing.expect(cmd == .change_window_title);
++        try testing.expectEqualStrings("abc", cmd.change_window_title);
++    }
++}
++
++test "osc: change window title (end in esc)" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next(']');
++    _ = p.next('0');
++    _ = p.next(';');
++    _ = p.next('a');
++    _ = p.next('b');
++    _ = p.next('c');
++
++    {
++        const a = p.next(0x1B);
++        _ = p.next('\\');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0].? == .osc_dispatch);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++
++        const cmd = a[0].?.osc_dispatch;
++        try testing.expect(cmd == .change_window_title);
++        try testing.expectEqualStrings("abc", cmd.change_window_title);
+     }
+ }
+ 
+
+commit d7fe6a1c47880efe989aa3c3f601e7447de469cf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 27 15:30:02 2022 -0800
+
+    fix sgr parsing for underline styles
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 9773da63..69087dc5 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -79,6 +79,10 @@ pub const Action = union(enum) {
+         intermediates: []u8,
+         params: []u16,
+         final: u8,
++        sep: Sep,
++
++        /// The separator used for CSI params.
++        pub const Sep = enum { semicolon, colon };
+ 
+         // Implement formatter for logging
+         pub fn format(
+@@ -392,6 +396,11 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                     .intermediates = self.intermediates[0..self.intermediates_idx],
+                     .params = self.params[0..self.params_idx],
+                     .final = c,
++                    .sep = switch (self.params_sep) {
++                        .none, .semicolon => .semicolon,
++                        .colon => .colon,
++                        .mixed => unreachable,
++                    },
+                 },
+             };
+         },
+
+commit 4a3e2b35b9fa41d1910b82a253a79fc8de25be8f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Dec 14 21:10:22 2022 -0800
+
+    terminal: parse table needs to have room for all chars
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 69087dc5..855ae640 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -245,7 +245,10 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     // In debug mode, we log bad state transitions.
+     if (builtin.mode == .Debug) {
+         if (next_state == .anywhere) {
+-            log.warn("state transition to 'anywhere', likely bug: {x}", .{c});
++            log.debug(
++                "state transition to 'anywhere' from '{}', likely binary input: {x}",
++                .{ self.state, c },
++            );
+         }
+     }
+ 
+
+commit df52fae76a3ea0d334969c8093af8528e9eaa9d9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 17 21:47:38 2023 -0800
+
+    terminal: check OSC parser for tmux 112 sequences from HN
+    
+    Saw this on HN:
+    https://github.com/darrenstarr/VtNetCore/pull/14
+    
+    I wanted to see if ghostty was vulnerable to it (it is not). But, its a
+    good example of a weird edge case in the wild and I wanted to make sure
+    it was redundantly tested. It looks like we read the "spec" (blog posts,
+    man pages, source of other terminal using tools, etc.) right.
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 855ae640..e8592dd2 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -607,6 +607,28 @@ test "osc: change window title (end in esc)" {
+     }
+ }
+ 
++// https://github.com/darrenstarr/VtNetCore/pull/14
++// Saw this on HN, decided to add a test case because why not.
++test "osc: 112 incomplete sequence" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next(']');
++    _ = p.next('1');
++    _ = p.next('1');
++    _ = p.next('2');
++
++    {
++        const a = p.next(0x07);
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0].? == .osc_dispatch);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++
++        const cmd = a[0].?.osc_dispatch;
++        try testing.expect(cmd == .reset_cursor_color);
++    }
++}
++
+ test "print: utf8 2 byte" {
+     var p = init();
+     var a: [3]?Action = undefined;
+
+commit 38cd496c823b1837eca9137e34fbf512dc1d2b09
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 17 13:46:22 2023 -0700
+
+    terminal: add missing anywhere states to ground, get rid of real state
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index e8592dd2..2b3d72e6 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -15,7 +15,6 @@ const log = std.log.scoped(.parser);
+ 
+ /// States for the state machine
+ pub const State = enum {
+-    anywhere,
+     ground,
+     escape,
+     escape_intermediate,
+@@ -225,14 +224,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+         return .{ self.next_utf8(c), null, null };
+     }
+ 
+-    const effect = effect: {
+-        // First look up the transition in the anywhere table.
+-        const anywhere = table[c][@enumToInt(State.anywhere)];
+-        if (anywhere.state != .anywhere) break :effect anywhere;
+-
+-        // If we don't have any transition from anywhere, use our state.
+-        break :effect table[c][@enumToInt(self.state)];
+-    };
++    const effect = table[c][@enumToInt(self.state)];
+ 
+     // log.info("next: {x}", .{c});
+ 
+@@ -242,16 +234,6 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     // After generating the actions, we set our next state.
+     defer self.state = next_state;
+ 
+-    // In debug mode, we log bad state transitions.
+-    if (builtin.mode == .Debug) {
+-        if (next_state == .anywhere) {
+-            log.debug(
+-                "state transition to 'anywhere' from '{}', likely binary input: {x}",
+-                .{ self.state, c },
+-            );
+-        }
+-    }
+-
+     // When going from one state to another, the actions take place in this order:
+     //
+     // 1. exit action from old state
+
+commit 01c053d7fc1cd8cd17d1df44b7aeb423b2395cd1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 24 14:47:03 2023 -0700
+
+    terminal: parser must reset intermediate storage for utf8
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 2b3d72e6..8e55ba56 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -269,6 +269,20 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+                     .final = c,
+                 },
+             },
++            .utf8 => utf8: {
++                // When entering the UTF8 state, we need to grab the
++                // last intermediate as our first byte and reset
++                // the intermediates, because prior actions (i.e. CSI)
++                // can pollute the intermediates and we use it to build
++                // our UTF-8 string.
++                if (self.intermediates_idx > 1) {
++                    const last = self.intermediates_idx - 1;
++                    self.intermediates[0] = self.intermediates[last];
++                    self.clear();
++                    self.intermediates_idx = 1;
++                }
++                break :utf8 null;
++            },
+             else => null,
+         },
+     };
+@@ -666,3 +680,33 @@ test "print: utf8 invalid" {
+     const rune = a[0].?.print;
+     try testing.expectEqual(try std.unicode.utf8Decode("�"), rune);
+ }
++
++test "csi followed by utf8" {
++    var p = init();
++    const prefix = &[_]u8{
++        // CSI sequence
++        0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x30, 0x34, 0x64, '\r',
++
++        // UTF8 prefix (not complete)
++        0xe2,
++    };
++    for (prefix) |char| {
++        _ = p.next(char);
++    }
++
++    {
++        const a = p.next(0x94);
++        try testing.expect(p.state == .utf8);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next(0x94);
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0].? == .print);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++}
+
+commit 28a22fc07f50bc097a6bd0ad1d5f8c2e463a77bb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jun 20 09:24:07 2023 -0700
+
+    various tests to ensure we parse curly underlines correctly
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 8e55ba56..0c3d8ca7 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -524,12 +524,67 @@ test "csi: SGR ESC [ 38 : 2 m" {
+ 
+         const d = a[1].?.csi_dispatch;
+         try testing.expect(d.final == 'm');
++        try testing.expect(d.sep == .colon);
+         try testing.expect(d.params.len == 2);
+         try testing.expectEqual(@as(u16, 38), d.params[0]);
+         try testing.expectEqual(@as(u16, 2), d.params[1]);
+     }
+ }
+ 
++test "csi: SGR ESC [4:3m colon" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next('[');
++    _ = p.next('4');
++    _ = p.next(':');
++    _ = p.next('3');
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'm');
++        try testing.expect(d.sep == .colon);
++        try testing.expect(d.params.len == 2);
++        try testing.expectEqual(@as(u16, 4), d.params[0]);
++        try testing.expectEqual(@as(u16, 3), d.params[1]);
++    }
++}
++
++test "csi: SGR with many blank and colon" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[58:2::240:143:104") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'm');
++        try testing.expect(d.sep == .colon);
++        try testing.expect(d.params.len == 6);
++        try testing.expectEqual(@as(u16, 58), d.params[0]);
++        try testing.expectEqual(@as(u16, 2), d.params[1]);
++        try testing.expectEqual(@as(u16, 0), d.params[2]);
++        try testing.expectEqual(@as(u16, 240), d.params[3]);
++        try testing.expectEqual(@as(u16, 143), d.params[4]);
++        try testing.expectEqual(@as(u16, 104), d.params[5]);
++    }
++}
++
+ test "csi: mixing semicolon/colon" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit 97df179b0466eba8adf46d45d37b3b20dbd85c29
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jun 24 15:04:33 2023 -0700
+
+    terminfo: switch to semicolon SGR 48 to prevent render issues
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 0c3d8ca7..abfbc0ef 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -531,6 +531,35 @@ test "csi: SGR ESC [ 38 : 2 m" {
+     }
+ }
+ 
++test "csi: SGR ESC [ 48 : 2 m" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[48:2:240:143:104") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'm');
++        try testing.expect(d.sep == .colon);
++        try testing.expect(d.params.len == 5);
++        try testing.expectEqual(@as(u16, 48), d.params[0]);
++        try testing.expectEqual(@as(u16, 2), d.params[1]);
++        try testing.expectEqual(@as(u16, 240), d.params[2]);
++        try testing.expectEqual(@as(u16, 143), d.params[3]);
++        try testing.expectEqual(@as(u16, 104), d.params[4]);
++    }
++}
++
+ test "csi: SGR ESC [4:3m colon" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit 60d4024d6448fb53ea34c7f7e24d001871a8d157
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jun 24 15:16:54 2023 -0700
+
+    terminal: reset CSI param separator in parser on clear
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index abfbc0ef..07466e19 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -382,15 +382,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 self.params_idx += 1;
+             }
+ 
+-            // We only allow the colon separator for the 'm' command.
+-            switch (self.params_sep) {
+-                .none => {},
+-                .semicolon => {},
+-                .colon => if (c != 'm') break :csi_dispatch null,
+-                .mixed => break :csi_dispatch null,
+-            }
+-
+-            break :csi_dispatch Action{
++            const result: Action = .{
+                 .csi_dispatch = .{
+                     .intermediates = self.intermediates[0..self.intermediates_idx],
+                     .params = self.params[0..self.params_idx],
+@@ -398,10 +390,35 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                     .sep = switch (self.params_sep) {
+                         .none, .semicolon => .semicolon,
+                         .colon => .colon,
+-                        .mixed => unreachable,
++
++                        // This should never happen because of the checks below
++                        // but we have to exhaustively handle the switch.
++                        .mixed => .semicolon,
+                     },
+                 },
+             };
++
++            // We only allow the colon separator for the 'm' command.
++            switch (self.params_sep) {
++                .none => {},
++                .semicolon => {},
++                .colon => if (c != 'm') {
++                    log.warn(
++                        "CSI colon separator only allowed for 'm' command, got: {}",
++                        .{result},
++                    );
++                    break :csi_dispatch null;
++                },
++                .mixed => {
++                    log.warn(
++                        "CSI command had mixed colons and semicolons, got: {}",
++                        .{result},
++                    );
++                    break :csi_dispatch null;
++                },
++            }
++
++            break :csi_dispatch result;
+         },
+         .esc_dispatch => Action{
+             .esc_dispatch = .{
+@@ -418,6 +435,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+ fn clear(self: *Parser) void {
+     self.intermediates_idx = 0;
+     self.params_idx = 0;
++    self.params_sep = .none;
+     self.param_acc = 0;
+     self.param_acc_idx = 0;
+ }
+@@ -531,6 +549,35 @@ test "csi: SGR ESC [ 38 : 2 m" {
+     }
+ }
+ 
++test "csi: SGR colon followed by semicolon" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[48:2") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++    }
++
++    _ = p.next(0x1B);
++    _ = p.next('[');
++    {
++        const a = p.next('H');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++    }
++}
++
+ test "csi: SGR ESC [ 48 : 2 m" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit 56f8e39e5bc4f7c96a5f5c661604d6a10390875f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jun 25 11:08:12 2023 -0700
+
+    Update zig, mach, fmt
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 07466e19..99d26b3b 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -171,7 +171,7 @@ pub const Action = union(enum) {
+ 
+             try writer.writeAll(" }");
+         } else {
+-            try format(writer, "@{x}", .{@ptrToInt(&self)});
++            try format(writer, "@{x}", .{@intFromPtr(&self)});
+         }
+     }
+ };
+@@ -224,7 +224,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+         return .{ self.next_utf8(c), null, null };
+     }
+ 
+-    const effect = table[c][@enumToInt(self.state)];
++    const effect = table[c][@intFromEnum(self.state)];
+ 
+     // log.info("next: {x}", .{c});
+ 
+@@ -348,8 +348,8 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+ 
+                 // If this is our first time seeing a parameter, we track
+                 // the separator used so that we can't mix separators later.
+-                if (self.params_idx == 0) self.params_sep = @intToEnum(ParamSepState, c);
+-                if (@intToEnum(ParamSepState, c) != self.params_sep) self.params_sep = .mixed;
++                if (self.params_idx == 0) self.params_sep = @enumFromInt(ParamSepState, c);
++                if (@enumFromInt(ParamSepState, c) != self.params_sep) self.params_sep = .mixed;
+ 
+                 // Set param final value
+                 self.params[self.params_idx] = self.param_acc;
+
+commit 314f9287b1854911e38d030ad6ec42bb6cd0a105
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 30 12:15:31 2023 -0700
+
+    Update Zig (#164)
+    
+    * update zig
+    
+    * pkg/fontconfig: clean up @as
+    
+    * pkg/freetype,harfbuzz: clean up @as
+    
+    * pkg/imgui: clean up @as
+    
+    * pkg/macos: clean up @as
+    
+    * pkg/pixman,utf8proc: clean up @as
+    
+    * clean up @as
+    
+    * lots more @as cleanup
+    
+    * undo flatpak changes
+    
+    * clean up @as
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 99d26b3b..b47260ff 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -348,8 +348,8 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+ 
+                 // If this is our first time seeing a parameter, we track
+                 // the separator used so that we can't mix separators later.
+-                if (self.params_idx == 0) self.params_sep = @enumFromInt(ParamSepState, c);
+-                if (@enumFromInt(ParamSepState, c) != self.params_sep) self.params_sep = .mixed;
++                if (self.params_idx == 0) self.params_sep = @enumFromInt(c);
++                if (@as(ParamSepState, @enumFromInt(c)) != self.params_sep) self.params_sep = .mixed;
+ 
+                 // Set param final value
+                 self.params[self.params_idx] = self.param_acc;
+
+commit 22b81731649bd1aca3e6fd33f215747d29ba1f72
+Author: Kevin Hovsäter <kevin@hovsater.com>
+Date:   Tue Aug 8 14:27:34 2023 +0200
+
+    Fix typos
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index b47260ff..3e7a764f 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -212,8 +212,8 @@ pub fn init() Parser {
+     return .{};
+ }
+ 
+-/// Next consums the next character c and returns the actions to execute.
+-/// Up to 3 actions may need to be exected -- in order -- representing
++/// Next consumes the next character c and returns the actions to execute.
++/// Up to 3 actions may need to be executed -- in order -- representing
+ /// the state exit, transition, and entry actions.
+ pub fn next(self: *Parser, c: u8) [3]?Action {
+     const tracy = trace(@src());
+
+commit 29e3e79b94ba98e0997fe1f43eba6346bdfffc68
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Aug 18 13:34:40 2023 -0700
+
+    terminal: parse APC strings
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 3e7a764f..90aaefcd 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -48,6 +48,7 @@ pub const TransitionAction = enum {
+     csi_dispatch,
+     put,
+     osc_put,
++    apc_put,
+ };
+ 
+ /// Action is the action that a caller of the parser is expected to
+@@ -74,6 +75,11 @@ pub const Action = union(enum) {
+     dcs_put: u8,
+     dcs_unhook: void,
+ 
++    /// APC data
++    apc_start: void,
++    apc_put: u8,
++    apc_end: void,
++
+     pub const CSI = struct {
+         intermediates: []u8,
+         params: []u16,
+@@ -247,6 +253,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+             else
+                 null,
+             .dcs_passthrough => Action{ .dcs_unhook = {} },
++            .sos_pm_apc_string => Action{ .apc_end = {} },
+             else => null,
+         },
+ 
+@@ -269,6 +276,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+                     .final = c,
+                 },
+             },
++            .sos_pm_apc_string => Action{ .apc_start = {} },
+             .utf8 => utf8: {
+                 // When entering the UTF8 state, we need to grab the
+                 // last intermediate as our first byte and reset
+@@ -426,9 +434,8 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 .final = c,
+             },
+         },
+-        .put => Action{
+-            .dcs_put = c,
+-        },
++        .put => Action{ .dcs_put = c },
++        .apc_put => Action{ .apc_put = c },
+     };
+ }
+ 
+
+commit cbfa22555eda19d3dc95722ad30f18781d5ca13b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 28 08:36:00 2023 -0700
+
+    terminal: test to ensure that DECRQM can parse
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 90aaefcd..ee65a165 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -694,6 +694,33 @@ test "csi: colon for non-m final" {
+     try testing.expect(p.state == .ground);
+ }
+ 
++test "csi: request mode decrqm" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[?2026$") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('p');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'p');
++        try testing.expectEqual(@as(usize, 2), d.intermediates.len);
++        try testing.expectEqual(@as(usize, 1), d.params.len);
++        try testing.expectEqual(@as(u16, '?'), d.intermediates[0]);
++        try testing.expectEqual(@as(u16, '$'), d.intermediates[1]);
++        try testing.expectEqual(@as(u16, 2026), d.params[0]);
++    }
++}
++
+ test "osc: change window title" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit 24af24a086cd91d3fc63ef9db501c9ad27a91ac3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 10 22:01:17 2023 -0700
+
+    terminal: CSI q requires a space intermediate
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index ee65a165..d376d5d1 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -721,6 +721,32 @@ test "csi: request mode decrqm" {
+     }
+ }
+ 
++test "csi: change cursor" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[3 ") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('q');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'q');
++        try testing.expectEqual(@as(usize, 1), d.intermediates.len);
++        try testing.expectEqual(@as(usize, 1), d.params.len);
++        try testing.expectEqual(@as(u16, ' '), d.intermediates[0]);
++        try testing.expectEqual(@as(u16, 3), d.params[0]);
++    }
++}
++
+ test "osc: change window title" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit a3696a918590d16f3191bda8774d1ebe4f85aaab
+Author: cryptocode <cryptocode@zolo.io>
+Date:   Thu Sep 14 14:53:31 2023 +0200
+
+    Implement OSC 10 and OSC 11 default color queries
+    
+    These OSC commands report the default foreground and background colors.
+    
+    Most terminals return the RGB components scaled up to 16-bit components, because some
+    legacy software are unable to read 8-bit components. The PR follows this conventions.
+    
+    iTerm2 allow 8-bit reporting through a config option, and a similar option is
+    added here. In addition to picking between scaled and unscaled reporting, the user
+    can also turn off OSC 10/11 replies altogether.
+    
+    Scaling is essentially c / 1 * 65535, where c is the 8-bit component, and reporting
+    is left-padded with zeros if necessary. This format appears to stem from the XParseColor
+    format.
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index d376d5d1..1ddf2f55 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -248,7 +248,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     return [3]?Action{
+         // Exit depends on current state
+         if (self.state == next_state) null else switch (self.state) {
+-            .osc_string => if (self.osc_parser.end()) |cmd|
++            .osc_string => if (self.osc_parser.endWithStringTerminator(c)) |cmd|
+                 Action{ .osc_dispatch = cmd }
+             else
+                 null,
+
+commit dc14ca86ca5ba9f3ff698b8dbc5dc8de42ce67a2
+Author: cryptocode <cryptocode@zolo.io>
+Date:   Thu Sep 14 21:14:23 2023 +0200
+
+    Review updates:
+    
+    * Change state names to more human readable query_default_fg/bg
+    * Single-line state prongs
+    * String terminator is not an enum
+    * Removed `endWithStringTerminator` and added nullabe arg to `end`
+    * Fixed a color reporting bug, fg/bg wasn't correctly picked
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 1ddf2f55..06b10e14 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -248,7 +248,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     return [3]?Action{
+         // Exit depends on current state
+         if (self.state == next_state) null else switch (self.state) {
+-            .osc_string => if (self.osc_parser.endWithStringTerminator(c)) |cmd|
++            .osc_string => if (self.osc_parser.end(c)) |cmd|
+                 Action{ .osc_dispatch = cmd }
+             else
+                 null,
+
+commit 063a66ea6cb1f75141521af3dfcea6da86a10f0a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Sep 18 21:45:19 2023 -0700
+
+    terminal: allow mixed semicolon/colon CSI m commands
+    
+    Fixes #487
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 06b10e14..3ed5dc1b 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -399,27 +399,20 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                         .none, .semicolon => .semicolon,
+                         .colon => .colon,
+ 
+-                        // This should never happen because of the checks below
+-                        // but we have to exhaustively handle the switch.
++                        // There is nothing that treats mixed separators specially
++                        // afaik so we just treat it as a semicolon.
+                         .mixed => .semicolon,
+                     },
+                 },
+             };
+ 
+-            // We only allow the colon separator for the 'm' command.
++            // We only allow colon or mixed separators for the 'm' command.
+             switch (self.params_sep) {
+                 .none => {},
+                 .semicolon => {},
+-                .colon => if (c != 'm') {
++                .colon, .mixed => if (c != 'm') {
+                     log.warn(
+-                        "CSI colon separator only allowed for 'm' command, got: {}",
+-                        .{result},
+-                    );
+-                    break :csi_dispatch null;
+-                },
+-                .mixed => {
+-                    log.warn(
+-                        "CSI command had mixed colons and semicolons, got: {}",
++                        "CSI colon or mixed separators only allowed for 'm' command, got: {}",
+                         .{result},
+                     );
+                     break :csi_dispatch null;
+@@ -585,6 +578,25 @@ test "csi: SGR colon followed by semicolon" {
+     }
+ }
+ 
++test "csi: SGR mixed colon and semicolon" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[38:5:1;48:5:0") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++    }
++}
++
+ test "csi: SGR ESC [ 48 : 2 m" {
+     var p = init();
+     _ = p.next(0x1B);
+@@ -668,19 +680,6 @@ test "csi: SGR with many blank and colon" {
+     }
+ }
+ 
+-test "csi: mixing semicolon/colon" {
+-    var p = init();
+-    _ = p.next(0x1B);
+-    for ("[38:2;4m") |c| {
+-        const a = p.next(c);
+-        try testing.expect(a[0] == null);
+-        try testing.expect(a[1] == null);
+-        try testing.expect(a[2] == null);
+-    }
+-
+-    try testing.expect(p.state == .ground);
+-}
+-
+ test "csi: colon for non-m final" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit 032fcee9ffa1f4f066839049ebf7fbf773bb0651
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Sep 27 11:04:32 2023 -0700
+
+    terminal: DCS handler, XTGETTCAP parsing
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 3ed5dc1b..50030620 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -127,8 +127,8 @@ pub const Action = union(enum) {
+     };
+ 
+     pub const DCS = struct {
+-        intermediates: []u8,
+-        params: []u16,
++        intermediates: []const u8 = "",
++        params: []const u16 = &.{},
+         final: u8,
+     };
+ 
+
+commit de1ed071ade1ecdff02876225788594dd44612c4
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Oct 15 08:41:38 2023 -0700
+
+    termio: configure OSC parser with an allocator
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 50030620..154dfee2 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -218,6 +218,10 @@ pub fn init() Parser {
+     return .{};
+ }
+ 
++pub fn deinit(self: *Parser) void {
++    self.osc_parser.deinit();
++}
++
+ /// Next consumes the next character c and returns the actions to execute.
+ /// Up to 3 actions may need to be executed -- in order -- representing
+ /// the state exit, transition, and entry actions.
+
+commit 81f7ae63b067c981ec9d1e85b7f44fc7ebc723ce
+Author: Nameless <truemedian@gmail.com>
+Date:   Thu Oct 19 14:28:23 2023 -0500
+
+    fuzz: src/terminal/stream.zig
+    
+    osc.zig: undefined pointer was dereferenced when warning was issued
+    for handler missing
+    Parser.zig: too many parameters was not handled in the final case
+    Parser.zig: parameters being too long (>255 digits) was not handled
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 154dfee2..186b9960 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -373,6 +373,9 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 break :param null;
+             }
+ 
++            // Ignore parameters that are too long
++            if (self.param_acc_idx == std.math.maxInt(u8)) break :param null;
++
+             // A numeric value. Add it to our accumulator.
+             if (self.param_acc_idx > 0) {
+                 self.param_acc *|= 10;
+@@ -388,6 +391,9 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+             break :osc_put null;
+         },
+         .csi_dispatch => csi_dispatch: {
++            // Ignore too many parameters
++            if (self.params_idx >= MAX_PARAMS) break :csi_dispatch null;
++
+             // Finalize parameters if we have one
+             if (self.param_acc_idx > 0) {
+                 self.params[self.params_idx] = self.param_acc;
+
+commit 99591f280b3ca68946d894a9380871e9eb65c6d4
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 26 09:50:29 2023 -0700
+
+    terminal: addWithOverflow to detect max int
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 186b9960..785fd938 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -373,15 +373,16 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 break :param null;
+             }
+ 
+-            // Ignore parameters that are too long
+-            if (self.param_acc_idx == std.math.maxInt(u8)) break :param null;
+-
+             // A numeric value. Add it to our accumulator.
+             if (self.param_acc_idx > 0) {
+                 self.param_acc *|= 10;
+             }
+             self.param_acc +|= c - '0';
+-            self.param_acc_idx += 1;
++
++            // Increment our accumulator index. If we overflow then
++            // we're out of bounds and we exit immediately.
++            self.param_acc_idx, const overflow = @addWithOverflow(self.param_acc_idx, 1);
++            if (overflow > 0) break :param null;
+ 
+             // The client is expected to perform no action.
+             break :param null;
+@@ -910,3 +911,22 @@ test "csi followed by utf8" {
+         try testing.expect(a[2] == null);
+     }
+ }
++
++test "csi: too many params" {
++    var p = init();
++    _ = p.next(0x1B);
++    _ = p.next('[');
++    for (0..100) |_| {
++        _ = p.next('1');
++        _ = p.next(';');
++    }
++    _ = p.next('1');
++
++    {
++        const a = p.next('C');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++}
+
+commit ccb1cea49a600204e0261a045fbbedc4be2e2f75
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 20:55:29 2023 -0700
+
+    inspector: filter terminal io events by kind
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 154dfee2..639063d0 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -54,6 +54,8 @@ pub const TransitionAction = enum {
+ /// Action is the action that a caller of the parser is expected to
+ /// take as a result of some input character.
+ pub const Action = union(enum) {
++    pub const Tag = std.meta.FieldEnum(Action);
++
+     /// Draw character to the screen. This is a unicode codepoint.
+     print: u21,
+ 
+
+commit 28aace43934e542ecaf8a7d0a95944e5dd937ff7
+Merge: 0fdf08e4 c12bb4a0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 26 10:12:39 2023 -0700
+
+    Merge pull request #728 from mitchellh/cimgui
+    
+    Terminal Inspector v1
+
+
+commit 4c45bfec9ed5d974c7f38afccbaf97275cd8f427
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 27 09:14:29 2023 -0700
+
+    terminal: improve some debug logging
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 3f427c6b..032ac1bc 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -159,7 +159,10 @@ pub const Action = union(enum) {
+                     const value = @field(self, u_field.name);
+                     switch (@TypeOf(value)) {
+                         // Unicode
+-                        u21 => try std.fmt.format(writer, "'{u}'", .{value}),
++                        u21 => try std.fmt.format(writer, "'{u}' (U+{X})", .{ value, value }),
++
++                        // Byte
++                        u8 => try std.fmt.format(writer, "0x{x}", .{value}),
+ 
+                         // Note: we don't do ASCII (u8) because there are a lot
+                         // of invisible characters we don't want to handle right
+
+commit 171292a0630162930a015f0cba3efd693f90023b
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Thu Nov 9 16:10:43 2023 -0600
+
+    core: implement OSC 12 and OSC 112 to query/set/reset cursor color
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 032ac1bc..20080364 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -827,7 +827,8 @@ test "osc: 112 incomplete sequence" {
+         try testing.expect(a[2] == null);
+ 
+         const cmd = a[0].?.osc_dispatch;
+-        try testing.expect(cmd == .reset_cursor_color);
++        try testing.expect(cmd == .reset_color);
++        try testing.expectEqual(cmd.reset_color.kind, .cursor);
+     }
+ }
+ 
+
+commit adb7958f6177dfe5df69bc2202da98c566f389b9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 13 15:06:08 2024 -0800
+
+    remove tracy usage from all files
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 20080364..b242ba6f 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -6,7 +6,6 @@ const Parser = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const trace = @import("tracy").trace;
+ const testing = std.testing;
+ const table = @import("parse_table.zig").table;
+ const osc = @import("osc.zig");
+@@ -231,9 +230,6 @@ pub fn deinit(self: *Parser) void {
+ /// Up to 3 actions may need to be executed -- in order -- representing
+ /// the state exit, transition, and entry actions.
+ pub fn next(self: *Parser, c: u8) [3]?Action {
+-    const tracy = trace(@src());
+-    defer tracy.end();
+-
+     // If we're processing UTF-8, we handle this manually.
+     if (self.state == .utf8) {
+         return .{ self.next_utf8(c), null, null };
+
+commit 846b3421e607aaac920101be132d8f54760da948
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Mon Feb 5 23:20:47 2024 -0500
+
+    terminal: replace utf8 decoding with custom decoder in stream.zig
+    
+    (Completely removed utf8 handling from Parser.zig)
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index b242ba6f..41cca719 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -28,9 +28,6 @@ pub const State = enum {
+     dcs_ignore,
+     osc_string,
+     sos_pm_apc_string,
+-
+-    // Custom states added that aren't present on vt100.net
+-    utf8,
+ };
+ 
+ /// Transition action is an action that can be taken during a state
+@@ -230,11 +227,6 @@ pub fn deinit(self: *Parser) void {
+ /// Up to 3 actions may need to be executed -- in order -- representing
+ /// the state exit, transition, and entry actions.
+ pub fn next(self: *Parser, c: u8) [3]?Action {
+-    // If we're processing UTF-8, we handle this manually.
+-    if (self.state == .utf8) {
+-        return .{ self.next_utf8(c), null, null };
+-    }
+-
+     const effect = table[c][@intFromEnum(self.state)];
+ 
+     // log.info("next: {x}", .{c});
+@@ -282,57 +274,11 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+                 },
+             },
+             .sos_pm_apc_string => Action{ .apc_start = {} },
+-            .utf8 => utf8: {
+-                // When entering the UTF8 state, we need to grab the
+-                // last intermediate as our first byte and reset
+-                // the intermediates, because prior actions (i.e. CSI)
+-                // can pollute the intermediates and we use it to build
+-                // our UTF-8 string.
+-                if (self.intermediates_idx > 1) {
+-                    const last = self.intermediates_idx - 1;
+-                    self.intermediates[0] = self.intermediates[last];
+-                    self.clear();
+-                    self.intermediates_idx = 1;
+-                }
+-                break :utf8 null;
+-            },
+             else => null,
+         },
+     };
+ }
+ 
+-/// Processes the next byte in a UTF8 sequence. It is assumed that
+-/// intermediates[0] already has the first byte of a UTF8 sequence
+-/// (triggered via the state machine).
+-fn next_utf8(self: *Parser, c: u8) ?Action {
+-    // Collect the byte into the intermediates array
+-    self.collect(c);
+-
+-    // Error is unreachable because the first byte comes from the state machine.
+-    // If we get an error here, it is a bug in the state machine that we want
+-    // to chase down.
+-    const len = std.unicode.utf8ByteSequenceLength(self.intermediates[0]) catch unreachable;
+-
+-    // We need to collect more
+-    if (self.intermediates_idx < len) return null;
+-
+-    // No matter what happens, we go back to ground since we know we have
+-    // enough bytes for the UTF8 sequence.
+-    defer {
+-        self.state = .ground;
+-        self.intermediates_idx = 0;
+-    }
+-
+-    // We have enough bytes, decode!
+-    const bytes = self.intermediates[0..len];
+-    const rune = std.unicode.utf8Decode(bytes) catch rune: {
+-        log.warn("invalid UTF-8 sequence: {any}", .{bytes});
+-        break :rune 0xFFFD; // �
+-    };
+-
+-    return Action{ .print = rune };
+-}
+-
+ fn collect(self: *Parser, c: u8) void {
+     if (self.intermediates_idx >= MAX_INTERMEDIATE) {
+         log.warn("invalid intermediates count", .{});
+@@ -828,91 +774,35 @@ test "osc: 112 incomplete sequence" {
+     }
+ }
+ 
+-test "print: utf8 2 byte" {
+-    var p = init();
+-    var a: [3]?Action = undefined;
+-    for ("£") |c| a = p.next(c);
+-
+-    try testing.expect(p.state == .ground);
+-    try testing.expect(a[0].? == .print);
+-    try testing.expect(a[1] == null);
+-    try testing.expect(a[2] == null);
+-
+-    const rune = a[0].?.print;
+-    try testing.expectEqual(try std.unicode.utf8Decode("£"), rune);
+-}
+-
+-test "print: utf8 3 byte" {
+-    var p = init();
+-    var a: [3]?Action = undefined;
+-    for ("€") |c| a = p.next(c);
+-
+-    try testing.expect(p.state == .ground);
+-    try testing.expect(a[0].? == .print);
+-    try testing.expect(a[1] == null);
+-    try testing.expect(a[2] == null);
+-
+-    const rune = a[0].?.print;
+-    try testing.expectEqual(try std.unicode.utf8Decode("€"), rune);
+-}
+-
+-test "print: utf8 4 byte" {
+-    var p = init();
+-    var a: [3]?Action = undefined;
+-    for ("𐍈") |c| a = p.next(c);
+-
+-    try testing.expect(p.state == .ground);
+-    try testing.expect(a[0].? == .print);
+-    try testing.expect(a[1] == null);
+-    try testing.expect(a[2] == null);
+-
+-    const rune = a[0].?.print;
+-    try testing.expectEqual(try std.unicode.utf8Decode("𐍈"), rune);
+-}
+-
+-test "print: utf8 invalid" {
+-    var p = init();
+-    var a: [3]?Action = undefined;
+-    for ("\xC3\x28") |c| a = p.next(c);
+-
+-    try testing.expect(p.state == .ground);
+-    try testing.expect(a[0].? == .print);
+-    try testing.expect(a[1] == null);
+-    try testing.expect(a[2] == null);
+-
+-    const rune = a[0].?.print;
+-    try testing.expectEqual(try std.unicode.utf8Decode("�"), rune);
+-}
+-
+-test "csi followed by utf8" {
+-    var p = init();
+-    const prefix = &[_]u8{
+-        // CSI sequence
+-        0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x30, 0x34, 0x64, '\r',
+-
+-        // UTF8 prefix (not complete)
+-        0xe2,
+-    };
+-    for (prefix) |char| {
+-        _ = p.next(char);
+-    }
+-
+-    {
+-        const a = p.next(0x94);
+-        try testing.expect(p.state == .utf8);
+-        try testing.expect(a[0] == null);
+-        try testing.expect(a[1] == null);
+-        try testing.expect(a[2] == null);
+-    }
+-
+-    {
+-        const a = p.next(0x94);
+-        try testing.expect(p.state == .ground);
+-        try testing.expect(a[0].? == .print);
+-        try testing.expect(a[1] == null);
+-        try testing.expect(a[2] == null);
+-    }
+-}
++// test "csi followed by utf8" {
++//     var p = init();
++//     const prefix = &[_]u8{
++//         // CSI sequence
++//         0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x30, 0x34, 0x64, '\r',
++//
++//         // UTF8 prefix (not complete)
++//         0xe2,
++//     };
++//     for (prefix) |char| {
++//         _ = p.next(char);
++//     }
++//
++//     {
++//         const a = p.next(0x94);
++//         try testing.expect(p.state == .utf8);
++//         try testing.expect(a[0] == null);
++//         try testing.expect(a[1] == null);
++//         try testing.expect(a[2] == null);
++//     }
++//
++//     {
++//         const a = p.next(0x94);
++//         try testing.expect(p.state == .ground);
++//         try testing.expect(a[0].? == .print);
++//         try testing.expect(a[1] == null);
++//         try testing.expect(a[2] == null);
++//     }
++// }
+ 
+ test "csi: too many params" {
+     var p = init();
+
+commit cd570890f640d57745bb1723f1738fad1d468d75
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Mon Feb 5 23:32:47 2024 -0500
+
+    remove commented out test
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 41cca719..5746be06 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -774,36 +774,6 @@ test "osc: 112 incomplete sequence" {
+     }
+ }
+ 
+-// test "csi followed by utf8" {
+-//     var p = init();
+-//     const prefix = &[_]u8{
+-//         // CSI sequence
+-//         0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x30, 0x34, 0x64, '\r',
+-//
+-//         // UTF8 prefix (not complete)
+-//         0xe2,
+-//     };
+-//     for (prefix) |char| {
+-//         _ = p.next(char);
+-//     }
+-//
+-//     {
+-//         const a = p.next(0x94);
+-//         try testing.expect(p.state == .utf8);
+-//         try testing.expect(a[0] == null);
+-//         try testing.expect(a[1] == null);
+-//         try testing.expect(a[2] == null);
+-//     }
+-//
+-//     {
+-//         const a = p.next(0x94);
+-//         try testing.expect(p.state == .ground);
+-//         try testing.expect(a[0].? == .print);
+-//         try testing.expect(a[1] == null);
+-//         try testing.expect(a[2] == null);
+-//     }
+-// }
+-
+ test "csi: too many params" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit f8c544c11978dbe34b70518f7adc66fc40f94821
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Feb 7 00:12:37 2024 -0500
+
+    terminal: stream/parser changes
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 5746be06..bfb25f2f 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -185,7 +185,7 @@ pub const Action = union(enum) {
+ 
+ /// Keeps track of the parameter sep used for CSI params. We allow colons
+ /// to be used ONLY by the 'm' CSI action.
+-const ParamSepState = enum(u8) {
++pub const ParamSepState = enum(u8) {
+     none = 0,
+     semicolon = ';',
+     colon = ':',
+@@ -279,7 +279,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+     };
+ }
+ 
+-fn collect(self: *Parser, c: u8) void {
++pub fn collect(self: *Parser, c: u8) void {
+     if (self.intermediates_idx >= MAX_INTERMEDIATE) {
+         log.warn("invalid intermediates count", .{});
+         return;
+
+commit 68c0813397325236b8876fb70832d86a1e06209d
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Thu Feb 8 21:49:58 2024 -0500
+
+    terminal/stream: Added ESC parsing fast tracks
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index bfb25f2f..f160619e 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -390,7 +390,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+     };
+ }
+ 
+-fn clear(self: *Parser) void {
++pub fn clear(self: *Parser) void {
+     self.intermediates_idx = 0;
+     self.params_idx = 0;
+     self.params_sep = .none;
+
+commit c28470e98a885261743c265162e4884fd01d390f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Jul 11 18:29:14 2024 -0700
+
+    terminal: DCS parses params correctly
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index f160619e..e18d14df 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -266,12 +266,19 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
+                 self.osc_parser.reset();
+                 break :osc_string null;
+             },
+-            .dcs_passthrough => Action{
+-                .dcs_hook = .{
+-                    .intermediates = self.intermediates[0..self.intermediates_idx],
+-                    .params = self.params[0..self.params_idx],
+-                    .final = c,
+-                },
++            .dcs_passthrough => dcs_hook: {
++                // Finalize parameters
++                if (self.param_acc_idx > 0) {
++                    self.params[self.params_idx] = self.param_acc;
++                    self.params_idx += 1;
++                }
++                break :dcs_hook .{
++                    .dcs_hook = .{
++                        .intermediates = self.intermediates[0..self.intermediates_idx],
++                        .params = self.params[0..self.params_idx],
++                        .final = c,
++                    },
++                };
+             },
+             .sos_pm_apc_string => Action{ .apc_start = {} },
+             else => null,
+@@ -792,3 +799,26 @@ test "csi: too many params" {
+         try testing.expect(a[2] == null);
+     }
+ }
++
++test "dcs" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("P1000") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('p');
++        try testing.expect(p.state == .dcs_passthrough);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2].? == .dcs_hook);
++
++        const hook = a[2].?.dcs_hook;
++        try testing.expectEqualSlices(u16, &[_]u16{1000}, hook.params);
++        try testing.expectEqual('p', hook.final);
++    }
++}
+
+commit 38d33a761b62926b53dd5cea4719d9df10375307
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Jul 11 18:34:05 2024 -0700
+
+    terminal: test DCS to make sure we don't regress
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index e18d14df..9aebdbd3 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -800,7 +800,31 @@ test "csi: too many params" {
+     }
+ }
+ 
+-test "dcs" {
++test "dcs: XTGETTCAP" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("P+") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('q');
++        try testing.expect(p.state == .dcs_passthrough);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2].? == .dcs_hook);
++
++        const hook = a[2].?.dcs_hook;
++        try testing.expectEqualSlices(u8, &[_]u8{'+'}, hook.intermediates);
++        try testing.expectEqualSlices(u16, &[_]u16{}, hook.params);
++        try testing.expectEqual('q', hook.final);
++    }
++}
++
++test "dcs: params" {
+     var p = init();
+     _ = p.next(0x1B);
+     for ("P1000") |c| {
+
+commit 7aed08be407ee22993974cb8eaa1a416c2c8c6bf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Jan 13 10:52:29 2025 -0800
+
+    terminal: keep track of colon vs semicolon state in CSI params
+    
+    Fixes #5022
+    
+    The CSI SGR sequence (CSI m) is unique in that its the only CSI sequence
+    that allows colons as delimiters between some parameters, and the colon
+    vs. semicolon changes the semantics of the parameters.
+    
+    Previously, Ghostty assumed that an SGR sequence was either all colons
+    or all semicolons, and would change its behavior based on the first
+    delimiter it encountered.
+    
+    This is incorrect. It is perfectly valid for an SGR sequence to have
+    both colons and semicolons as delimiters. For example, Kakoune sends
+    the following:
+    
+        ;4:3;38;2;175;175;215;58:2::190:80:70m
+    
+    This is equivalent to:
+    
+      - unset (0)
+      - curly underline (4:3)
+      - foreground color (38;2;175;175;215)
+      - underline color (58:2::190:80:70)
+    
+    This commit changes the behavior of Ghostty to track the delimiter per
+    parameter, rather than per sequence. It also updates the SGR parser to
+    be more robust and handle the various edge cases that can occur. Tests
+    were added for the new cases.
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index 9aebdbd3..a779c335 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -6,6 +6,7 @@ const Parser = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const assert = std.debug.assert;
+ const testing = std.testing;
+ const table = @import("parse_table.zig").table;
+ const osc = @import("osc.zig");
+@@ -81,11 +82,15 @@ pub const Action = union(enum) {
+     pub const CSI = struct {
+         intermediates: []u8,
+         params: []u16,
++        params_sep: SepList,
+         final: u8,
+-        sep: Sep,
++
++        /// The list of separators used for CSI params. The value of the
++        /// bit can be mapped to Sep.
++        pub const SepList = std.StaticBitSet(MAX_PARAMS);
+ 
+         /// The separator used for CSI params.
+-        pub const Sep = enum { semicolon, colon };
++        pub const Sep = enum(u1) { semicolon = 0, colon = 1 };
+ 
+         // Implement formatter for logging
+         pub fn format(
+@@ -183,15 +188,6 @@ pub const Action = union(enum) {
+     }
+ };
+ 
+-/// Keeps track of the parameter sep used for CSI params. We allow colons
+-/// to be used ONLY by the 'm' CSI action.
+-pub const ParamSepState = enum(u8) {
+-    none = 0,
+-    semicolon = ';',
+-    colon = ':',
+-    mixed = 1,
+-};
+-
+ /// Maximum number of intermediate characters during parsing. This is
+ /// 4 because we also use the intermediates array for UTF8 decoding which
+ /// can be at most 4 bytes.
+@@ -207,8 +203,8 @@ intermediates_idx: u8 = 0,
+ 
+ /// Param tracking, building
+ params: [MAX_PARAMS]u16 = undefined,
++params_sep: Action.CSI.SepList = Action.CSI.SepList.initEmpty(),
+ params_idx: u8 = 0,
+-params_sep: ParamSepState = .none,
+ param_acc: u16 = 0,
+ param_acc_idx: u8 = 0,
+ 
+@@ -312,13 +308,9 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 // Ignore too many parameters
+                 if (self.params_idx >= MAX_PARAMS) break :param null;
+ 
+-                // If this is our first time seeing a parameter, we track
+-                // the separator used so that we can't mix separators later.
+-                if (self.params_idx == 0) self.params_sep = @enumFromInt(c);
+-                if (@as(ParamSepState, @enumFromInt(c)) != self.params_sep) self.params_sep = .mixed;
+-
+                 // Set param final value
+                 self.params[self.params_idx] = self.param_acc;
++                if (c == ':') self.params_sep.set(self.params_idx);
+                 self.params_idx += 1;
+ 
+                 // Reset current param value to 0
+@@ -359,29 +351,18 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+                 .csi_dispatch = .{
+                     .intermediates = self.intermediates[0..self.intermediates_idx],
+                     .params = self.params[0..self.params_idx],
++                    .params_sep = self.params_sep,
+                     .final = c,
+-                    .sep = switch (self.params_sep) {
+-                        .none, .semicolon => .semicolon,
+-                        .colon => .colon,
+-
+-                        // There is nothing that treats mixed separators specially
+-                        // afaik so we just treat it as a semicolon.
+-                        .mixed => .semicolon,
+-                    },
+                 },
+             };
+ 
+             // We only allow colon or mixed separators for the 'm' command.
+-            switch (self.params_sep) {
+-                .none => {},
+-                .semicolon => {},
+-                .colon, .mixed => if (c != 'm') {
+-                    log.warn(
+-                        "CSI colon or mixed separators only allowed for 'm' command, got: {}",
+-                        .{result},
+-                    );
+-                    break :csi_dispatch null;
+-                },
++            if (c != 'm' and self.params_sep.count() > 0) {
++                log.warn(
++                    "CSI colon or mixed separators only allowed for 'm' command, got: {}",
++                    .{result},
++                );
++                break :csi_dispatch null;
+             }
+ 
+             break :csi_dispatch result;
+@@ -400,7 +381,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+ pub fn clear(self: *Parser) void {
+     self.intermediates_idx = 0;
+     self.params_idx = 0;
+-    self.params_sep = .none;
++    self.params_sep = Action.CSI.SepList.initEmpty();
+     self.param_acc = 0;
+     self.param_acc_idx = 0;
+ }
+@@ -507,10 +488,11 @@ test "csi: SGR ESC [ 38 : 2 m" {
+ 
+         const d = a[1].?.csi_dispatch;
+         try testing.expect(d.final == 'm');
+-        try testing.expect(d.sep == .colon);
+         try testing.expect(d.params.len == 2);
+         try testing.expectEqual(@as(u16, 38), d.params[0]);
++        try testing.expect(d.params_sep.isSet(0));
+         try testing.expectEqual(@as(u16, 2), d.params[1]);
++        try testing.expect(!d.params_sep.isSet(1));
+     }
+ }
+ 
+@@ -581,13 +563,17 @@ test "csi: SGR ESC [ 48 : 2 m" {
+ 
+         const d = a[1].?.csi_dispatch;
+         try testing.expect(d.final == 'm');
+-        try testing.expect(d.sep == .colon);
+         try testing.expect(d.params.len == 5);
+         try testing.expectEqual(@as(u16, 48), d.params[0]);
++        try testing.expect(d.params_sep.isSet(0));
+         try testing.expectEqual(@as(u16, 2), d.params[1]);
++        try testing.expect(d.params_sep.isSet(1));
+         try testing.expectEqual(@as(u16, 240), d.params[2]);
++        try testing.expect(d.params_sep.isSet(2));
+         try testing.expectEqual(@as(u16, 143), d.params[3]);
++        try testing.expect(d.params_sep.isSet(3));
+         try testing.expectEqual(@as(u16, 104), d.params[4]);
++        try testing.expect(!d.params_sep.isSet(4));
+     }
+ }
+ 
+@@ -608,10 +594,11 @@ test "csi: SGR ESC [4:3m colon" {
+ 
+         const d = a[1].?.csi_dispatch;
+         try testing.expect(d.final == 'm');
+-        try testing.expect(d.sep == .colon);
+         try testing.expect(d.params.len == 2);
+         try testing.expectEqual(@as(u16, 4), d.params[0]);
++        try testing.expect(d.params_sep.isSet(0));
+         try testing.expectEqual(@as(u16, 3), d.params[1]);
++        try testing.expect(!d.params_sep.isSet(1));
+     }
+ }
+ 
+@@ -634,14 +621,71 @@ test "csi: SGR with many blank and colon" {
+ 
+         const d = a[1].?.csi_dispatch;
+         try testing.expect(d.final == 'm');
+-        try testing.expect(d.sep == .colon);
+         try testing.expect(d.params.len == 6);
+         try testing.expectEqual(@as(u16, 58), d.params[0]);
++        try testing.expect(d.params_sep.isSet(0));
+         try testing.expectEqual(@as(u16, 2), d.params[1]);
++        try testing.expect(d.params_sep.isSet(1));
+         try testing.expectEqual(@as(u16, 0), d.params[2]);
++        try testing.expect(d.params_sep.isSet(2));
+         try testing.expectEqual(@as(u16, 240), d.params[3]);
++        try testing.expect(d.params_sep.isSet(3));
+         try testing.expectEqual(@as(u16, 143), d.params[4]);
++        try testing.expect(d.params_sep.isSet(4));
+         try testing.expectEqual(@as(u16, 104), d.params[5]);
++        try testing.expect(!d.params_sep.isSet(5));
++    }
++}
++
++// This is from a Kakoune actual SGR sequence.
++test "csi: SGR mixed colon and semicolon with blank" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[;4:3;38;2;175;175;215;58:2::190:80:70") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'm');
++        try testing.expectEqual(14, d.params.len);
++        try testing.expectEqual(@as(u16, 0), d.params[0]);
++        try testing.expect(!d.params_sep.isSet(0));
++        try testing.expectEqual(@as(u16, 4), d.params[1]);
++        try testing.expect(d.params_sep.isSet(1));
++        try testing.expectEqual(@as(u16, 3), d.params[2]);
++        try testing.expect(!d.params_sep.isSet(2));
++        try testing.expectEqual(@as(u16, 38), d.params[3]);
++        try testing.expect(!d.params_sep.isSet(3));
++        try testing.expectEqual(@as(u16, 2), d.params[4]);
++        try testing.expect(!d.params_sep.isSet(4));
++        try testing.expectEqual(@as(u16, 175), d.params[5]);
++        try testing.expect(!d.params_sep.isSet(5));
++        try testing.expectEqual(@as(u16, 175), d.params[6]);
++        try testing.expect(!d.params_sep.isSet(6));
++        try testing.expectEqual(@as(u16, 215), d.params[7]);
++        try testing.expect(!d.params_sep.isSet(7));
++        try testing.expectEqual(@as(u16, 58), d.params[8]);
++        try testing.expect(d.params_sep.isSet(8));
++        try testing.expectEqual(@as(u16, 2), d.params[9]);
++        try testing.expect(d.params_sep.isSet(9));
++        try testing.expectEqual(@as(u16, 0), d.params[10]);
++        try testing.expect(d.params_sep.isSet(10));
++        try testing.expectEqual(@as(u16, 190), d.params[11]);
++        try testing.expect(d.params_sep.isSet(11));
++        try testing.expectEqual(@as(u16, 80), d.params[12]);
++        try testing.expect(d.params_sep.isSet(12));
++        try testing.expectEqual(@as(u16, 70), d.params[13]);
++        try testing.expect(!d.params_sep.isSet(13));
+     }
+ }
+ 
+
+commit 22c506b03e2ea2ff83d0088b7cb1e15c6e2c64f7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 22 20:40:06 2025 -0800
+
+    terminal: increase CSI max params to 24 to accept Kakoune sequence
+    
+    See #5930
+    
+    Kakoune sends a real SGR sequence with 17 parameters. Our previous max
+    was 16 so we through away the entire sequence. This commit increases the
+    max rather than fundamentally addressing limitations.
+    
+    Practically, it took us this long to witness a real world sequence that
+    exceeded our previous limit. We may need to revisit this in the future,
+    but this is an easy fix for now.
+    
+    In the future, as the comment states in this diff, we should probably
+    look into a rare slow path where we heap allocate to accept up to some
+    larger size (but still would need a cap to avoid DoS). For now,
+    increasing to 24 slightly increases our memory usage but shouldn't
+    result in any real world issues.
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index a779c335..bc5859ed 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -86,7 +86,9 @@ pub const Action = union(enum) {
+         final: u8,
+ 
+         /// The list of separators used for CSI params. The value of the
+-        /// bit can be mapped to Sep.
++        /// bit can be mapped to Sep. The index of this bit set specifies
++        /// the separator AFTER that param. For example: 0;4:3 would have
++        /// index 1 set.
+         pub const SepList = std.StaticBitSet(MAX_PARAMS);
+ 
+         /// The separator used for CSI params.
+@@ -192,7 +194,19 @@ pub const Action = union(enum) {
+ /// 4 because we also use the intermediates array for UTF8 decoding which
+ /// can be at most 4 bytes.
+ const MAX_INTERMEDIATE = 4;
+-const MAX_PARAMS = 16;
++
++/// Maximum number of CSI parameters. This is arbitrary. Practically, the
++/// only CSI command that uses more than 3 parameters is the SGR command
++/// which can be infinitely long. 24 is a reasonable limit based on empirical
++/// data. This used to be 16 but Kakoune has a SGR command that uses 17
++/// parameters.
++///
++/// We could in the future make this the static limit and then allocate after
++/// but that's a lot more work and practically its so rare to exceed this
++/// number. I implore TUI authors to not use more than this number of CSI
++/// params, but I suspect we'll introduce a slow path with heap allocation
++/// one day.
++const MAX_PARAMS = 24;
+ 
+ /// Current state of the state machine
+ state: State = .ground,
+@@ -689,6 +703,64 @@ test "csi: SGR mixed colon and semicolon with blank" {
+     }
+ }
+ 
++// This is from a Kakoune actual SGR sequence also.
++test "csi: SGR mixed colon and semicolon setting underline, bg, fg" {
++    var p = init();
++    _ = p.next(0x1B);
++    for ("[4:3;38;2;51;51;51;48;2;170;170;170;58;2;255;97;136") |c| {
++        const a = p.next(c);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1] == null);
++        try testing.expect(a[2] == null);
++    }
++
++    {
++        const a = p.next('m');
++        try testing.expect(p.state == .ground);
++        try testing.expect(a[0] == null);
++        try testing.expect(a[1].? == .csi_dispatch);
++        try testing.expect(a[2] == null);
++
++        const d = a[1].?.csi_dispatch;
++        try testing.expect(d.final == 'm');
++        try testing.expectEqual(17, d.params.len);
++        try testing.expectEqual(@as(u16, 4), d.params[0]);
++        try testing.expect(d.params_sep.isSet(0));
++        try testing.expectEqual(@as(u16, 3), d.params[1]);
++        try testing.expect(!d.params_sep.isSet(1));
++        try testing.expectEqual(@as(u16, 38), d.params[2]);
++        try testing.expect(!d.params_sep.isSet(2));
++        try testing.expectEqual(@as(u16, 2), d.params[3]);
++        try testing.expect(!d.params_sep.isSet(3));
++        try testing.expectEqual(@as(u16, 51), d.params[4]);
++        try testing.expect(!d.params_sep.isSet(4));
++        try testing.expectEqual(@as(u16, 51), d.params[5]);
++        try testing.expect(!d.params_sep.isSet(5));
++        try testing.expectEqual(@as(u16, 51), d.params[6]);
++        try testing.expect(!d.params_sep.isSet(6));
++        try testing.expectEqual(@as(u16, 48), d.params[7]);
++        try testing.expect(!d.params_sep.isSet(7));
++        try testing.expectEqual(@as(u16, 2), d.params[8]);
++        try testing.expect(!d.params_sep.isSet(8));
++        try testing.expectEqual(@as(u16, 170), d.params[9]);
++        try testing.expect(!d.params_sep.isSet(9));
++        try testing.expectEqual(@as(u16, 170), d.params[10]);
++        try testing.expect(!d.params_sep.isSet(10));
++        try testing.expectEqual(@as(u16, 170), d.params[11]);
++        try testing.expect(!d.params_sep.isSet(11));
++        try testing.expectEqual(@as(u16, 58), d.params[12]);
++        try testing.expect(!d.params_sep.isSet(12));
++        try testing.expectEqual(@as(u16, 2), d.params[13]);
++        try testing.expect(!d.params_sep.isSet(13));
++        try testing.expectEqual(@as(u16, 255), d.params[14]);
++        try testing.expect(!d.params_sep.isSet(14));
++        try testing.expectEqual(@as(u16, 97), d.params[15]);
++        try testing.expect(!d.params_sep.isSet(15));
++        try testing.expectEqual(@as(u16, 136), d.params[16]);
++        try testing.expect(!d.params_sep.isSet(16));
++    }
++}
++
+ test "csi: colon for non-m final" {
+     var p = init();
+     _ = p.next(0x1B);
+
+commit 0f4d2bb2375c707182dba8cf2dd7723a2e918e79
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 09:55:46 2025 -0700
+
+    Lots of 0.14 changes
+
+diff --git a/src/terminal/Parser.zig b/src/terminal/Parser.zig
+index bc5859ed..4e74f04b 100644
+--- a/src/terminal/Parser.zig
++++ b/src/terminal/Parser.zig
+@@ -148,7 +148,7 @@ pub const Action = union(enum) {
+     ) !void {
+         _ = layout;
+         const T = Action;
+-        const info = @typeInfo(T).Union;
++        const info = @typeInfo(T).@"union";
+ 
+         try writer.writeAll(@typeName(T));
+         if (info.tag_type) |TagType| {
+

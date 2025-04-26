@@ -1,0 +1,2999 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/font/discovery.zig
+
+commit 141182aa1371f356b9c6115fc05eba64ff75894c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Sep 16 15:06:00 2022 -0700
+
+    start adding fontconfig conditional compilation
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+new file mode 100644
+index 00000000..e352fa92
+--- /dev/null
++++ b/src/font/discovery.zig
+@@ -0,0 +1,77 @@
++const std = @import("std");
++const assert = std.debug.assert;
++const fontconfig = @import("fontconfig");
++
++const log = std.log.named(.discovery);
++
++/// Descriptor is used to search for fonts. The only required field
++/// is "family". The rest are ignored unless they're set to a non-zero value.
++pub const Descriptor = struct {
++    /// Font family to search for. This can be a fully qualified font
++    /// name such as "Fira Code", "monospace", "serif", etc. Memory is
++    /// owned by the caller and should be freed when this descriptor
++    /// is no longer in use. The discovery structs will never store the
++    /// descriptor.
++    ///
++    /// On systems that use fontconfig (Linux), this can be a full
++    /// fontconfig pattern, such as "Fira Code-14:bold".
++    family: [:0]const u8,
++
++    /// Font size in points that the font should support.
++    size: u16 = 0,
++
++    /// True if we want to search specifically for a font that supports
++    /// bold, italic, or both.
++    bold: bool = false,
++    italic: bool = false,
++
++    /// Convert to Fontconfig pattern to use for lookup. The pattern does
++    /// not have defaults filled/substituted (Fontconfig thing) so callers
++    /// must still do this.
++    pub fn toFcPattern(self: Descriptor) *fontconfig.Pattern {
++        const pat = fontconfig.Pattern.create();
++        assert(pat.add(.family, .{ .string = self.family }, false));
++        if (self.size > 0) assert(pat.add(.size, .{ .integer = self.size }, false));
++        if (self.bold) assert(pat.add(
++            .weight,
++            .{ .integer = @enumToInt(fontconfig.Weight.bold) },
++            false,
++        ));
++        if (self.italic) assert(pat.add(
++            .slant,
++            .{ .integer = @enumToInt(fontconfig.Slant.italic) },
++            false,
++        ));
++
++        return pat;
++    }
++};
++
++pub const Fontconfig = struct {
++    fc_config: *fontconfig.Config,
++
++    pub fn init() Fontconfig {
++        // safe to call multiple times and concurrently
++        _ = fontconfig.init();
++        return .{ .fc_config = fontconfig.initLoadConfig() };
++    }
++
++    pub fn discover(self: *Fontconfig, desc: Descriptor) void {
++        // Build our pattern that we'll search for
++        const pat = desc.toFcPattern();
++        defer pat.destroy();
++        assert(self.fc_config.substituteWithPat(pat, .pattern));
++        pat.defaultSubstitute();
++
++        // Search
++        const res = self.fc_config.fontSort(pat, true, null);
++        defer res.fs.destroy();
++    }
++};
++
++test {
++    defer fontconfig.fini();
++    var fc = Fontconfig.init();
++
++    fc.discover(.{ .family = "monospace" });
++}
+
+commit ac26c20e94c8098df90f126ab28069a390bcb30a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 17 09:21:23 2022 -0700
+
+    font discovery builds up a set of deferred faces
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index e352fa92..06790e01 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -1,9 +1,14 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const fontconfig = @import("fontconfig");
++const DeferredFace = @import("main.zig").DeferredFace;
+ 
+ const log = std.log.named(.discovery);
+ 
++pub const Error = error{
++    FontConfigFailed,
++};
++
+ /// Descriptor is used to search for fonts. The only required field
+ /// is "family". The rest are ignored unless they're set to a non-zero value.
+ pub const Descriptor = struct {
+@@ -53,25 +58,78 @@ pub const Fontconfig = struct {
+     pub fn init() Fontconfig {
+         // safe to call multiple times and concurrently
+         _ = fontconfig.init();
+-        return .{ .fc_config = fontconfig.initLoadConfig() };
++        return .{ .fc_config = fontconfig.initLoadConfigAndFonts() };
+     }
+ 
+-    pub fn discover(self: *Fontconfig, desc: Descriptor) void {
++    /// Discover fonts from a descriptor. This returns an iterator that can
++    /// be used to build up the deferred fonts.
++    pub fn discover(self: *Fontconfig, desc: Descriptor) !DiscoverIterator {
+         // Build our pattern that we'll search for
+         const pat = desc.toFcPattern();
+-        defer pat.destroy();
++        errdefer pat.destroy();
+         assert(self.fc_config.substituteWithPat(pat, .pattern));
+         pat.defaultSubstitute();
+ 
+         // Search
+         const res = self.fc_config.fontSort(pat, true, null);
+-        defer res.fs.destroy();
++        if (res.result != .match) return Error.FontConfigFailed;
++        errdefer res.fs.destroy();
++
++        return DiscoverIterator{
++            .config = self.fc_config,
++            .pattern = pat,
++            .set = res.fs,
++            .fonts = res.fs.fonts(),
++            .i = 0,
++        };
+     }
++
++    pub const DiscoverIterator = struct {
++        config: *fontconfig.Config,
++        pattern: *fontconfig.Pattern,
++        set: *fontconfig.FontSet,
++        fonts: []*fontconfig.Pattern,
++        i: usize,
++
++        pub fn deinit(self: *DiscoverIterator) void {
++            self.set.destroy();
++            self.pattern.destroy();
++            self.* = undefined;
++        }
++
++        pub fn next(self: *DiscoverIterator) fontconfig.Error!?DeferredFace {
++            if (self.i >= self.fonts.len) return null;
++
++            // Get the copied pattern from our fontset that has the
++            // attributes configured for rendering.
++            const font_pattern = try self.config.fontRenderPrepare(
++                self.pattern,
++                self.fonts[self.i],
++            );
++            errdefer font_pattern.destroy();
++
++            // Increment after we return
++            defer self.i += 1;
++
++            return DeferredFace{
++                .face = null,
++                .fc = .{
++                    .pattern = font_pattern,
++                    .charset = (try font_pattern.get(.charset, 0)).char_set,
++                    .langset = (try font_pattern.get(.lang, 0)).lang_set,
++                },
++            };
++        }
++    };
+ };
+ 
+ test {
+-    defer fontconfig.fini();
+-    var fc = Fontconfig.init();
++    const testing = std.testing;
+ 
+-    fc.discover(.{ .family = "monospace" });
++    var fc = Fontconfig.init();
++    var it = try fc.discover(.{ .family = "monospace" });
++    defer it.deinit();
++    while (try it.next()) |face| {
++        try testing.expect(!face.loaded());
++    }
+ }
+
+commit bc9a0a36a8e21c02a8369b8e5c7cb733ac089acb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 17 10:05:26 2022 -0700
+
+    store requested size alongside deferred font for loading
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 06790e01..dcdb818f 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -22,8 +22,10 @@ pub const Descriptor = struct {
+     /// fontconfig pattern, such as "Fira Code-14:bold".
+     family: [:0]const u8,
+ 
+-    /// Font size in points that the font should support.
+-    size: u16 = 0,
++    /// Font size in points that the font should support. For conversion
++    /// to pixels, we will use 72 DPI for Mac and 96 DPI for everything else.
++    /// (If pixel conversion is necessary, i.e. emoji fonts)
++    size: u16,
+ 
+     /// True if we want to search specifically for a font that supports
+     /// bold, italic, or both.
+@@ -81,6 +83,7 @@ pub const Fontconfig = struct {
+             .set = res.fs,
+             .fonts = res.fs.fonts(),
+             .i = 0,
++            .req_size = @floatToInt(u16, (try pat.get(.size, 0)).double),
+         };
+     }
+ 
+@@ -90,6 +93,7 @@ pub const Fontconfig = struct {
+         set: *fontconfig.FontSet,
+         fonts: []*fontconfig.Pattern,
+         i: usize,
++        req_size: u16,
+ 
+         pub fn deinit(self: *DiscoverIterator) void {
+             self.set.destroy();
+@@ -117,6 +121,7 @@ pub const Fontconfig = struct {
+                     .pattern = font_pattern,
+                     .charset = (try font_pattern.get(.charset, 0)).char_set,
+                     .langset = (try font_pattern.get(.lang, 0)).lang_set,
++                    .req_size = self.req_size,
+                 },
+             };
+         }
+@@ -127,7 +132,7 @@ test {
+     const testing = std.testing;
+ 
+     var fc = Fontconfig.init();
+-    var it = try fc.discover(.{ .family = "monospace" });
++    var it = try fc.discover(.{ .family = "monospace", .size = 12 });
+     defer it.deinit();
+     while (try it.next()) |face| {
+         try testing.expect(!face.loaded());
+
+commit b11ed06fc27986257211c59883e9e6c6602cdcf8
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 24 06:24:51 2022 -0700
+
+    font: test loading deferred face for fontconfig
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index dcdb818f..b5f725a4 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -1,16 +1,17 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const fontconfig = @import("fontconfig");
++const options = @import("main.zig").options;
+ const DeferredFace = @import("main.zig").DeferredFace;
+ 
+ const log = std.log.named(.discovery);
+ 
+-pub const Error = error{
+-    FontConfigFailed,
+-};
++/// Discover implementation for the compile options.
++pub const Discover = if (options.fontconfig) Fontconfig else void;
+ 
+ /// Descriptor is used to search for fonts. The only required field
+-/// is "family". The rest are ignored unless they're set to a non-zero value.
++/// is "family". The rest are ignored unless they're set to a non-zero
++/// value.
+ pub const Descriptor = struct {
+     /// Font family to search for. This can be a fully qualified font
+     /// name such as "Fira Code", "monospace", "serif", etc. Memory is
+@@ -74,7 +75,7 @@ pub const Fontconfig = struct {
+ 
+         // Search
+         const res = self.fc_config.fontSort(pat, true, null);
+-        if (res.result != .match) return Error.FontConfigFailed;
++        if (res.result != .match) return error.FontConfigFailed;
+         errdefer res.fs.destroy();
+ 
+         return DiscoverIterator{
+@@ -129,6 +130,8 @@ pub const Fontconfig = struct {
+ };
+ 
+ test {
++    if (!options.fontconfig) return error.SkipZigTest;
++
+     const testing = std.testing;
+ 
+     var fc = Fontconfig.init();
+
+commit b6a4fff6d8d141f6738e0d01efcfb7518e8f1602
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Sep 29 11:57:29 2022 -0700
+
+    search for fonts on startup
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index b5f725a4..d3b32578 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -39,7 +39,11 @@ pub const Descriptor = struct {
+     pub fn toFcPattern(self: Descriptor) *fontconfig.Pattern {
+         const pat = fontconfig.Pattern.create();
+         assert(pat.add(.family, .{ .string = self.family }, false));
+-        if (self.size > 0) assert(pat.add(.size, .{ .integer = self.size }, false));
++        if (self.size > 0) assert(pat.add(
++            .size,
++            .{ .integer = self.size },
++            false,
++        ));
+         if (self.bold) assert(pat.add(
+             .weight,
+             .{ .integer = @enumToInt(fontconfig.Weight.bold) },
+@@ -64,6 +68,10 @@ pub const Fontconfig = struct {
+         return .{ .fc_config = fontconfig.initLoadConfigAndFonts() };
+     }
+ 
++    pub fn deinit(self: *Fontconfig) void {
++        _ = self;
++    }
++
+     /// Discover fonts from a descriptor. This returns an iterator that can
+     /// be used to build up the deferred fonts.
+     pub fn discover(self: *Fontconfig, desc: Descriptor) !DiscoverIterator {
+@@ -84,7 +92,6 @@ pub const Fontconfig = struct {
+             .set = res.fs,
+             .fonts = res.fs.fonts(),
+             .i = 0,
+-            .req_size = @floatToInt(u16, (try pat.get(.size, 0)).double),
+         };
+     }
+ 
+@@ -94,7 +101,6 @@ pub const Fontconfig = struct {
+         set: *fontconfig.FontSet,
+         fonts: []*fontconfig.Pattern,
+         i: usize,
+-        req_size: u16,
+ 
+         pub fn deinit(self: *DiscoverIterator) void {
+             self.set.destroy();
+@@ -122,7 +128,6 @@ pub const Fontconfig = struct {
+                     .pattern = font_pattern,
+                     .charset = (try font_pattern.get(.charset, 0)).char_set,
+                     .langset = (try font_pattern.get(.lang, 0)).lang_set,
+-                    .req_size = self.req_size,
+                 },
+             };
+         }
+
+commit 12c9482d48790c3a2b3b01dbc349a6a06339ac14
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Oct 1 22:21:30 2022 -0700
+
+    Mac Font Discovery with CoreText (#17)
+    
+    This implements font discovery so the `--font-family` flag works for macOS. Fonts are looked up using the Core Text API so any installed font on the Mac system can be used.
+    
+    We still use FreeType for rendering, and CoreText doesn't _quite_ give us all the information we need to build the exact face in FreeType. So a TODO after this is to now implement glyph _rendering_ using Core Text and Core Graphics. Until then, a couple fonts don't quite work (i.e. Monaco, a big one!) but many do!
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index d3b32578..0022ab52 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -1,13 +1,20 @@
+ const std = @import("std");
++const builtin = @import("builtin");
+ const assert = std.debug.assert;
+ const fontconfig = @import("fontconfig");
++const macos = @import("macos");
+ const options = @import("main.zig").options;
+ const DeferredFace = @import("main.zig").DeferredFace;
+ 
+ const log = std.log.named(.discovery);
+ 
+ /// Discover implementation for the compile options.
+-pub const Discover = if (options.fontconfig) Fontconfig else void;
++pub const Discover = if (options.fontconfig)
++    Fontconfig
++else if (options.coretext)
++    CoreText
++else
++    void;
+ 
+ /// Descriptor is used to search for fonts. The only required field
+ /// is "family". The rest are ignored unless they're set to a non-zero
+@@ -57,6 +64,70 @@ pub const Descriptor = struct {
+ 
+         return pat;
+     }
++
++    /// Convert to Core Text font descriptor to use for lookup or
++    /// conversion to a specific font.
++    pub fn toCoreTextDescriptor(self: Descriptor) !*macos.text.FontDescriptor {
++        const attrs = try macos.foundation.MutableDictionary.create(0);
++        defer attrs.release();
++
++        // Family is always set
++        const family = try macos.foundation.String.createWithBytes(self.family, .utf8, false);
++        defer family.release();
++        attrs.setValue(
++            macos.text.FontAttribute.family_name.key(),
++            family,
++        );
++
++        // Set our size attribute if set
++        if (self.size > 0) {
++            const size32 = @intCast(i32, self.size);
++            const size = try macos.foundation.Number.create(
++                .sint32,
++                &size32,
++            );
++            defer size.release();
++            attrs.setValue(
++                macos.text.FontAttribute.size.key(),
++                size,
++            );
++        }
++
++        // Build our traits. If we set any, then we store it in the attributes
++        // otherwise we do nothing. We determine this by setting up the packed
++        // struct, converting to an int, and checking if it is non-zero.
++        const traits: macos.text.FontSymbolicTraits = .{
++            .bold = self.bold,
++            .italic = self.italic,
++        };
++        const traits_cval = traits.cval();
++        if (traits_cval > 0) {
++            // Setting traits is a pain. We have to create a nested dictionary
++            // of the symbolic traits value, and set that in our attributes.
++            const traits_num = try macos.foundation.Number.create(
++                .sint32,
++                @ptrCast(*const i32, &traits_cval),
++            );
++            defer traits_num.release();
++
++            const traits_dict = try macos.foundation.MutableDictionary.create(0);
++            defer traits_dict.release();
++            traits_dict.setValue(
++                macos.text.FontTraitKey.symbolic.key(),
++                traits_num,
++            );
++
++            attrs.setValue(
++                macos.text.FontAttribute.traits.key(),
++                traits_dict,
++            );
++        }
++
++        return try macos.text.FontDescriptor.createWithAttributes(@ptrCast(
++            *macos.foundation.Dictionary,
++            attrs,
++        ));
++    }
+ };
+ 
+ pub const Fontconfig = struct {
+@@ -134,7 +205,74 @@ pub const Fontconfig = struct {
+     };
+ };
+ 
+-test {
++pub const CoreText = struct {
++    pub fn init() CoreText {
++        // Required for the "interface" but does nothing for CoreText.
++        return .{};
++    }
++
++    pub fn deinit(self: *CoreText) void {
++        _ = self;
++    }
++
++    /// Discover fonts from a descriptor. This returns an iterator that can
++    /// be used to build up the deferred fonts.
++    pub fn discover(self: *const CoreText, desc: Descriptor) !DiscoverIterator {
++        _ = self;
++
++        // Build our pattern that we'll search for
++        const ct_desc = try desc.toCoreTextDescriptor();
++        defer ct_desc.release();
++
++        // Our descriptors have to be in an array
++        const desc_arr = try macos.foundation.Array.create(
++            macos.text.FontDescriptor,
++            &[_]*const macos.text.FontDescriptor{ct_desc},
++        );
++        defer desc_arr.release();
++
++        // Build our collection
++        const set = try macos.text.FontCollection.createWithFontDescriptors(desc_arr);
++        defer set.release();
++        const list = set.createMatchingFontDescriptors();
++        errdefer list.release();
++
++        return DiscoverIterator{
++            .list = list,
++            .i = 0,
++        };
++    }
++
++    pub const DiscoverIterator = struct {
++        list: *macos.foundation.Array,
++        i: usize,
++
++        pub fn deinit(self: *DiscoverIterator) void {
++            self.list.release();
++            self.* = undefined;
++        }
++
++        pub fn next(self: *DiscoverIterator) !?DeferredFace {
++            if (self.i >= self.list.getCount()) return null;
++
++            // Create our font. We need a size to initialize it so we use size
++            // 12 but we will alter the size later.
++            const desc = self.list.getValueAtIndex(macos.text.FontDescriptor, self.i);
++            const font = try macos.text.Font.createWithFontDescriptor(desc, 12);
++            errdefer font.release();
++
++            // Increment after we return
++            defer self.i += 1;
++
++            return DeferredFace{
++                .face = null,
++                .ct = .{ .font = font },
++            };
++        }
++    };
++};
++
++test "fontconfig" {
+     if (!options.fontconfig) return error.SkipZigTest;
+ 
+     const testing = std.testing;
+@@ -146,3 +284,20 @@ test {
+         try testing.expect(!face.loaded());
+     }
+ }
++
++test "core text" {
++    if (!options.coretext) return error.SkipZigTest;
++
++    const testing = std.testing;
++
++    var ct = CoreText.init();
++    defer ct.deinit();
++    var it = try ct.discover(.{ .family = "Monaco", .size = 12 });
++    defer it.deinit();
++    var count: usize = 0;
++    while (try it.next()) |face| {
++        count += 1;
++        try testing.expect(!face.loaded());
++    }
++    try testing.expect(count > 0);
++}
+
+commit f41cbf228beccbe8acf852aead5c7f268f0fd8b0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Oct 2 09:41:37 2022 -0700
+
+    font: set "backend" enum vs booleans
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 0022ab52..c83d7563 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -9,12 +9,11 @@ const DeferredFace = @import("main.zig").DeferredFace;
+ const log = std.log.named(.discovery);
+ 
+ /// Discover implementation for the compile options.
+-pub const Discover = if (options.fontconfig)
+-    Fontconfig
+-else if (options.coretext)
+-    CoreText
+-else
+-    void;
++pub const Discover = switch (options.backend) {
++    .fontconfig_freetype => Fontconfig,
++    .coretext => CoreText,
++    else => void,
++};
+ 
+ /// Descriptor is used to search for fonts. The only required field
+ /// is "family". The rest are ignored unless they're set to a non-zero
+@@ -273,7 +272,7 @@ pub const CoreText = struct {
+ };
+ 
+ test "fontconfig" {
+-    if (!options.fontconfig) return error.SkipZigTest;
++    if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+ 
+     const testing = std.testing;
+ 
+@@ -286,7 +285,7 @@ test "fontconfig" {
+ }
+ 
+ test "core text" {
+-    if (!options.coretext) return error.SkipZigTest;
++    if (options.backend != .coretext) return error.SkipZigTest;
+ 
+     const testing = std.testing;
+ 
+
+commit 8dd9e7b325455e0ad739c65e44bf7a12c22527fb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 24 15:55:57 2022 -0700
+
+    Fix memory leak forgetting to clean up fontconfig
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index c83d7563..e13d06fa 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -139,7 +139,7 @@ pub const Fontconfig = struct {
+     }
+ 
+     pub fn deinit(self: *Fontconfig) void {
+-        _ = self;
++        self.fc_config.destroy();
+     }
+ 
+     /// Discover fonts from a descriptor. This returns an iterator that can
+
+commit da2942e083adb0eda4b19523813d9f5f1d6bb5f2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 17 15:49:14 2022 -0800
+
+    font: specific codepoint lookup in internals
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index e13d06fa..eefb857b 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -6,7 +6,7 @@ const macos = @import("macos");
+ const options = @import("main.zig").options;
+ const DeferredFace = @import("main.zig").DeferredFace;
+ 
+-const log = std.log.named(.discovery);
++const log = std.log.scoped(.discovery);
+ 
+ /// Discover implementation for the compile options.
+ pub const Discover = switch (options.backend) {
+@@ -27,12 +27,15 @@ pub const Descriptor = struct {
+     ///
+     /// On systems that use fontconfig (Linux), this can be a full
+     /// fontconfig pattern, such as "Fira Code-14:bold".
+-    family: [:0]const u8,
++    family: ?[:0]const u8 = null,
++
++    /// A codepoint that this font must be able to render.
++    codepoint: u32 = 0,
+ 
+     /// Font size in points that the font should support. For conversion
+     /// to pixels, we will use 72 DPI for Mac and 96 DPI for everything else.
+     /// (If pixel conversion is necessary, i.e. emoji fonts)
+-    size: u16,
++    size: u16 = 0,
+ 
+     /// True if we want to search specifically for a font that supports
+     /// bold, italic, or both.
+@@ -44,7 +47,15 @@ pub const Descriptor = struct {
+     /// must still do this.
+     pub fn toFcPattern(self: Descriptor) *fontconfig.Pattern {
+         const pat = fontconfig.Pattern.create();
+-        assert(pat.add(.family, .{ .string = self.family }, false));
++        if (self.family) |family| {
++            assert(pat.add(.family, .{ .string = family }, false));
++        }
++        if (self.codepoint > 0) {
++            const cs = fontconfig.CharSet.create();
++            defer cs.destroy();
++            assert(cs.addChar(self.codepoint));
++            assert(pat.add(.charset, .{ .char_set = cs }, false));
++        }
+         if (self.size > 0) assert(pat.add(
+             .size,
+             .{ .integer = self.size },
+@@ -70,13 +81,28 @@ pub const Descriptor = struct {
+         const attrs = try macos.foundation.MutableDictionary.create(0);
+         defer attrs.release();
+ 
+-        // Family is always set
+-        const family = try macos.foundation.String.createWithBytes(self.family, .utf8, false);
+-        defer family.release();
+-        attrs.setValue(
+-            macos.text.FontAttribute.family_name.key(),
+-            family,
+-        );
++        // Family
++        if (self.family) |family_bytes| {
++            const family = try macos.foundation.String.createWithBytes(family_bytes, .utf8, false);
++            defer family.release();
++            attrs.setValue(
++                macos.text.FontAttribute.family_name.key(),
++                family,
++            );
++        }
++
++        // Codepoint support
++        if (self.codepoint > 0) {
++            const cs = try macos.foundation.CharacterSet.createWithCharactersInRange(.{
++                .location = self.codepoint,
++                .length = 1,
++            });
++            defer cs.release();
++            attrs.setValue(
++                macos.text.FontAttribute.character_set.key(),
++                cs,
++            );
++        }
+ 
+         // Set our size attribute if set
+         if (self.size > 0) {
+@@ -254,9 +280,26 @@ pub const CoreText = struct {
+         pub fn next(self: *DiscoverIterator) !?DeferredFace {
+             if (self.i >= self.list.getCount()) return null;
+ 
++            // Get our descriptor. We need to remove the character set
++            // limitation because we may have used that to filter but we
++            // don't want it anymore because it'll restrict the characters
++            // available.
++            //const desc = self.list.getValueAtIndex(macos.text.FontDescriptor, self.i);
++            const desc = desc: {
++                const original = self.list.getValueAtIndex(macos.text.FontDescriptor, self.i);
++
++                // For some reason simply copying the attributes and recreating
++                // the descriptor removes the charset restriction. This is tested.
++                const attrs = original.copyAttributes();
++                defer attrs.release();
++                break :desc try macos.text.FontDescriptor.createWithAttributes(
++                    @ptrCast(*macos.foundation.Dictionary, attrs),
++                );
++            };
++            defer desc.release();
++
+             // Create our font. We need a size to initialize it so we use size
+             // 12 but we will alter the size later.
+-            const desc = self.list.getValueAtIndex(macos.text.FontDescriptor, self.i);
+             const font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+             errdefer font.release();
+ 
+@@ -284,7 +327,26 @@ test "fontconfig" {
+     }
+ }
+ 
+-test "core text" {
++test "fontconfig codepoint" {
++    if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
++
++    const testing = std.testing;
++
++    var fc = Fontconfig.init();
++    var it = try fc.discover(.{ .codepoint = 'A', .size = 12 });
++    defer it.deinit();
++
++    // The first result should have the codepoint. Later ones may not
++    // because fontconfig returns all fonts sorted.
++    const face = (try it.next()).?;
++    try testing.expect(!face.loaded());
++    try testing.expect(face.hasCodepoint('A', null));
++
++    // Should have other codepoints too
++    try testing.expect(face.hasCodepoint('B', null));
++}
++
++test "coretext" {
+     if (options.backend != .coretext) return error.SkipZigTest;
+ 
+     const testing = std.testing;
+@@ -300,3 +362,23 @@ test "core text" {
+     }
+     try testing.expect(count > 0);
+ }
++
++test "coretext codepoint" {
++    if (options.backend != .coretext) return error.SkipZigTest;
++
++    const testing = std.testing;
++
++    var ct = CoreText.init();
++    defer ct.deinit();
++    var it = try ct.discover(.{ .codepoint = 'A', .size = 12 });
++    defer it.deinit();
++
++    // The first result should have the codepoint. Later ones may not
++    // because fontconfig returns all fonts sorted.
++    const face = (try it.next()).?;
++    try testing.expect(!face.loaded());
++    try testing.expect(face.hasCodepoint('A', null));
++
++    // Should have other codepoints too
++    try testing.expect(face.hasCodepoint('B', null));
++}
+
+commit aaa0d46b5d221408d1a36ca796243ab9c28ba8ca
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Dec 5 20:37:17 2022 -0800
+
+    font: web canvas doesn't support discovery
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index eefb857b..25d4a318 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -10,9 +10,10 @@ const log = std.log.scoped(.discovery);
+ 
+ /// Discover implementation for the compile options.
+ pub const Discover = switch (options.backend) {
++    .freetype => void, // no discovery
+     .fontconfig_freetype => Fontconfig,
+-    .coretext => CoreText,
+-    else => void,
++    .coretext, .coretext_freetype => CoreText,
++    .web_canvas => void, // no discovery
+ };
+ 
+ /// Descriptor is used to search for fonts. The only required field
+
+commit b196e43ee423226646cc4839194b2763a185f4e6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri May 19 08:34:07 2023 -0700
+
+    fix some issues for future Zig update
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 25d4a318..48f225eb 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -251,10 +251,8 @@ pub const CoreText = struct {
+         defer ct_desc.release();
+ 
+         // Our descriptors have to be in an array
+-        const desc_arr = try macos.foundation.Array.create(
+-            macos.text.FontDescriptor,
+-            &[_]*const macos.text.FontDescriptor{ct_desc},
+-        );
++        var ct_desc_arr = [_]*const macos.text.FontDescriptor{ct_desc};
++        const desc_arr = try macos.foundation.Array.create(macos.text.FontDescriptor, &ct_desc_arr);
+         defer desc_arr.release();
+ 
+         // Build our collection
+
+commit 6e79e84acfaf97e1ae937b687dffa599bc65d5ae
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 23 13:45:48 2023 -0700
+
+    config file quoted strings are accepted now
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 48f225eb..b392613a 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -346,7 +346,8 @@ test "fontconfig codepoint" {
+ }
+ 
+ test "coretext" {
+-    if (options.backend != .coretext) return error.SkipZigTest;
++    if (options.backend != .coretext and options.backend != .coretext_freetype)
++        return error.SkipZigTest;
+ 
+     const testing = std.testing;
+ 
+@@ -363,7 +364,8 @@ test "coretext" {
+ }
+ 
+ test "coretext codepoint" {
+-    if (options.backend != .coretext) return error.SkipZigTest;
++    if (options.backend != .coretext and options.backend != .coretext_freetype)
++        return error.SkipZigTest;
+ 
+     const testing = std.testing;
+ 
+
+commit 56f8e39e5bc4f7c96a5f5c661604d6a10390875f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jun 25 11:08:12 2023 -0700
+
+    Update zig, mach, fmt
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index b392613a..1d931f9d 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -64,12 +64,12 @@ pub const Descriptor = struct {
+         ));
+         if (self.bold) assert(pat.add(
+             .weight,
+-            .{ .integer = @enumToInt(fontconfig.Weight.bold) },
++            .{ .integer = @intFromEnum(fontconfig.Weight.bold) },
+             false,
+         ));
+         if (self.italic) assert(pat.add(
+             .slant,
+-            .{ .integer = @enumToInt(fontconfig.Slant.italic) },
++            .{ .integer = @intFromEnum(fontconfig.Slant.italic) },
+             false,
+         ));
+ 
+
+commit 314f9287b1854911e38d030ad6ec42bb6cd0a105
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 30 12:15:31 2023 -0700
+
+    Update Zig (#164)
+    
+    * update zig
+    
+    * pkg/fontconfig: clean up @as
+    
+    * pkg/freetype,harfbuzz: clean up @as
+    
+    * pkg/imgui: clean up @as
+    
+    * pkg/macos: clean up @as
+    
+    * pkg/pixman,utf8proc: clean up @as
+    
+    * clean up @as
+    
+    * lots more @as cleanup
+    
+    * undo flatpak changes
+    
+    * clean up @as
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 1d931f9d..6cfc0d88 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -107,7 +107,7 @@ pub const Descriptor = struct {
+ 
+         // Set our size attribute if set
+         if (self.size > 0) {
+-            const size32 = @intCast(i32, self.size);
++            const size32 = @as(i32, @intCast(self.size));
+             const size = try macos.foundation.Number.create(
+                 .sint32,
+                 &size32,
+@@ -132,7 +132,7 @@ pub const Descriptor = struct {
+             // of the symbolic traits value, and set that in our attributes.
+             const traits_num = try macos.foundation.Number.create(
+                 .sint32,
+-                @ptrCast(*const i32, &traits_cval),
++                @as(*const i32, @ptrCast(&traits_cval)),
+             );
+             defer traits_num.release();
+ 
+@@ -149,10 +149,7 @@ pub const Descriptor = struct {
+             );
+         }
+ 
+-        return try macos.text.FontDescriptor.createWithAttributes(@ptrCast(
+-            *macos.foundation.Dictionary,
+-            attrs,
+-        ));
++        return try macos.text.FontDescriptor.createWithAttributes(@ptrCast(attrs));
+     }
+ };
+ 
+@@ -291,9 +288,7 @@ pub const CoreText = struct {
+                 // the descriptor removes the charset restriction. This is tested.
+                 const attrs = original.copyAttributes();
+                 defer attrs.release();
+-                break :desc try macos.text.FontDescriptor.createWithAttributes(
+-                    @ptrCast(*macos.foundation.Dictionary, attrs),
+-                );
++                break :desc try macos.text.FontDescriptor.createWithAttributes(@ptrCast(attrs));
+             };
+             defer desc.release();
+ 
+
+commit 0a718ec3eb6456e378b2209321c67ae3d78c850a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jul 1 13:38:10 2023 -0700
+
+    pkg/macos: do not use bitCast through a function
+    
+    workaround Zig issue: https://github.com/ziglang/zig/issues/16290
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 6cfc0d88..2ef7080d 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -126,7 +126,7 @@ pub const Descriptor = struct {
+             .bold = self.bold,
+             .italic = self.italic,
+         };
+-        const traits_cval = traits.cval();
++        const traits_cval: u32 = @bitCast(traits);
+         if (traits_cval > 0) {
+             // Setting traits is a pain. We have to create a nested dictionary
+             // of the symbolic traits value, and set that in our attributes.
+
+commit 619d2ade3ee194551889fe6cb1ea2d28aada8cba
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 13 08:01:33 2023 -0700
+
+    only initialize font discovery mechanism once, cache on App
+    
+    Fontconfig in particular appears unsafe to initialize multiple times.
+    
+    Font discovery is a singleton object in an application and only ever
+    accessed from the main thread so we can work around this by only
+    initializing and caching the font discovery mechanism exactly once on
+    the app singleton.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 2ef7080d..548c23af 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -168,7 +168,7 @@ pub const Fontconfig = struct {
+ 
+     /// Discover fonts from a descriptor. This returns an iterator that can
+     /// be used to build up the deferred fonts.
+-    pub fn discover(self: *Fontconfig, desc: Descriptor) !DiscoverIterator {
++    pub fn discover(self: *const Fontconfig, desc: Descriptor) !DiscoverIterator {
+         // Build our pattern that we'll search for
+         const pat = desc.toFcPattern();
+         errdefer pat.destroy();
+
+commit 167bf6f0980c312fdff0d4eedb6ad3ecdfa39d26
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Aug 25 13:28:46 2023 -0700
+
+    font: DeferredFace can no longer represent a loaded face
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 548c23af..f105b630 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -301,7 +301,6 @@ pub const CoreText = struct {
+             defer self.i += 1;
+ 
+             return DeferredFace{
+-                .face = null,
+                 .ct = .{ .font = font },
+             };
+         }
+@@ -311,14 +310,9 @@ pub const CoreText = struct {
+ test "fontconfig" {
+     if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+ 
+-    const testing = std.testing;
+-
+     var fc = Fontconfig.init();
+     var it = try fc.discover(.{ .family = "monospace", .size = 12 });
+     defer it.deinit();
+-    while (try it.next()) |face| {
+-        try testing.expect(!face.loaded());
+-    }
+ }
+ 
+ test "fontconfig codepoint" {
+@@ -333,7 +327,6 @@ test "fontconfig codepoint" {
+     // The first result should have the codepoint. Later ones may not
+     // because fontconfig returns all fonts sorted.
+     const face = (try it.next()).?;
+-    try testing.expect(!face.loaded());
+     try testing.expect(face.hasCodepoint('A', null));
+ 
+     // Should have other codepoints too
+@@ -351,9 +344,8 @@ test "coretext" {
+     var it = try ct.discover(.{ .family = "Monaco", .size = 12 });
+     defer it.deinit();
+     var count: usize = 0;
+-    while (try it.next()) |face| {
++    while (try it.next()) |_| {
+         count += 1;
+-        try testing.expect(!face.loaded());
+     }
+     try testing.expect(count > 0);
+ }
+@@ -372,7 +364,6 @@ test "coretext codepoint" {
+     // The first result should have the codepoint. Later ones may not
+     // because fontconfig returns all fonts sorted.
+     const face = (try it.next()).?;
+-    try testing.expect(!face.loaded());
+     try testing.expect(face.hasCodepoint('A', null));
+ 
+     // Should have other codepoints too
+
+commit c15cf6d9f138d94e5437ac23f2a2ae5f1248ec34
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Aug 25 14:57:05 2023 -0700
+
+    font: fontconfig adaptations to new api
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index f105b630..67bde3b0 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -217,7 +217,6 @@ pub const Fontconfig = struct {
+             defer self.i += 1;
+ 
+             return DeferredFace{
+-                .face = null,
+                 .fc = .{
+                     .pattern = font_pattern,
+                     .charset = (try font_pattern.get(.charset, 0)).char_set,
+
+commit 9d0729f17cb155f58dea04d4817411dce535e079
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 27 07:56:17 2023 -0700
+
+    font/coretext: ability to set variation axes
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 67bde3b0..fb3c8322 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -5,6 +5,7 @@ const fontconfig = @import("fontconfig");
+ const macos = @import("macos");
+ const options = @import("main.zig").options;
+ const DeferredFace = @import("main.zig").DeferredFace;
++const Variation = @import("main.zig").face.Variation;
+ 
+ const log = std.log.scoped(.discovery);
+ 
+@@ -43,6 +44,11 @@ pub const Descriptor = struct {
+     bold: bool = false,
+     italic: bool = false,
+ 
++    /// Variation axes to apply to the font. This also impacts searching
++    /// for fonts since fonts with the ability to set these variations
++    /// will be preferred, but not guaranteed.
++    variations: []const Variation = &.{},
++
+     /// Convert to Fontconfig pattern to use for lookup. The pattern does
+     /// not have defaults filled/substituted (Fontconfig thing) so callers
+     /// must still do this.
+@@ -149,7 +155,21 @@ pub const Descriptor = struct {
+             );
+         }
+ 
+-        return try macos.text.FontDescriptor.createWithAttributes(@ptrCast(attrs));
++        // Build our descriptor from attrs
++        var desc = try macos.text.FontDescriptor.createWithAttributes(@ptrCast(attrs));
++        errdefer desc.release();
++
++        // Variations are built by copying the descriptor. I don't know a way
++        // to set it on attrs directly.
++        for (self.variations) |v| {
++            const id = try macos.foundation.Number.create(.int, @ptrCast(&v.id));
++            defer id.release();
++            const next = try desc.createCopyWithVariation(id, v.value);
++            desc.release();
++            desc = next;
++        }
++
++        return desc;
+     }
+ };
+ 
+
+commit 1ee5b7f91c7e8d715110fe928a74e2ad60b19fce
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 27 19:58:25 2023 -0700
+
+    font: freetype supports font variation settings
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index fb3c8322..d1dc6a60 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -205,6 +205,7 @@ pub const Fontconfig = struct {
+             .pattern = pat,
+             .set = res.fs,
+             .fonts = res.fs.fonts(),
++            .variations = desc.variations,
+             .i = 0,
+         };
+     }
+@@ -214,6 +215,7 @@ pub const Fontconfig = struct {
+         pattern: *fontconfig.Pattern,
+         set: *fontconfig.FontSet,
+         fonts: []*fontconfig.Pattern,
++        variations: []const Variation,
+         i: usize,
+ 
+         pub fn deinit(self: *DiscoverIterator) void {
+@@ -241,6 +243,7 @@ pub const Fontconfig = struct {
+                     .pattern = font_pattern,
+                     .charset = (try font_pattern.get(.charset, 0)).char_set,
+                     .langset = (try font_pattern.get(.lang, 0)).lang_set,
++                    .variations = self.variations,
+                 },
+             };
+         }
+
+commit 2fb14eee09fa4cd368fb05731acd6d661ba6f785
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 24 08:22:50 2023 -0700
+
+    font: CoreText discovery searches monospace only by default
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index d1dc6a60..7bd7900f 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -40,9 +40,10 @@ pub const Descriptor = struct {
+     size: u16 = 0,
+ 
+     /// True if we want to search specifically for a font that supports
+-    /// bold, italic, or both.
++    /// specific styles.
+     bold: bool = false,
+     italic: bool = false,
++    monospace: bool = true,
+ 
+     /// Variation axes to apply to the font. This also impacts searching
+     /// for fonts since fonts with the ability to set these variations
+@@ -131,6 +132,7 @@ pub const Descriptor = struct {
+         const traits: macos.text.FontSymbolicTraits = .{
+             .bold = self.bold,
+             .italic = self.italic,
++            .monospace = self.monospace,
+         };
+         const traits_cval: u32 = @bitCast(traits);
+         if (traits_cval > 0) {
+
+commit 70a2a0556dc818c71811fcc1e3bb10a6f54f6829
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 24 08:42:12 2023 -0700
+
+    font: fontconfig should not omit earlier fonts
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 7bd7900f..19b7141d 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -198,7 +198,7 @@ pub const Fontconfig = struct {
+         pat.defaultSubstitute();
+ 
+         // Search
+-        const res = self.fc_config.fontSort(pat, true, null);
++        const res = self.fc_config.fontSort(pat, false, null);
+         if (res.result != .match) return error.FontConfigFailed;
+         errdefer res.fs.destroy();
+ 
+
+commit 966166015f148fe1a781be5000844acea5cf07d3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 24 09:02:35 2023 -0700
+
+    font/core-text: discovery supports style search
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 19b7141d..82811786 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -31,6 +31,12 @@ pub const Descriptor = struct {
+     /// fontconfig pattern, such as "Fira Code-14:bold".
+     family: ?[:0]const u8 = null,
+ 
++    /// Specific font style to search for. This will filter the style
++    /// string the font advertises. The "bold/italic" booleans later in this
++    /// struct filter by the style trait the font has, not the string, so
++    /// these can be used in conjunction or not.
++    style: ?[:0]const u8 = null,
++
+     /// A codepoint that this font must be able to render.
+     codepoint: u32 = 0,
+ 
+@@ -99,6 +105,16 @@ pub const Descriptor = struct {
+             );
+         }
+ 
++        // Style
++        if (self.style) |style_bytes| {
++            const style = try macos.foundation.String.createWithBytes(style_bytes, .utf8, false);
++            defer style.release();
++            attrs.setValue(
++                macos.text.FontAttribute.style_name.key(),
++                style,
++            );
++        }
++
+         // Codepoint support
+         if (self.codepoint > 0) {
+             const cs = try macos.foundation.CharacterSet.createWithCharactersInRange(.{
+
+commit 8e083d86180b7dd26b4e98bf7717c21aed61d8dd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 24 09:05:07 2023 -0700
+
+    font/fontconfig: support style descriptor
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 82811786..7ac5d6ff 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -64,6 +64,9 @@ pub const Descriptor = struct {
+         if (self.family) |family| {
+             assert(pat.add(.family, .{ .string = family }, false));
+         }
++        if (self.style) |style| {
++            assert(pat.add(.style, .{ .string = style }, false));
++        }
+         if (self.codepoint > 0) {
+             const cs = fontconfig.CharSet.create();
+             defer cs.destroy();
+
+commit 6b640c2d9f5a867199620b592464103bab0ad008
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 24 11:17:07 2023 -0700
+
+    font: discovery descriptor can be hashed
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 7ac5d6ff..b85f411a 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -56,6 +56,30 @@ pub const Descriptor = struct {
+     /// will be preferred, but not guaranteed.
+     variations: []const Variation = &.{},
+ 
++    /// Returns a hash code that can be used to uniquely identify this
++    /// action.
++    pub fn hash(self: Descriptor) u64 {
++        const autoHash = std.hash.autoHash;
++        var hasher = std.hash.Wyhash.init(0);
++        autoHash(&hasher, self.family);
++        autoHash(&hasher, self.style);
++        autoHash(&hasher, self.codepoint);
++        autoHash(&hasher, self.size);
++        autoHash(&hasher, self.bold);
++        autoHash(&hasher, self.italic);
++        autoHash(&hasher, self.monospace);
++        autoHash(&hasher, self.variations.len);
++        for (self.variations) |variation| {
++            autoHash(&hasher, variation.id);
++
++            // This is not correct, but we don't currently depend on the
++            // hash value being different based on decimal values of variations.
++            autoHash(&hasher, @as(u64, @intFromFloat(variation.value)));
++        }
++
++        return hasher.final();
++    }
++
+     /// Convert to Fontconfig pattern to use for lookup. The pattern does
+     /// not have defaults filled/substituted (Fontconfig thing) so callers
+     /// must still do this.
+@@ -350,6 +374,21 @@ pub const CoreText = struct {
+     };
+ };
+ 
++test "descriptor hash" {
++    const testing = std.testing;
++
++    var d: Descriptor = .{};
++    try testing.expect(d.hash() != 0);
++}
++
++test "descriptor hash familiy names" {
++    const testing = std.testing;
++
++    var d1: Descriptor = .{ .family = "A" };
++    var d2: Descriptor = .{ .family = "B" };
++    try testing.expect(d1.hash() != d2.hash());
++}
++
+ test "fontconfig" {
+     if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+ 
+
+commit 1127330b3a10dfa3da82dff9358501b7d8ed8c11
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 3 09:17:41 2023 -0700
+
+    font/coretext: score discovered fonts
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index b85f411a..dfde8299 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -1,5 +1,6 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
++const Allocator = std.mem.Allocator;
+ const assert = std.debug.assert;
+ const fontconfig = @import("fontconfig");
+ const macos = @import("macos");
+@@ -307,7 +308,7 @@ pub const CoreText = struct {
+ 
+     /// Discover fonts from a descriptor. This returns an iterator that can
+     /// be used to build up the deferred fonts.
+-    pub fn discover(self: *const CoreText, desc: Descriptor) !DiscoverIterator {
++    pub fn discover(self: *const CoreText, alloc: Allocator, desc: Descriptor) !DiscoverIterator {
+         _ = self;
+ 
+         // Build our pattern that we'll search for
+@@ -323,25 +324,104 @@ pub const CoreText = struct {
+         const set = try macos.text.FontCollection.createWithFontDescriptors(desc_arr);
+         defer set.release();
+         const list = set.createMatchingFontDescriptors();
+-        errdefer list.release();
++        defer list.release();
++
++        // Sort our descriptors
++        const zig_list = try copyMatchingDescriptors(alloc, list);
++        errdefer alloc.free(zig_list);
++        sortMatchingDescriptors(&desc, zig_list);
+ 
+         return DiscoverIterator{
+-            .list = list,
++            .alloc = alloc,
++            .list = zig_list,
+             .i = 0,
+         };
+     }
+ 
+-    pub const DiscoverIterator = struct {
++    fn copyMatchingDescriptors(
++        alloc: Allocator,
+         list: *macos.foundation.Array,
++    ) ![]*macos.text.FontDescriptor {
++        var result = try alloc.alloc(*macos.text.FontDescriptor, list.getCount());
++        errdefer alloc.free(result);
++        for (0..result.len) |i| {
++            result[i] = list.getValueAtIndex(macos.text.FontDescriptor, i);
++
++            // We need to retain becauseonce the list is freed it will
++            // release all its members.
++            result[i].retain();
++        }
++        return result;
++    }
++
++    fn sortMatchingDescriptors(
++        desc: *const Descriptor,
++        list: []*macos.text.FontDescriptor,
++    ) void {
++        var desc_mut = desc.*;
++        if (desc_mut.style == null) {
++            // If there is no explicit style set, we set a preferred
++            // based on the style bool attributes.
++            //
++            // TODO: doesn't handle i18n font names well, we should have
++            // another mechanism that uses the weight attribute if it exists.
++            // Wait for this to be a real problem.
++            desc_mut.style = if (desc_mut.bold and desc_mut.italic)
++                "Bold Italic"
++            else if (desc_mut.bold)
++                "Bold"
++            else if (desc_mut.italic)
++                "Italic"
++            else
++                null;
++        }
++
++        std.mem.sortUnstable(*macos.text.FontDescriptor, list, &desc_mut, struct {
++            fn lessThan(
++                desc_inner: *const Descriptor,
++                lhs: *macos.text.FontDescriptor,
++                rhs: *macos.text.FontDescriptor,
++            ) bool {
++                const lhs_score = score(desc_inner, lhs);
++                const rhs_score = score(desc_inner, rhs);
++                // Higher score is "less" (earlier)
++                return lhs_score > rhs_score;
++            }
++        }.lessThan);
++    }
++
++    fn score(desc: *const Descriptor, ct_desc: *const macos.text.FontDescriptor) i32 {
++        var score_acc: i32 = 0;
++
++        score_acc += if (desc.style) |desired_style| style: {
++            const style = ct_desc.copyAttribute(.style_name);
++            defer style.release();
++            var buf: [128]u8 = undefined;
++            const style_str = style.cstring(&buf, .utf8) orelse break :style 0;
++
++            // Matching style string gets highest score
++            if (std.mem.eql(u8, desired_style, style_str)) break :style 100;
++
++            // Otherwise the score is based on the length of the style string.
++            // Shorter styles are scored higher.
++            break :style -1 * @as(i32, @intCast(style_str.len));
++        } else 0;
++
++        return score_acc;
++    }
++
++    pub const DiscoverIterator = struct {
++        alloc: Allocator,
++        list: []const *macos.text.FontDescriptor,
+         i: usize,
+ 
+         pub fn deinit(self: *DiscoverIterator) void {
+-            self.list.release();
++            self.alloc.free(self.list);
+             self.* = undefined;
+         }
+ 
+         pub fn next(self: *DiscoverIterator) !?DeferredFace {
+-            if (self.i >= self.list.getCount()) return null;
++            if (self.i >= self.list.len) return null;
+ 
+             // Get our descriptor. We need to remove the character set
+             // limitation because we may have used that to filter but we
+@@ -349,7 +429,7 @@ pub const CoreText = struct {
+             // available.
+             //const desc = self.list.getValueAtIndex(macos.text.FontDescriptor, self.i);
+             const desc = desc: {
+-                const original = self.list.getValueAtIndex(macos.text.FontDescriptor, self.i);
++                const original = self.list[self.i];
+ 
+                 // For some reason simply copying the attributes and recreating
+                 // the descriptor removes the charset restriction. This is tested.
+@@ -392,8 +472,11 @@ test "descriptor hash familiy names" {
+ test "fontconfig" {
+     if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+ 
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
+     var fc = Fontconfig.init();
+-    var it = try fc.discover(.{ .family = "monospace", .size = 12 });
++    var it = try fc.discover(alloc, .{ .family = "monospace", .size = 12 });
+     defer it.deinit();
+ }
+ 
+@@ -401,9 +484,10 @@ test "fontconfig codepoint" {
+     if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+ 
+     const testing = std.testing;
++    const alloc = testing.allocator;
+ 
+     var fc = Fontconfig.init();
+-    var it = try fc.discover(.{ .codepoint = 'A', .size = 12 });
++    var it = try fc.discover(alloc, .{ .codepoint = 'A', .size = 12 });
+     defer it.deinit();
+ 
+     // The first result should have the codepoint. Later ones may not
+@@ -420,10 +504,11 @@ test "coretext" {
+         return error.SkipZigTest;
+ 
+     const testing = std.testing;
++    const alloc = testing.allocator;
+ 
+     var ct = CoreText.init();
+     defer ct.deinit();
+-    var it = try ct.discover(.{ .family = "Monaco", .size = 12 });
++    var it = try ct.discover(alloc, .{ .family = "Monaco", .size = 12 });
+     defer it.deinit();
+     var count: usize = 0;
+     while (try it.next()) |_| {
+@@ -437,10 +522,11 @@ test "coretext codepoint" {
+         return error.SkipZigTest;
+ 
+     const testing = std.testing;
++    const alloc = testing.allocator;
+ 
+     var ct = CoreText.init();
+     defer ct.deinit();
+-    var it = try ct.discover(.{ .codepoint = 'A', .size = 12 });
++    var it = try ct.discover(alloc, .{ .codepoint = 'A', .size = 12 });
+     defer it.deinit();
+ 
+     // The first result should have the codepoint. Later ones may not
+
+commit 15e6c07bd953b1bc863a9a2295a1af4cbeb87ccd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 3 09:18:40 2023 -0700
+
+    font/fontconfig: adhere to correct function signature
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index dfde8299..53fd2ce3 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -234,7 +234,9 @@ pub const Fontconfig = struct {
+ 
+     /// Discover fonts from a descriptor. This returns an iterator that can
+     /// be used to build up the deferred fonts.
+-    pub fn discover(self: *const Fontconfig, desc: Descriptor) !DiscoverIterator {
++    pub fn discover(self: *const Fontconfig, alloc: Allocator, desc: Descriptor) !DiscoverIterator {
++        _ = alloc;
++
+         // Build our pattern that we'll search for
+         const pat = desc.toFcPattern();
+         errdefer pat.destroy();
+
+commit 224b39b86e4088445376fc693862c0d954c0ea9e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 5 08:39:48 2023 -0700
+
+    font/coretext: allow setting a non-monospace font explicitly
+    
+    This changes our font discovery to not filter out monospace and updates
+    our scoring mechanism to prefer monospace.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 53fd2ce3..12552c96 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -50,7 +50,7 @@ pub const Descriptor = struct {
+     /// specific styles.
+     bold: bool = false,
+     italic: bool = false,
+-    monospace: bool = true,
++    monospace: bool = false,
+ 
+     /// Variation axes to apply to the font. This also impacts searching
+     /// for fonts since fonts with the ability to set these variations
+@@ -387,27 +387,57 @@ pub const CoreText = struct {
+                 const lhs_score = score(desc_inner, lhs);
+                 const rhs_score = score(desc_inner, rhs);
+                 // Higher score is "less" (earlier)
+-                return lhs_score > rhs_score;
++                return lhs_score.int() > rhs_score.int();
+             }
+         }.lessThan);
+     }
+ 
+-    fn score(desc: *const Descriptor, ct_desc: *const macos.text.FontDescriptor) i32 {
+-        var score_acc: i32 = 0;
++    /// We represent our sorting score as a packed struct so that we can
++    /// compare scores numerically but build scores symbolically.
++    const Score = packed struct {
++        const Backing = @typeInfo(@This()).Struct.backing_integer.?;
+ 
+-        score_acc += if (desc.style) |desired_style| style: {
++        style: Style = .unmatched,
++        monospace: bool = false,
++
++        const Style = enum(u8) { unmatched = 0, match = 0xFF, _ };
++
++        pub fn int(self: Score) Backing {
++            return @bitCast(self);
++        }
++    };
++
++    fn score(desc: *const Descriptor, ct_desc: *const macos.text.FontDescriptor) Score {
++        var score_acc: Score = .{};
++
++        // Get our symbolic traits for the descriptor so we can compare
++        // boolean attributes like bold, monospace, etc.
++        const symbolic_traits: macos.text.FontSymbolicTraits = traits: {
++            const traits = ct_desc.copyAttribute(.traits);
++            defer traits.release();
++
++            const key = macos.text.FontTraitKey.symbolic.key();
++            const symbolic = traits.getValue(macos.foundation.Number, key) orelse
++                break :traits .{};
++
++            break :traits macos.text.FontSymbolicTraits.init(symbolic);
++        };
++
++        score_acc.monospace = symbolic_traits.monospace;
++
++        score_acc.style = if (desc.style) |desired_style| style: {
+             const style = ct_desc.copyAttribute(.style_name);
+             defer style.release();
+             var buf: [128]u8 = undefined;
+-            const style_str = style.cstring(&buf, .utf8) orelse break :style 0;
++            const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
+ 
+             // Matching style string gets highest score
+-            if (std.mem.eql(u8, desired_style, style_str)) break :style 100;
++            if (std.mem.eql(u8, desired_style, style_str)) break :style .match;
+ 
+             // Otherwise the score is based on the length of the style string.
+             // Shorter styles are scored higher.
+-            break :style -1 * @as(i32, @intCast(style_str.len));
+-        } else 0;
++            break :style @enumFromInt(100 -| style_str.len);
++        } else .unmatched;
+ 
+         return score_acc;
+     }
+
+commit 1411015038536766416e15aaeb6a7f7f7f64167c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 13 12:25:27 2023 -0700
+
+    font: fallback search should search full discovery chain
+    
+    Fixes #668
+    
+    We were previously only checking the first font result in the search.
+    This also fixes our CoreText scoring algorithm to prioritize faces that
+    have the codepoint we're searching for.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 12552c96..7d15d2de 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -399,6 +399,7 @@ pub const CoreText = struct {
+ 
+         style: Style = .unmatched,
+         monospace: bool = false,
++        codepoint: bool = false,
+ 
+         const Style = enum(u8) { unmatched = 0, match = 0xFF, _ };
+ 
+@@ -410,6 +411,26 @@ pub const CoreText = struct {
+     fn score(desc: *const Descriptor, ct_desc: *const macos.text.FontDescriptor) Score {
+         var score_acc: Score = .{};
+ 
++        // If we're searching for a codepoint, prioritize fonts that
++        // have that codepoint.
++        if (desc.codepoint > 0) codepoint: {
++            const font = macos.text.Font.createWithFontDescriptor(ct_desc, 12) catch
++                break :codepoint;
++            defer font.release();
++
++            // Turn UTF-32 into UTF-16 for CT API
++            var unichars: [2]u16 = undefined;
++            const pair = macos.foundation.stringGetSurrogatePairForLongCharacter(
++                desc.codepoint,
++                &unichars,
++            );
++            const len: usize = if (pair) 2 else 1;
++
++            // Get our glyphs
++            var glyphs = [2]macos.graphics.Glyph{ 0, 0 };
++            score_acc.codepoint = font.getGlyphsForCharacters(unichars[0..len], glyphs[0..len]);
++        }
++
+         // Get our symbolic traits for the descriptor so we can compare
+         // boolean attributes like bold, monospace, etc.
+         const symbolic_traits: macos.text.FontSymbolicTraits = traits: {
+
+commit cb684e35cc3c5c796cf876662c3977ecde34f5e8
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 3 22:02:16 2023 -0700
+
+    font/coretext: discovery scoring should take into account symb. traits
+    
+    Fixes #707
+    
+    Our scoring algorithm previously did not take into account symbolic
+    traits, so when `bold = false and italic = false`, regular, bold, italic
+    would all be equally likely to appear first.
+    
+    This modifies our scoring algorithm to prioritize matching symbolic
+    traits. Further, we have a special case for no symbolic traits to
+    prioritize "Regular" named styles. We can expand this to other styles
+    too but we do not do this here.
+    
+    We also modified the algorithm to always prefer fonts with more glyphs
+    over fonts with less, hopeful that we can load fewer fonts for other
+    glyphs later.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 7d15d2de..8874c343 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -397,10 +397,13 @@ pub const CoreText = struct {
+     const Score = packed struct {
+         const Backing = @typeInfo(@This()).Struct.backing_integer.?;
+ 
++        glyph_count: u16 = 0, // clamped if > intmax
++        traits: Traits = .unmatched,
+         style: Style = .unmatched,
+         monospace: bool = false,
+         codepoint: bool = false,
+ 
++        const Traits = enum(u8) { unmatched = 0, _ };
+         const Style = enum(u8) { unmatched = 0, match = 0xFF, _ };
+ 
+         pub fn int(self: Score) Backing {
+@@ -411,12 +414,27 @@ pub const CoreText = struct {
+     fn score(desc: *const Descriptor, ct_desc: *const macos.text.FontDescriptor) Score {
+         var score_acc: Score = .{};
+ 
++        // We always load the font if we can since some things can only be
++        // inspected on the font itself.
++        const font_: ?*macos.text.Font = macos.text.Font.createWithFontDescriptor(
++            ct_desc,
++            12,
++        ) catch null;
++        defer if (font_) |font| font.release();
++
++        // If we have a font, prefer the font with more glyphs.
++        if (font_) |font| {
++            const Type = @TypeOf(score_acc.glyph_count);
++            score_acc.glyph_count = std.math.cast(
++                Type,
++                font.getGlyphCount(),
++            ) orelse std.math.maxInt(Type);
++        }
++
+         // If we're searching for a codepoint, prioritize fonts that
+         // have that codepoint.
+         if (desc.codepoint > 0) codepoint: {
+-            const font = macos.text.Font.createWithFontDescriptor(ct_desc, 12) catch
+-                break :codepoint;
+-            defer font.release();
++            const font = font_ orelse break :codepoint;
+ 
+             // Turn UTF-32 into UTF-16 for CT API
+             var unichars: [2]u16 = undefined;
+@@ -446,19 +464,42 @@ pub const CoreText = struct {
+ 
+         score_acc.monospace = symbolic_traits.monospace;
+ 
+-        score_acc.style = if (desc.style) |desired_style| style: {
++        score_acc.style = style: {
+             const style = ct_desc.copyAttribute(.style_name);
+             defer style.release();
+-            var buf: [128]u8 = undefined;
+-            const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
+ 
+-            // Matching style string gets highest score
+-            if (std.mem.eql(u8, desired_style, style_str)) break :style .match;
++            // If we have a specific desired style, attempt to search for that.
++            if (desc.style) |desired_style| {
++                var buf: [128]u8 = undefined;
++                const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
++
++                // Matching style string gets highest score
++                if (std.mem.eql(u8, desired_style, style_str)) break :style .match;
++
++                // Otherwise the score is based on the length of the style string.
++                // Shorter styles are scored higher.
++                break :style @enumFromInt(100 -| style_str.len);
++            }
++
++            // If we do not, and we have no symbolic traits, then we try
++            // to find "regular" (or no style). If we have symbolic traits
++            // we do nothing but we can improve scoring by taking that into
++            // account, too.
++            if (!desc.bold and !desc.italic) {
++                var buf: [128]u8 = undefined;
++                const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
++                if (std.mem.eql(u8, "Regular", style_str)) break :style .match;
++            }
+ 
+-            // Otherwise the score is based on the length of the style string.
+-            // Shorter styles are scored higher.
+-            break :style @enumFromInt(100 -| style_str.len);
+-        } else .unmatched;
++            break :style .unmatched;
++        };
++
++        score_acc.traits = traits: {
++            var count: u8 = 0;
++            if (desc.bold == symbolic_traits.bold) count += 1;
++            if (desc.italic == symbolic_traits.italic) count += 1;
++            break :traits @enumFromInt(count);
++        };
+ 
+         return score_acc;
+     }
+
+commit 7fef1aa29459fb681b115dbd02ac0b7398090a95
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Apr 1 11:54:41 2024 -0700
+
+    font: descritor can hash using a hasher
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 8874c343..c926445f 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -57,27 +57,31 @@ pub const Descriptor = struct {
+     /// will be preferred, but not guaranteed.
+     variations: []const Variation = &.{},
+ 
+-    /// Returns a hash code that can be used to uniquely identify this
+-    /// action.
+-    pub fn hash(self: Descriptor) u64 {
++    /// Hash the descriptor with the given hasher.
++    pub fn hash(self: Descriptor, hasher: anytype) void {
+         const autoHash = std.hash.autoHash;
+-        var hasher = std.hash.Wyhash.init(0);
+-        autoHash(&hasher, self.family);
+-        autoHash(&hasher, self.style);
+-        autoHash(&hasher, self.codepoint);
+-        autoHash(&hasher, self.size);
+-        autoHash(&hasher, self.bold);
+-        autoHash(&hasher, self.italic);
+-        autoHash(&hasher, self.monospace);
+-        autoHash(&hasher, self.variations.len);
++        autoHash(hasher, self.family);
++        autoHash(hasher, self.style);
++        autoHash(hasher, self.codepoint);
++        autoHash(hasher, self.size);
++        autoHash(hasher, self.bold);
++        autoHash(hasher, self.italic);
++        autoHash(hasher, self.monospace);
++        autoHash(hasher, self.variations.len);
+         for (self.variations) |variation| {
+-            autoHash(&hasher, variation.id);
++            autoHash(hasher, variation.id);
+ 
+             // This is not correct, but we don't currently depend on the
+             // hash value being different based on decimal values of variations.
+-            autoHash(&hasher, @as(u64, @intFromFloat(variation.value)));
++            autoHash(hasher, @as(u64, @intFromFloat(variation.value)));
+         }
++    }
+ 
++    /// Returns a hash code that can be used to uniquely identify this
++    /// action.
++    pub fn hashcode(self: Descriptor) u64 {
++        var hasher = std.hash.Wyhash.init(0);
++        self.hash(&hasher);
+         return hasher.final();
+     }
+ 
+@@ -552,7 +556,7 @@ test "descriptor hash" {
+     const testing = std.testing;
+ 
+     var d: Descriptor = .{};
+-    try testing.expect(d.hash() != 0);
++    try testing.expect(d.hashcode() != 0);
+ }
+ 
+ test "descriptor hash familiy names" {
+@@ -560,7 +564,7 @@ test "descriptor hash familiy names" {
+ 
+     var d1: Descriptor = .{ .family = "A" };
+     var d2: Descriptor = .{ .family = "B" };
+-    try testing.expect(d1.hash() != d2.hash());
++    try testing.expect(d1.hashcode() != d2.hashcode());
+ }
+ 
+ test "fontconfig" {
+
+commit 2f61f7d6a398b6bf9caf2ce485e3686cca37705e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 6 19:49:14 2024 -0700
+
+    font: fix hashing of descriptor strings
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index c926445f..13a994f7 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -60,8 +60,9 @@ pub const Descriptor = struct {
+     /// Hash the descriptor with the given hasher.
+     pub fn hash(self: Descriptor, hasher: anytype) void {
+         const autoHash = std.hash.autoHash;
+-        autoHash(hasher, self.family);
+-        autoHash(hasher, self.style);
++        const autoHashStrat = std.hash.autoHashStrat;
++        autoHashStrat(hasher, self.family, .Deep);
++        autoHashStrat(hasher, self.style, .Deep);
+         autoHash(hasher, self.codepoint);
+         autoHash(hasher, self.size);
+         autoHash(hasher, self.bold);
+
+commit 21a648748dbc28282f7e0ea54292cebae6118c4b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Apr 7 10:54:59 2024 -0700
+
+    font: CodepointMap supports clone
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 13a994f7..4371909b 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -86,6 +86,21 @@ pub const Descriptor = struct {
+         return hasher.final();
+     }
+ 
++    /// Deep copy of the struct. The given allocator is expected to
++    /// be an arena allocator of some sort since the descriptor
++    /// itself doesn't support fine-grained deallocation of fields.
++    pub fn clone(self: *const Descriptor, alloc: Allocator) !Descriptor {
++        // We can't do any errdefer cleanup in here. As documented we
++        // expect the allocator to be an arena so any errors should be
++        // cleaned up somewhere else.
++
++        var copy = self.*;
++        copy.family = if (self.family) |src| try alloc.dupeZ(u8, src) else null;
++        copy.style = if (self.style) |src| try alloc.dupeZ(u8, src) else null;
++        copy.variations = try alloc.dupe(Variation, self.variations);
++        return copy;
++    }
++
+     /// Convert to Fontconfig pattern to use for lookup. The pattern does
+     /// not have defaults filled/substituted (Fontconfig thing) so callers
+     /// must still do this.
+
+commit 107235474787498468b709f0a239b07bcc3d899e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Apr 30 14:03:38 2024 -0700
+
+    build: add -Dfont-backend=coretext_harfbuzz to force Harfbuzz w/ CT
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 4371909b..b21d374f 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -14,7 +14,7 @@ const log = std.log.scoped(.discovery);
+ pub const Discover = switch (options.backend) {
+     .freetype => void, // no discovery
+     .fontconfig_freetype => Fontconfig,
+-    .coretext, .coretext_freetype => CoreText,
++    .coretext, .coretext_freetype, .coretext_harfbuzz => CoreText,
+     .web_canvas => void, // no discovery
+ };
+ 
+
+commit 851b1fe2ac0cfd1e183c2caf7bd7605a2da8652e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed May 1 10:24:41 2024 -0700
+
+    font: noop shaper
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index b21d374f..0259200c 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -14,8 +14,12 @@ const log = std.log.scoped(.discovery);
+ pub const Discover = switch (options.backend) {
+     .freetype => void, // no discovery
+     .fontconfig_freetype => Fontconfig,
+-    .coretext, .coretext_freetype, .coretext_harfbuzz => CoreText,
+     .web_canvas => void, // no discovery
++    .coretext,
++    .coretext_freetype,
++    .coretext_harfbuzz,
++    .coretext_noshape,
++    => CoreText,
+ };
+ 
+ /// Descriptor is used to search for fonts. The only required field
+
+commit 7c5d829274dd850b2f8464b701e82dc0af6baa87
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue May 7 15:05:34 2024 -0700
+
+    font: use CoreText API for CJK unified ideographs
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 0259200c..17e30ee6 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -5,6 +5,7 @@ const assert = std.debug.assert;
+ const fontconfig = @import("fontconfig");
+ const macos = @import("macos");
+ const options = @import("main.zig").options;
++const Collection = @import("main.zig").Collection;
+ const DeferredFace = @import("main.zig").DeferredFace;
+ const Variation = @import("main.zig").face.Variation;
+ 
+@@ -258,7 +259,11 @@ pub const Fontconfig = struct {
+ 
+     /// Discover fonts from a descriptor. This returns an iterator that can
+     /// be used to build up the deferred fonts.
+-    pub fn discover(self: *const Fontconfig, alloc: Allocator, desc: Descriptor) !DiscoverIterator {
++    pub fn discover(
++        self: *const Fontconfig,
++        alloc: Allocator,
++        desc: Descriptor,
++    ) !DiscoverIterator {
+         _ = alloc;
+ 
+         // Build our pattern that we'll search for
+@@ -282,6 +287,16 @@ pub const Fontconfig = struct {
+         };
+     }
+ 
++    pub fn discoverFallback(
++        self: *const CoreText,
++        alloc: Allocator,
++        collection: *Collection,
++        desc: Descriptor,
++    ) !DiscoverIterator {
++        _ = collection;
++        return try self.discover(alloc, desc);
++    }
++
+     pub const DiscoverIterator = struct {
+         config: *fontconfig.Config,
+         pattern: *fontconfig.Pattern,
+@@ -364,6 +379,87 @@ pub const CoreText = struct {
+         };
+     }
+ 
++    pub fn discoverFallback(
++        self: *const CoreText,
++        alloc: Allocator,
++        collection: *Collection,
++        desc: Descriptor,
++    ) !DiscoverIterator {
++        // If we have a codepoint within the CJK unified ideographs block
++        // then we fallback to macOS to find a font that supports it because
++        // there isn't a better way manually with CoreText that I can find that
++        // properly takes into account system locale.
++        //
++        // References:
++        // - http://unicode.org/charts/PDF/U4E00.pdf
++        // - https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/platform/fonts/LocaleInFonts.md#unified-han-ideographs
++        if (desc.codepoint >= 0x4E00 and
++            desc.codepoint <= 0x9FFF)
++        han: {
++            const han = try self.discoverCodepoint(
++                collection,
++                desc,
++            ) orelse break :han;
++
++            // This is silly but our discover iterator needs a slice so
++            // we allocate here. This isn't a performance bottleneck but
++            // this is something we can optimize very easily...
++            const list = try alloc.alloc(*macos.text.FontDescriptor, 1);
++            errdefer alloc.free(list);
++            list[0] = han;
++
++            return DiscoverIterator{
++                .alloc = alloc,
++                .list = list,
++                .i = 0,
++            };
++        }
++
++        return try self.discover(alloc, desc);
++    }
++
++    /// Discover a font for a specific codepoint using the CoreText
++    /// CTFontCreateForString API.
++    fn discoverCodepoint(
++        self: *const CoreText,
++        collection: *Collection,
++        desc: Descriptor,
++    ) !?*macos.text.FontDescriptor {
++        _ = self;
++
++        assert(desc.codepoint > 0);
++
++        // Get our original font. This is dependent on the requestd style
++        // from the descriptor.
++        const original = original: {
++            break :original try collection.getFace(.{ .style = .regular });
++        };
++
++        // We need it in utf8 format
++        var buf: [4]u8 = undefined;
++        const len = try std.unicode.utf8Encode(
++            @intCast(desc.codepoint),
++            &buf,
++        );
++
++        // We need a CFString
++        const str = try macos.foundation.String.createWithBytes(
++            buf[0..len],
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        // Get our font
++        const font = original.font.createForString(
++            str,
++            macos.foundation.Range.init(0, 1),
++        ) orelse return null;
++        defer font.release();
++
++        // Get the descriptor
++        return font.copyDescriptor();
++    }
+     fn copyMatchingDescriptors(
+         alloc: Allocator,
+         list: *macos.foundation.Array,
+
+commit 84095025d5eedc666c2f06ed9af246055d299acf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue May 7 15:10:53 2024 -0700
+
+    font: fontconfig has proper function
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 17e30ee6..9cfbe4a0 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -288,7 +288,7 @@ pub const Fontconfig = struct {
+     }
+ 
+     pub fn discoverFallback(
+-        self: *const CoreText,
++        self: *const Fontconfig,
+         alloc: Allocator,
+         collection: *Collection,
+         desc: Descriptor,
+
+commit 91bcc3de396c76118363bb407d651a044c0b6dcc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue May 7 15:39:17 2024 -0700
+
+    font/coretext: choose proper original font for CJK search
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 9cfbe4a0..b44878cb 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -432,6 +432,31 @@ pub const CoreText = struct {
+         // Get our original font. This is dependent on the requestd style
+         // from the descriptor.
+         const original = original: {
++            // In all the styles below, we try to match it but if we don't
++            // we always fall back to some other option. The order matters
++            // here.
++
++            if (desc.bold and desc.italic) {
++                const items = collection.faces.get(.bold_italic).items;
++                if (items.len > 0) {
++                    break :original try collection.getFace(.{ .style = .bold_italic });
++                }
++            }
++
++            if (desc.bold) {
++                const items = collection.faces.get(.bold).items;
++                if (items.len > 0) {
++                    break :original try collection.getFace(.{ .style = .bold });
++                }
++            }
++
++            if (desc.italic) {
++                const items = collection.faces.get(.italic).items;
++                if (items.len > 0) {
++                    break :original try collection.getFace(.{ .style = .italic });
++                }
++            }
++
+             break :original try collection.getFace(.{ .style = .regular });
+         };
+ 
+
+commit 3c882e364ad82753d030ee51a3b219ae50bfb0bf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed May 8 12:18:35 2024 -0700
+
+    font: disable CJK unification fallback with freetype rasterizer
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index b44878cb..a93574e0 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -427,6 +427,13 @@ pub const CoreText = struct {
+     ) !?*macos.text.FontDescriptor {
+         _ = self;
+ 
++        if (comptime options.backend.hasFreetype()) {
++            // If we have freetype, we can't use CoreText to find a font
++            // that supports a specific codepoint because we need to
++            // have a CoreText font to be able to do so.
++            return null;
++        }
++
+         assert(desc.codepoint > 0);
+ 
+         // Get our original font. This is dependent on the requestd style
+
+commit d4a75492225e571f91fcd6ef79662563fad9be94
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed May 8 14:23:20 2024 -0400
+
+    feat(font): Non-integer point sizes
+    
+    Allows for high dpi displays to get odd numbered pixel sizes, for
+    example, 13.5pt @ 2px/pt for 27px font. This implementation performs
+    all the sizing calculations with f32, rounding to the nearest pixel
+    size when it comes to rendering. In the future this can be enhanced
+    by adding fractional scaling to support fractional pixel sizes.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index a93574e0..eb245176 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -49,7 +49,7 @@ pub const Descriptor = struct {
+     /// Font size in points that the font should support. For conversion
+     /// to pixels, we will use 72 DPI for Mac and 96 DPI for everything else.
+     /// (If pixel conversion is necessary, i.e. emoji fonts)
+-    size: u16 = 0,
++    size: f32 = 0,
+ 
+     /// True if we want to search specifically for a font that supports
+     /// specific styles.
+@@ -69,7 +69,7 @@ pub const Descriptor = struct {
+         autoHashStrat(hasher, self.family, .Deep);
+         autoHashStrat(hasher, self.style, .Deep);
+         autoHash(hasher, self.codepoint);
+-        autoHash(hasher, self.size);
++        autoHash(hasher, @as(u32, @bitCast(self.size)));
+         autoHash(hasher, self.bold);
+         autoHash(hasher, self.italic);
+         autoHash(hasher, self.monospace);
+@@ -125,7 +125,7 @@ pub const Descriptor = struct {
+         }
+         if (self.size > 0) assert(pat.add(
+             .size,
+-            .{ .integer = self.size },
++            .{ .integer = @round(self.size) },
+             false,
+         ));
+         if (self.bold) assert(pat.add(
+@@ -183,7 +183,7 @@ pub const Descriptor = struct {
+ 
+         // Set our size attribute if set
+         if (self.size > 0) {
+-            const size32 = @as(i32, @intCast(self.size));
++            const size32: i32 = @intFromFloat(@round(self.size));
+             const size = try macos.foundation.Number.create(
+                 .sint32,
+                 &size32,
+
+commit 3156df261f39c8dd4f6e54907de4bb50ecc9b141
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed May 8 14:47:01 2024 -0400
+
+    fix a couple test failures
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index eb245176..c9176adc 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -125,7 +125,7 @@ pub const Descriptor = struct {
+         }
+         if (self.size > 0) assert(pat.add(
+             .size,
+-            .{ .integer = @round(self.size) },
++            .{ .integer = @intFromFloat(@round(self.size)) },
+             false,
+         ));
+         if (self.bold) assert(pat.add(
+
+commit 4b5ad77b70edf547e7532fd1116e87f68bfaa94a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jul 21 09:48:07 2024 -0700
+
+    font: fontconfig always prefer monospace in pattern
+    
+    Fixes #1984
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index c9176adc..aea5a31e 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -139,6 +139,15 @@ pub const Descriptor = struct {
+             false,
+         ));
+ 
++        // For fontconfig, we always add monospace in the pattern. Since
++        // fontconfig sorts by closeness to the pattern, this doesn't fully
++        // exclude non-monospace but helps prefer it.
++        assert(pat.add(
++            .spacing,
++            .{ .integer = @intFromEnum(fontconfig.Spacing.mono) },
++            false,
++        ));
++
+         return pat;
+     }
+ 
+@@ -277,7 +286,7 @@ pub const Fontconfig = struct {
+         if (res.result != .match) return error.FontConfigFailed;
+         errdefer res.fs.destroy();
+ 
+-        return DiscoverIterator{
++        return .{
+             .config = self.fc_config,
+             .pattern = pat,
+             .set = res.fs,
+
+commit f9be02a20f9f77649efad3f6fda3dd15639ef252
+Author: Łukasz Niemier <lukasz@niemier.pl>
+Date:   Mon Aug 5 13:56:57 2024 +0200
+
+    chore: clean up typos
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index aea5a31e..70823989 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -445,7 +445,7 @@ pub const CoreText = struct {
+ 
+         assert(desc.codepoint > 0);
+ 
+-        // Get our original font. This is dependent on the requestd style
++        // Get our original font. This is dependent on the requested style
+         // from the descriptor.
+         const original = original: {
+             // In all the styles below, we try to match it but if we don't
+@@ -716,7 +716,7 @@ test "descriptor hash" {
+     try testing.expect(d.hashcode() != 0);
+ }
+ 
+-test "descriptor hash familiy names" {
++test "descriptor hash family names" {
+     const testing = std.testing;
+ 
+     var d1: Descriptor = .{ .family = "A" };
+
+commit 1f3ccb2d664cf0fe041943e6073c97c36650d431
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Aug 23 14:49:51 2024 -0700
+
+    font: Collection uses SegmentedList for styles for pointer stability
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 70823989..de17a3fb 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -453,22 +453,22 @@ pub const CoreText = struct {
+             // here.
+ 
+             if (desc.bold and desc.italic) {
+-                const items = collection.faces.get(.bold_italic).items;
+-                if (items.len > 0) {
++                const entries = collection.faces.get(.bold_italic);
++                if (entries.count() > 0) {
+                     break :original try collection.getFace(.{ .style = .bold_italic });
+                 }
+             }
+ 
+             if (desc.bold) {
+-                const items = collection.faces.get(.bold).items;
+-                if (items.len > 0) {
++                const entries = collection.faces.get(.bold);
++                if (entries.count() > 0) {
+                     break :original try collection.getFace(.{ .style = .bold });
+                 }
+             }
+ 
+             if (desc.italic) {
+-                const items = collection.faces.get(.italic).items;
+-                if (items.len > 0) {
++                const entries = collection.faces.get(.italic);
++                if (entries.count() > 0) {
+                     break :original try collection.getFace(.{ .style = .italic });
+                 }
+             }
+
+commit def4abf6a9efd51ca0857e185b329b67518e1cc0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Aug 24 20:33:58 2024 -0700
+
+    font: support variations for coretext_freetype backend
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index de17a3fb..6f43fcb7 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -613,7 +613,7 @@ pub const CoreText = struct {
+         // Get our symbolic traits for the descriptor so we can compare
+         // boolean attributes like bold, monospace, etc.
+         const symbolic_traits: macos.text.FontSymbolicTraits = traits: {
+-            const traits = ct_desc.copyAttribute(.traits);
++            const traits = ct_desc.copyAttribute(.traits) orelse break :traits .{};
+             defer traits.release();
+ 
+             const key = macos.text.FontTraitKey.symbolic.key();
+@@ -626,7 +626,8 @@ pub const CoreText = struct {
+         score_acc.monospace = symbolic_traits.monospace;
+ 
+         score_acc.style = style: {
+-            const style = ct_desc.copyAttribute(.style_name);
++            const style = ct_desc.copyAttribute(.style_name) orelse
++                break :style .unmatched;
+             defer style.release();
+ 
+             // If we have a specific desired style, attempt to search for that.
+
+commit 1aa932f810a11617e9c9751c72b87aff8e55e281
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 25 21:25:15 2024 -0700
+
+    font/coretext: use CTFontCreateForString for final codepoint fallback
+    
+    Fixes #2499
+    
+    We rely on CoreText's font discovery to find the best font for a
+    fallback by using the character set attribute. It appears that for some
+    codepoints, the character set attribute is not enough to find a font
+    that supports the codepoint.
+    
+    In this case, we use CTFontCreateForString to find the font that
+    CoreText would use. The one subtlety here is we need to ignore the
+    last resort font, which just has replacement glyphs for all codepoints.
+    
+    We already had a function to do this for CJK characters (#1637)
+    thankfully so we can just reuse that!
+    
+    This also fixes a bug where CTFontCreateForString range param expects
+    the range length to be utf16 code units, not utf32.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 6f43fcb7..3aa16eeb 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -424,7 +424,30 @@ pub const CoreText = struct {
+             };
+         }
+ 
+-        return try self.discover(alloc, desc);
++        const it = try self.discover(alloc, desc);
++
++        // If our normal discovery doesn't find anything and we have a specific
++        // codepoint, then fallback to using CTFontCreateForString to find a
++        // matching font CoreText wants to use. See:
++        // https://github.com/ghostty-org/ghostty/issues/2499
++        if (it.list.len == 0 and desc.codepoint > 0) codepoint: {
++            const ct_desc = try self.discoverCodepoint(
++                collection,
++                desc,
++            ) orelse break :codepoint;
++
++            const list = try alloc.alloc(*macos.text.FontDescriptor, 1);
++            errdefer alloc.free(list);
++            list[0] = ct_desc;
++
++            return DiscoverIterator{
++                .alloc = alloc,
++                .list = list,
++                .i = 0,
++            };
++        }
++
++        return it;
+     }
+ 
+     /// Discover a font for a specific codepoint using the CoreText
+@@ -491,16 +514,45 @@ pub const CoreText = struct {
+         );
+         defer str.release();
+ 
++        // Get our range length for CTFontCreateForString. It looks like
++        // the range uses UTF-16 codepoints and not UTF-32 codepoints.
++        const range_len: usize = range_len: {
++            var unichars: [2]u16 = undefined;
++            const pair = macos.foundation.stringGetSurrogatePairForLongCharacter(
++                desc.codepoint,
++                &unichars,
++            );
++            break :range_len if (pair) 2 else 1;
++        };
++
+         // Get our font
+         const font = original.font.createForString(
+             str,
+-            macos.foundation.Range.init(0, 1),
++            macos.foundation.Range.init(0, range_len),
+         ) orelse return null;
+         defer font.release();
+ 
++        // Do not allow the last resort font to go through. This is the
++        // last font used by CoreText if it can't find anything else and
++        // only contains replacement characters.
++        last_resort: {
++            const name_str = font.copyPostScriptName();
++            defer name_str.release();
++
++            // If the name doesn't fit in our buffer, then it can't
++            // be the last resort font so we break out.
++            var name_buf: [64]u8 = undefined;
++            const name: []const u8 = name_str.cstring(&name_buf, .utf8) orelse
++                break :last_resort;
++
++            // If the name is "LastResort" then we don't want to use it.
++            if (std.mem.eql(u8, "LastResort", name)) return null;
++        }
++
+         // Get the descriptor
+         return font.copyDescriptor();
+     }
++
+     fn copyMatchingDescriptors(
+         alloc: Allocator,
+         list: *macos.foundation.Array,
+
+commit e08eeb2b2ad810c4db22530a181858caee834b22
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 5 16:13:53 2024 -0800
+
+    coretext: set variations on deferred face load
+    
+    This commit makes CoreText behave a lot like FreeType where we set the
+    variation axes on the deferred face load. This fixes a bug where the
+    `slnt` variation axis could not be set with CoreText with the Monaspace
+    Argon Variable font.
+    
+    This was a bug found in Discord. Specifically, with the Monaspace Argon
+    Variable font, the `slnt` variation axis could not be set with CoreText.
+    I'm not sure _exactly_ what causes this but I suspect it has to do with
+    the `slnt` axis being a negative value. I'm not sure if this is a bug
+    with CoreText or not.
+    
+    What was happening was that with CoreText, we set the variation axes
+    during discovery and expect them to be preserved in the resulting
+    discovered faces. That seems to be true with the `wght` axis but not the
+    `slnt` axis for whatever reason.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 3aa16eeb..aeaeb955 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -79,7 +79,7 @@ pub const Descriptor = struct {
+ 
+             // This is not correct, but we don't currently depend on the
+             // hash value being different based on decimal values of variations.
+-            autoHash(hasher, @as(u64, @intFromFloat(variation.value)));
++            autoHash(hasher, @as(i64, @intFromFloat(variation.value)));
+         }
+     }
+ 
+@@ -384,6 +384,7 @@ pub const CoreText = struct {
+         return DiscoverIterator{
+             .alloc = alloc,
+             .list = zig_list,
++            .variations = desc.variations,
+             .i = 0,
+         };
+     }
+@@ -420,6 +421,7 @@ pub const CoreText = struct {
+             return DiscoverIterator{
+                 .alloc = alloc,
+                 .list = list,
++                .variations = desc.variations,
+                 .i = 0,
+             };
+         }
+@@ -443,6 +445,7 @@ pub const CoreText = struct {
+             return DiscoverIterator{
+                 .alloc = alloc,
+                 .list = list,
++                .variations = desc.variations,
+                 .i = 0,
+             };
+         }
+@@ -721,6 +724,7 @@ pub const CoreText = struct {
+     pub const DiscoverIterator = struct {
+         alloc: Allocator,
+         list: []const *macos.text.FontDescriptor,
++        variations: []const Variation,
+         i: usize,
+ 
+         pub fn deinit(self: *DiscoverIterator) void {
+@@ -756,7 +760,10 @@ pub const CoreText = struct {
+             defer self.i += 1;
+ 
+             return DeferredFace{
+-                .ct = .{ .font = font },
++                .ct = .{
++                    .font = font,
++                    .variations = self.variations,
++                },
+             };
+         }
+     };
+
+commit 964f2ce96a01b5d05719c08fb48101d7c61ccdf6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 6 12:53:34 2024 -0800
+
+    font/coretext: always score based on style string length
+    
+    This fixes an issue where for the regular style we were picking a
+    suboptimal style because for some font faces we were choosing more bold
+    faces (just as chance). This modifies our scoring to take the style
+    length into account even for regular style. We already had this logic
+    for explicit styles.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index aeaeb955..67236d5c 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -685,30 +685,29 @@ pub const CoreText = struct {
+                 break :style .unmatched;
+             defer style.release();
+ 
++            // Get our style string
++            var buf: [128]u8 = undefined;
++            const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
++
+             // If we have a specific desired style, attempt to search for that.
+             if (desc.style) |desired_style| {
+-                var buf: [128]u8 = undefined;
+-                const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
+-
+                 // Matching style string gets highest score
+                 if (std.mem.eql(u8, desired_style, style_str)) break :style .match;
+-
+-                // Otherwise the score is based on the length of the style string.
+-                // Shorter styles are scored higher.
+-                break :style @enumFromInt(100 -| style_str.len);
+-            }
+-
+-            // If we do not, and we have no symbolic traits, then we try
+-            // to find "regular" (or no style). If we have symbolic traits
+-            // we do nothing but we can improve scoring by taking that into
+-            // account, too.
+-            if (!desc.bold and !desc.italic) {
+-                var buf: [128]u8 = undefined;
+-                const style_str = style.cstring(&buf, .utf8) orelse break :style .unmatched;
+-                if (std.mem.eql(u8, "Regular", style_str)) break :style .match;
++            } else if (!desc.bold and !desc.italic) {
++                // If we do not, and we have no symbolic traits, then we try
++                // to find "regular" (or no style). If we have symbolic traits
++                // we do nothing but we can improve scoring by taking that into
++                // account, too.
++                if (std.mem.eql(u8, "Regular", style_str)) {
++                    break :style .match;
++                }
+             }
+ 
+-            break :style .unmatched;
++            // Otherwise the score is based on the length of the style string.
++            // Shorter styles are scored higher. This is a heuristic that
++            // if we don't have a desired style then shorter tends to be
++            // more often the "regular" style.
++            break :style @enumFromInt(100 -| style_str.len);
+         };
+ 
+         score_acc.traits = traits: {
+
+commit 94542b04f2f9e958f922be7e4400e1742e617a2d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 6 12:56:12 2024 -0800
+
+    font/coretext: do not set variation axes in discovery
+    
+    This was causing discovery to find some odd fonts under certain
+    scenarios (namely: Recursive Mono). Due to our prior fix in
+    e08eeb2b2ad810c4db22530a181858caee834b22 we no longer need to set
+    variations here for them to stick.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 67236d5c..e73ea626 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -235,21 +235,7 @@ pub const Descriptor = struct {
+             );
+         }
+ 
+-        // Build our descriptor from attrs
+-        var desc = try macos.text.FontDescriptor.createWithAttributes(@ptrCast(attrs));
+-        errdefer desc.release();
+-
+-        // Variations are built by copying the descriptor. I don't know a way
+-        // to set it on attrs directly.
+-        for (self.variations) |v| {
+-            const id = try macos.foundation.Number.create(.int, @ptrCast(&v.id));
+-            defer id.release();
+-            const next = try desc.createCopyWithVariation(id, v.value);
+-            desc.release();
+-            desc = next;
+-        }
+-
+-        return desc;
++        return try macos.text.FontDescriptor.createWithAttributes(@ptrCast(attrs));
+     }
+ };
+ 
+
+commit 322f166ca50eb495aba3e49d24fda280e2b0a759
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Fri Dec 27 14:03:59 2024 -0500
+
+    coretext: exclude bitmap fonts from discovery
+    
+    We do not currently support bitmap fonts in a real capacity, and they
+    often are missing some tables which we currently rely on for metrics,
+    and we don't handle the metrics calculations failing gracefully right
+    now.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index e73ea626..a42055d5 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -362,9 +362,16 @@ pub const CoreText = struct {
+         const list = set.createMatchingFontDescriptors();
+         defer list.release();
+ 
+-        // Sort our descriptors
+-        const zig_list = try copyMatchingDescriptors(alloc, list);
++        // Bring the list of descriptors in to zig land
++        var zig_list = try copyMatchingDescriptors(alloc, list);
+         errdefer alloc.free(zig_list);
++
++        // Filter them. We don't use `CTFontCollectionSetExclusionDescriptors`
++        // to do this because that requires a mutable collection. This way is
++        // much more straight forward.
++        zig_list = try alloc.realloc(zig_list, filterDescriptors(zig_list));
++
++        // Sort our descriptors
+         sortMatchingDescriptors(&desc, zig_list);
+ 
+         return DiscoverIterator{
+@@ -551,13 +558,47 @@ pub const CoreText = struct {
+         for (0..result.len) |i| {
+             result[i] = list.getValueAtIndex(macos.text.FontDescriptor, i);
+ 
+-            // We need to retain becauseonce the list is freed it will
+-            // release all its members.
++            // We need to retain because once the list
++            // is freed it will release all its members.
+             result[i].retain();
+         }
+         return result;
+     }
+ 
++    /// Filter any descriptors out of the list that aren't acceptable for
++    /// some reason or another (e.g. the font isn't in a format we can handle).
++    ///
++    /// Invalid descriptors are filled in from the end of
++    /// the list and the new length for the list is returned.
++    fn filterDescriptors(list: []*macos.text.FontDescriptor) usize {
++        var end = list.len;
++        var i: usize = 0;
++        while (i < end) {
++            if (validDescriptor(list[i])) {
++                i += 1;
++            } else {
++                list[i].release();
++                end -= 1;
++                list[i] = list[end];
++            }
++        }
++        return end;
++    }
++
++    /// Used by `filterDescriptors` to decide whether a descriptor is valid.
++    fn validDescriptor(desc: *macos.text.FontDescriptor) bool {
++        if (desc.copyAttribute(macos.text.FontAttribute.format)) |format| {
++            defer format.release();
++            var value: c_int = undefined;
++            assert(format.getValue(.int, &value));
++
++            // Bitmap fonts are not currently supported.
++            if (value == macos.text.c.kCTFontFormatBitmap) return false;
++        }
++
++        return true;
++    }
++
+     fn sortMatchingDescriptors(
+         desc: *const Descriptor,
+         list: []*macos.text.FontDescriptor,
+
+commit 31f101c97051be3b7482fa9828d2b329ae8288a7
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Mon Dec 30 14:39:07 2024 -0500
+
+    Revert "coretext: exclude bitmap fonts from discovery"
+    
+    This reverts commit 322f166ca50eb495aba3e49d24fda280e2b0a759.
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index a42055d5..e73ea626 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -362,16 +362,9 @@ pub const CoreText = struct {
+         const list = set.createMatchingFontDescriptors();
+         defer list.release();
+ 
+-        // Bring the list of descriptors in to zig land
+-        var zig_list = try copyMatchingDescriptors(alloc, list);
+-        errdefer alloc.free(zig_list);
+-
+-        // Filter them. We don't use `CTFontCollectionSetExclusionDescriptors`
+-        // to do this because that requires a mutable collection. This way is
+-        // much more straight forward.
+-        zig_list = try alloc.realloc(zig_list, filterDescriptors(zig_list));
+-
+         // Sort our descriptors
++        const zig_list = try copyMatchingDescriptors(alloc, list);
++        errdefer alloc.free(zig_list);
+         sortMatchingDescriptors(&desc, zig_list);
+ 
+         return DiscoverIterator{
+@@ -558,47 +551,13 @@ pub const CoreText = struct {
+         for (0..result.len) |i| {
+             result[i] = list.getValueAtIndex(macos.text.FontDescriptor, i);
+ 
+-            // We need to retain because once the list
+-            // is freed it will release all its members.
++            // We need to retain becauseonce the list is freed it will
++            // release all its members.
+             result[i].retain();
+         }
+         return result;
+     }
+ 
+-    /// Filter any descriptors out of the list that aren't acceptable for
+-    /// some reason or another (e.g. the font isn't in a format we can handle).
+-    ///
+-    /// Invalid descriptors are filled in from the end of
+-    /// the list and the new length for the list is returned.
+-    fn filterDescriptors(list: []*macos.text.FontDescriptor) usize {
+-        var end = list.len;
+-        var i: usize = 0;
+-        while (i < end) {
+-            if (validDescriptor(list[i])) {
+-                i += 1;
+-            } else {
+-                list[i].release();
+-                end -= 1;
+-                list[i] = list[end];
+-            }
+-        }
+-        return end;
+-    }
+-
+-    /// Used by `filterDescriptors` to decide whether a descriptor is valid.
+-    fn validDescriptor(desc: *macos.text.FontDescriptor) bool {
+-        if (desc.copyAttribute(macos.text.FontAttribute.format)) |format| {
+-            defer format.release();
+-            var value: c_int = undefined;
+-            assert(format.getValue(.int, &value));
+-
+-            // Bitmap fonts are not currently supported.
+-            if (value == macos.text.c.kCTFontFormatBitmap) return false;
+-        }
+-
+-        return true;
+-    }
+-
+     fn sortMatchingDescriptors(
+         desc: *const Descriptor,
+         list: []*macos.text.FontDescriptor,
+
+commit b1a197ef57450838fc8320475dacee1e6ac019eb
+Author: moritz-john <70295002+moritz-john@users.noreply.github.com>
+Date:   Wed Jan 1 09:46:06 2025 +0100
+
+    Fix: typo in comment
+    
+    Fix: 'becauseonce' -> 'because once'
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index e73ea626..071407d9 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -551,7 +551,7 @@ pub const CoreText = struct {
+         for (0..result.len) |i| {
+             result[i] = list.getValueAtIndex(macos.text.FontDescriptor, i);
+ 
+-            // We need to retain becauseonce the list is freed it will
++            // We need to retain because once the list is freed it will
+             // release all its members.
+             result[i].retain();
+         }
+
+commit 0f4d2bb2375c707182dba8cf2dd7723a2e918e79
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 09:55:46 2025 -0700
+
+    Lots of 0.14 changes
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index 071407d9..384799da 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -597,7 +597,7 @@ pub const CoreText = struct {
+     /// We represent our sorting score as a packed struct so that we can
+     /// compare scores numerically but build scores symbolically.
+     const Score = packed struct {
+-        const Backing = @typeInfo(@This()).Struct.backing_integer.?;
++        const Backing = @typeInfo(@This()).@"struct".backing_integer.?;
+ 
+         glyph_count: u16 = 0, // clamped if > intmax
+         traits: Traits = .unmatched,
+

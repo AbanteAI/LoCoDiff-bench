@@ -1,0 +1,3370 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/Command.zig
+
+commit 992d52fe81a3c8c6bbaff18273db15bce6941499
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 16 10:22:18 2022 -0700
+
+    working on subprocessing
+
+diff --git a/src/Command.zig b/src/Command.zig
+new file mode 100644
+index 00000000..93001fc3
+--- /dev/null
++++ b/src/Command.zig
+@@ -0,0 +1,189 @@
++//! Command launches sub-processes. This is an alternate implementation to the
++//! Zig std.ChildProcess since at the time of authoring this, ChildProcess
++//! didn't support the options necessary to spawn a shell attached to a pty.
++//!
++//! Consequently, I didn't implement a lot of features that std.ChildProcess
++//! supports because we didn't need them. Cross-platform subprocessing is not
++//! a trivial thing to implement (I've done it in three separate languages now)
++//! so if we want to replatform onto std.ChildProcess I'd love to do that.
++//! This was just the fastest way to get something built.
++//!
++//! TODO:
++//!
++//!   * Windows
++//!   * Mac
++//!
++const Command = @This();
++
++const std = @import("std");
++const builtin = @import("builtin");
++const os = std.os;
++const debug = std.debug;
++const testing = std.testing;
++const Allocator = std.mem.Allocator;
++const File = std.fs.File;
++
++/// Path to the command to run. This must be an absolute path. This
++/// library does not do PATH lookup.
++path: []const u8,
++
++/// Command-line arguments. It is the responsibility of the caller to set
++/// args[0] to the command. If args is empty then args[0] will automatically
++/// be set to equal path.
++args: []const []const u8,
++
++/// The file handle to set for stdin/out/err. If this isn't set, we do
++/// nothing explicitly so it is up to the behavior of the operating system.
++stdin: ?File = null,
++stdout: ?File = null,
++stderr: ?File = null,
++
++/// If set, this will be executed /in the child process/ after fork but
++/// before exec. This is useful to setup some state in the child before the
++/// exec process takes over, such as signal handlers, setsid, setuid, etc.
++pre_exec: ?fn () void = null,
++
++/// Process ID is set after start is called.
++pid: ?i32 = null,
++
++/// The various methods a process may exit.
++pub const Exit = union(enum) {
++    /// Exited by normal exit call, value is exit status
++    Exited: u8,
++
++    /// Exited by a signal, value is the signal
++    Signal: u32,
++
++    /// Exited by a stop signal, value is signal
++    Stopped: u32,
++
++    /// Unknown exit reason, value is the status from waitpid
++    Unknown: u32,
++
++    pub fn init(status: u32) Exit {
++        return if (os.W.IFEXITED(status))
++            Exit{ .Exited = os.W.EXITSTATUS(status) }
++        else if (os.W.IFSIGNALED(status))
++            Exit{ .Signal = os.W.TERMSIG(status) }
++        else if (os.W.IFSTOPPED(status))
++            Exit{ .Stopped = os.W.STOPSIG(status) }
++        else
++            Exit{ .Unknown = status };
++    }
++};
++
++/// Start the subprocess. This returns immediately once the child is started.
++///
++/// After this is successful, self.pid is available.
++pub fn start(self: *Command, alloc: Allocator) !void {
++    // Use an arena allocator for the temporary allocations we need in this func.
++    // IMPORTANT: do all allocation prior to the fork(). I believe it is undefined
++    // behavior if you malloc between fork and exec. The source of the Zig
++    // stdlib seems to verify this as well as Go.
++    var arena_allocator = std.heap.ArenaAllocator.init(alloc);
++    defer arena_allocator.deinit();
++    const arena = arena_allocator.allocator();
++
++    // Null-terminate all our arguments
++    const pathZ = try arena.dupeZ(u8, self.path);
++    const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
++    for (self.args) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
++
++    // Determine our env vars
++    const envp = if (builtin.link_libc) std.c.environ else @compileError("missing env vars");
++
++    // Fork
++    const pid = try std.os.fork();
++    if (pid != 0) {
++        // Parent, return immediately.
++        self.pid = @intCast(i32, pid);
++        return;
++    }
++
++    // We are the child.
++
++    // Setup our file descriptors for std streams.
++    if (self.stdin) |f| try setupFd(f.handle, os.STDIN_FILENO);
++    if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
++    if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
++
++    // If the user requested a pre exec callback, call it now.
++    if (self.pre_exec) |f| f();
++
++    // Finally, replace our process.
++    _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
++}
++
++fn setupFd(src: File.Handle, target: i32) !void {
++    // We use dup3 so that we can clear CLO_ON_EXEC. We do NOT want this
++    // file descriptor to be closed on exec since we're exactly exec-ing after
++    // this.
++    if (os.linux.dup3(src, target, 0) < 0) return error.Dup3Failed;
++}
++
++/// Wait for the command to exit and return information about how it exited.
++pub fn wait(self: Command) !Exit {
++    const res = std.os.waitpid(self.pid.?, 0);
++    return Exit.init(res.status);
++}
++
++test "Command: basic exec" {
++    var cmd: Command = .{
++        .path = "/usr/bin/env",
++        .args = &.{ "/usr/bin/env", "--version" },
++    };
++
++    try cmd.start(testing.allocator);
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait();
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 0);
++}
++
++test "Command: pre exec" {
++    var cmd: Command = .{
++        .path = "/usr/bin/env",
++        .args = &.{ "/usr/bin/env", "--version" },
++        .pre_exec = (struct {
++            fn do() void {
++                // This runs in the child, so we can exit and it won't
++                // kill the test runner.
++                os.exit(42);
++            }
++        }).do,
++    };
++
++    try cmd.start(testing.allocator);
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait();
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 42);
++}
++
++test "Command: redirect stdout to file" {
++    const cwd = std.fs.cwd();
++    var stdout = try cwd.createFile("test1234.txt", .{
++        .read = true,
++        .truncate = true,
++    });
++    defer cwd.deleteFile("test1234.txt") catch unreachable;
++    defer stdout.close();
++
++    var cmd: Command = .{
++        .path = "/usr/bin/env",
++        .args = &.{ "/usr/bin/env", "--version" },
++        .stdout = stdout,
++    };
++
++    try cmd.start(testing.allocator);
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait();
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 0);
++
++    // Read our stdout
++    try stdout.seekTo(0);
++    const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
++    defer testing.allocator.free(contents);
++    try testing.expect(contents.len > 0);
++}
+
+commit 82a4aef1fa5d52631ee0d56ec9e421dc20a45afb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 16 11:07:27 2022 -0700
+
+    TempDir implementation
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 93001fc3..7c3ae6c6 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -17,6 +17,7 @@ const Command = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const TempDir = @import("TempDir.zig");
+ const os = std.os;
+ const debug = std.debug;
+ const testing = std.testing;
+@@ -161,12 +162,9 @@ test "Command: pre exec" {
+ }
+ 
+ test "Command: redirect stdout to file" {
+-    const cwd = std.fs.cwd();
+-    var stdout = try cwd.createFile("test1234.txt", .{
+-        .read = true,
+-        .truncate = true,
+-    });
+-    defer cwd.deleteFile("test1234.txt") catch unreachable;
++    const td = try TempDir.create();
++    defer td.deinit();
++    var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+     defer stdout.close();
+ 
+     var cmd: Command = .{
+
+commit 74e04355a010a51a864d0ae8cbf086278f3b802d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 16 11:12:38 2022 -0700
+
+    improve commnts
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 7c3ae6c6..8dc00df1 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -162,7 +162,7 @@ test "Command: pre exec" {
+ }
+ 
+ test "Command: redirect stdout to file" {
+-    const td = try TempDir.create();
++    const td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+     defer stdout.close();
+
+commit 38685d965ebeece1dc74a75893f98eb565a935cb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 23 13:00:37 2022 -0700
+
+    expandPath for looking in PATH
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 8dc00df1..e6a7f5d5 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -18,6 +18,7 @@ const Command = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const TempDir = @import("TempDir.zig");
++const mem = std.mem;
+ const os = std.os;
+ const debug = std.debug;
+ const testing = std.testing;
+@@ -128,6 +129,74 @@ pub fn wait(self: Command) !Exit {
+     return Exit.init(res.status);
+ }
+ 
++/// Search for "cmd" in the PATH and return the absolute path. This will
++/// always allocate if there is a non-null result. The caller must free the
++/// resulting value.
++///
++/// TODO: windows
++pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
++    // If the command already contains a slash, then we return it as-is
++    // because it is assumed to be absolute or relative.
++    if (std.mem.indexOfScalar(u8, cmd, '/') != null) {
++        return try alloc.dupe(u8, cmd);
++    }
++
++    const PATH = os.getenvZ("PATH") orelse return null;
++    var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
++    var it = std.mem.tokenize(u8, PATH, ":");
++    var seen_eacces = false;
++    while (it.next()) |search_path| {
++        // We need enough space in our path buffer to store this
++        const path_len = search_path.len + cmd.len + 1;
++        if (path_buf.len < path_len) return error.PathTooLong;
++
++        // Copy in the full path
++        mem.copy(u8, &path_buf, search_path);
++        path_buf[search_path.len] = '/';
++        mem.copy(u8, path_buf[search_path.len + 1 ..], cmd);
++        path_buf[path_len] = 0;
++        const full_path = path_buf[0..path_len :0];
++
++        // Stat it
++        const f = std.fs.openFileAbsolute(full_path, .{}) catch |err| switch (err) {
++            error.FileNotFound => continue,
++            error.AccessDenied => {
++                // Accumulate this and return it later so we can try other
++                // paths that we have access to.
++                seen_eacces = true;
++                continue;
++            },
++            else => return err,
++        };
++        defer f.close();
++        const stat = try f.stat();
++        if (stat.kind != .Directory and stat.mode & 0111 != 0) {
++            return try alloc.dupe(u8, full_path);
++        }
++    }
++
++    if (seen_eacces) return error.AccessDenied;
++
++    return null;
++}
++
++test "expandPath: env" {
++    const path = (try expandPath(testing.allocator, "env")).?;
++    defer testing.allocator.free(path);
++    try testing.expect(path.len > 0);
++}
++
++test "expandPath: does not exist" {
++    const path = try expandPath(testing.allocator, "thisreallyprobablydoesntexist123");
++    try testing.expect(path == null);
++}
++
++test "expandPath: slash" {
++    const path = (try expandPath(testing.allocator, "foo/env")).?;
++    defer testing.allocator.free(path);
++    try testing.expect(path.len == 7);
++}
++
+ test "Command: basic exec" {
+     var cmd: Command = .{
+         .path = "/usr/bin/env",
+
+commit 2bb2897d635d045519c4eb37e2861030e094fc24
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 23 13:44:57 2022 -0700
+
+    Command: set custom env vars
+
+diff --git a/src/Command.zig b/src/Command.zig
+index e6a7f5d5..12068adc 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -24,6 +24,7 @@ const debug = std.debug;
+ const testing = std.testing;
+ const Allocator = std.mem.Allocator;
+ const File = std.fs.File;
++const BufMap = std.BufMap;
+ 
+ /// Path to the command to run. This must be an absolute path. This
+ /// library does not do PATH lookup.
+@@ -34,6 +35,11 @@ path: []const u8,
+ /// be set to equal path.
+ args: []const []const u8,
+ 
++/// Environment variables for the child process. If this is null, inherits
++/// the environment variables from this process. These are the exact
++/// environment variables to set; these are /not/ merged.
++env: ?*const BufMap = null,
++
+ /// The file handle to set for stdin/out/err. If this isn't set, we do
+ /// nothing explicitly so it is up to the behavior of the operating system.
+ stdin: ?File = null,
+@@ -92,7 +98,12 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     for (self.args) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
+ 
+     // Determine our env vars
+-    const envp = if (builtin.link_libc) std.c.environ else @compileError("missing env vars");
++    const envp = if (self.env) |env_map|
++        (try createNullDelimitedEnvMap(arena, env_map)).ptr
++    else if (builtin.link_libc)
++        std.c.environ
++    else
++        @compileError("missing env vars");
+ 
+     // Fork
+     const pid = try std.os.fork();
+@@ -197,6 +208,58 @@ test "expandPath: slash" {
+     try testing.expect(path.len == 7);
+ }
+ 
++// Copied from Zig. This is a publicly exported function but there is no
++// way to get it from the std package.
++fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const std.BufMap) ![:null]?[*:0]u8 {
++    const envp_count = env_map.count();
++    const envp_buf = try arena.allocSentinel(?[*:0]u8, envp_count, null);
++
++    var it = env_map.iterator();
++    var i: usize = 0;
++    while (it.next()) |pair| : (i += 1) {
++        const env_buf = try arena.allocSentinel(u8, pair.key_ptr.len + pair.value_ptr.len + 1, 0);
++        mem.copy(u8, env_buf, pair.key_ptr.*);
++        env_buf[pair.key_ptr.len] = '=';
++        mem.copy(u8, env_buf[pair.key_ptr.len + 1 ..], pair.value_ptr.*);
++        envp_buf[i] = env_buf.ptr;
++    }
++    std.debug.assert(i == envp_count);
++
++    return envp_buf;
++}
++
++test "createNullDelimitedEnvMap" {
++    const allocator = testing.allocator;
++    var envmap = BufMap.init(allocator);
++    defer envmap.deinit();
++
++    try envmap.put("HOME", "/home/ifreund");
++    try envmap.put("WAYLAND_DISPLAY", "wayland-1");
++    try envmap.put("DISPLAY", ":1");
++    try envmap.put("DEBUGINFOD_URLS", " ");
++    try envmap.put("XCURSOR_SIZE", "24");
++
++    var arena = std.heap.ArenaAllocator.init(allocator);
++    defer arena.deinit();
++    const environ = try createNullDelimitedEnvMap(arena.allocator(), &envmap);
++
++    try testing.expectEqual(@as(usize, 5), environ.len);
++
++    inline for (.{
++        "HOME=/home/ifreund",
++        "WAYLAND_DISPLAY=wayland-1",
++        "DISPLAY=:1",
++        "DEBUGINFOD_URLS= ",
++        "XCURSOR_SIZE=24",
++    }) |target| {
++        for (environ) |variable| {
++            if (mem.eql(u8, mem.span(variable orelse continue), target)) break;
++        } else {
++            try testing.expect(false); // Environment variable not found
++        }
++    }
++}
++
+ test "Command: basic exec" {
+     var cmd: Command = .{
+         .path = "/usr/bin/env",
+@@ -254,3 +317,33 @@ test "Command: redirect stdout to file" {
+     defer testing.allocator.free(contents);
+     try testing.expect(contents.len > 0);
+ }
++
++test "Command: custom env vars" {
++    const td = try TempDir.init();
++    defer td.deinit();
++    var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
++    defer stdout.close();
++
++    var env = std.BufMap.init(testing.allocator);
++    defer env.deinit();
++    try env.put("VALUE", "hello");
++
++    var cmd: Command = .{
++        .path = "/usr/bin/env",
++        .args = &.{ "/usr/bin/env", "sh", "-c", "echo $VALUE" },
++        .stdout = stdout,
++        .env = &env,
++    };
++
++    try cmd.start(testing.allocator);
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait();
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 0);
++
++    // Read our stdout
++    try stdout.seekTo(0);
++    const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
++    defer testing.allocator.free(contents);
++    try testing.expectEqualStrings("hello\n", contents);
++}
+
+commit 9cc19b055326f19e07b08a8769b438a9fd321d01
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Apr 24 14:33:25 2022 -0700
+
+    execute the child command
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 12068adc..264c20af 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -49,7 +49,11 @@ stderr: ?File = null,
+ /// If set, this will be executed /in the child process/ after fork but
+ /// before exec. This is useful to setup some state in the child before the
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+-pre_exec: ?fn () void = null,
++pre_exec: ?fn (*Command) void = null,
++
++/// User data that is sent to the callback. Set with setData and getData
++/// for a more user-friendly API.
++data: ?*anyopaque = null,
+ 
+ /// Process ID is set after start is called.
+ pid: ?i32 = null,
+@@ -121,7 +125,7 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
+ 
+     // If the user requested a pre exec callback, call it now.
+-    if (self.pre_exec) |f| f();
++    if (self.pre_exec) |f| f(self);
+ 
+     // Finally, replace our process.
+     _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
+@@ -140,6 +144,19 @@ pub fn wait(self: Command) !Exit {
+     return Exit.init(res.status);
+ }
+ 
++/// Sets command->data to data.
++pub fn setData(self: *Command, pointer: ?*anyopaque) void {
++    self.data = pointer;
++}
++
++/// Returns command->data.
++pub fn getData(self: Command, comptime DT: type) ?*DT {
++    return if (self.data) |ptr|
++        @ptrCast(?*DT, @alignCast(@alignOf(DT), ptr))
++    else
++        null;
++}
++
+ /// Search for "cmd" in the PATH and return the absolute path. This will
+ /// always allocate if there is a non-null result. The caller must free the
+ /// resulting value.
+
+commit 6613ae0f8f6843b867af72c1331fd2567aa72ab9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Apr 24 21:57:52 2022 -0700
+
+    libuv: starting Tty impl
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 264c20af..3d344459 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -295,7 +295,7 @@ test "Command: pre exec" {
+         .path = "/usr/bin/env",
+         .args = &.{ "/usr/bin/env", "--version" },
+         .pre_exec = (struct {
+-            fn do() void {
++            fn do(_: *Command) void {
+                 // This runs in the child, so we can exit and it won't
+                 // kill the test runner.
+                 os.exit(42);
+
+commit 22c34512cb8245e5daeba1a8a32c338fb29837d8
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Apr 26 14:42:42 2022 -0700
+
+    Command: setup fd properly on mac
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 3d344459..f65eb947 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -132,10 +132,41 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+ }
+ 
+ fn setupFd(src: File.Handle, target: i32) !void {
+-    // We use dup3 so that we can clear CLO_ON_EXEC. We do NOT want this
+-    // file descriptor to be closed on exec since we're exactly exec-ing after
+-    // this.
+-    if (os.linux.dup3(src, target, 0) < 0) return error.Dup3Failed;
++    switch (builtin.os.tag) {
++        .linux => {
++            // We use dup3 so that we can clear CLO_ON_EXEC. We do NOT want this
++            // file descriptor to be closed on exec since we're exactly exec-ing after
++            // this.
++            while (true) {
++                const rc = os.linux.dup3(src, target, 0);
++                switch (os.errno(rc)) {
++                    .SUCCESS => break,
++                    .INTR => continue,
++                    .AGAIN, .ACCES => return error.Locked,
++                    .BADF => unreachable,
++                    .BUSY => return error.FileBusy,
++                    .INVAL => unreachable, // invalid parameters
++                    .PERM => return error.PermissionDenied,
++                    .MFILE => return error.ProcessFdQuotaExceeded,
++                    .NOTDIR => unreachable, // invalid parameter
++                    .DEADLK => return error.DeadLock,
++                    .NOLCK => return error.LockedRegionLimitExceeded,
++                    else => |err| return os.unexpectedErrno(err),
++                }
++            }
++        },
++        .macos => {
++            // Mac doesn't support dup3 so we use dup2. We purposely clear
++            // CLO_ON_EXEC for this fd.
++            const flags = try os.fcntl(src, os.F.GETFD, 0);
++            if (flags & os.FD_CLOEXEC != 0) {
++                try os.fcntl(src, os.F.SETFD, flags & ~@as(u32, os.FD_CLOEXEC));
++            }
++
++            try os.dup2(src, target);
++        },
++        else => @compileError("unsupported platform"),
++    }
+ }
+ 
+ /// Wait for the command to exit and return information about how it exited.
+
+commit b74b6103ea53efae768212d4735cfd5399c2a53a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Apr 26 14:51:26 2022 -0700
+
+    update command comments
+
+diff --git a/src/Command.zig b/src/Command.zig
+index f65eb947..81251de7 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -8,6 +8,12 @@
+ //! so if we want to replatform onto std.ChildProcess I'd love to do that.
+ //! This was just the fastest way to get something built.
+ //!
++//! Issues with std.ChildProcess:
++//!
++//!   * No pre_exec callback for logic after fork but before exec.
++//!   * posix_spawn is used for Mac, but doesn't support the necessary
++//!     features for tty setup.
++//!
+ //! TODO:
+ //!
+ //!   * Windows
+
+commit e462f35727c944159bc8f0af5d4638ad284977d7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Apr 26 17:14:26 2022 -0700
+
+    don't ignore fcntl return for macos
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 81251de7..d8145d5a 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -166,7 +166,7 @@ fn setupFd(src: File.Handle, target: i32) !void {
+             // CLO_ON_EXEC for this fd.
+             const flags = try os.fcntl(src, os.F.GETFD, 0);
+             if (flags & os.FD_CLOEXEC != 0) {
+-                try os.fcntl(src, os.F.SETFD, flags & ~@as(u32, os.FD_CLOEXEC));
++                _ = try os.fcntl(src, os.F.SETFD, flags & ~@as(u32, os.FD_CLOEXEC));
+             }
+ 
+             try os.dup2(src, target);
+
+commit 5b47195e4901b6d48e0278f8ed59bcd3e5208f52
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue May 17 12:05:56 2022 -0700
+
+    update zig
+
+diff --git a/src/Command.zig b/src/Command.zig
+index d8145d5a..53826a64 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -30,7 +30,7 @@ const debug = std.debug;
+ const testing = std.testing;
+ const Allocator = std.mem.Allocator;
+ const File = std.fs.File;
+-const BufMap = std.BufMap;
++const EnvMap = std.process.EnvMap;
+ 
+ /// Path to the command to run. This must be an absolute path. This
+ /// library does not do PATH lookup.
+@@ -44,7 +44,7 @@ args: []const []const u8,
+ /// Environment variables for the child process. If this is null, inherits
+ /// the environment variables from this process. These are the exact
+ /// environment variables to set; these are /not/ merged.
+-env: ?*const BufMap = null,
++env: ?*const EnvMap = null,
+ 
+ /// The file handle to set for stdin/out/err. If this isn't set, we do
+ /// nothing explicitly so it is up to the behavior of the operating system.
+@@ -264,7 +264,7 @@ test "expandPath: slash" {
+ 
+ // Copied from Zig. This is a publicly exported function but there is no
+ // way to get it from the std package.
+-fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const std.BufMap) ![:null]?[*:0]u8 {
++fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:null]?[*:0]u8 {
+     const envp_count = env_map.count();
+     const envp_buf = try arena.allocSentinel(?[*:0]u8, envp_count, null);
+ 
+@@ -284,7 +284,7 @@ fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const std.BufMap) !
+ 
+ test "createNullDelimitedEnvMap" {
+     const allocator = testing.allocator;
+-    var envmap = BufMap.init(allocator);
++    var envmap = EnvMap.init(allocator);
+     defer envmap.deinit();
+ 
+     try envmap.put("HOME", "/home/ifreund");
+@@ -378,7 +378,7 @@ test "Command: custom env vars" {
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+     defer stdout.close();
+ 
+-    var env = std.BufMap.init(testing.allocator);
++    var env = EnvMap.init(testing.allocator);
+     defer env.deinit();
+     try env.put("VALUE", "hello");
+ 
+
+commit 5c2edf4d2aee63667d6e1e5426767e984d1866d3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 17 14:42:23 2022 -0700
+
+    Fix some stage2 compilation errors
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 53826a64..71b929d0 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -32,6 +32,8 @@ const Allocator = std.mem.Allocator;
+ const File = std.fs.File;
+ const EnvMap = std.process.EnvMap;
+ 
++const PreExecFn = fn (*Command) void;
++
+ /// Path to the command to run. This must be an absolute path. This
+ /// library does not do PATH lookup.
+ path: []const u8,
+@@ -55,7 +57,10 @@ stderr: ?File = null,
+ /// If set, this will be executed /in the child process/ after fork but
+ /// before exec. This is useful to setup some state in the child before the
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+-pre_exec: ?fn (*Command) void = null,
++pre_exec: switch (builtin.zig_backend) {
++    .stage1 => ?PreExecFn,
++    else => ?*const PreExecFn,
++} = null,
+ 
+ /// User data that is sent to the callback. Set with setData and getData
+ /// for a more user-friendly API.
+
+commit d16c672771a7d02405359ee7cddee36b6255c784
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Aug 19 08:58:27 2022 -0700
+
+    update Zig, fixed new invalid octal error
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 71b929d0..e798a3f7 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -240,7 +240,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         };
+         defer f.close();
+         const stat = try f.stat();
+-        if (stat.kind != .Directory and stat.mode & 0111 != 0) {
++        if (stat.kind != .Directory and stat.mode & 0o0111 != 0) {
+             return try alloc.dupe(u8, full_path);
+         }
+     }
+
+commit a1d238e385e44c8e152c4a8aacdb6f518a17054d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Sep 23 12:51:50 2022 -0700
+
+    Fix a couple bugs in memory access (tests only)
+
+diff --git a/src/Command.zig b/src/Command.zig
+index e798a3f7..6aa96f39 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -353,7 +353,7 @@ test "Command: pre exec" {
+ }
+ 
+ test "Command: redirect stdout to file" {
+-    const td = try TempDir.init();
++    var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+     defer stdout.close();
+@@ -378,7 +378,7 @@ test "Command: redirect stdout to file" {
+ }
+ 
+ test "Command: custom env vars" {
+-    const td = try TempDir.init();
++    var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+     defer stdout.close();
+
+commit a3d9dad7260d50d5c708026492e3a4868916aeba
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Sep 30 13:24:54 2022 -0700
+
+    fix tests so they pass on mac
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 6aa96f39..418181a3 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -319,23 +319,10 @@ test "createNullDelimitedEnvMap" {
+     }
+ }
+ 
+-test "Command: basic exec" {
+-    var cmd: Command = .{
+-        .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "--version" },
+-    };
+-
+-    try cmd.start(testing.allocator);
+-    try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait();
+-    try testing.expect(exit == .Exited);
+-    try testing.expect(exit.Exited == 0);
+-}
+-
+ test "Command: pre exec" {
+     var cmd: Command = .{
+         .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "--version" },
++        .args = &.{ "/usr/bin/env", "-v" },
+         .pre_exec = (struct {
+             fn do(_: *Command) void {
+                 // This runs in the child, so we can exit and it won't
+@@ -360,7 +347,7 @@ test "Command: redirect stdout to file" {
+ 
+     var cmd: Command = .{
+         .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "--version" },
++        .args = &.{ "/usr/bin/env", "-v" },
+         .stdout = stdout,
+     };
+ 
+@@ -372,7 +359,7 @@ test "Command: redirect stdout to file" {
+ 
+     // Read our stdout
+     try stdout.seekTo(0);
+-    const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
++    const contents = try stdout.readToEndAlloc(testing.allocator, 1024 * 128);
+     defer testing.allocator.free(contents);
+     try testing.expect(contents.len > 0);
+ }
+
+commit c7db5b96d615ad6c743287e4d84dfd87c5bbc46e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 1 14:10:35 2022 -0700
+
+    get rid of stage1 compat
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 418181a3..109e4d79 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -57,10 +57,7 @@ stderr: ?File = null,
+ /// If set, this will be executed /in the child process/ after fork but
+ /// before exec. This is useful to setup some state in the child before the
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+-pre_exec: switch (builtin.zig_backend) {
+-    .stage1 => ?PreExecFn,
+-    else => ?*const PreExecFn,
+-} = null,
++pre_exec: ?*const PreExecFn,
+ 
+ /// User data that is sent to the callback. Set with setData and getData
+ /// for a more user-friendly API.
+
+commit 63fab367fed71d487f53aa1a1c96138ed289aa70
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 1 17:51:50 2022 -0700
+
+    Command supports setting cwd
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 109e4d79..121b91a4 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -48,6 +48,10 @@ args: []const []const u8,
+ /// environment variables to set; these are /not/ merged.
+ env: ?*const EnvMap = null,
+ 
++/// Working directory to change to in the child process. If not set, the
++/// working directory of the calling process is preserved.
++cwd: ?[]const u8 = null,
++
+ /// The file handle to set for stdin/out/err. If this isn't set, we do
+ /// nothing explicitly so it is up to the behavior of the operating system.
+ stdin: ?File = null,
+@@ -57,7 +61,7 @@ stderr: ?File = null,
+ /// If set, this will be executed /in the child process/ after fork but
+ /// before exec. This is useful to setup some state in the child before the
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+-pre_exec: ?*const PreExecFn,
++pre_exec: ?*const PreExecFn = null,
+ 
+ /// User data that is sent to the callback. Set with setData and getData
+ /// for a more user-friendly API.
+@@ -132,6 +136,9 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
+     if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
+ 
++    // Setup our working directory
++    if (self.cwd) |cwd| try os.chdir(cwd);
++
+     // If the user requested a pre exec callback, call it now.
+     if (self.pre_exec) |f| f(self);
+ 
+@@ -390,3 +397,29 @@ test "Command: custom env vars" {
+     defer testing.allocator.free(contents);
+     try testing.expectEqualStrings("hello\n", contents);
+ }
++
++test "Command: custom working directory" {
++    var td = try TempDir.init();
++    defer td.deinit();
++    var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
++    defer stdout.close();
++
++    var cmd: Command = .{
++        .path = "/usr/bin/env",
++        .args = &.{ "/usr/bin/env", "sh", "-c", "pwd" },
++        .stdout = stdout,
++        .cwd = "/usr/bin",
++    };
++
++    try cmd.start(testing.allocator);
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait();
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 0);
++
++    // Read our stdout
++    try stdout.seekTo(0);
++    const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
++    defer testing.allocator.free(contents);
++    try testing.expectEqualStrings("/usr/bin\n", contents);
++}
+
+commit d567a976b46f71ed815f07ed68fd12a8b384aad9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 16 20:54:17 2022 -0800
+
+    waitpid should specify WNOHANG
+    
+    If the child process our terminal is executing behaves poorly and
+    doesn't waitpid all of its own children, then we can hang the full
+    terminal. This is not ideal, so specify WNOHANG.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 121b91a4..1e63d916 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -186,7 +186,10 @@ fn setupFd(src: File.Handle, target: i32) !void {
+ 
+ /// Wait for the command to exit and return information about how it exited.
+ pub fn wait(self: Command) !Exit {
+-    const res = std.os.waitpid(self.pid.?, 0);
++    // We specify NOHANG because its not our fault if the process we launch
++    // for the tty doesn't properly waitpid its children. We don't want
++    // to hang the terminal over it.
++    const res = std.os.waitpid(self.pid.?, std.c.W.NOHANG);
+     return Exit.init(res.status);
+ }
+ 
+
+commit 465b4df6eab0aaaf7127b2e3bdf8445214d259b6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 16 21:04:31 2022 -0800
+
+    fix tests for WNOHANG commit
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 1e63d916..ba11090d 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -185,11 +185,11 @@ fn setupFd(src: File.Handle, target: i32) !void {
+ }
+ 
+ /// Wait for the command to exit and return information about how it exited.
+-pub fn wait(self: Command) !Exit {
++pub fn wait(self: Command, block: bool) !Exit {
+     // We specify NOHANG because its not our fault if the process we launch
+     // for the tty doesn't properly waitpid its children. We don't want
+     // to hang the terminal over it.
+-    const res = std.os.waitpid(self.pid.?, std.c.W.NOHANG);
++    const res = std.os.waitpid(self.pid.?, if (block) 0 else std.c.W.NOHANG);
+     return Exit.init(res.status);
+ }
+ 
+@@ -341,7 +341,7 @@ test "Command: pre exec" {
+ 
+     try cmd.start(testing.allocator);
+     try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait();
++    const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+     try testing.expect(exit.Exited == 42);
+ }
+@@ -360,7 +360,7 @@ test "Command: redirect stdout to file" {
+ 
+     try cmd.start(testing.allocator);
+     try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait();
++    const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+     try testing.expect(exit.Exited == 0);
+ 
+@@ -390,7 +390,7 @@ test "Command: custom env vars" {
+ 
+     try cmd.start(testing.allocator);
+     try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait();
++    const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+     try testing.expect(exit.Exited == 0);
+ 
+@@ -416,7 +416,7 @@ test "Command: custom working directory" {
+ 
+     try cmd.start(testing.allocator);
+     try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait();
++    const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+     try testing.expect(exit.Exited == 0);
+ 
+
+commit ec956debb739550c7f73ce104be7c95d430f929b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 25 21:19:57 2023 -0800
+
+    Command/Pty work better with Flatpak but not 100% yet
+
+diff --git a/src/Command.zig b/src/Command.zig
+index ba11090d..f5607b20 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -24,6 +24,7 @@ const Command = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const TempDir = @import("TempDir.zig");
++const internal_os = @import("os/main.zig");
+ const mem = std.mem;
+ const os = std.os;
+ const debug = std.debug;
+
+commit ce86c64b4299b2524a59eb75c575b85270da70fa
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Feb 27 21:46:42 2023 -0800
+
+    update zig, src for loops
+
+diff --git a/src/Command.zig b/src/Command.zig
+index f5607b20..c54f2607 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -112,7 +112,7 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     // Null-terminate all our arguments
+     const pathZ = try arena.dupeZ(u8, self.path);
+     const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
+-    for (self.args) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
++    for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
+ 
+     // Determine our env vars
+     const envp = if (self.env) |env_map|
+
+commit 7116ce0806d2455b367dbfeff20d1e58a8fd9da4
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon May 29 08:24:12 2023 -0700
+
+    update zig version
+
+diff --git a/src/Command.zig b/src/Command.zig
+index c54f2607..1a9307fc 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -248,7 +248,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         };
+         defer f.close();
+         const stat = try f.stat();
+-        if (stat.kind != .Directory and stat.mode & 0o0111 != 0) {
++        if (stat.kind != .directory and stat.mode & 0o0111 != 0) {
+             return try alloc.dupe(u8, full_path);
+         }
+     }
+
+commit 314f9287b1854911e38d030ad6ec42bb6cd0a105
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 30 12:15:31 2023 -0700
+
+    Update Zig (#164)
+    
+    * update zig
+    
+    * pkg/fontconfig: clean up @as
+    
+    * pkg/freetype,harfbuzz: clean up @as
+    
+    * pkg/imgui: clean up @as
+    
+    * pkg/macos: clean up @as
+    
+    * pkg/pixman,utf8proc: clean up @as
+    
+    * clean up @as
+    
+    * lots more @as cleanup
+    
+    * undo flatpak changes
+    
+    * clean up @as
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 1a9307fc..2f8b871e 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -126,7 +126,7 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     const pid = try std.os.fork();
+     if (pid != 0) {
+         // Parent, return immediately.
+-        self.pid = @intCast(i32, pid);
++        self.pid = @intCast(pid);
+         return;
+     }
+ 
+@@ -201,10 +201,7 @@ pub fn setData(self: *Command, pointer: ?*anyopaque) void {
+ 
+ /// Returns command->data.
+ pub fn getData(self: Command, comptime DT: type) ?*DT {
+-    return if (self.data) |ptr|
+-        @ptrCast(?*DT, @alignCast(@alignOf(DT), ptr))
+-    else
+-        null;
++    return if (self.data) |ptr| @ptrCast(@alignCast(ptr)) else null;
+ }
+ 
+ /// Search for "cmd" in the PATH and return the absolute path. This will
+
+commit 9a0d131b5b942164fc3029b8d7bb1f1d408bc011
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jul 9 12:14:05 2023 -0700
+
+    move TempDir to src/os and use the real tmpDir
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 2f8b871e..7bf64566 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -23,8 +23,8 @@ const Command = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const TempDir = @import("TempDir.zig");
+ const internal_os = @import("os/main.zig");
++const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+ const os = std.os;
+ const debug = std.debug;
+
+commit aa9e12dac2d11fc71f055bd5db61f18453fb5345
+Author: Will Pragnell <wpragnell@gmail.com>
+Date:   Wed Aug 30 21:34:34 2023 -0700
+
+    termio/exec: don't leak zombie subprocesses
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 7bf64566..12dea7f3 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -190,7 +190,14 @@ pub fn wait(self: Command, block: bool) !Exit {
+     // We specify NOHANG because its not our fault if the process we launch
+     // for the tty doesn't properly waitpid its children. We don't want
+     // to hang the terminal over it.
+-    const res = std.os.waitpid(self.pid.?, if (block) 0 else std.c.W.NOHANG);
++    // When NOHANG is specified, waitpid will return a pid of 0 if the process
++    // doesn't have a status to report. When that happens, it is as though the
++    // wait call has not been performed, so we need to keep trying until we get
++    // a non-zero pid back, otherwise we end up with zombie processes.
++    var res = std.os.WaitPidResult{ .pid = 0, .status = 0 };
++    while (res.pid == 0) {
++        res = std.os.waitpid(self.pid.?, if (block) 0 else std.c.W.NOHANG);
++    }
+     return Exit.init(res.status);
+ }
+ 
+
+commit 2e54ad2ccefc2cd1b8832aad40e8d93884392372
+Author: Will Pragnell <wpragnell@gmail.com>
+Date:   Wed Aug 30 22:02:25 2023 -0700
+
+    command: only spin on waitpid if it's non-blocking
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 12dea7f3..8fa8808a 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -187,17 +187,20 @@ fn setupFd(src: File.Handle, target: i32) !void {
+ 
+ /// Wait for the command to exit and return information about how it exited.
+ pub fn wait(self: Command, block: bool) !Exit {
+-    // We specify NOHANG because its not our fault if the process we launch
+-    // for the tty doesn't properly waitpid its children. We don't want
+-    // to hang the terminal over it.
+-    // When NOHANG is specified, waitpid will return a pid of 0 if the process
+-    // doesn't have a status to report. When that happens, it is as though the
+-    // wait call has not been performed, so we need to keep trying until we get
+-    // a non-zero pid back, otherwise we end up with zombie processes.
+-    var res = std.os.WaitPidResult{ .pid = 0, .status = 0 };
+-    while (res.pid == 0) {
+-        res = std.os.waitpid(self.pid.?, if (block) 0 else std.c.W.NOHANG);
+-    }
++    const res = if (block) std.os.waitpid(self.pid.?, 0) else res: {
++        // We specify NOHANG because its not our fault if the process we launch
++        // for the tty doesn't properly waitpid its children. We don't want
++        // to hang the terminal over it.
++        // When NOHANG is specified, waitpid will return a pid of 0 if the process
++        // doesn't have a status to report. When that happens, it is as though the
++        // wait call has not been performed, so we need to keep trying until we get
++        // a non-zero pid back, otherwise we end up with zombie processes.
++        while (true) {
++            const res = std.os.waitpid(self.pid.?, std.c.W.NOHANG);
++            if (res.pid != 0) break :res res;
++        }
++    };
++
+     return Exit.init(res.status);
+ }
+ 
+
+commit a2e881ff4ef83792500bb4b985bb70063bb58ea8
+Author: Jonathan Marler <johnnymarler@gmail.com>
+Date:   Thu Sep 14 02:34:43 2023 -0600
+
+    windows: initial support for zig build test
+    
+    Makes progress getting "zig build test" to work on windows.  Mostly
+    fixed issues around build configuration and added some branches throughout
+    the Zig code to return/throw errors for unimplemented parts.
+    
+    I also added an initial implementation for getting the home dir.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 8fa8808a..5daa2bcf 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -122,6 +122,9 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     else
+         @compileError("missing env vars");
+ 
++    if (builtin.os.tag == .windows)
++        @panic("start not implemented on windows");
++
+     // Fork
+     const pid = try std.os.fork();
+     if (pid != 0) {
+@@ -187,6 +190,9 @@ fn setupFd(src: File.Handle, target: i32) !void {
+ 
+ /// Wait for the command to exit and return information about how it exited.
+ pub fn wait(self: Command, block: bool) !Exit {
++    if (builtin.os.tag == .windows)
++        @panic("wait not implemented on windows");
++
+     const res = if (block) std.os.waitpid(self.pid.?, 0) else res: {
+         // We specify NOHANG because its not our fault if the process we launch
+         // for the tty doesn't properly waitpid its children. We don't want
+@@ -255,7 +261,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         };
+         defer f.close();
+         const stat = try f.stat();
+-        if (stat.kind != .directory and stat.mode & 0o0111 != 0) {
++        if (stat.kind != .directory and isExecutable(stat.mode)) {
+             return try alloc.dupe(u8, full_path);
+         }
+     }
+@@ -265,6 +271,11 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     return null;
+ }
+ 
++fn isExecutable(mode: std.fs.File.Mode) bool {
++    if (builtin.os.tag == .windows) return true;
++    return mode & 0o0111 != 0;
++}
++
+ test "expandPath: env" {
+     const path = (try expandPath(testing.allocator, "env")).?;
+     defer testing.allocator.free(path);
+
+commit d700fb6fc760e1ea38a5b4792bd8d0e7d0d4c8e8
+Author: Will Pragnell <wpragnell@gmail.com>
+Date:   Thu Sep 14 18:31:46 2023 -0700
+
+    windows: implement expandPath
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 5daa2bcf..b2d7e74e 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -232,9 +232,19 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         return try alloc.dupe(u8, cmd);
+     }
+ 
+-    const PATH = os.getenvZ("PATH") orelse return null;
++    const PATH = switch (builtin.os.tag) {
++        .windows => blk: {
++            const win_path = os.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
++            const path = try std.unicode.utf16leToUtf8Alloc(alloc, win_path);
++            break :blk path;
++        },
++        else => os.getenvZ("PATH") orelse return null,
++    };
++    defer if (builtin.os.tag == .windows) alloc.free(PATH);
++
+     var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+-    var it = std.mem.tokenize(u8, PATH, ":");
++    const path_separator = if (builtin.os.tag == .windows) ";" else ":";
++    var it = std.mem.tokenize(u8, PATH, path_separator);
+     var seen_eacces = false;
+     while (it.next()) |search_path| {
+         // We need enough space in our path buffer to store this
+@@ -243,7 +253,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+ 
+         // Copy in the full path
+         mem.copy(u8, &path_buf, search_path);
+-        path_buf[search_path.len] = '/';
++        path_buf[search_path.len] = if (builtin.os.tag == .windows) '\\' else '/';
+         mem.copy(u8, path_buf[search_path.len + 1 ..], cmd);
+         path_buf[path_len] = 0;
+         const full_path = path_buf[0..path_len :0];
+@@ -276,10 +286,12 @@ fn isExecutable(mode: std.fs.File.Mode) bool {
+     return mode & 0o0111 != 0;
+ }
+ 
+-test "expandPath: env" {
+-    const path = (try expandPath(testing.allocator, "env")).?;
++// `hostname` is present on both *nix and windows
++test "expandPath: hostname" {
++    const executable = if (builtin.os.tag == .windows) "hostname.exe" else "hostname";
++    const path = (try expandPath(testing.allocator, executable)).?;
+     defer testing.allocator.free(path);
+-    try testing.expect(path.len > 0);
++    try testing.expect(path.len > executable.len);
+ }
+ 
+ test "expandPath: does not exist" {
+
+commit 8f2ab46e1ebf329cff63bae3eda308b1e3174f58
+Author: Will Pragnell <wpragnell@gmail.com>
+Date:   Fri Sep 15 16:01:33 2023 -0700
+
+    windows: use cross platform consts where available
+
+diff --git a/src/Command.zig b/src/Command.zig
+index b2d7e74e..b9d282aa 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -223,8 +223,6 @@ pub fn getData(self: Command, comptime DT: type) ?*DT {
+ /// Search for "cmd" in the PATH and return the absolute path. This will
+ /// always allocate if there is a non-null result. The caller must free the
+ /// resulting value.
+-///
+-/// TODO: windows
+ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     // If the command already contains a slash, then we return it as-is
+     // because it is assumed to be absolute or relative.
+@@ -243,8 +241,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     defer if (builtin.os.tag == .windows) alloc.free(PATH);
+ 
+     var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+-    const path_separator = if (builtin.os.tag == .windows) ";" else ":";
+-    var it = std.mem.tokenize(u8, PATH, path_separator);
++    var it = std.mem.tokenize(u8, PATH, &[_]u8{std.fs.path.delimiter});
+     var seen_eacces = false;
+     while (it.next()) |search_path| {
+         // We need enough space in our path buffer to store this
+@@ -253,7 +250,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+ 
+         // Copy in the full path
+         mem.copy(u8, &path_buf, search_path);
+-        path_buf[search_path.len] = if (builtin.os.tag == .windows) '\\' else '/';
++        path_buf[search_path.len] = std.fs.path.sep;
+         mem.copy(u8, path_buf[search_path.len + 1 ..], cmd);
+         path_buf[path_len] = 0;
+         const full_path = path_buf[0..path_len :0];
+
+commit 3936b471a8a3e67573d9ad0628f98c8970f56705
+Author: Krzysztof Wolicki <der.teufel.mail@gmail.com>
+Date:   Thu Oct 19 09:39:20 2023 +0200
+
+    Disable iconv on Windows by default (enabled via cli flag).
+    Skip various tests not implemented on windows.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index b9d282aa..ce606f77 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -355,6 +355,7 @@ test "createNullDelimitedEnvMap" {
+ }
+ 
+ test "Command: pre exec" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var cmd: Command = .{
+         .path = "/usr/bin/env",
+         .args = &.{ "/usr/bin/env", "-v" },
+@@ -375,6 +376,7 @@ test "Command: pre exec" {
+ }
+ 
+ test "Command: redirect stdout to file" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+@@ -400,6 +402,7 @@ test "Command: redirect stdout to file" {
+ }
+ 
+ test "Command: custom env vars" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+@@ -430,6 +433,7 @@ test "Command: custom env vars" {
+ }
+ 
+ test "Command: custom working directory" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
+
+commit 49f1866f2820a3f1325a1e2d0c97da7c17f87d5c
+Author: Nameless <truemedian@gmail.com>
+Date:   Thu Oct 19 16:38:52 2023 -0500
+
+    add tests for fuzzed results, clean up unimplemented osc warning
+
+diff --git a/src/Command.zig b/src/Command.zig
+index ce606f77..1f0e81be 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -255,6 +255,9 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         path_buf[path_len] = 0;
+         const full_path = path_buf[0..path_len :0];
+ 
++        // Skip if this isn't an absolute path
++        if (!std.fs.path.isAbsolute(full_path)) continue;
++
+         // Stat it
+         const f = std.fs.openFileAbsolute(full_path, .{}) catch |err| switch (err) {
+             error.FileNotFound => continue,
+
+commit b049cb7d21c48a5f18cae325208e71096f44d2d5
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 26 09:30:11 2023 -0700
+
+    command: allow relative paths in PATH
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 1f0e81be..f963a185 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -255,11 +255,11 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         path_buf[path_len] = 0;
+         const full_path = path_buf[0..path_len :0];
+ 
+-        // Skip if this isn't an absolute path
+-        if (!std.fs.path.isAbsolute(full_path)) continue;
+-
+         // Stat it
+-        const f = std.fs.openFileAbsolute(full_path, .{}) catch |err| switch (err) {
++        const f = std.fs.cwd().openFile(
++            full_path,
++            .{},
++        ) catch |err| switch (err) {
+             error.FileNotFound => continue,
+             error.AccessDenied => {
+                 // Accumulate this and return it later so we can try other
+
+commit 232df8de8ff23ca6f3bd65516224df0f80ddf6ad
+Author: kcbanner <kcbanner@gmail.com>
+Date:   Sun Oct 29 04:03:06 2023 -0400
+
+    windows: add support for the glfw backend on Windows
+    
+    Changes:
+    - Add WindowsPty, which uses the ConPTY API to create a pseudo console
+    - Pty now selects between PosixPty and WindowsPty
+    - Windows support in Command, including the ability to launch a process with a pseudo console
+    - Enable Command tests on windows
+    - Add some environment variable abstractions to handle the missing libc APIs on Windows
+    - Windows version of ReadThread
+
+diff --git a/src/Command.zig b/src/Command.zig
+index f963a185..de284040 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -16,7 +16,6 @@
+ //!
+ //! TODO:
+ //!
+-//!   * Windows
+ //!   * Mac
+ //!
+ const Command = @This();
+@@ -24,6 +23,7 @@ const Command = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const internal_os = @import("os/main.zig");
++const windows = @import("windows.zig");
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+ const os = std.os;
+@@ -64,15 +64,22 @@ stderr: ?File = null,
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+ pre_exec: ?*const PreExecFn = null,
+ 
++/// If set, then the process will be created attached to this pseudo console.
++/// `stdin`, `stdout`, and `stderr` will be ignored if set.
++pseudo_console: if (builtin.os.tag == .windows) ?windows.exp.HPCON else void =
++    if (builtin.os.tag == .windows) null else {},
++
+ /// User data that is sent to the callback. Set with setData and getData
+ /// for a more user-friendly API.
+ data: ?*anyopaque = null,
+ 
+ /// Process ID is set after start is called.
+-pid: ?i32 = null,
++pid: ?os.pid_t = null,
+ 
+ /// The various methods a process may exit.
+-pub const Exit = union(enum) {
++pub const Exit = if (builtin.os.tag == .windows) union(enum) {
++    Exited: u32,
++} else union(enum) {
+     /// Exited by normal exit call, value is exit status
+     Exited: u8,
+ 
+@@ -109,45 +116,145 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     defer arena_allocator.deinit();
+     const arena = arena_allocator.allocator();
+ 
+-    // Null-terminate all our arguments
+-    const pathZ = try arena.dupeZ(u8, self.path);
+-    const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
+-    for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
+-
+-    // Determine our env vars
+-    const envp = if (self.env) |env_map|
+-        (try createNullDelimitedEnvMap(arena, env_map)).ptr
+-    else if (builtin.link_libc)
+-        std.c.environ
+-    else
+-        @compileError("missing env vars");
+-
+-    if (builtin.os.tag == .windows)
+-        @panic("start not implemented on windows");
+-
+-    // Fork
+-    const pid = try std.os.fork();
+-    if (pid != 0) {
+-        // Parent, return immediately.
+-        self.pid = @intCast(pid);
+-        return;
+-    }
++    if (builtin.os.tag == .windows) {
++        const application_w = try std.unicode.utf8ToUtf16LeWithNull(arena, self.path);
++        const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeWithNull(arena, cwd) else null;
++        const command_line_w = if (self.args.len > 0) b: {
++            const command_line = try windowsCreateCommandLine(arena, self.args);
++            break :b try std.unicode.utf8ToUtf16LeWithNull(arena, command_line);
++        } else null;
++        const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
++
++        const any_null_fd = self.stdin == null or self.stdout == null or self.stderr == null;
++        const null_fd = if (any_null_fd) try windows.OpenFile(
++            &[_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 'u', 'l', 'l' },
++            .{
++                .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
++                .share_access = windows.FILE_SHARE_READ,
++                .creation = windows.OPEN_EXISTING,
++                .io_mode = .blocking,
++            },
++        ) else null;
++        defer if (null_fd) |fd| std.os.close(fd);
++
++        // TODO: In the case of having FDs instead of pty, need to set up attributes such that the
++        //       child process only inherits these handles, then set bInheritsHandles below.
++
++        const attribute_list, const stdin, const stdout, const stderr = if (self.pseudo_console) |pseudo_console| b: {
++            var attribute_list_size: usize = undefined;
++            _ = windows.exp.kernel32.InitializeProcThreadAttributeList(
++                null,
++                1,
++                0,
++                &attribute_list_size,
++            );
++
++            const attribute_list_buf = try arena.alloc(u8, attribute_list_size);
++            if (windows.exp.kernel32.InitializeProcThreadAttributeList(
++                attribute_list_buf.ptr,
++                1,
++                0,
++                &attribute_list_size,
++            ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++            if (windows.exp.kernel32.UpdateProcThreadAttribute(
++                attribute_list_buf.ptr,
++                0,
++                windows.exp.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
++                pseudo_console,
++                @sizeOf(windows.exp.HPCON),
++                null,
++                null,
++            ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++            break :b .{ attribute_list_buf.ptr, null, null, null };
++        } else b: {
++            const stdin = if (self.stdin) |f| f.handle else null_fd.?;
++            const stdout = if (self.stdout) |f| f.handle else null_fd.?;
++            const stderr = if (self.stderr) |f| f.handle else null_fd.?;
++            break :b .{ null, stdin, stdout, stderr };
++        };
+ 
+-    // We are the child.
++        var startup_info_ex = windows.exp.STARTUPINFOEX{
++            .StartupInfo = .{
++                .cb = if (attribute_list != null) @sizeOf(windows.exp.STARTUPINFOEX) else @sizeOf(windows.STARTUPINFOW),
++                .hStdError = stderr,
++                .hStdOutput = stdout,
++                .hStdInput = stdin,
++                .dwFlags = windows.STARTF_USESTDHANDLES,
++                .lpReserved = null,
++                .lpDesktop = null,
++                .lpTitle = null,
++                .dwX = 0,
++                .dwY = 0,
++                .dwXSize = 0,
++                .dwYSize = 0,
++                .dwXCountChars = 0,
++                .dwYCountChars = 0,
++                .dwFillAttribute = 0,
++                .wShowWindow = 0,
++                .cbReserved2 = 0,
++                .lpReserved2 = null,
++            },
++            .lpAttributeList = attribute_list,
++        };
+ 
+-    // Setup our file descriptors for std streams.
+-    if (self.stdin) |f| try setupFd(f.handle, os.STDIN_FILENO);
+-    if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
+-    if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
++        var flags: windows.DWORD = windows.exp.CREATE_UNICODE_ENVIRONMENT;
++        if (attribute_list != null) flags |= windows.exp.EXTENDED_STARTUPINFO_PRESENT;
++
++        var process_information: windows.PROCESS_INFORMATION = undefined;
++        if (windows.exp.kernel32.CreateProcessW(
++            application_w.ptr,
++            if (command_line_w) |w| w.ptr else null,
++            null,
++            null,
++            windows.TRUE,
++            flags,
++            if (env_w) |w| w.ptr else null,
++            if (cwd_w) |w| w.ptr else null,
++            @ptrCast(&startup_info_ex.StartupInfo),
++            &process_information,
++        ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++        self.pid = process_information.hProcess;
++    } else {
++        // Null-terminate all our arguments
++        const pathZ = try arena.dupeZ(u8, self.path);
++        const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
++        for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
++
++        // Determine our env vars
++        const envp = if (self.env) |env_map|
++            (try createNullDelimitedEnvMap(arena, env_map)).ptr
++        else if (builtin.link_libc)
++            std.c.environ
++        else
++            @compileError("missing env vars");
++
++        // Fork
++        const pid = try std.os.fork();
++        if (pid != 0) {
++            // Parent, return immediately.
++            self.pid = @intCast(pid);
++            return;
++        }
++
++        // We are the child.
++
++        // Setup our file descriptors for std streams.
++        if (self.stdin) |f| try setupFd(f.handle, os.STDIN_FILENO);
++        if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
++        if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
+ 
+-    // Setup our working directory
+-    if (self.cwd) |cwd| try os.chdir(cwd);
++        // Setup our working directory
++        if (self.cwd) |cwd| try os.chdir(cwd);
+ 
+-    // If the user requested a pre exec callback, call it now.
+-    if (self.pre_exec) |f| f(self);
++        // If the user requested a pre exec callback, call it now.
++        if (self.pre_exec) |f| f(self);
+ 
+-    // Finally, replace our process.
+-    _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
++        // Finally, replace our process.
++        _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
++    }
+ }
+ 
+ fn setupFd(src: File.Handle, target: i32) !void {
+@@ -190,8 +297,18 @@ fn setupFd(src: File.Handle, target: i32) !void {
+ 
+ /// Wait for the command to exit and return information about how it exited.
+ pub fn wait(self: Command, block: bool) !Exit {
+-    if (builtin.os.tag == .windows)
+-        @panic("wait not implemented on windows");
++    if (builtin.os.tag == .windows) {
++
++        // Block until the process exits. This returns immediately if the process already exited.
++        const result = windows.kernel32.WaitForSingleObject(self.pid.?, windows.INFINITE);
++        if (result == windows.WAIT_FAILED) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++        var exit_code: windows.DWORD = undefined;
++        var has_code = windows.kernel32.GetExitCodeProcess(self.pid.?, &exit_code) != 0;
++        if (!has_code) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++        return .{ .Exited = exit_code };
++    }
+ 
+     const res = if (block) std.os.waitpid(self.pid.?, 0) else res: {
+         // We specify NOHANG because its not our fault if the process we launch
+@@ -325,6 +442,79 @@ fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:nu
+     return envp_buf;
+ }
+ 
++// Copied from Zig. This is a publicly exported function but there is no
++// way to get it from the std package.
++pub fn createWindowsEnvBlock(allocator: mem.Allocator, env_map: *const EnvMap) ![]u16 {
++    // count bytes needed
++    const max_chars_needed = x: {
++        var max_chars_needed: usize = 4; // 4 for the final 4 null bytes
++        var it = env_map.iterator();
++        while (it.next()) |pair| {
++            // +1 for '='
++            // +1 for null byte
++            max_chars_needed += pair.key_ptr.len + pair.value_ptr.len + 2;
++        }
++        break :x max_chars_needed;
++    };
++    const result = try allocator.alloc(u16, max_chars_needed);
++    errdefer allocator.free(result);
++
++    var it = env_map.iterator();
++    var i: usize = 0;
++    while (it.next()) |pair| {
++        i += try std.unicode.utf8ToUtf16Le(result[i..], pair.key_ptr.*);
++        result[i] = '=';
++        i += 1;
++        i += try std.unicode.utf8ToUtf16Le(result[i..], pair.value_ptr.*);
++        result[i] = 0;
++        i += 1;
++    }
++    result[i] = 0;
++    i += 1;
++    result[i] = 0;
++    i += 1;
++    result[i] = 0;
++    i += 1;
++    result[i] = 0;
++    i += 1;
++    return try allocator.realloc(result, i);
++}
++
++/// Copied from Zig. This function could be made public in child_process.zig instead.
++fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) ![:0]u8 {
++    var buf = std.ArrayList(u8).init(allocator);
++    defer buf.deinit();
++
++    for (argv, 0..) |arg, arg_i| {
++        if (arg_i != 0) try buf.append(' ');
++        if (mem.indexOfAny(u8, arg, " \t\n\"") == null) {
++            try buf.appendSlice(arg);
++            continue;
++        }
++        try buf.append('"');
++        var backslash_count: usize = 0;
++        for (arg) |byte| {
++            switch (byte) {
++                '\\' => backslash_count += 1,
++                '"' => {
++                    try buf.appendNTimes('\\', backslash_count * 2 + 1);
++                    try buf.append('"');
++                    backslash_count = 0;
++                },
++                else => {
++                    try buf.appendNTimes('\\', backslash_count);
++                    try buf.append(byte);
++                    backslash_count = 0;
++                },
++            }
++        }
++        try buf.appendNTimes('\\', backslash_count * 2);
++        try buf.append('"');
++    }
++
++    return buf.toOwnedSliceSentinel(0);
++}
++
+ test "createNullDelimitedEnvMap" {
+     const allocator = testing.allocator;
+     var envmap = EnvMap.init(allocator);
+@@ -378,14 +568,26 @@ test "Command: pre exec" {
+     try testing.expect(exit.Exited == 42);
+ }
+ 
++fn createTestStdout(dir: std.fs.Dir) !File {
++    const file = try dir.createFile("stdout.txt", .{ .read = true });
++    if (builtin.os.tag == .windows) {
++        try windows.SetHandleInformation(file.handle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT);
++    }
++
++    return file;
++}
++
+ test "Command: redirect stdout to file" {
+-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var td = try TempDir.init();
+     defer td.deinit();
+-    var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
++    var stdout = try createTestStdout(td.dir);
+     defer stdout.close();
+ 
+-    var cmd: Command = .{
++    var cmd: Command = if (builtin.os.tag == .windows) .{
++        .path = "C:\\Windows\\System32\\whoami.exe",
++        .args = &.{"C:\\Windows\\System32\\whoami.exe"},
++        .stdout = stdout,
++    } else .{
+         .path = "/usr/bin/env",
+         .args = &.{ "/usr/bin/env", "-v" },
+         .stdout = stdout,
+@@ -395,7 +597,7 @@ test "Command: redirect stdout to file" {
+     try testing.expect(cmd.pid != null);
+     const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+-    try testing.expect(exit.Exited == 0);
++    try testing.expectEqual(@as(u32, 0), @as(u32, exit.Exited));
+ 
+     // Read our stdout
+     try stdout.seekTo(0);
+@@ -405,17 +607,21 @@ test "Command: redirect stdout to file" {
+ }
+ 
+ test "Command: custom env vars" {
+-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var td = try TempDir.init();
+     defer td.deinit();
+-    var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
++    var stdout = try createTestStdout(td.dir);
+     defer stdout.close();
+ 
+     var env = EnvMap.init(testing.allocator);
+     defer env.deinit();
+     try env.put("VALUE", "hello");
+ 
+-    var cmd: Command = .{
++    var cmd: Command = if (builtin.os.tag == .windows) .{
++        .path = "C:\\Windows\\System32\\cmd.exe",
++        .args = &.{ "C:\\Windows\\System32\\cmd.exe", "/C", "echo %VALUE%" },
++        .stdout = stdout,
++        .env = &env,
++    } else .{
+         .path = "/usr/bin/env",
+         .args = &.{ "/usr/bin/env", "sh", "-c", "echo $VALUE" },
+         .stdout = stdout,
+@@ -432,17 +638,26 @@ test "Command: custom env vars" {
+     try stdout.seekTo(0);
+     const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
+     defer testing.allocator.free(contents);
+-    try testing.expectEqualStrings("hello\n", contents);
++
++    if (builtin.os.tag == .windows) {
++        try testing.expectEqualStrings("hello\r\n", contents);
++    } else {
++        try testing.expectEqualStrings("hello\n", contents);
++    }
+ }
+ 
+ test "Command: custom working directory" {
+-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var td = try TempDir.init();
+     defer td.deinit();
+-    var stdout = try td.dir.createFile("stdout.txt", .{ .read = true });
++    var stdout = try createTestStdout(td.dir);
+     defer stdout.close();
+ 
+-    var cmd: Command = .{
++    var cmd: Command = if (builtin.os.tag == .windows) .{
++        .path = "C:\\Windows\\System32\\cmd.exe",
++        .args = &.{ "C:\\Windows\\System32\\cmd.exe", "/C", "cd" },
++        .stdout = stdout,
++        .cwd = "C:\\Windows\\System32",
++    } else .{
+         .path = "/usr/bin/env",
+         .args = &.{ "/usr/bin/env", "sh", "-c", "pwd" },
+         .stdout = stdout,
+@@ -459,5 +674,10 @@ test "Command: custom working directory" {
+     try stdout.seekTo(0);
+     const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
+     defer testing.allocator.free(contents);
+-    try testing.expectEqualStrings("/usr/bin\n", contents);
++
++    if (builtin.os.tag == .windows) {
++        try testing.expectEqualStrings("C:\\Windows\\System32\r\n", contents);
++    } else {
++        try testing.expectEqualStrings("/usr/bin\n", contents);
++    }
+ }
+
+commit 7594bbd621508d4b950b65e277682a021fca1d00
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 5 15:27:46 2023 -0800
+
+    shuffle some source around
+
+diff --git a/src/Command.zig b/src/Command.zig
+index de284040..5c9a6d59 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -14,16 +14,12 @@
+ //!   * posix_spawn is used for Mac, but doesn't support the necessary
+ //!     features for tty setup.
+ //!
+-//! TODO:
+-//!
+-//!   * Mac
+-//!
+ const Command = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const internal_os = @import("os/main.zig");
+-const windows = @import("windows.zig");
++const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+ const os = std.os;
+@@ -297,15 +293,19 @@ fn setupFd(src: File.Handle, target: i32) !void {
+ 
+ /// Wait for the command to exit and return information about how it exited.
+ pub fn wait(self: Command, block: bool) !Exit {
+-    if (builtin.os.tag == .windows) {
+-
+-        // Block until the process exits. This returns immediately if the process already exited.
++    if (comptime builtin.os.tag == .windows) {
++        // Block until the process exits. This returns immediately if the
++        // process already exited.
+         const result = windows.kernel32.WaitForSingleObject(self.pid.?, windows.INFINITE);
+-        if (result == windows.WAIT_FAILED) return windows.unexpectedError(windows.kernel32.GetLastError());
++        if (result == windows.WAIT_FAILED) {
++            return windows.unexpectedError(windows.kernel32.GetLastError());
++        }
+ 
+         var exit_code: windows.DWORD = undefined;
+         var has_code = windows.kernel32.GetExitCodeProcess(self.pid.?, &exit_code) != 0;
+-        if (!has_code) return windows.unexpectedError(windows.kernel32.GetLastError());
++        if (!has_code) {
++            return windows.unexpectedError(windows.kernel32.GetLastError());
++        }
+ 
+         return .{ .Exited = exit_code };
+     }
+@@ -444,7 +444,7 @@ fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:nu
+ 
+ // Copied from Zig. This is a publicly exported function but there is no
+ // way to get it from the std package.
+-pub fn createWindowsEnvBlock(allocator: mem.Allocator, env_map: *const EnvMap) ![]u16 {
++fn createWindowsEnvBlock(allocator: mem.Allocator, env_map: *const EnvMap) ![]u16 {
+     // count bytes needed
+     const max_chars_needed = x: {
+         var max_chars_needed: usize = 4; // 4 for the final 4 null bytes
+@@ -571,7 +571,11 @@ test "Command: pre exec" {
+ fn createTestStdout(dir: std.fs.Dir) !File {
+     const file = try dir.createFile("stdout.txt", .{ .read = true });
+     if (builtin.os.tag == .windows) {
+-        try windows.SetHandleInformation(file.handle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT);
++        try windows.SetHandleInformation(
++            file.handle,
++            windows.HANDLE_FLAG_INHERIT,
++            windows.HANDLE_FLAG_INHERIT,
++        );
+     }
+ 
+     return file;
+
+commit 1a846597b1d82930479c91d661f1b3928a22264b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 5 18:03:22 2023 -0800
+
+    command: stylistic changes
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 5c9a6d59..d12b6720 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -112,145 +112,153 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+     defer arena_allocator.deinit();
+     const arena = arena_allocator.allocator();
+ 
+-    if (builtin.os.tag == .windows) {
+-        const application_w = try std.unicode.utf8ToUtf16LeWithNull(arena, self.path);
+-        const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeWithNull(arena, cwd) else null;
+-        const command_line_w = if (self.args.len > 0) b: {
+-            const command_line = try windowsCreateCommandLine(arena, self.args);
+-            break :b try std.unicode.utf8ToUtf16LeWithNull(arena, command_line);
+-        } else null;
+-        const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
+-
+-        const any_null_fd = self.stdin == null or self.stdout == null or self.stderr == null;
+-        const null_fd = if (any_null_fd) try windows.OpenFile(
+-            &[_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 'u', 'l', 'l' },
+-            .{
+-                .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
+-                .share_access = windows.FILE_SHARE_READ,
+-                .creation = windows.OPEN_EXISTING,
+-                .io_mode = .blocking,
+-            },
+-        ) else null;
+-        defer if (null_fd) |fd| std.os.close(fd);
+-
+-        // TODO: In the case of having FDs instead of pty, need to set up attributes such that the
+-        //       child process only inherits these handles, then set bInheritsHandles below.
+-
+-        const attribute_list, const stdin, const stdout, const stderr = if (self.pseudo_console) |pseudo_console| b: {
+-            var attribute_list_size: usize = undefined;
+-            _ = windows.exp.kernel32.InitializeProcThreadAttributeList(
+-                null,
+-                1,
+-                0,
+-                &attribute_list_size,
+-            );
+-
+-            const attribute_list_buf = try arena.alloc(u8, attribute_list_size);
+-            if (windows.exp.kernel32.InitializeProcThreadAttributeList(
+-                attribute_list_buf.ptr,
+-                1,
+-                0,
+-                &attribute_list_size,
+-            ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
+-
+-            if (windows.exp.kernel32.UpdateProcThreadAttribute(
+-                attribute_list_buf.ptr,
+-                0,
+-                windows.exp.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+-                pseudo_console,
+-                @sizeOf(windows.exp.HPCON),
+-                null,
+-                null,
+-            ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
+-
+-            break :b .{ attribute_list_buf.ptr, null, null, null };
+-        } else b: {
+-            const stdin = if (self.stdin) |f| f.handle else null_fd.?;
+-            const stdout = if (self.stdout) |f| f.handle else null_fd.?;
+-            const stderr = if (self.stderr) |f| f.handle else null_fd.?;
+-            break :b .{ null, stdin, stdout, stderr };
+-        };
++    switch (builtin.os.tag) {
++        .windows => try self.startWindows(arena),
++        else => try self.startPosix(arena),
++    }
++}
+ 
+-        var startup_info_ex = windows.exp.STARTUPINFOEX{
+-            .StartupInfo = .{
+-                .cb = if (attribute_list != null) @sizeOf(windows.exp.STARTUPINFOEX) else @sizeOf(windows.STARTUPINFOW),
+-                .hStdError = stderr,
+-                .hStdOutput = stdout,
+-                .hStdInput = stdin,
+-                .dwFlags = windows.STARTF_USESTDHANDLES,
+-                .lpReserved = null,
+-                .lpDesktop = null,
+-                .lpTitle = null,
+-                .dwX = 0,
+-                .dwY = 0,
+-                .dwXSize = 0,
+-                .dwYSize = 0,
+-                .dwXCountChars = 0,
+-                .dwYCountChars = 0,
+-                .dwFillAttribute = 0,
+-                .wShowWindow = 0,
+-                .cbReserved2 = 0,
+-                .lpReserved2 = null,
+-            },
+-            .lpAttributeList = attribute_list,
+-        };
++fn startPosix(self: *Command, arena: Allocator) !void {
++    // Null-terminate all our arguments
++    const pathZ = try arena.dupeZ(u8, self.path);
++    const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
++    for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
++
++    // Determine our env vars
++    const envp = if (self.env) |env_map|
++        (try createNullDelimitedEnvMap(arena, env_map)).ptr
++    else if (builtin.link_libc)
++        std.c.environ
++    else
++        @compileError("missing env vars");
++
++    // Fork
++    const pid = try std.os.fork();
++    if (pid != 0) {
++        // Parent, return immediately.
++        self.pid = @intCast(pid);
++        return;
++    }
+ 
+-        var flags: windows.DWORD = windows.exp.CREATE_UNICODE_ENVIRONMENT;
+-        if (attribute_list != null) flags |= windows.exp.EXTENDED_STARTUPINFO_PRESENT;
++    // We are the child.
+ 
+-        var process_information: windows.PROCESS_INFORMATION = undefined;
+-        if (windows.exp.kernel32.CreateProcessW(
+-            application_w.ptr,
+-            if (command_line_w) |w| w.ptr else null,
+-            null,
+-            null,
+-            windows.TRUE,
+-            flags,
+-            if (env_w) |w| w.ptr else null,
+-            if (cwd_w) |w| w.ptr else null,
+-            @ptrCast(&startup_info_ex.StartupInfo),
+-            &process_information,
+-        ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
++    // Setup our file descriptors for std streams.
++    if (self.stdin) |f| try setupFd(f.handle, os.STDIN_FILENO);
++    if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
++    if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
+ 
+-        self.pid = process_information.hProcess;
+-    } else {
+-        // Null-terminate all our arguments
+-        const pathZ = try arena.dupeZ(u8, self.path);
+-        const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
+-        for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
+-
+-        // Determine our env vars
+-        const envp = if (self.env) |env_map|
+-            (try createNullDelimitedEnvMap(arena, env_map)).ptr
+-        else if (builtin.link_libc)
+-            std.c.environ
+-        else
+-            @compileError("missing env vars");
+-
+-        // Fork
+-        const pid = try std.os.fork();
+-        if (pid != 0) {
+-            // Parent, return immediately.
+-            self.pid = @intCast(pid);
+-            return;
+-        }
++    // Setup our working directory
++    if (self.cwd) |cwd| try os.chdir(cwd);
++
++    // If the user requested a pre exec callback, call it now.
++    if (self.pre_exec) |f| f(self);
+ 
+-        // We are the child.
++    // Finally, replace our process.
++    _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
++}
++
++fn startWindows(self: *Command, arena: Allocator) !void {
++    const application_w = try std.unicode.utf8ToUtf16LeWithNull(arena, self.path);
++    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeWithNull(arena, cwd) else null;
++    const command_line_w = if (self.args.len > 0) b: {
++        const command_line = try windowsCreateCommandLine(arena, self.args);
++        break :b try std.unicode.utf8ToUtf16LeWithNull(arena, command_line);
++    } else null;
++    const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
++
++    const any_null_fd = self.stdin == null or self.stdout == null or self.stderr == null;
++    const null_fd = if (any_null_fd) try windows.OpenFile(
++        &[_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 'u', 'l', 'l' },
++        .{
++            .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
++            .share_access = windows.FILE_SHARE_READ,
++            .creation = windows.OPEN_EXISTING,
++            .io_mode = .blocking,
++        },
++    ) else null;
++    defer if (null_fd) |fd| std.os.close(fd);
+ 
+-        // Setup our file descriptors for std streams.
+-        if (self.stdin) |f| try setupFd(f.handle, os.STDIN_FILENO);
+-        if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
+-        if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
++    // TODO: In the case of having FDs instead of pty, need to set up
++    // attributes such that the child process only inherits these handles,
++    // then set bInheritsHandles below.
+ 
+-        // Setup our working directory
+-        if (self.cwd) |cwd| try os.chdir(cwd);
++    const attribute_list, const stdin, const stdout, const stderr = if (self.pseudo_console) |pseudo_console| b: {
++        var attribute_list_size: usize = undefined;
++        _ = windows.exp.kernel32.InitializeProcThreadAttributeList(
++            null,
++            1,
++            0,
++            &attribute_list_size,
++        );
+ 
+-        // If the user requested a pre exec callback, call it now.
+-        if (self.pre_exec) |f| f(self);
++        const attribute_list_buf = try arena.alloc(u8, attribute_list_size);
++        if (windows.exp.kernel32.InitializeProcThreadAttributeList(
++            attribute_list_buf.ptr,
++            1,
++            0,
++            &attribute_list_size,
++        ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
+ 
+-        // Finally, replace our process.
+-        _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
+-    }
++        if (windows.exp.kernel32.UpdateProcThreadAttribute(
++            attribute_list_buf.ptr,
++            0,
++            windows.exp.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
++            pseudo_console,
++            @sizeOf(windows.exp.HPCON),
++            null,
++            null,
++        ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++        break :b .{ attribute_list_buf.ptr, null, null, null };
++    } else b: {
++        const stdin = if (self.stdin) |f| f.handle else null_fd.?;
++        const stdout = if (self.stdout) |f| f.handle else null_fd.?;
++        const stderr = if (self.stderr) |f| f.handle else null_fd.?;
++        break :b .{ null, stdin, stdout, stderr };
++    };
++
++    var startup_info_ex = windows.exp.STARTUPINFOEX{
++        .StartupInfo = .{
++            .cb = if (attribute_list != null) @sizeOf(windows.exp.STARTUPINFOEX) else @sizeOf(windows.STARTUPINFOW),
++            .hStdError = stderr,
++            .hStdOutput = stdout,
++            .hStdInput = stdin,
++            .dwFlags = windows.STARTF_USESTDHANDLES,
++            .lpReserved = null,
++            .lpDesktop = null,
++            .lpTitle = null,
++            .dwX = 0,
++            .dwY = 0,
++            .dwXSize = 0,
++            .dwYSize = 0,
++            .dwXCountChars = 0,
++            .dwYCountChars = 0,
++            .dwFillAttribute = 0,
++            .wShowWindow = 0,
++            .cbReserved2 = 0,
++            .lpReserved2 = null,
++        },
++        .lpAttributeList = attribute_list,
++    };
++
++    var flags: windows.DWORD = windows.exp.CREATE_UNICODE_ENVIRONMENT;
++    if (attribute_list != null) flags |= windows.exp.EXTENDED_STARTUPINFO_PRESENT;
++
++    var process_information: windows.PROCESS_INFORMATION = undefined;
++    if (windows.exp.kernel32.CreateProcessW(
++        application_w.ptr,
++        if (command_line_w) |w| w.ptr else null,
++        null,
++        null,
++        windows.TRUE,
++        flags,
++        if (env_w) |w| w.ptr else null,
++        if (cwd_w) |w| w.ptr else null,
++        @ptrCast(&startup_info_ex.StartupInfo),
++        &process_information,
++    ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
++
++    self.pid = process_information.hProcess;
+ }
+ 
+ fn setupFd(src: File.Handle, target: i32) !void {
+
+commit 44a48f62f1f3888d9f91f5592effdfeed9041f9a
+Author: Krzysztof Wolicki <der.teufel.mail@gmail.com>
+Date:   Fri Nov 17 15:40:59 2023 +0100
+
+    change unmodified `var`s to `const`s in anticipation of zig changes
+
+diff --git a/src/Command.zig b/src/Command.zig
+index d12b6720..afca6a56 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -310,7 +310,7 @@ pub fn wait(self: Command, block: bool) !Exit {
+         }
+ 
+         var exit_code: windows.DWORD = undefined;
+-        var has_code = windows.kernel32.GetExitCodeProcess(self.pid.?, &exit_code) != 0;
++        const has_code = windows.kernel32.GetExitCodeProcess(self.pid.?, &exit_code) != 0;
+         if (!has_code) {
+             return windows.unexpectedError(windows.kernel32.GetLastError());
+         }
+
+commit 0750698b62eef62a64b41f0a8c6ec78012882c50
+Author: Krzysztof Wolicki <der.teufel.mail@gmail.com>
+Date:   Thu Nov 30 21:23:28 2023 +0100
+
+    Update to latest master,
+    update libxev dependency,
+    change mach_glfw to an updated fork until upstream updates
+
+diff --git a/src/Command.zig b/src/Command.zig
+index afca6a56..b02a9bc7 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -374,9 +374,9 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         if (path_buf.len < path_len) return error.PathTooLong;
+ 
+         // Copy in the full path
+-        mem.copy(u8, &path_buf, search_path);
++        @memcpy(path_buf[0..search_path.len], search_path);
+         path_buf[search_path.len] = std.fs.path.sep;
+-        mem.copy(u8, path_buf[search_path.len + 1 ..], cmd);
++        @memcpy(path_buf[search_path.len + 1 ..][0..cmd.len], cmd);
+         path_buf[path_len] = 0;
+         const full_path = path_buf[0..path_len :0];
+ 
+@@ -440,9 +440,9 @@ fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:nu
+     var i: usize = 0;
+     while (it.next()) |pair| : (i += 1) {
+         const env_buf = try arena.allocSentinel(u8, pair.key_ptr.len + pair.value_ptr.len + 1, 0);
+-        mem.copy(u8, env_buf, pair.key_ptr.*);
++        @memcpy(env_buf[0..pair.key_ptr.len], pair.key_ptr.*);
+         env_buf[pair.key_ptr.len] = '=';
+-        mem.copy(u8, env_buf[pair.key_ptr.len + 1 ..], pair.value_ptr.*);
++        @memcpy(env_buf[pair.key_ptr.len + 1 ..], pair.value_ptr.*);
+         envp_buf[i] = env_buf.ptr;
+     }
+     std.debug.assert(i == envp_count);
+
+commit 2ed75d47b5d86cdc387a6cb9536fb6fbe9fdd8ed
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Dec 30 15:04:06 2023 -0800
+
+    termio/exec: detect exec failure and show an error message
+
+diff --git a/src/Command.zig b/src/Command.zig
+index b02a9bc7..3c35b1cc 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -155,6 +155,11 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+ 
+     // Finally, replace our process.
+     _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
++
++    // If we are executing this code, the exec failed. In that scenario,
++    // we return a very specific error that can be detected to determine
++    // we're in the child.
++    return error.ExecFailedInChild;
+ }
+ 
+ fn startWindows(self: *Command, arena: Allocator) !void {
+
+commit f4292bccfcf719a1846514a3799dd47b06812c88
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Wed Jan 3 10:22:33 2024 -0600
+
+    replace deprecated std.mem.tokenize with std.mem.tokenizeScalar
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 3c35b1cc..4a15d122 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -371,7 +371,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     defer if (builtin.os.tag == .windows) alloc.free(PATH);
+ 
+     var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+-    var it = std.mem.tokenize(u8, PATH, &[_]u8{std.fs.path.delimiter});
++    var it = std.mem.tokenizeScalar(u8, PATH, std.fs.path.delimiter);
+     var seen_eacces = false;
+     while (it.next()) |search_path| {
+         // We need enough space in our path buffer to store this
+
+commit 3360a008cd137b428631fc8052f64d672a660240
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 13 20:21:49 2024 -0800
+
+    build: build produces a broken object file for iOS
+    
+    This gets `zig build -Dtarget=aarch64-ios` working. By "working" I mean
+    it produces an object file without compiler errors. However, the object
+    file certainly isn't useful since it uses a number of features that will
+    not work in the iOS sandbox.
+    
+    This is just an experiment more than anything to see how hard it would be to
+    get libghostty working within iOS to render a terminal. Note iOS doesn't
+    support ptys so this wouldn't be a true on-device terminal. The
+    challenge right now is to just get a terminal rendering (not usable).
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 4a15d122..af3979b3 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -290,7 +290,7 @@ fn setupFd(src: File.Handle, target: i32) !void {
+                 }
+             }
+         },
+-        .macos => {
++        .ios, .macos => {
+             // Mac doesn't support dup3 so we use dup2. We purposely clear
+             // CLO_ON_EXEC for this fd.
+             const flags = try os.fcntl(src, os.F.GETFD, 0);
+
+commit 8456e9d7f721a34e6a4ae10e4872fcf9849d6208
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 10 16:58:45 2024 -0800
+
+    command: io_mode removed for windows
+
+diff --git a/src/Command.zig b/src/Command.zig
+index af3979b3..c5419814 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -178,7 +178,6 @@ fn startWindows(self: *Command, arena: Allocator) !void {
+             .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
+             .share_access = windows.FILE_SHARE_READ,
+             .creation = windows.OPEN_EXISTING,
+-            .io_mode = .blocking,
+         },
+     ) else null;
+     defer if (null_fd) |fd| std.os.close(fd);
+
+commit b7bf59d772a8a2ad0c9c935436f59cc6579aef59
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 22 11:15:26 2024 -0700
+
+    update zig
+
+diff --git a/src/Command.zig b/src/Command.zig
+index c5419814..80305431 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -22,7 +22,8 @@ const internal_os = @import("os/main.zig");
+ const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+-const os = std.os;
++const linux = std.os.linux;
++const posix = std.posix;
+ const debug = std.debug;
+ const testing = std.testing;
+ const Allocator = std.mem.Allocator;
+@@ -70,7 +71,7 @@ pseudo_console: if (builtin.os.tag == .windows) ?windows.exp.HPCON else void =
+ data: ?*anyopaque = null,
+ 
+ /// Process ID is set after start is called.
+-pid: ?os.pid_t = null,
++pid: ?posix.pid_t = null,
+ 
+ /// The various methods a process may exit.
+ pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+@@ -89,12 +90,12 @@ pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+     Unknown: u32,
+ 
+     pub fn init(status: u32) Exit {
+-        return if (os.W.IFEXITED(status))
+-            Exit{ .Exited = os.W.EXITSTATUS(status) }
+-        else if (os.W.IFSIGNALED(status))
+-            Exit{ .Signal = os.W.TERMSIG(status) }
+-        else if (os.W.IFSTOPPED(status))
+-            Exit{ .Stopped = os.W.STOPSIG(status) }
++        return if (posix.W.IFEXITED(status))
++            Exit{ .Exited = posix.W.EXITSTATUS(status) }
++        else if (posix.W.IFSIGNALED(status))
++            Exit{ .Signal = posix.W.TERMSIG(status) }
++        else if (posix.W.IFSTOPPED(status))
++            Exit{ .Stopped = posix.W.STOPSIG(status) }
+         else
+             Exit{ .Unknown = status };
+     }
+@@ -133,7 +134,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+         @compileError("missing env vars");
+ 
+     // Fork
+-    const pid = try std.os.fork();
++    const pid = try posix.fork();
+     if (pid != 0) {
+         // Parent, return immediately.
+         self.pid = @intCast(pid);
+@@ -143,18 +144,18 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     // We are the child.
+ 
+     // Setup our file descriptors for std streams.
+-    if (self.stdin) |f| try setupFd(f.handle, os.STDIN_FILENO);
+-    if (self.stdout) |f| try setupFd(f.handle, os.STDOUT_FILENO);
+-    if (self.stderr) |f| try setupFd(f.handle, os.STDERR_FILENO);
++    if (self.stdin) |f| try setupFd(f.handle, posix.STDIN_FILENO);
++    if (self.stdout) |f| try setupFd(f.handle, posix.STDOUT_FILENO);
++    if (self.stderr) |f| try setupFd(f.handle, posix.STDERR_FILENO);
+ 
+     // Setup our working directory
+-    if (self.cwd) |cwd| try os.chdir(cwd);
++    if (self.cwd) |cwd| try posix.chdir(cwd);
+ 
+     // If the user requested a pre exec callback, call it now.
+     if (self.pre_exec) |f| f(self);
+ 
+     // Finally, replace our process.
+-    _ = std.os.execveZ(pathZ, argsZ, envp) catch null;
++    _ = posix.execveZ(pathZ, argsZ, envp) catch null;
+ 
+     // If we are executing this code, the exec failed. In that scenario,
+     // we return a very specific error that can be detected to determine
+@@ -180,7 +181,7 @@ fn startWindows(self: *Command, arena: Allocator) !void {
+             .creation = windows.OPEN_EXISTING,
+         },
+     ) else null;
+-    defer if (null_fd) |fd| std.os.close(fd);
++    defer if (null_fd) |fd| posix.close(fd);
+ 
+     // TODO: In the case of having FDs instead of pty, need to set up
+     // attributes such that the child process only inherits these handles,
+@@ -272,8 +273,8 @@ fn setupFd(src: File.Handle, target: i32) !void {
+             // file descriptor to be closed on exec since we're exactly exec-ing after
+             // this.
+             while (true) {
+-                const rc = os.linux.dup3(src, target, 0);
+-                switch (os.errno(rc)) {
++                const rc = linux.dup3(src, target, 0);
++                switch (posix.errno(rc)) {
+                     .SUCCESS => break,
+                     .INTR => continue,
+                     .AGAIN, .ACCES => return error.Locked,
+@@ -285,19 +286,19 @@ fn setupFd(src: File.Handle, target: i32) !void {
+                     .NOTDIR => unreachable, // invalid parameter
+                     .DEADLK => return error.DeadLock,
+                     .NOLCK => return error.LockedRegionLimitExceeded,
+-                    else => |err| return os.unexpectedErrno(err),
++                    else => |err| return posix.unexpectedErrno(err),
+                 }
+             }
+         },
+         .ios, .macos => {
+             // Mac doesn't support dup3 so we use dup2. We purposely clear
+             // CLO_ON_EXEC for this fd.
+-            const flags = try os.fcntl(src, os.F.GETFD, 0);
+-            if (flags & os.FD_CLOEXEC != 0) {
+-                _ = try os.fcntl(src, os.F.SETFD, flags & ~@as(u32, os.FD_CLOEXEC));
++            const flags = try posix.fcntl(src, posix.F.GETFD, 0);
++            if (flags & posix.FD_CLOEXEC != 0) {
++                _ = try posix.fcntl(src, posix.F.SETFD, flags & ~@as(u32, posix.FD_CLOEXEC));
+             }
+ 
+-            try os.dup2(src, target);
++            try posix.dup2(src, target);
+         },
+         else => @compileError("unsupported platform"),
+     }
+@@ -322,7 +323,7 @@ pub fn wait(self: Command, block: bool) !Exit {
+         return .{ .Exited = exit_code };
+     }
+ 
+-    const res = if (block) std.os.waitpid(self.pid.?, 0) else res: {
++    const res = if (block) posix.waitpid(self.pid.?, 0) else res: {
+         // We specify NOHANG because its not our fault if the process we launch
+         // for the tty doesn't properly waitpid its children. We don't want
+         // to hang the terminal over it.
+@@ -331,7 +332,7 @@ pub fn wait(self: Command, block: bool) !Exit {
+         // wait call has not been performed, so we need to keep trying until we get
+         // a non-zero pid back, otherwise we end up with zombie processes.
+         while (true) {
+-            const res = std.os.waitpid(self.pid.?, std.c.W.NOHANG);
++            const res = posix.waitpid(self.pid.?, std.c.W.NOHANG);
+             if (res.pid != 0) break :res res;
+         }
+     };
+@@ -361,11 +362,11 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+ 
+     const PATH = switch (builtin.os.tag) {
+         .windows => blk: {
+-            const win_path = os.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
++            const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
+             const path = try std.unicode.utf16leToUtf8Alloc(alloc, win_path);
+             break :blk path;
+         },
+-        else => os.getenvZ("PATH") orelse return null,
++        else => std.posix.getenvZ("PATH") orelse return null,
+     };
+     defer if (builtin.os.tag == .windows) alloc.free(PATH);
+ 
+@@ -568,7 +569,7 @@ test "Command: pre exec" {
+             fn do(_: *Command) void {
+                 // This runs in the child, so we can exit and it won't
+                 // kill the test runner.
+-                os.exit(42);
++                posix.exit(42);
+             }
+         }).do,
+     };
+
+commit b1e1d8c3eb595a22d4b3860e17e7f958a074dfcf
+Author: Jon Parise <jon@indelible.org>
+Date:   Fri Jun 7 12:36:30 2024 -0400
+
+    os: std.ChildProcess -> std.process.Child
+    
+    std.ChildProcess was deprecated in favor of std.process.Child a few
+    releases back, and the old name is removed in Zig 0.13.0.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 80305431..505fe3f8 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -1,14 +1,14 @@
+ //! Command launches sub-processes. This is an alternate implementation to the
+-//! Zig std.ChildProcess since at the time of authoring this, ChildProcess
++//! Zig std.process.Child since at the time of authoring this, std.process.Child
+ //! didn't support the options necessary to spawn a shell attached to a pty.
+ //!
+-//! Consequently, I didn't implement a lot of features that std.ChildProcess
++//! Consequently, I didn't implement a lot of features that std.process.Child
+ //! supports because we didn't need them. Cross-platform subprocessing is not
+ //! a trivial thing to implement (I've done it in three separate languages now)
+-//! so if we want to replatform onto std.ChildProcess I'd love to do that.
++//! so if we want to replatform onto std.process.Child I'd love to do that.
+ //! This was just the fastest way to get something built.
+ //!
+-//! Issues with std.ChildProcess:
++//! Issues with std.process.Child:
+ //!
+ //!   * No pre_exec callback for logic after fork but before exec.
+ //!   * posix_spawn is used for Mac, but doesn't support the necessary
+
+commit e6f97c28f8b3ff46b3685108539c47353c328d88
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Fri Jun 7 23:48:03 2024 -0600
+
+    Use clone3 / CLONE_INTO_CGROUP on Linux
+    
+    Use clone3 / CLONE_INTO_CGROUP to have the Linux kernel create the process in the
+    correct cgroup rather than move the process into the cgroup after it is created.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 505fe3f8..7c7eb85f 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -19,6 +19,7 @@ const Command = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const internal_os = @import("os/main.zig");
++const termio = @import("termio.zig");
+ const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+@@ -32,6 +33,8 @@ const EnvMap = std.process.EnvMap;
+ 
+ const PreExecFn = fn (*Command) void;
+ 
++const log = std.log.scoped(.command);
++
+ /// Path to the command to run. This must be an absolute path. This
+ /// library does not do PATH lookup.
+ path: []const u8,
+@@ -61,6 +64,8 @@ stderr: ?File = null,
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+ pre_exec: ?*const PreExecFn = null,
+ 
++linux_cgroup: termio.Options.LinuxCgroup = termio.Options.linux_cgroup_default,
++
+ /// If set, then the process will be created attached to this pseudo console.
+ /// `stdin`, `stdout`, and `stderr` will be ignored if set.
+ pseudo_console: if (builtin.os.tag == .windows) ?windows.exp.HPCON else void =
+@@ -133,8 +138,11 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     else
+         @compileError("missing env vars");
+ 
+-    // Fork
+-    const pid = try posix.fork();
++    const pid: linux.pid_t = switch (builtin.os.tag) {
++        .linux => if (self.linux_cgroup) |cgroup| try internal_os.cgroup.cloneInto(cgroup) else try posix.fork(),
++        else => try posix.fork(),
++    };
++
+     if (pid != 0) {
+         // Parent, return immediately.
+         self.pid = @intCast(pid);
+
+commit af9efd4d93931143adec60c06e9cb9754c155424
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Jun 8 07:43:44 2024 -0600
+
+    use consistent type for pid
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 7c7eb85f..6b6752e0 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -138,7 +138,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     else
+         @compileError("missing env vars");
+ 
+-    const pid: linux.pid_t = switch (builtin.os.tag) {
++    const pid: posix.pid_t = switch (builtin.os.tag) {
+         .linux => if (self.linux_cgroup) |cgroup| try internal_os.cgroup.cloneInto(cgroup) else try posix.fork(),
+         else => try posix.fork(),
+     };
+
+commit 8f9cdff1f5908360fc4d86a98a3bff83fa675bbf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jun 8 19:07:10 2024 -0700
+
+    small stylistic tweaks
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 6b6752e0..c8cf0075 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -19,7 +19,6 @@ const Command = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const internal_os = @import("os/main.zig");
+-const termio = @import("termio.zig");
+ const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+@@ -64,7 +63,7 @@ stderr: ?File = null,
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+ pre_exec: ?*const PreExecFn = null,
+ 
+-linux_cgroup: termio.Options.LinuxCgroup = termio.Options.linux_cgroup_default,
++linux_cgroup: LinuxCgroup = linux_cgroup_default,
+ 
+ /// If set, then the process will be created attached to this pseudo console.
+ /// `stdin`, `stdout`, and `stderr` will be ignored if set.
+@@ -78,6 +77,11 @@ data: ?*anyopaque = null,
+ /// Process ID is set after start is called.
+ pid: ?posix.pid_t = null,
+ 
++/// LinuxCGroup type depends on our target OS
++pub const LinuxCgroup = if (builtin.os.tag == .linux) ?[]const u8 else void;
++pub const linux_cgroup_default = if (LinuxCgroup == void)
++{} else null;
++
+ /// The various methods a process may exit.
+ pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+     Exited: u32,
+@@ -138,8 +142,13 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     else
+         @compileError("missing env vars");
+ 
++    // Fork. If we have a cgroup specified on Linxu then we use clone
+     const pid: posix.pid_t = switch (builtin.os.tag) {
+-        .linux => if (self.linux_cgroup) |cgroup| try internal_os.cgroup.cloneInto(cgroup) else try posix.fork(),
++        .linux => if (self.linux_cgroup) |cgroup|
++            try internal_os.cgroup.cloneInto(cgroup)
++        else
++            try posix.fork(),
++
+         else => try posix.fork(),
+     };
+ 
+
+commit 6ae6e3ba11db2cf2f69e6cd54aae91421cc020ed
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jun 8 19:08:05 2024 -0700
+
+    remove unused var
+
+diff --git a/src/Command.zig b/src/Command.zig
+index c8cf0075..60a89830 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -32,8 +32,6 @@ const EnvMap = std.process.EnvMap;
+ 
+ const PreExecFn = fn (*Command) void;
+ 
+-const log = std.log.scoped(.command);
+-
+ /// Path to the command to run. This must be an absolute path. This
+ /// library does not do PATH lookup.
+ path: []const u8,
+
+commit 9baf4d143d0867a383b8dea414f5bccd8766637f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jul 2 09:47:50 2024 -0700
+
+    command: if chdir fails for subprocess, ignore the error
+    
+    Fixes #1911
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 60a89830..5bf2f129 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -159,12 +159,21 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     // We are the child.
+ 
+     // Setup our file descriptors for std streams.
+-    if (self.stdin) |f| try setupFd(f.handle, posix.STDIN_FILENO);
+-    if (self.stdout) |f| try setupFd(f.handle, posix.STDOUT_FILENO);
+-    if (self.stderr) |f| try setupFd(f.handle, posix.STDERR_FILENO);
++    if (self.stdin) |f| setupFd(f.handle, posix.STDIN_FILENO) catch
++        return error.ExecFailedInChild;
++    if (self.stdout) |f| setupFd(f.handle, posix.STDOUT_FILENO) catch
++        return error.ExecFailedInChild;
++    if (self.stderr) |f| setupFd(f.handle, posix.STDERR_FILENO) catch
++        return error.ExecFailedInChild;
+ 
+     // Setup our working directory
+-    if (self.cwd) |cwd| try posix.chdir(cwd);
++    if (self.cwd) |cwd| posix.chdir(cwd) catch {
++        // This can fail if we don't have permission to go to
++        // this directory or if due to race conditions it doesn't
++        // exist or any various other reasons. We don't want to
++        // crash the entire process if this fails so we ignore it.
++        // We don't log because that'll show up in the output.
++    };
+ 
+     // If the user requested a pre exec callback, call it now.
+     if (self.pre_exec) |f| f(self);
+
+commit 72c672adb7ff9d7ce766be4ed8b0f263775636b8
+Author: multifred <github-ghostty@2al.ch>
+Date:   Mon Jul 22 00:06:18 2024 +0200
+
+    Fix multiple deprecated names for zig lib/std
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 5bf2f129..daca54f9 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -394,7 +394,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     };
+     defer if (builtin.os.tag == .windows) alloc.free(PATH);
+ 
+-    var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
++    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+     var it = std.mem.tokenizeScalar(u8, PATH, std.fs.path.delimiter);
+     var seen_eacces = false;
+     while (it.next()) |search_path| {
+
+commit cb5848c7b7b03680df1943c7b612e15af23023bb
+Author: Khang Nguyen Duy <k@ndykhang.net>
+Date:   Wed Dec 11 16:47:20 2024 +0700
+
+    command: fix hostname test compatibility
+    
+    hostname is not guaranteed on *nix as in the comment.
+    For example, Arch does not have hostname by default.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index daca54f9..2b600979 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -440,9 +440,9 @@ fn isExecutable(mode: std.fs.File.Mode) bool {
+     return mode & 0o0111 != 0;
+ }
+ 
+-// `hostname` is present on both *nix and windows
++// `uname -n` is the *nix equivalent of `hostname.exe` on Windows
+ test "expandPath: hostname" {
+-    const executable = if (builtin.os.tag == .windows) "hostname.exe" else "hostname";
++    const executable = if (builtin.os.tag == .windows) "hostname.exe" else "uname";
+     const path = (try expandPath(testing.allocator, executable)).?;
+     defer testing.allocator.free(path);
+     try testing.expect(path.len > executable.len);
+
+commit 184db2654ceea7ae233171effa2581163d05507d
+Author: Anund <anundm@gmail.com>
+Date:   Thu Dec 26 14:48:03 2024 +1100
+
+    testing: handle execveZ failing during test execution
+    
+    Duplicating a test process via fork does unexepected things.
+    zig build test will hang
+    A test binary created via -Demit-test-exe will run 2 copies of the test suite
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 2b600979..09ae86d8 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -182,9 +182,10 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     _ = posix.execveZ(pathZ, argsZ, envp) catch null;
+ 
+     // If we are executing this code, the exec failed. In that scenario,
+-    // we return a very specific error that can be detected to determine
+-    // we're in the child.
+-    return error.ExecFailedInChild;
++    // terminate so we don't duplicate the original process
++    // note: returning to test code from this point would run 2 copies of the test suite
++    std.debug.print("failed to execveZ as child process, terminating", .{});
++    std.process.exit(1);
+ }
+ 
+ fn startWindows(self: *Command, arena: Allocator) !void {
+@@ -722,3 +723,32 @@ test "Command: custom working directory" {
+         try testing.expectEqualStrings("/usr/bin\n", contents);
+     }
+ }
++
++// Duplicating a test process via fork does unexepected things.
++// zig build test will hang
++// test binary created via -Demit-test-exe will run 2 copies of the test suite
++//
++// This test relys on cmd.start -> posix.start terminating the child process rather
++// than returning to avoid those two strange behaviours
++test "Command: posix fork handles execveZ failure" {
++    if (builtin.os.tag == .windows) {
++        return error.SkipZigTest;
++    }
++    var td = try TempDir.init();
++    defer td.deinit();
++    var stdout = try createTestStdout(td.dir);
++    defer stdout.close();
++
++    var cmd: Command = .{
++        .path = "/not/a/binary",
++        .args = &.{ "/not/a/binary", "" },
++        .stdout = stdout,
++        .cwd = "/bin",
++    };
++
++    try cmd.start(testing.allocator);
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait(true);
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 1);
++}
+
+commit b2cb80dfbbde72262be7fc00591694673b240331
+Author: Anund <anundm@gmail.com>
+Date:   Thu Dec 26 23:12:35 2024 +1100
+
+    testing: move cleanup of execveZ into the test code
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 09ae86d8..6b42e12a 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -182,10 +182,9 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     _ = posix.execveZ(pathZ, argsZ, envp) catch null;
+ 
+     // If we are executing this code, the exec failed. In that scenario,
+-    // terminate so we don't duplicate the original process
+-    // note: returning to test code from this point would run 2 copies of the test suite
+-    std.debug.print("failed to execveZ as child process, terminating", .{});
+-    std.process.exit(1);
++    // we return a very specific error that can be detected to determine
++    // we're in the child.
++    return error.ExecFailedInChild;
+ }
+ 
+ fn startWindows(self: *Command, arena: Allocator) !void {
+@@ -599,7 +598,7 @@ test "Command: pre exec" {
+         }).do,
+     };
+ 
+-    try cmd.start(testing.allocator);
++    try cmd.testingStart();
+     try testing.expect(cmd.pid != null);
+     const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+@@ -635,7 +634,7 @@ test "Command: redirect stdout to file" {
+         .stdout = stdout,
+     };
+ 
+-    try cmd.start(testing.allocator);
++    try cmd.testingStart();
+     try testing.expect(cmd.pid != null);
+     const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+@@ -670,7 +669,7 @@ test "Command: custom env vars" {
+         .env = &env,
+     };
+ 
+-    try cmd.start(testing.allocator);
++    try cmd.testingStart();
+     try testing.expect(cmd.pid != null);
+     const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+@@ -706,7 +705,7 @@ test "Command: custom working directory" {
+         .cwd = "/usr/bin",
+     };
+ 
+-    try cmd.start(testing.allocator);
++    try cmd.testingStart();
+     try testing.expect(cmd.pid != null);
+     const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+@@ -724,12 +723,12 @@ test "Command: custom working directory" {
+     }
+ }
+ 
+-// Duplicating a test process via fork does unexepected things.
++// Test validate an execveZ failure correctly terminates when error.ExecFailedInChild is correctly handled
++//
++// Incorrectly handling an error.ExecFailedInChild results in a second copy of the test process running.
++// Duplicating the test process leads to weird behavior
+ // zig build test will hang
+ // test binary created via -Demit-test-exe will run 2 copies of the test suite
+-//
+-// This test relys on cmd.start -> posix.start terminating the child process rather
+-// than returning to avoid those two strange behaviours
+ test "Command: posix fork handles execveZ failure" {
+     if (builtin.os.tag == .windows) {
+         return error.SkipZigTest;
+@@ -746,9 +745,22 @@ test "Command: posix fork handles execveZ failure" {
+         .cwd = "/bin",
+     };
+ 
+-    try cmd.start(testing.allocator);
++    try cmd.testingStart();
+     try testing.expect(cmd.pid != null);
+     const exit = try cmd.wait(true);
+     try testing.expect(exit == .Exited);
+     try testing.expect(exit.Exited == 1);
+ }
++
++// If cmd.start fails with error.ExecFailedInChild it's the _child_ process that is running. If it does not
++// terminate in response to that error both the parent and child will continue as if they _are_ the test suite
++// process.
++fn testingStart(self: *Command) !void {
++    self.start(testing.allocator) catch |err| {
++        if (err == error.ExecFailedInChild) {
++            // I am a child process, I must not get confused and continue running the rest of the test suite.
++            posix.exit(1);
++        }
++        return err;
++    };
++}
+
+commit 600eea08cdcf1957373ccab2da8b7f5c4c85d6f3
+Author: Anund <anundm@gmail.com>
+Date:   Fri Dec 27 11:50:29 2024 +1100
+
+    testing: point Command.zig at ~more universal external binaries
+    
+    The `Command.zig` tests reach outside the local source tree and look for
+    files on the host os machine. This introduces some portability issues
+    for the tests.
+    
+    The nix build sandbox doesn't include `/usr/bin/env` making it error out
+    when `zig build test` runs `Command.zig` tests as part of a `nix build`.
+    Current ci and local development relies on `nix develop` sharing a host os
+    file system that includes `/usr/bin/env`.
+    
+    Turns out `/tmp` and `/bin/sh` are available in the build sandbox in
+    nix so we swap these in to enable nixpkg builds to include testing
+    ghostty as part of any update cycle.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 6b42e12a..82b48fa1 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -587,8 +587,8 @@ test "createNullDelimitedEnvMap" {
+ test "Command: pre exec" {
+     if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var cmd: Command = .{
+-        .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "-v" },
++        .path = "/bin/sh",
++        .args = &.{ "/bin/sh", "-v" },
+         .pre_exec = (struct {
+             fn do(_: *Command) void {
+                 // This runs in the child, so we can exit and it won't
+@@ -629,8 +629,8 @@ test "Command: redirect stdout to file" {
+         .args = &.{"C:\\Windows\\System32\\whoami.exe"},
+         .stdout = stdout,
+     } else .{
+-        .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "-v" },
++        .path = "/bin/sh",
++        .args = &.{ "/bin/sh", "-c", "echo hello" },
+         .stdout = stdout,
+     };
+ 
+@@ -663,8 +663,8 @@ test "Command: custom env vars" {
+         .stdout = stdout,
+         .env = &env,
+     } else .{
+-        .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "sh", "-c", "echo $VALUE" },
++        .path = "/bin/sh",
++        .args = &.{ "/bin/sh", "-c", "echo $VALUE" },
+         .stdout = stdout,
+         .env = &env,
+     };
+@@ -699,10 +699,10 @@ test "Command: custom working directory" {
+         .stdout = stdout,
+         .cwd = "C:\\Windows\\System32",
+     } else .{
+-        .path = "/usr/bin/env",
+-        .args = &.{ "/usr/bin/env", "sh", "-c", "pwd" },
++        .path = "/bin/sh",
++        .args = &.{ "/bin/sh", "-c", "pwd" },
+         .stdout = stdout,
+-        .cwd = "/usr/bin",
++        .cwd = "/tmp",
+     };
+ 
+     try cmd.testingStart();
+@@ -718,8 +718,10 @@ test "Command: custom working directory" {
+ 
+     if (builtin.os.tag == .windows) {
+         try testing.expectEqualStrings("C:\\Windows\\System32\r\n", contents);
++    } else if (builtin.os.tag == .macos) {
++        try testing.expectEqualStrings("/private/tmp\n", contents);
+     } else {
+-        try testing.expectEqualStrings("/usr/bin\n", contents);
++        try testing.expectEqualStrings("/tmp\n", contents);
+     }
+ }
+ 
+
+commit 9ea0aa49348ca653f7236636e6370abdd1b4767c
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Wed Jan 1 14:31:15 2025 -0600
+
+    core: if we change RLIMIT_NOFILE, reset it when executing commands
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 82b48fa1..2801def3 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -18,6 +18,7 @@ const Command = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const global_state = &@import("global.zig").state;
+ const internal_os = @import("os/main.zig");
+ const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+@@ -178,6 +179,10 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     // If the user requested a pre exec callback, call it now.
+     if (self.pre_exec) |f| f(self);
+ 
++    if (global_state.rlimits.nofile) |lim| {
++        internal_os.restoreMaxFiles(lim);
++    }
++
+     // Finally, replace our process.
+     _ = posix.execveZ(pathZ, argsZ, envp) catch null;
+ 
+
+commit 8e47d0267bc468483d3fb53acf3aa07fa1e87dea
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Jan 2 15:04:49 2025 -0800
+
+    Move resource limits to a dedicated struct, restore before preexec
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 2801def3..6e30eae1 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -176,13 +176,13 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+         // We don't log because that'll show up in the output.
+     };
+ 
++    // Restore any rlimits that were set by Ghostty. This might fail but
++    // any failures are ignored (its best effort).
++    global_state.rlimits.restore();
++
+     // If the user requested a pre exec callback, call it now.
+     if (self.pre_exec) |f| f(self);
+ 
+-    if (global_state.rlimits.nofile) |lim| {
+-        internal_os.restoreMaxFiles(lim);
+-    }
+-
+     // Finally, replace our process.
+     _ = posix.execveZ(pathZ, argsZ, envp) catch null;
+ 
+
+commit 7e9be00924144950ab6100cb7136e91c6abb403e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 10:13:31 2025 -0700
+
+    working on macos
+
+diff --git a/src/Command.zig b/src/Command.zig
+index 6e30eae1..ffc44423 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -392,7 +392,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     const PATH = switch (builtin.os.tag) {
+         .windows => blk: {
+             const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
+-            const path = try std.unicode.utf16leToUtf8Alloc(alloc, win_path);
++            const path = try std.unicode.utf16LeToUtf8Alloc(alloc, win_path);
+             break :blk path;
+         },
+         else => std.posix.getenvZ("PATH") orelse return null,
+
+commit fc21444f2da7022d6c6e3ec217e73fb738ddac31
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 16:14:23 2025 -0700
+
+    fix windows
+
+diff --git a/src/Command.zig b/src/Command.zig
+index ffc44423..a810b16c 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -193,11 +193,11 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+ }
+ 
+ fn startWindows(self: *Command, arena: Allocator) !void {
+-    const application_w = try std.unicode.utf8ToUtf16LeWithNull(arena, self.path);
+-    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeWithNull(arena, cwd) else null;
++    const application_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, self.path);
++    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeAllocZ(arena, cwd) else null;
+     const command_line_w = if (self.args.len > 0) b: {
+         const command_line = try windowsCreateCommandLine(arena, self.args);
+-        break :b try std.unicode.utf8ToUtf16LeWithNull(arena, command_line);
++        break :b try std.unicode.utf8ToUtf16LeAllocZ(arena, command_line);
+     } else null;
+     const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
+ 
+
+commit 722d41a359d71f251efab9135d1bef5837512352
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 5 11:45:40 2025 -0400
+
+    config: allow commands to specify whether they shell expand or not
+    
+    This introduces a syntax for `command` and `initial-command` that allows
+    the user to specify whether it should be run via `/bin/sh -c` or not.
+    The syntax is a prefix `direct:` or `shell:` prior to the command,
+    with no prefix implying a default behavior as documented.
+    
+    Previously, we unconditionally ran commands via `/bin/sh -c`, primarily
+    to avoid having to do any shell expansion ourselves. We also leaned on
+    it as a crutch for PATH-expansion but this is an easy problem compared
+    to shell expansion.
+    
+    For the principle of least surprise, this worked well for configurations
+    specified via the config file, and is still the default. However, these
+    configurations are also set via the `-e` special flag to the CLI, and it
+    is very much not the principle of least surprise to have the command run via
+    `/bin/sh -c` in that scenario since a shell has already expanded all the
+    arguments and given them to us in a nice separated format. But we had no
+    way to toggle this behavior.
+    
+    This commit introduces the ability to do this, and changes the defaults
+    so that `-e` doesn't shell expand. Further, we also do PATH lookups
+    ourselves for the non-shell expanded case because thats easy (using
+    execvpe style extensions but implemented as part of the Zig stdlib). We don't
+    do path expansion (e.g. `~/`) because thats a shell expansion.
+    
+    So to be clear, there are no two polar opposite behavioes here with
+    clear semantics:
+    
+      1. Direct commands are passed to `execvpe` directly, space separated.
+         This will not handle quoted strings, environment variables, path
+         expansion (e.g. `~/`), command expansion (e.g. `$()`), etc.
+    
+      2. Shell commands are passed to `/bin/sh -c` and will be shell expanded
+         as per the shell's rules. This will handle everything that `sh`
+         supports.
+    
+    In doing this work, I also stumbled upon a variety of smaller
+    improvements that could be made:
+    
+      - A number of allocations have been removed from the startup path that
+        only existed to add a null terminator to various strings. We now
+        have null terminators from the beginning since we are almost always
+        on a system that's going to need it anyways.
+    
+      - For bash shell integration, we no longer wrap the new bash command
+        in a shell since we've formed a full parsed command line.
+    
+      - The process of creating the command to execute by termio is now unit
+        tested, so we can test the various complex cases particularly on
+        macOS of wrapping commands in the login command.
+    
+      - `xdg-terminal-exec` on Linux uses the `direct:` method by default
+        since it is also assumed to be executed via a shell environment.
+
+diff --git a/src/Command.zig b/src/Command.zig
+index a810b16c..e17c1b37 100644
+--- a/src/Command.zig
++++ b/src/Command.zig
+@@ -33,14 +33,17 @@ const EnvMap = std.process.EnvMap;
+ 
+ const PreExecFn = fn (*Command) void;
+ 
+-/// Path to the command to run. This must be an absolute path. This
+-/// library does not do PATH lookup.
+-path: []const u8,
++/// Path to the command to run. This doesn't have to be an absolute path,
++/// because use exec functions that search the PATH, if necessary.
++///
++/// This field is null-terminated to avoid a copy for the sake of
++/// adding a null terminator since POSIX systems are so common.
++path: [:0]const u8,
+ 
+ /// Command-line arguments. It is the responsibility of the caller to set
+ /// args[0] to the command. If args is empty then args[0] will automatically
+ /// be set to equal path.
+-args: []const []const u8,
++args: []const [:0]const u8,
+ 
+ /// Environment variables for the child process. If this is null, inherits
+ /// the environment variables from this process. These are the exact
+@@ -129,9 +132,8 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+ 
+ fn startPosix(self: *Command, arena: Allocator) !void {
+     // Null-terminate all our arguments
+-    const pathZ = try arena.dupeZ(u8, self.path);
+-    const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
+-    for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
++    const argsZ = try arena.allocSentinel(?[*:0]const u8, self.args.len, null);
++    for (self.args, 0..) |arg, i| argsZ[i] = arg.ptr;
+ 
+     // Determine our env vars
+     const envp = if (self.env) |env_map|
+@@ -184,7 +186,9 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     if (self.pre_exec) |f| f(self);
+ 
+     // Finally, replace our process.
+-    _ = posix.execveZ(pathZ, argsZ, envp) catch null;
++    // Note: we must use the "p"-variant of exec here because we
++    // do not guarantee our command is looked up already in the path.
++    _ = posix.execvpeZ(self.path, argsZ, envp) catch null;
+ 
+     // If we are executing this code, the exec failed. In that scenario,
+     // we return a very specific error that can be detected to determine
+

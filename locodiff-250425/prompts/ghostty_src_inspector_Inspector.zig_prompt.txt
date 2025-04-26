@@ -1,0 +1,3539 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/inspector/Inspector.zig
+
+commit a162c7c47fb74c17c4f2984c9d121fc51f295f69
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 14:48:33 2023 -0700
+
+    inspector: move inspector to dedicated folder
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+new file mode 100644
+index 00000000..9142f7bc
+--- /dev/null
++++ b/src/inspector/Inspector.zig
+@@ -0,0 +1,992 @@
++//! The Inspector is a development tool to debug the terminal. This is
++//! useful for terminal application developers as well as people potentially
++//! debugging issues in Ghostty itself.
++const Inspector = @This();
++
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const builtin = @import("builtin");
++const cimgui = @import("cimgui");
++const Surface = @import("../Surface.zig");
++const input = @import("../input.zig");
++const terminal = @import("../terminal/main.zig");
++const inspector = @import("main.zig");
++
++/// The window names. These are used with docking so we need to have access.
++const window_cell = "Cell";
++const window_modes = "Modes";
++const window_keyboard = "Keyboard";
++const window_screen = "Screen";
++const window_size = "Surface Info";
++const window_imgui_demo = "Dear ImGui Demo";
++
++/// Unique ID system. This is used to generate unique IDs for Dear ImGui
++/// widgets. Overflow to reset to 0 is fine. IDs should still be prefixed
++/// by type to avoid collisions but its never going to happen.
++next_id: usize = 123456789,
++
++/// The surface that we're inspecting.
++surface: *Surface,
++
++/// This is used to track whether we're rendering for the first time. This
++/// is used to set up the initial window positions.
++first_render: bool = true,
++
++/// Mouse state that we track in addition to normal mouse states that
++/// Ghostty always knows about.
++mouse: struct {
++    /// Last hovered x/y
++    last_xpos: f64 = 0,
++    last_ypos: f64 = 0,
++
++    /// Last hovered screen point
++    last_point: terminal.point.ScreenPoint = .{},
++} = .{},
++
++/// A selected cell.
++cell: CellInspect = .{ .idle = {} },
++
++/// The list of keyboard events
++key_events: inspector.key.EventRing,
++
++const CellInspect = union(enum) {
++    /// Idle, no cell inspection is requested
++    idle: void,
++
++    /// Requested, a cell is being picked.
++    requested: void,
++
++    /// The cell has been picked and set to this. This is a copy so that
++    /// if the cell contents change we still have the original cell.
++    selected: Selected,
++
++    const Selected = struct {
++        row: usize,
++        col: usize,
++        cell: terminal.Screen.Cell,
++    };
++
++    pub fn request(self: *CellInspect) void {
++        switch (self.*) {
++            .idle, .selected => self.* = .requested,
++            .requested => {},
++        }
++    }
++};
++
++/// Setup the ImGui state. This requires an ImGui context to be set.
++pub fn setup() void {
++    const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
++
++    // Enable docking, which we use heavily for the UI.
++    io.ConfigFlags |= cimgui.c.ImGuiConfigFlags_DockingEnable;
++
++    // Our colorspace is sRGB.
++    io.ConfigFlags |= cimgui.c.ImGuiConfigFlags_IsSRGB;
++
++    // Disable the ini file to save layout
++    io.IniFilename = null;
++    io.LogFilename = null;
++
++    // Use our own embedded font
++    {
++        // TODO: This will have to be recalculated for different screen DPIs.
++        // This is currently hardcoded to a 2x content scale.
++        const font_size = 16 * 2;
++
++        const font_config: *cimgui.c.ImFontConfig = cimgui.c.ImFontConfig_ImFontConfig();
++        defer cimgui.c.ImFontConfig_destroy(font_config);
++        font_config.FontDataOwnedByAtlas = false;
++        _ = cimgui.c.ImFontAtlas_AddFontFromMemoryTTF(
++            io.Fonts,
++            @constCast(@ptrCast(Surface.face_ttf)),
++            Surface.face_ttf.len,
++            font_size,
++            font_config,
++            null,
++        );
++    }
++}
++
++pub fn init(surface: *Surface) !Inspector {
++    var key_buf = try inspector.key.EventRing.init(surface.alloc, 2);
++    errdefer key_buf.deinit(surface.alloc);
++
++    return .{
++        .surface = surface,
++        .key_events = key_buf,
++    };
++}
++
++pub fn deinit(self: *Inspector) void {
++    {
++        var it = self.key_events.iterator(.forward);
++        while (it.next()) |v| v.deinit(self.surface.alloc);
++        self.key_events.deinit(self.surface.alloc);
++    }
++}
++
++/// Record a keyboard event.
++pub fn recordKeyEvent(self: *Inspector, ev: inspector.key.Event) !void {
++    const max_capacity = 50;
++    self.key_events.append(ev) catch |err| switch (err) {
++        error.OutOfMemory => if (self.key_events.capacity() < max_capacity) {
++            // We're out of memory, but we can allocate to our capacity.
++            const new_capacity = @min(self.key_events.capacity() * 2, max_capacity);
++            try self.key_events.resize(self.surface.alloc, new_capacity);
++            try self.key_events.append(ev);
++        } else {
++            self.key_events.deleteOldest(1);
++            try self.key_events.append(ev);
++        },
++
++        else => return err,
++    };
++}
++
++/// Render the frame.
++pub fn render(self: *Inspector) void {
++    const dock_id = cimgui.c.igDockSpaceOverViewport(
++        cimgui.c.igGetMainViewport(),
++        cimgui.c.ImGuiDockNodeFlags_None,
++        null,
++    );
++
++    // Render all of our data. We hold the mutex for this duration. This is
++    // expensive but this is an initial implementation until it doesn't work
++    // anymore.
++    {
++        self.surface.renderer_state.mutex.lock();
++        defer self.surface.renderer_state.mutex.unlock();
++        self.renderScreenWindow();
++        self.renderModesWindow();
++        self.renderKeyboardWindow();
++        self.renderCellWindow();
++        self.renderSizeWindow();
++    }
++
++    // In debug we show the ImGui demo window so we can easily view available
++    // widgets and such.
++    if (builtin.mode == .Debug) {
++        var show: bool = true;
++        cimgui.c.igShowDemoWindow(&show);
++    }
++
++    // On first render we set up the layout. We can actually do this at
++    // the end of the frame, allowing the individual rendering to also
++    // observe the first render flag.
++    if (self.first_render) {
++        self.first_render = false;
++        self.setupLayout(dock_id);
++    }
++}
++
++fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
++    _ = self;
++
++    // Our initial focus
++    cimgui.c.igSetWindowFocus_Str(window_screen);
++
++    // Setup our initial layout.
++    const dock_id: struct {
++        left: cimgui.c.ImGuiID,
++        right: cimgui.c.ImGuiID,
++    } = dock_id: {
++        var dock_id_left: cimgui.c.ImGuiID = undefined;
++        var dock_id_right: cimgui.c.ImGuiID = undefined;
++        _ = cimgui.c.igDockBuilderSplitNode(
++            dock_id_main,
++            cimgui.c.ImGuiDir_Left,
++            0.7,
++            &dock_id_left,
++            &dock_id_right,
++        );
++
++        break :dock_id .{
++            .left = dock_id_left,
++            .right = dock_id_right,
++        };
++    };
++
++    cimgui.c.igDockBuilderDockWindow(window_cell, dock_id.left);
++    cimgui.c.igDockBuilderDockWindow(window_modes, dock_id.left);
++    cimgui.c.igDockBuilderDockWindow(window_keyboard, dock_id.left);
++    cimgui.c.igDockBuilderDockWindow(window_screen, dock_id.left);
++    cimgui.c.igDockBuilderDockWindow(window_imgui_demo, dock_id.left);
++    cimgui.c.igDockBuilderDockWindow(window_size, dock_id.right);
++    cimgui.c.igDockBuilderFinish(dock_id_main);
++}
++
++fn renderScreenWindow(self: *Inspector) void {
++    // Start our window. If we're collapsed we do nothing.
++    defer cimgui.c.igEnd();
++    if (!cimgui.c.igBegin(
++        window_screen,
++        null,
++        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
++    )) return;
++
++    const t = self.surface.renderer_state.terminal;
++    const screen = &t.screen;
++
++    {
++        _ = cimgui.c.igBeginTable(
++            "table_screen",
++            2,
++            cimgui.c.ImGuiTableFlags_None,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Active Screen");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText("%s", @tagName(t.active_screen).ptr);
++            }
++        }
++    }
++
++    if (cimgui.c.igCollapsingHeader_TreeNodeFlags(
++        "Cursor",
++        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
++    )) {
++        {
++            _ = cimgui.c.igBeginTable(
++                "table_cursor",
++                2,
++                cimgui.c.ImGuiTableFlags_None,
++                .{ .x = 0, .y = 0 },
++                0,
++            );
++            defer cimgui.c.igEndTable();
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Position (x, y)");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("(%d, %d)", screen.cursor.x, screen.cursor.y);
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Pending Wrap");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%s", if (screen.cursor.pending_wrap) "true".ptr else "false".ptr);
++                }
++            }
++
++            // If we have a color then we show the color
++            color: {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Foreground Color");
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                if (!screen.cursor.pen.attrs.has_fg) {
++                    cimgui.c.igText("default");
++                    break :color;
++                }
++
++                var color: [3]f32 = .{
++                    @as(f32, @floatFromInt(screen.cursor.pen.fg.r)) / 255,
++                    @as(f32, @floatFromInt(screen.cursor.pen.fg.g)) / 255,
++                    @as(f32, @floatFromInt(screen.cursor.pen.fg.b)) / 255,
++                };
++                _ = cimgui.c.igColorEdit3(
++                    "color_fg",
++                    &color,
++                    cimgui.c.ImGuiColorEditFlags_NoPicker |
++                        cimgui.c.ImGuiColorEditFlags_NoLabel,
++                );
++            }
++            color: {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Background Color");
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                if (!screen.cursor.pen.attrs.has_bg) {
++                    cimgui.c.igText("default");
++                    break :color;
++                }
++
++                var color: [3]f32 = .{
++                    @as(f32, @floatFromInt(screen.cursor.pen.bg.r)) / 255,
++                    @as(f32, @floatFromInt(screen.cursor.pen.bg.g)) / 255,
++                    @as(f32, @floatFromInt(screen.cursor.pen.bg.b)) / 255,
++                };
++                _ = cimgui.c.igColorEdit3(
++                    "color_bg",
++                    &color,
++                    cimgui.c.ImGuiColorEditFlags_NoPicker |
++                        cimgui.c.ImGuiColorEditFlags_NoLabel,
++                );
++            }
++
++            // Boolean styles
++            const styles = .{
++                "bold",    "italic",    "faint",     "blink",
++                "inverse", "invisible", "protected", "strikethrough",
++            };
++            inline for (styles) |style| style: {
++                if (!@field(screen.cursor.pen.attrs, style)) break :style;
++
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText(style.ptr);
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("true");
++                }
++            }
++        } // table
++
++        cimgui.c.igTextDisabled("(Any styles not shown are not currently set)");
++    } // cursor
++
++    if (cimgui.c.igCollapsingHeader_TreeNodeFlags(
++        "Keyboard",
++        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
++    )) {
++        {
++            _ = cimgui.c.igBeginTable(
++                "table_keyboard",
++                2,
++                cimgui.c.ImGuiTableFlags_None,
++                .{ .x = 0, .y = 0 },
++                0,
++            );
++            defer cimgui.c.igEndTable();
++
++            const kitty_flags = screen.kitty_keyboard.current();
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Mode");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    const mode = if (kitty_flags.int() != 0) "kitty" else "legacy";
++                    cimgui.c.igText("%s", mode.ptr);
++                }
++            }
++
++            if (kitty_flags.int() != 0) {
++                const Flags = @TypeOf(kitty_flags);
++                inline for (@typeInfo(Flags).Struct.fields) |field| {
++                    {
++                        const value = @field(kitty_flags, field.name);
++
++                        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                        {
++                            _ = cimgui.c.igTableSetColumnIndex(0);
++                            const name = std.fmt.comptimePrint("{s}", .{field.name});
++                            cimgui.c.igText("%s", name.ptr);
++                        }
++                        {
++                            _ = cimgui.c.igTableSetColumnIndex(1);
++                            cimgui.c.igText(
++                                "%s",
++                                if (value) "true".ptr else "false".ptr,
++                            );
++                        }
++                    }
++                }
++            } else {
++                {
++                    cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                    {
++                        _ = cimgui.c.igTableSetColumnIndex(0);
++                        cimgui.c.igText("Xterm modify keys");
++                    }
++                    {
++                        _ = cimgui.c.igTableSetColumnIndex(1);
++                        cimgui.c.igText(
++                            "%s",
++                            if (t.flags.modify_other_keys_2) "true".ptr else "false".ptr,
++                        );
++                    }
++                }
++            } // keyboard mode info
++        } // table
++    } // keyboard
++}
++
++/// The modes window shows the currently active terminal modes and allows
++/// users to toggle them on and off.
++fn renderModesWindow(self: *Inspector) void {
++    // Start our window. If we're collapsed we do nothing.
++    defer cimgui.c.igEnd();
++    if (!cimgui.c.igBegin(
++        window_modes,
++        null,
++        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
++    )) return;
++
++    _ = cimgui.c.igBeginTable(
++        "table_modes",
++        3,
++        cimgui.c.ImGuiTableFlags_SizingFixedFit |
++            cimgui.c.ImGuiTableFlags_RowBg,
++        .{ .x = 0, .y = 0 },
++        0,
++    );
++    defer cimgui.c.igEndTable();
++
++    {
++        _ = cimgui.c.igTableSetupColumn("", cimgui.c.ImGuiTableColumnFlags_NoResize, 0, 0);
++        _ = cimgui.c.igTableSetupColumn("Number", cimgui.c.ImGuiTableColumnFlags_PreferSortAscending, 0, 0);
++        _ = cimgui.c.igTableSetupColumn("Name", cimgui.c.ImGuiTableColumnFlags_WidthStretch, 0, 0);
++        cimgui.c.igTableHeadersRow();
++    }
++
++    const t = self.surface.renderer_state.terminal;
++    inline for (@typeInfo(terminal.Mode).Enum.fields) |field| {
++        const tag: terminal.modes.ModeTag = @bitCast(@as(terminal.modes.ModeTag.Backing, field.value));
++
++        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++        {
++            _ = cimgui.c.igTableSetColumnIndex(0);
++            var value: bool = t.modes.get(@field(terminal.Mode, field.name));
++            _ = cimgui.c.igCheckbox("", &value);
++        }
++        {
++            _ = cimgui.c.igTableSetColumnIndex(1);
++            cimgui.c.igText(
++                "%s%d",
++                if (tag.ansi) "?" else "",
++                @as(u32, @intCast(tag.value)),
++            );
++        }
++        {
++            _ = cimgui.c.igTableSetColumnIndex(2);
++            const name = std.fmt.comptimePrint("{s}", .{field.name});
++            cimgui.c.igText("%s", name.ptr);
++        }
++    }
++}
++
++fn renderSizeWindow(self: *Inspector) void {
++    // Start our window. If we're collapsed we do nothing.
++    defer cimgui.c.igEnd();
++    if (!cimgui.c.igBegin(
++        window_size,
++        null,
++        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
++    )) return;
++
++    cimgui.c.igSeparatorText("Dimensions");
++
++    {
++        _ = cimgui.c.igBeginTable(
++            "table_size",
++            2,
++            cimgui.c.ImGuiTableFlags_None,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        // Screen Size
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Screen Size");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "%dpx x %dpx",
++                    self.surface.screen_size.width,
++                    self.surface.screen_size.height,
++                );
++            }
++        }
++
++        // Grid Size
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Grid Size");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "%dc x %dr",
++                    self.surface.grid_size.columns,
++                    self.surface.grid_size.rows,
++                );
++            }
++        }
++
++        // Cell Size
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Cell Size");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "%dpx x %dpx",
++                    self.surface.cell_size.width,
++                    self.surface.cell_size.height,
++                );
++            }
++        }
++
++        // Padding
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Window Padding");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "T=%d B=%d L=%d R=%d px",
++                    self.surface.padding.top,
++                    self.surface.padding.bottom,
++                    self.surface.padding.left,
++                    self.surface.padding.right,
++                );
++            }
++        }
++    }
++
++    cimgui.c.igSeparatorText("Font");
++
++    {
++        _ = cimgui.c.igBeginTable(
++            "table_font",
++            2,
++            cimgui.c.ImGuiTableFlags_None,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Size (Points)");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "%d pt",
++                    self.surface.font_size.points,
++                );
++            }
++        }
++
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Size (Pixels)");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "%d px",
++                    self.surface.font_size.pixels(),
++                );
++            }
++        }
++    }
++
++    cimgui.c.igSeparatorText("Mouse");
++
++    {
++        _ = cimgui.c.igBeginTable(
++            "table_mouse",
++            2,
++            cimgui.c.ImGuiTableFlags_None,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        const mouse = &self.surface.mouse;
++        const t = self.surface.renderer_state.terminal;
++
++        {
++            const hover_point = self.mouse.last_point.toViewport(&t.screen);
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Hover Grid");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "row=%d, col=%d",
++                    hover_point.y,
++                    hover_point.x,
++                );
++            }
++        }
++
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Hover Point");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "(%dpx, %dpx)",
++                    @as(u32, @intFromFloat(self.mouse.last_xpos)),
++                    @as(u32, @intFromFloat(self.mouse.last_ypos)),
++                );
++            }
++        }
++
++        const any_click = for (mouse.click_state) |state| {
++            if (state == .press) break true;
++        } else false;
++
++        click: {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Click State");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                if (!any_click) {
++                    cimgui.c.igText("none");
++                    break :click;
++                }
++
++                for (mouse.click_state, 0..) |state, i| {
++                    if (state != .press) continue;
++                    const button: input.MouseButton = @enumFromInt(i);
++                    cimgui.c.igSameLine(0, 0);
++                    cimgui.c.igText("%s", (switch (button) {
++                        .unknown => "?",
++                        .left => "L",
++                        .middle => "M",
++                        .right => "R",
++                        .four => "{4}",
++                        .five => "{5}",
++                        .six => "{6}",
++                        .seven => "{7}",
++                        .eight => "{8}",
++                        .nine => "{9}",
++                        .ten => "{10}",
++                        .eleven => "{11}",
++                    }).ptr);
++                }
++            }
++        }
++
++        {
++            const left_click_point = mouse.left_click_point.toViewport(&t.screen);
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Click Grid");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "row=%d, col=%d",
++                    left_click_point.y,
++                    left_click_point.x,
++                );
++            }
++        }
++
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Click Point");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "(%dpx, %dpx)",
++                    @as(u32, @intFromFloat(mouse.left_click_xpos)),
++                    @as(u32, @intFromFloat(mouse.left_click_ypos)),
++                );
++            }
++        }
++    }
++}
++
++fn renderCellWindow(self: *Inspector) void {
++    // Start our window. If we're collapsed we do nothing.
++    defer cimgui.c.igEnd();
++    if (!cimgui.c.igBegin(
++        window_cell,
++        null,
++        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
++    )) return;
++
++    // Our popup for the picker
++    const popup_picker = "Cell Picker";
++
++    if (cimgui.c.igButton("Picker", .{ .x = 0, .y = 0 })) {
++        // Request a cell
++        self.cell.request();
++
++        cimgui.c.igOpenPopup_Str(
++            popup_picker,
++            cimgui.c.ImGuiPopupFlags_None,
++        );
++    }
++
++    if (cimgui.c.igBeginPopupModal(
++        popup_picker,
++        null,
++        cimgui.c.ImGuiWindowFlags_AlwaysAutoResize,
++    )) popup: {
++        defer cimgui.c.igEndPopup();
++
++        // Once we select a cell, close this popup.
++        if (self.cell == .selected) {
++            cimgui.c.igCloseCurrentPopup();
++            break :popup;
++        }
++
++        cimgui.c.igText(
++            "Click on a cell in the terminal to inspect it.\n" ++
++                "The click will be intercepted by the picker, \n" ++
++                "so it won't be sent to the terminal.",
++        );
++        cimgui.c.igSeparator();
++
++        if (cimgui.c.igButton("Cancel", .{ .x = 0, .y = 0 })) {
++            cimgui.c.igCloseCurrentPopup();
++        }
++    } // cell pick popup
++
++    cimgui.c.igSeparator();
++
++    if (self.cell != .selected) {
++        cimgui.c.igText("No cell selected.");
++        return;
++    }
++
++    const selected = self.cell.selected;
++
++    {
++        // We have a selected cell, show information about it.
++        _ = cimgui.c.igBeginTable(
++            "table_cursor",
++            2,
++            cimgui.c.ImGuiTableFlags_None,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Grid Position");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText("row=%d col=%d", selected.row, selected.col);
++            }
++        }
++
++        // NOTE: we don't currently write the character itself because
++        // we haven't hooked up imgui to our font system. That's hard! We
++        // can/should instead hook up our renderer to imgui and just render
++        // the single glyph in an image view so it looks _identical_ to the
++        // terminal.
++        codepoint: {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Codepoint");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                if (selected.cell.char == 0) {
++                    cimgui.c.igTextDisabled("(empty)");
++                    break :codepoint;
++                }
++
++                cimgui.c.igText("U+%X", selected.cell.char);
++            }
++        }
++
++        // If we have a color then we show the color
++        color: {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            _ = cimgui.c.igTableSetColumnIndex(0);
++            cimgui.c.igText("Foreground Color");
++            _ = cimgui.c.igTableSetColumnIndex(1);
++            if (!selected.cell.attrs.has_fg) {
++                cimgui.c.igText("default");
++                break :color;
++            }
++
++            var color: [3]f32 = .{
++                @as(f32, @floatFromInt(selected.cell.fg.r)) / 255,
++                @as(f32, @floatFromInt(selected.cell.fg.g)) / 255,
++                @as(f32, @floatFromInt(selected.cell.fg.b)) / 255,
++            };
++            _ = cimgui.c.igColorEdit3(
++                "color_fg",
++                &color,
++                cimgui.c.ImGuiColorEditFlags_NoPicker |
++                    cimgui.c.ImGuiColorEditFlags_NoLabel,
++            );
++        }
++        color: {
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            _ = cimgui.c.igTableSetColumnIndex(0);
++            cimgui.c.igText("Background Color");
++            _ = cimgui.c.igTableSetColumnIndex(1);
++            if (!selected.cell.attrs.has_bg) {
++                cimgui.c.igText("default");
++                break :color;
++            }
++
++            var color: [3]f32 = .{
++                @as(f32, @floatFromInt(selected.cell.bg.r)) / 255,
++                @as(f32, @floatFromInt(selected.cell.bg.g)) / 255,
++                @as(f32, @floatFromInt(selected.cell.bg.b)) / 255,
++            };
++            _ = cimgui.c.igColorEdit3(
++                "color_bg",
++                &color,
++                cimgui.c.ImGuiColorEditFlags_NoPicker |
++                    cimgui.c.ImGuiColorEditFlags_NoLabel,
++            );
++        }
++
++        // Boolean styles
++        const styles = .{
++            "bold",    "italic",    "faint",     "blink",
++            "inverse", "invisible", "protected", "strikethrough",
++        };
++        inline for (styles) |style| style: {
++            if (!@field(selected.cell.attrs, style)) break :style;
++
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText(style.ptr);
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText("true");
++            }
++        }
++    } // table
++
++    cimgui.c.igTextDisabled("(Any styles not shown are not currently set)");
++}
++
++fn renderKeyboardWindow(self: *Inspector) void {
++    // Start our window. If we're collapsed we do nothing.
++    defer cimgui.c.igEnd();
++    if (!cimgui.c.igBegin(
++        window_keyboard,
++        null,
++        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
++    )) return;
++
++    list: {
++        if (self.key_events.empty()) {
++            cimgui.c.igText("No recorded key events. Press a key with the " ++
++                "terminal focused to record it.");
++            break :list;
++        }
++
++        _ = cimgui.c.igBeginTable(
++            "table_key_events",
++            1,
++            //cimgui.c.ImGuiTableFlags_ScrollY |
++            cimgui.c.ImGuiTableFlags_RowBg |
++                cimgui.c.ImGuiTableFlags_Borders,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        var it = self.key_events.iterator(.reverse);
++        while (it.next()) |ev| {
++            // Need to push an ID so that our selectable is unique.
++            cimgui.c.igPushID_Ptr(ev);
++            defer cimgui.c.igPopID();
++
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            _ = cimgui.c.igTableSetColumnIndex(0);
++
++            var buf: [1024]u8 = undefined;
++            const label = ev.label(&buf) catch "Key Event";
++            _ = cimgui.c.igSelectable_BoolPtr(
++                label.ptr,
++                &ev.imgui_state.selected,
++                cimgui.c.ImGuiSelectableFlags_None,
++                .{ .x = 0, .y = 0 },
++            );
++
++            if (!ev.imgui_state.selected) continue;
++
++            _ = cimgui.c.igBeginTable(
++                "##event",
++                2,
++                cimgui.c.ImGuiTableFlags_None,
++                .{ .x = 0, .y = 0 },
++                0,
++            );
++            defer cimgui.c.igEndTable();
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Action");
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText("%s", @tagName(ev.event.action).ptr);
++            }
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Key");
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText("%s", @tagName(ev.event.key).ptr);
++            }
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Physical Key");
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText("%s", @tagName(ev.event.physical_key).ptr);
++            }
++        }
++    } // table
++}
+
+commit f560423e3efa67bbdb267dcf32f8c230944adb09
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 15:22:48 2023 -0700
+
+    inspector: render key events
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 9142f7bc..cb7739cf 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -956,37 +956,7 @@ fn renderKeyboardWindow(self: *Inspector) void {
+             );
+ 
+             if (!ev.imgui_state.selected) continue;
+-
+-            _ = cimgui.c.igBeginTable(
+-                "##event",
+-                2,
+-                cimgui.c.ImGuiTableFlags_None,
+-                .{ .x = 0, .y = 0 },
+-                0,
+-            );
+-            defer cimgui.c.igEndTable();
+-
+-            {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Action");
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText("%s", @tagName(ev.event.action).ptr);
+-            }
+-            {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Key");
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText("%s", @tagName(ev.event.key).ptr);
+-            }
+-            {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Physical Key");
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText("%s", @tagName(ev.event.physical_key).ptr);
+-            }
++            ev.render();
+         }
+     } // table
+ }
+
+commit 25106f9644e542cc2efdbc3b774ba7cd4014dc53
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 15:27:17 2023 -0700
+
+    inspector: add clear keyboard events button
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index cb7739cf..018cc892 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -926,6 +926,14 @@ fn renderKeyboardWindow(self: *Inspector) void {
+             break :list;
+         }
+ 
++        if (cimgui.c.igButton("Clear", .{ .x = 0, .y = 0 })) {
++            var it = self.key_events.iterator(.forward);
++            while (it.next()) |v| v.deinit(self.surface.alloc);
++            self.key_events.clear();
++        }
++
++        cimgui.c.igSeparator();
++
+         _ = cimgui.c.igBeginTable(
+             "table_key_events",
+             1,
+
+commit d82a4760da0a4f11d646404df2b5eb554bc10836
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 15:36:01 2023 -0700
+
+    inspector: note memory leak
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 018cc892..d3a0c8f6 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -136,6 +136,7 @@ pub fn recordKeyEvent(self: *Inspector, ev: inspector.key.Event) !void {
+             try self.key_events.resize(self.surface.alloc, new_capacity);
+             try self.key_events.append(ev);
+         } else {
++            // TODO: there is a memory leak here, we have to deinit the oldest
+             self.key_events.deleteOldest(1);
+             try self.key_events.append(ev);
+         },
+
+commit 60c8ae806b8772902003269b489181a3f23c9bce
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 15:37:06 2023 -0700
+
+    inspector: remove unused next id system
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index d3a0c8f6..521590d9 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -20,11 +20,6 @@ const window_screen = "Screen";
+ const window_size = "Surface Info";
+ const window_imgui_demo = "Dear ImGui Demo";
+ 
+-/// Unique ID system. This is used to generate unique IDs for Dear ImGui
+-/// widgets. Overflow to reset to 0 is fine. IDs should still be prefixed
+-/// by type to avoid collisions but its never going to happen.
+-next_id: usize = 123456789,
+-
+ /// The surface that we're inspecting.
+ surface: *Surface,
+ 
+
+commit dbe4530377cdf653ef3873bce14cac4bdbd18175
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 15:45:32 2023 -0700
+
+    inspector: fix key memory leak
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 521590d9..0064c995 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -131,7 +131,8 @@ pub fn recordKeyEvent(self: *Inspector, ev: inspector.key.Event) !void {
+             try self.key_events.resize(self.surface.alloc, new_capacity);
+             try self.key_events.append(ev);
+         } else {
+-            // TODO: there is a memory leak here, we have to deinit the oldest
++            var it = self.key_events.iterator(.forward);
++            if (it.next()) |old_ev| old_ev.deinit(self.surface.alloc);
+             self.key_events.deleteOldest(1);
+             try self.key_events.append(ev);
+         },
+
+commit 5da0e0dab63d31f8ce704610b5efcbb93c30eaee
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 16:50:05 2023 -0700
+
+    inspector: show kitty graphics metadata
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 0064c995..18f0bb86 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -424,6 +424,89 @@ fn renderScreenWindow(self: *Inspector) void {
+             } // keyboard mode info
+         } // table
+     } // keyboard
++
++    if (cimgui.c.igCollapsingHeader_TreeNodeFlags(
++        "Kitty Graphics",
++        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
++    )) kitty_gfx: {
++        if (!screen.kitty_images.enabled()) {
++            cimgui.c.igTextDisabled("(Kitty graphics are disabled)");
++            break :kitty_gfx;
++        }
++
++        {
++            _ = cimgui.c.igBeginTable(
++                "##kitty_graphics",
++                2,
++                cimgui.c.ImGuiTableFlags_None,
++                .{ .x = 0, .y = 0 },
++                0,
++            );
++            defer cimgui.c.igEndTable();
++
++            const kitty_images = &screen.kitty_images;
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Memory Usage");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%d bytes", kitty_images.total_bytes);
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Memory Limit");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%d bytes", kitty_images.total_limit);
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Image Count");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%d", kitty_images.images.count());
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Placement Count");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%d", kitty_images.placements.count());
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Image Loading");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%s", if (kitty_images.loading != null) "true".ptr else "false".ptr);
++                }
++            }
++        } // table
++    } // kitty graphics
+ }
+ 
+ /// The modes window shows the currently active terminal modes and allows
+
+commit 7b2af3a039f7a79fe6d500d5c695fda295f57ec8
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 23 17:16:01 2023 -0700
+
+    inspector: start termio log
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 18f0bb86..f52a0743 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -16,6 +16,7 @@ const inspector = @import("main.zig");
+ const window_cell = "Cell";
+ const window_modes = "Modes";
+ const window_keyboard = "Keyboard";
++const window_termio = "Terminal IO";
+ const window_screen = "Screen";
+ const window_size = "Surface Info";
+ const window_imgui_demo = "Dear ImGui Demo";
+@@ -44,6 +45,10 @@ cell: CellInspect = .{ .idle = {} },
+ /// The list of keyboard events
+ key_events: inspector.key.EventRing,
+ 
++/// The VT stream
++vt_events: inspector.termio.VTEventRing,
++vt_stream: inspector.termio.Stream,
++
+ const CellInspect = union(enum) {
+     /// Idle, no cell inspection is requested
+     idle: void,
+@@ -107,9 +112,24 @@ pub fn init(surface: *Surface) !Inspector {
+     var key_buf = try inspector.key.EventRing.init(surface.alloc, 2);
+     errdefer key_buf.deinit(surface.alloc);
+ 
++    var vt_events = try inspector.termio.VTEventRing.init(surface.alloc, 2);
++    errdefer vt_events.deinit(surface.alloc);
++
+     return .{
+         .surface = surface,
+         .key_events = key_buf,
++        .vt_events = vt_events,
++        .vt_stream = .{
++            .handler = .{
++                .surface = surface,
++            },
++
++            .parser = .{
++                .osc_parser = .{
++                    .alloc = surface.alloc,
++                },
++            },
++        },
+     };
+ }
+ 
+@@ -119,6 +139,13 @@ pub fn deinit(self: *Inspector) void {
+         while (it.next()) |v| v.deinit(self.surface.alloc);
+         self.key_events.deinit(self.surface.alloc);
+     }
++
++    {
++        var it = self.vt_events.iterator(.forward);
++        while (it.next()) |v| v.deinit(self.surface.alloc);
++        self.vt_events.deinit(self.surface.alloc);
++        self.vt_stream.deinit();
++    }
+ }
+ 
+ /// Record a keyboard event.
+@@ -141,6 +168,11 @@ pub fn recordKeyEvent(self: *Inspector, ev: inspector.key.Event) !void {
+     };
+ }
+ 
++/// Record data read from the pty.
++pub fn recordPtyRead(self: *Inspector, data: []const u8) !void {
++    try self.vt_stream.nextSlice(data);
++}
++
+ /// Render the frame.
+ pub fn render(self: *Inspector) void {
+     const dock_id = cimgui.c.igDockSpaceOverViewport(
+@@ -158,6 +190,7 @@ pub fn render(self: *Inspector) void {
+         self.renderScreenWindow();
+         self.renderModesWindow();
+         self.renderKeyboardWindow();
++        self.renderTermioWindow();
+         self.renderCellWindow();
+         self.renderSizeWindow();
+     }
+@@ -208,6 +241,7 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
+     cimgui.c.igDockBuilderDockWindow(window_cell, dock_id.left);
+     cimgui.c.igDockBuilderDockWindow(window_modes, dock_id.left);
+     cimgui.c.igDockBuilderDockWindow(window_keyboard, dock_id.left);
++    cimgui.c.igDockBuilderDockWindow(window_termio, dock_id.left);
+     cimgui.c.igDockBuilderDockWindow(window_screen, dock_id.left);
+     cimgui.c.igDockBuilderDockWindow(window_imgui_demo, dock_id.left);
+     cimgui.c.igDockBuilderDockWindow(window_size, dock_id.right);
+@@ -1048,3 +1082,50 @@ fn renderKeyboardWindow(self: *Inspector) void {
+         }
+     } // table
+ }
++
++fn renderTermioWindow(self: *Inspector) void {
++    // Start our window. If we're collapsed we do nothing.
++    defer cimgui.c.igEnd();
++    if (!cimgui.c.igBegin(
++        window_termio,
++        null,
++        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
++    )) return;
++
++    list: {
++        if (self.vt_events.empty()) {
++            cimgui.c.igText("Waiting for events...");
++            break :list;
++        }
++
++        if (cimgui.c.igButton("Clear", .{ .x = 0, .y = 0 })) {
++            var it = self.vt_events.iterator(.forward);
++            while (it.next()) |v| v.deinit(self.surface.alloc);
++            self.vt_events.clear();
++        }
++
++        cimgui.c.igSeparator();
++
++        _ = cimgui.c.igBeginTable(
++            "table_vt_events",
++            1,
++            cimgui.c.ImGuiTableFlags_RowBg |
++                cimgui.c.ImGuiTableFlags_Borders,
++            .{ .x = 0, .y = 0 },
++            0,
++        );
++        defer cimgui.c.igEndTable();
++
++        var it = self.vt_events.iterator(.reverse);
++        while (it.next()) |ev| {
++            // Need to push an ID so that our selectable is unique.
++            cimgui.c.igPushID_Ptr(ev);
++            defer cimgui.c.igPopID();
++
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            _ = cimgui.c.igTableSetColumnIndex(0);
++
++            cimgui.c.igText("%s", ev.str.ptr);
++        }
++    } // table
++}
+
+commit c60ead99aa5c51b1b31fd89805ccaf6cfe38e7f1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 16:00:38 2023 -0700
+
+    inspector: format termio a little better, incomplete
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index f52a0743..5caa5d0a 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1108,7 +1108,7 @@ fn renderTermioWindow(self: *Inspector) void {
+ 
+         _ = cimgui.c.igBeginTable(
+             "table_vt_events",
+-            1,
++            2,
+             cimgui.c.ImGuiTableFlags_RowBg |
+                 cimgui.c.ImGuiTableFlags_Borders,
+             .{ .x = 0, .y = 0 },
+@@ -1116,6 +1116,19 @@ fn renderTermioWindow(self: *Inspector) void {
+         );
+         defer cimgui.c.igEndTable();
+ 
++        cimgui.c.igTableSetupColumn(
++            "Kind",
++            cimgui.c.ImGuiTableColumnFlags_WidthFixed,
++            0,
++            0,
++        );
++        cimgui.c.igTableSetupColumn(
++            "Description",
++            cimgui.c.ImGuiTableColumnFlags_WidthStretch,
++            0,
++            0,
++        );
++
+         var it = self.vt_events.iterator(.reverse);
+         while (it.next()) |ev| {
+             // Need to push an ID so that our selectable is unique.
+@@ -1124,7 +1137,8 @@ fn renderTermioWindow(self: *Inspector) void {
+ 
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+             _ = cimgui.c.igTableSetColumnIndex(0);
+-
++            cimgui.c.igText("%s", @tagName(ev.kind).ptr);
++            _ = cimgui.c.igTableSetColumnIndex(1);
+             cimgui.c.igText("%s", ev.str.ptr);
+         }
+     } // table
+
+commit ccb1cea49a600204e0261a045fbbedc4be2e2f75
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 20:55:29 2023 -0700
+
+    inspector: filter terminal io events by kind
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 5caa5d0a..1043bff3 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1093,17 +1093,69 @@ fn renderTermioWindow(self: *Inspector) void {
+     )) return;
+ 
+     list: {
++        const popup_filter = "Filter";
++        if (cimgui.c.igButton("Filter", .{ .x = 0, .y = 0 })) {
++            cimgui.c.igOpenPopup_Str(
++                popup_filter,
++                cimgui.c.ImGuiPopupFlags_None,
++            );
++        }
++
++        if (cimgui.c.igBeginPopupModal(
++            popup_filter,
++            null,
++            cimgui.c.ImGuiWindowFlags_AlwaysAutoResize,
++        )) {
++            defer cimgui.c.igEndPopup();
++
++            cimgui.c.igText("Selected filters will only affect future events.");
++            cimgui.c.igSeparator();
++
++            {
++                _ = cimgui.c.igBeginTable(
++                    "table_filter_kind",
++                    3,
++                    cimgui.c.ImGuiTableFlags_None,
++                    .{ .x = 0, .y = 0 },
++                    0,
++                );
++                defer cimgui.c.igEndTable();
++
++                inline for (@typeInfo(terminal.Parser.Action.Tag).Enum.fields) |field| {
++                    const tag = @field(terminal.Parser.Action.Tag, field.name);
++                    if (tag == .apc_put or tag == .dcs_put) continue;
++
++                    _ = cimgui.c.igTableNextColumn();
++                    var value = !self.vt_stream.handler.filter_exclude.contains(tag);
++                    if (cimgui.c.igCheckbox(@tagName(tag).ptr, &value)) {
++                        if (value) {
++                            self.vt_stream.handler.filter_exclude.insert(tag);
++                        } else {
++                            self.vt_stream.handler.filter_exclude.remove(tag);
++                        }
++                    }
++                }
++            } // Filter kind table
++
++            if (cimgui.c.igButton("Close", .{ .x = 0, .y = 0 })) {
++                cimgui.c.igCloseCurrentPopup();
++            }
++        } // filter popup
++
++        if (!self.vt_events.empty()) {
++            cimgui.c.igSameLine(0, cimgui.c.igGetStyle().*.ItemInnerSpacing.x);
++            if (cimgui.c.igButton("Clear", .{ .x = 0, .y = 0 })) {
++                var it = self.vt_events.iterator(.forward);
++                while (it.next()) |v| v.deinit(self.surface.alloc);
++                self.vt_events.clear();
++            }
++        }
++
+         if (self.vt_events.empty()) {
+             cimgui.c.igText("Waiting for events...");
+             break :list;
+         }
+ 
+-        if (cimgui.c.igButton("Clear", .{ .x = 0, .y = 0 })) {
+-            var it = self.vt_events.iterator(.forward);
+-            while (it.next()) |v| v.deinit(self.surface.alloc);
+-            self.vt_events.clear();
+-        }
+-
+         cimgui.c.igSeparator();
+ 
+         _ = cimgui.c.igBeginTable(
+
+commit dc11513c1bf1497c326e09e6bfc4dac56ed0d70f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 21:15:00 2023 -0700
+
+    inspector: add basic termio seq filter
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 1043bff3..56ecd852 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -115,15 +115,15 @@ pub fn init(surface: *Surface) !Inspector {
+     var vt_events = try inspector.termio.VTEventRing.init(surface.alloc, 2);
+     errdefer vt_events.deinit(surface.alloc);
+ 
++    var vt_handler = inspector.termio.VTHandler.init(surface);
++    errdefer vt_handler.deinit();
++
+     return .{
+         .surface = surface,
+         .key_events = key_buf,
+         .vt_events = vt_events,
+         .vt_stream = .{
+-            .handler = .{
+-                .surface = surface,
+-            },
+-
++            .handler = vt_handler,
+             .parser = .{
+                 .osc_parser = .{
+                     .alloc = surface.alloc,
+@@ -144,6 +144,8 @@ pub fn deinit(self: *Inspector) void {
+         var it = self.vt_events.iterator(.forward);
+         while (it.next()) |v| v.deinit(self.surface.alloc);
+         self.vt_events.deinit(self.surface.alloc);
++
++        self.vt_stream.handler.deinit();
+         self.vt_stream.deinit();
+     }
+ }
+@@ -1108,7 +1110,8 @@ fn renderTermioWindow(self: *Inspector) void {
+         )) {
+             defer cimgui.c.igEndPopup();
+ 
+-            cimgui.c.igText("Selected filters will only affect future events.");
++            cimgui.c.igText("Changed filter settings will only affect future events.");
++
+             cimgui.c.igSeparator();
+ 
+             {
+@@ -1137,6 +1140,20 @@ fn renderTermioWindow(self: *Inspector) void {
+                 }
+             } // Filter kind table
+ 
++            cimgui.c.igSeparator();
++
++            cimgui.c.igText(
++                "Filter by string. Empty displays all, \"abc\" finds lines\n" ++
++                    "containing \"abc\", \"abc,xyz\" finds lines containing \"abc\"\n" ++
++                    "or \"xyz\", \"-abc\" excludes lines containing \"abc\".",
++            );
++            _ = cimgui.c.ImGuiTextFilter_Draw(
++                self.vt_stream.handler.filter_text,
++                "##filter_text",
++                0,
++            );
++
++            cimgui.c.igSeparator();
+             if (cimgui.c.igButton("Close", .{ .x = 0, .y = 0 })) {
+                 cimgui.c.igCloseCurrentPopup();
+             }
+
+commit ff54c466cdcb6464e6477bdd7e4cbf0c24528dbb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 21:20:08 2023 -0700
+
+    inspector: termio pause/resume
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 56ecd852..506424d1 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1094,8 +1094,18 @@ fn renderTermioWindow(self: *Inspector) void {
+         cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
+     )) return;
+ 
++    const popup_filter = "Filter";
++
+     list: {
+-        const popup_filter = "Filter";
++        const pause_play: [:0]const u8 = if (self.vt_stream.handler.active)
++            "Pause##pause_play"
++        else
++            "Resume##pause_play";
++        if (cimgui.c.igButton(pause_play.ptr, .{ .x = 0, .y = 0 })) {
++            self.vt_stream.handler.active = !self.vt_stream.handler.active;
++        }
++
++        cimgui.c.igSameLine(0, cimgui.c.igGetStyle().*.ItemInnerSpacing.x);
+         if (cimgui.c.igButton("Filter", .{ .x = 0, .y = 0 })) {
+             cimgui.c.igOpenPopup_Str(
+                 popup_filter,
+@@ -1103,62 +1113,6 @@ fn renderTermioWindow(self: *Inspector) void {
+             );
+         }
+ 
+-        if (cimgui.c.igBeginPopupModal(
+-            popup_filter,
+-            null,
+-            cimgui.c.ImGuiWindowFlags_AlwaysAutoResize,
+-        )) {
+-            defer cimgui.c.igEndPopup();
+-
+-            cimgui.c.igText("Changed filter settings will only affect future events.");
+-
+-            cimgui.c.igSeparator();
+-
+-            {
+-                _ = cimgui.c.igBeginTable(
+-                    "table_filter_kind",
+-                    3,
+-                    cimgui.c.ImGuiTableFlags_None,
+-                    .{ .x = 0, .y = 0 },
+-                    0,
+-                );
+-                defer cimgui.c.igEndTable();
+-
+-                inline for (@typeInfo(terminal.Parser.Action.Tag).Enum.fields) |field| {
+-                    const tag = @field(terminal.Parser.Action.Tag, field.name);
+-                    if (tag == .apc_put or tag == .dcs_put) continue;
+-
+-                    _ = cimgui.c.igTableNextColumn();
+-                    var value = !self.vt_stream.handler.filter_exclude.contains(tag);
+-                    if (cimgui.c.igCheckbox(@tagName(tag).ptr, &value)) {
+-                        if (value) {
+-                            self.vt_stream.handler.filter_exclude.insert(tag);
+-                        } else {
+-                            self.vt_stream.handler.filter_exclude.remove(tag);
+-                        }
+-                    }
+-                }
+-            } // Filter kind table
+-
+-            cimgui.c.igSeparator();
+-
+-            cimgui.c.igText(
+-                "Filter by string. Empty displays all, \"abc\" finds lines\n" ++
+-                    "containing \"abc\", \"abc,xyz\" finds lines containing \"abc\"\n" ++
+-                    "or \"xyz\", \"-abc\" excludes lines containing \"abc\".",
+-            );
+-            _ = cimgui.c.ImGuiTextFilter_Draw(
+-                self.vt_stream.handler.filter_text,
+-                "##filter_text",
+-                0,
+-            );
+-
+-            cimgui.c.igSeparator();
+-            if (cimgui.c.igButton("Close", .{ .x = 0, .y = 0 })) {
+-                cimgui.c.igCloseCurrentPopup();
+-            }
+-        } // filter popup
+-
+         if (!self.vt_events.empty()) {
+             cimgui.c.igSameLine(0, cimgui.c.igGetStyle().*.ItemInnerSpacing.x);
+             if (cimgui.c.igButton("Clear", .{ .x = 0, .y = 0 })) {
+@@ -1211,4 +1165,60 @@ fn renderTermioWindow(self: *Inspector) void {
+             cimgui.c.igText("%s", ev.str.ptr);
+         }
+     } // table
++
++    if (cimgui.c.igBeginPopupModal(
++        popup_filter,
++        null,
++        cimgui.c.ImGuiWindowFlags_AlwaysAutoResize,
++    )) {
++        defer cimgui.c.igEndPopup();
++
++        cimgui.c.igText("Changed filter settings will only affect future events.");
++
++        cimgui.c.igSeparator();
++
++        {
++            _ = cimgui.c.igBeginTable(
++                "table_filter_kind",
++                3,
++                cimgui.c.ImGuiTableFlags_None,
++                .{ .x = 0, .y = 0 },
++                0,
++            );
++            defer cimgui.c.igEndTable();
++
++            inline for (@typeInfo(terminal.Parser.Action.Tag).Enum.fields) |field| {
++                const tag = @field(terminal.Parser.Action.Tag, field.name);
++                if (tag == .apc_put or tag == .dcs_put) continue;
++
++                _ = cimgui.c.igTableNextColumn();
++                var value = !self.vt_stream.handler.filter_exclude.contains(tag);
++                if (cimgui.c.igCheckbox(@tagName(tag).ptr, &value)) {
++                    if (value) {
++                        self.vt_stream.handler.filter_exclude.insert(tag);
++                    } else {
++                        self.vt_stream.handler.filter_exclude.remove(tag);
++                    }
++                }
++            }
++        } // Filter kind table
++
++        cimgui.c.igSeparator();
++
++        cimgui.c.igText(
++            "Filter by string. Empty displays all, \"abc\" finds lines\n" ++
++                "containing \"abc\", \"abc,xyz\" finds lines containing \"abc\"\n" ++
++                "or \"xyz\", \"-abc\" excludes lines containing \"abc\".",
++        );
++        _ = cimgui.c.ImGuiTextFilter_Draw(
++            self.vt_stream.handler.filter_text,
++            "##filter_text",
++            0,
++        );
++
++        cimgui.c.igSeparator();
++        if (cimgui.c.igButton("Close", .{ .x = 0, .y = 0 })) {
++            cimgui.c.igCloseCurrentPopup();
++        }
++    } // filter popup
+ }
+
+commit a72bfc4a31ae4712011d4f5962229d2cb8dbc2a1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 21:26:34 2023 -0700
+
+    inspector: add sequence number to termio
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 506424d1..432a5642 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1046,6 +1046,7 @@ fn renderKeyboardWindow(self: *Inspector) void {
+             var it = self.key_events.iterator(.forward);
+             while (it.next()) |v| v.deinit(self.surface.alloc);
+             self.key_events.clear();
++            self.vt_stream.handler.current_seq = 1;
+         }
+ 
+         cimgui.c.igSeparator();
+@@ -1131,7 +1132,7 @@ fn renderTermioWindow(self: *Inspector) void {
+ 
+         _ = cimgui.c.igBeginTable(
+             "table_vt_events",
+-            2,
++            3,
+             cimgui.c.ImGuiTableFlags_RowBg |
+                 cimgui.c.ImGuiTableFlags_Borders,
+             .{ .x = 0, .y = 0 },
+@@ -1139,6 +1140,12 @@ fn renderTermioWindow(self: *Inspector) void {
+         );
+         defer cimgui.c.igEndTable();
+ 
++        cimgui.c.igTableSetupColumn(
++            "Seq",
++            cimgui.c.ImGuiTableColumnFlags_WidthFixed,
++            0,
++            0,
++        );
+         cimgui.c.igTableSetupColumn(
+             "Kind",
+             cimgui.c.ImGuiTableColumnFlags_WidthFixed,
+@@ -1159,9 +1166,11 @@ fn renderTermioWindow(self: *Inspector) void {
+             defer cimgui.c.igPopID();
+ 
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            _ = cimgui.c.igTableSetColumnIndex(0);
++            _ = cimgui.c.igTableNextColumn();
++            cimgui.c.igText("%d", ev.seq);
++            _ = cimgui.c.igTableNextColumn();
+             cimgui.c.igText("%s", @tagName(ev.kind).ptr);
+-            _ = cimgui.c.igTableSetColumnIndex(1);
++            _ = cimgui.c.igTableNextColumn();
+             cimgui.c.igText("%s", ev.str.ptr);
+         }
+     } // table
+
+commit c1469eb7b212f4663d90c155983d527d4b3d7c3c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 21:56:38 2023 -0700
+
+    inspector: track lots of metadata for vt events
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 432a5642..3ec57874 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -299,94 +299,7 @@ fn renderScreenWindow(self: *Inspector) void {
+             );
+             defer cimgui.c.igEndTable();
+ 
+-            {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                {
+-                    _ = cimgui.c.igTableSetColumnIndex(0);
+-                    cimgui.c.igText("Position (x, y)");
+-                }
+-                {
+-                    _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("(%d, %d)", screen.cursor.x, screen.cursor.y);
+-                }
+-            }
+-
+-            {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                {
+-                    _ = cimgui.c.igTableSetColumnIndex(0);
+-                    cimgui.c.igText("Pending Wrap");
+-                }
+-                {
+-                    _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%s", if (screen.cursor.pending_wrap) "true".ptr else "false".ptr);
+-                }
+-            }
+-
+-            // If we have a color then we show the color
+-            color: {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Foreground Color");
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                if (!screen.cursor.pen.attrs.has_fg) {
+-                    cimgui.c.igText("default");
+-                    break :color;
+-                }
+-
+-                var color: [3]f32 = .{
+-                    @as(f32, @floatFromInt(screen.cursor.pen.fg.r)) / 255,
+-                    @as(f32, @floatFromInt(screen.cursor.pen.fg.g)) / 255,
+-                    @as(f32, @floatFromInt(screen.cursor.pen.fg.b)) / 255,
+-                };
+-                _ = cimgui.c.igColorEdit3(
+-                    "color_fg",
+-                    &color,
+-                    cimgui.c.ImGuiColorEditFlags_NoPicker |
+-                        cimgui.c.ImGuiColorEditFlags_NoLabel,
+-                );
+-            }
+-            color: {
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Background Color");
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                if (!screen.cursor.pen.attrs.has_bg) {
+-                    cimgui.c.igText("default");
+-                    break :color;
+-                }
+-
+-                var color: [3]f32 = .{
+-                    @as(f32, @floatFromInt(screen.cursor.pen.bg.r)) / 255,
+-                    @as(f32, @floatFromInt(screen.cursor.pen.bg.g)) / 255,
+-                    @as(f32, @floatFromInt(screen.cursor.pen.bg.b)) / 255,
+-                };
+-                _ = cimgui.c.igColorEdit3(
+-                    "color_bg",
+-                    &color,
+-                    cimgui.c.ImGuiColorEditFlags_NoPicker |
+-                        cimgui.c.ImGuiColorEditFlags_NoLabel,
+-                );
+-            }
+-
+-            // Boolean styles
+-            const styles = .{
+-                "bold",    "italic",    "faint",     "blink",
+-                "inverse", "invisible", "protected", "strikethrough",
+-            };
+-            inline for (styles) |style| style: {
+-                if (!@field(screen.cursor.pen.attrs, style)) break :style;
+-
+-                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-                {
+-                    _ = cimgui.c.igTableSetColumnIndex(0);
+-                    cimgui.c.igText(style.ptr);
+-                }
+-                {
+-                    _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("true");
+-                }
+-            }
++            inspector.cursor.renderInTable(&screen.cursor);
+         } // table
+ 
+         cimgui.c.igTextDisabled("(Any styles not shown are not currently set)");
+@@ -1167,11 +1080,53 @@ fn renderTermioWindow(self: *Inspector) void {
+ 
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+             _ = cimgui.c.igTableNextColumn();
++            _ = cimgui.c.igSelectable_BoolPtr(
++                "##select",
++                &ev.imgui_selected,
++                cimgui.c.ImGuiSelectableFlags_SpanAllColumns,
++                .{ .x = 0, .y = 0 },
++            );
++            cimgui.c.igSameLine(0, 0);
+             cimgui.c.igText("%d", ev.seq);
+             _ = cimgui.c.igTableNextColumn();
+             cimgui.c.igText("%s", @tagName(ev.kind).ptr);
+             _ = cimgui.c.igTableNextColumn();
+             cimgui.c.igText("%s", ev.str.ptr);
++
++            // If the event is selected, we render info about it. For now
++            // we put this in the last column because thats the widest and
++            // imgui has no way to make a column span.
++            if (ev.imgui_selected) {
++                {
++                    _ = cimgui.c.igBeginTable(
++                        "details",
++                        2,
++                        cimgui.c.ImGuiTableFlags_None,
++                        .{ .x = 0, .y = 0 },
++                        0,
++                    );
++                    defer cimgui.c.igEndTable();
++                    inspector.cursor.renderInTable(&ev.cursor);
++
++                    {
++                        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                        {
++                            _ = cimgui.c.igTableSetColumnIndex(0);
++                            cimgui.c.igText("Scroll Region");
++                        }
++                        {
++                            _ = cimgui.c.igTableSetColumnIndex(1);
++                            cimgui.c.igText(
++                                "T=%d B=%d L=%d R=%d",
++                                ev.scrolling_region.top,
++                                ev.scrolling_region.bottom,
++                                ev.scrolling_region.left,
++                                ev.scrolling_region.right,
++                            );
++                        }
++                    }
++                }
++            }
+         }
+     } // table
+ 
+
+commit b70498e77ab202d7a7c672305c84fd1db738f970
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 24 22:04:01 2023 -0700
+
+    inspector: reversed a checkbox
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 3ec57874..bbf67dee 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1159,9 +1159,9 @@ fn renderTermioWindow(self: *Inspector) void {
+                 var value = !self.vt_stream.handler.filter_exclude.contains(tag);
+                 if (cimgui.c.igCheckbox(@tagName(tag).ptr, &value)) {
+                     if (value) {
+-                        self.vt_stream.handler.filter_exclude.insert(tag);
+-                    } else {
+                         self.vt_stream.handler.filter_exclude.remove(tag);
++                    } else {
++                        self.vt_stream.handler.filter_exclude.insert(tag);
+                     }
+                 }
+             }
+
+commit 2ecbc8d04e2489ce3b6ddc5bddd01e37d2e5df5a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Oct 25 08:55:15 2023 -0700
+
+    inspector: add OSC command metadata to inspector
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index bbf67dee..ba40e631 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1125,6 +1125,18 @@ fn renderTermioWindow(self: *Inspector) void {
+                             );
+                         }
+                     }
++
++                    var md_it = ev.metadata.iterator();
++                    while (md_it.next()) |entry| {
++                        var buf: [256]u8 = undefined;
++                        const key = std.fmt.bufPrintZ(&buf, "{s}", .{entry.key_ptr.*}) catch
++                            "<internal error>";
++                        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                        _ = cimgui.c.igTableNextColumn();
++                        cimgui.c.igText("%s", key.ptr);
++                        _ = cimgui.c.igTableNextColumn();
++                        cimgui.c.igText("%s", entry.value_ptr.ptr);
++                    }
+                 }
+             }
+         }
+
+commit b91f4c6b0c04437d8c13ba8f22a36e8f3ad83417
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Oct 25 08:56:58 2023 -0700
+
+    inspector: minor style tweak
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index ba40e631..4c327f16 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1036,13 +1036,13 @@ fn renderTermioWindow(self: *Inspector) void {
+             }
+         }
+ 
++        cimgui.c.igSeparator();
++
+         if (self.vt_events.empty()) {
+             cimgui.c.igText("Waiting for events...");
+             break :list;
+         }
+ 
+-        cimgui.c.igSeparator();
+-
+         _ = cimgui.c.igBeginTable(
+             "table_vt_events",
+             3,
+
+commit c12bb4a0350b91ad8c01602054c7a66f2dbccde2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Oct 25 09:24:37 2023 -0700
+
+    inspector: reset vt seq number on clear
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 4c327f16..36d362e4 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -1033,6 +1033,9 @@ fn renderTermioWindow(self: *Inspector) void {
+                 var it = self.vt_events.iterator(.forward);
+                 while (it.next()) |v| v.deinit(self.surface.alloc);
+                 self.vt_events.clear();
++
++                // We also reset the sequence number.
++                self.vt_stream.handler.current_seq = 1;
+             }
+         }
+ 
+
+commit 060bdff117224ea467f2ade55f90dbc96a1b942f
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Tue Jan 2 17:01:00 2024 -0600
+
+    terminal: track palette color in cell state
+    
+    Rather than immediately converting a color palette index into an RGB
+    value for a cell color, when a palette color is used track the palette
+    color directly in the cell state and convert to an RGB value in the
+    renderer.
+    
+    This causes palette color changes to take effect immediately instead of
+    only for newly drawn cells.
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 36d362e4..6a4235a7 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -299,7 +299,8 @@ fn renderScreenWindow(self: *Inspector) void {
+             );
+             defer cimgui.c.igEndTable();
+ 
+-            inspector.cursor.renderInTable(&screen.cursor);
++            const palette = self.surface.io.terminal.color_palette.colors;
++            inspector.cursor.renderInTable(&screen.cursor, &palette);
+         } // table
+ 
+         cimgui.c.igTextDisabled("(Any styles not shown are not currently set)");
+@@ -871,49 +872,66 @@ fn renderCellWindow(self: *Inspector) void {
+         }
+ 
+         // If we have a color then we show the color
+-        color: {
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            _ = cimgui.c.igTableSetColumnIndex(0);
+-            cimgui.c.igText("Foreground Color");
+-            _ = cimgui.c.igTableSetColumnIndex(1);
+-            if (!selected.cell.attrs.has_fg) {
+-                cimgui.c.igText("default");
+-                break :color;
+-            }
++        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++        _ = cimgui.c.igTableSetColumnIndex(0);
++        cimgui.c.igText("Foreground Color");
++        _ = cimgui.c.igTableSetColumnIndex(1);
++        switch (selected.cell.fg) {
++            .none => cimgui.c.igText("default"),
++            else => {
++                const rgb = switch (selected.cell.fg) {
++                    .none => unreachable,
++                    .indexed => |idx| self.surface.io.terminal.color_palette.colors[idx],
++                    .rgb => |rgb| rgb,
++                };
++
++                if (selected.cell.fg == .indexed) {
++                    cimgui.c.igValue_Int("Palette", selected.cell.fg.indexed);
++                }
+ 
+-            var color: [3]f32 = .{
+-                @as(f32, @floatFromInt(selected.cell.fg.r)) / 255,
+-                @as(f32, @floatFromInt(selected.cell.fg.g)) / 255,
+-                @as(f32, @floatFromInt(selected.cell.fg.b)) / 255,
+-            };
+-            _ = cimgui.c.igColorEdit3(
+-                "color_fg",
+-                &color,
+-                cimgui.c.ImGuiColorEditFlags_NoPicker |
+-                    cimgui.c.ImGuiColorEditFlags_NoLabel,
+-            );
++                var color: [3]f32 = .{
++                    @as(f32, @floatFromInt(rgb.r)) / 255,
++                    @as(f32, @floatFromInt(rgb.g)) / 255,
++                    @as(f32, @floatFromInt(rgb.b)) / 255,
++                };
++                _ = cimgui.c.igColorEdit3(
++                    "color_fg",
++                    &color,
++                    cimgui.c.ImGuiColorEditFlags_NoPicker |
++                        cimgui.c.ImGuiColorEditFlags_NoLabel,
++                );
++            },
+         }
+-        color: {
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            _ = cimgui.c.igTableSetColumnIndex(0);
+-            cimgui.c.igText("Background Color");
+-            _ = cimgui.c.igTableSetColumnIndex(1);
+-            if (!selected.cell.attrs.has_bg) {
+-                cimgui.c.igText("default");
+-                break :color;
+-            }
+ 
+-            var color: [3]f32 = .{
+-                @as(f32, @floatFromInt(selected.cell.bg.r)) / 255,
+-                @as(f32, @floatFromInt(selected.cell.bg.g)) / 255,
+-                @as(f32, @floatFromInt(selected.cell.bg.b)) / 255,
+-            };
+-            _ = cimgui.c.igColorEdit3(
+-                "color_bg",
+-                &color,
+-                cimgui.c.ImGuiColorEditFlags_NoPicker |
+-                    cimgui.c.ImGuiColorEditFlags_NoLabel,
+-            );
++        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++        _ = cimgui.c.igTableSetColumnIndex(0);
++        cimgui.c.igText("Background Color");
++        _ = cimgui.c.igTableSetColumnIndex(1);
++        switch (selected.cell.bg) {
++            .none => cimgui.c.igText("default"),
++            else => {
++                const rgb = switch (selected.cell.bg) {
++                    .none => unreachable,
++                    .indexed => |idx| self.surface.io.terminal.color_palette.colors[idx],
++                    .rgb => |rgb| rgb,
++                };
++
++                if (selected.cell.bg == .indexed) {
++                    cimgui.c.igValue_Int("Palette", selected.cell.bg.indexed);
++                }
++
++                var color: [3]f32 = .{
++                    @as(f32, @floatFromInt(rgb.r)) / 255,
++                    @as(f32, @floatFromInt(rgb.g)) / 255,
++                    @as(f32, @floatFromInt(rgb.b)) / 255,
++                };
++                _ = cimgui.c.igColorEdit3(
++                    "color_bg",
++                    &color,
++                    cimgui.c.ImGuiColorEditFlags_NoPicker |
++                        cimgui.c.ImGuiColorEditFlags_NoLabel,
++                );
++            },
+         }
+ 
+         // Boolean styles
+@@ -1109,7 +1127,8 @@ fn renderTermioWindow(self: *Inspector) void {
+                         0,
+                     );
+                     defer cimgui.c.igEndTable();
+-                    inspector.cursor.renderInTable(&ev.cursor);
++                    const palette = self.surface.io.terminal.color_palette.colors;
++                    inspector.cursor.renderInTable(&ev.cursor, &palette);
+ 
+                     {
+                         cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+
+commit 9b4ab0e209b84890cf53182078a6c42d85553263
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 10:17:41 2024 -0800
+
+    zig build test with renamed terminal package
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 6a4235a7..11ef18a0 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -35,8 +35,9 @@ mouse: struct {
+     last_xpos: f64 = 0,
+     last_ypos: f64 = 0,
+ 
+-    /// Last hovered screen point
+-    last_point: terminal.point.ScreenPoint = .{},
++    // Last hovered screen point
++    // TODO(paged-terminal)
++    // last_point: terminal.point.ScreenPoint = .{},
+ } = .{},
+ 
+ /// A selected cell.
+@@ -63,7 +64,8 @@ const CellInspect = union(enum) {
+     const Selected = struct {
+         row: usize,
+         col: usize,
+-        cell: terminal.Screen.Cell,
++        // TODO(paged-terminal)
++        //cell: terminal.Screen.Cell,
+     };
+ 
+     pub fn request(self: *CellInspect) void {
+
+commit ea51e9bca5acc98424051ae6022e324756e99c78
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 21:40:40 2024 -0800
+
+    inspector: todo on render
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 11ef18a0..4262dccb 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -179,6 +179,9 @@ pub fn recordPtyRead(self: *Inspector, data: []const u8) !void {
+ 
+ /// Render the frame.
+ pub fn render(self: *Inspector) void {
++    // TODO(paged-terminal)
++    if (true) return;
++
+     const dock_id = cimgui.c.igDockSpaceOverViewport(
+         cimgui.c.igGetMainViewport(),
+         cimgui.c.ImGuiDockNodeFlags_None,
+
+commit 9015b7548f91d86add837f4368378dd39e82d0a9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 14 10:00:50 2024 -0700
+
+    inspector: support cell pinning again
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 4262dccb..446dcee1 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -4,6 +4,7 @@
+ const Inspector = @This();
+ 
+ const std = @import("std");
++const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+ const builtin = @import("builtin");
+ const cimgui = @import("cimgui");
+@@ -62,18 +63,47 @@ const CellInspect = union(enum) {
+     selected: Selected,
+ 
+     const Selected = struct {
++        alloc: Allocator,
+         row: usize,
+         col: usize,
+-        // TODO(paged-terminal)
+-        //cell: terminal.Screen.Cell,
++        cell: inspector.Cell,
+     };
+ 
++    pub fn deinit(self: *CellInspect) void {
++        switch (self.*) {
++            .idle, .requested => {},
++            .selected => |*v| v.cell.deinit(v.alloc),
++        }
++    }
++
+     pub fn request(self: *CellInspect) void {
+         switch (self.*) {
+-            .idle, .selected => self.* = .requested,
++            .idle => self.* = .requested,
++            .selected => |*v| {
++                v.cell.deinit(v.alloc);
++                self.* = .requested;
++            },
+             .requested => {},
+         }
+     }
++
++    pub fn select(
++        self: *CellInspect,
++        alloc: Allocator,
++        pin: terminal.Pin,
++        x: usize,
++        y: usize,
++    ) !void {
++        assert(self.* == .requested);
++        const cell = try inspector.Cell.init(alloc, pin);
++        errdefer cell.deinit(alloc);
++        self.* = .{ .selected = .{
++            .alloc = alloc,
++            .row = y,
++            .col = x,
++            .cell = cell,
++        } };
++    }
+ };
+ 
+ /// Setup the ImGui state. This requires an ImGui context to be set.
+@@ -136,6 +166,8 @@ pub fn init(surface: *Surface) !Inspector {
+ }
+ 
+ pub fn deinit(self: *Inspector) void {
++    self.cell.deinit();
++
+     {
+         var it = self.key_events.iterator(.forward);
+         while (it.next()) |v| v.deinit(self.surface.alloc);
+
+commit 62932f36316c7239e5ee8e1c5a061533ae3d1f2c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 14 10:16:34 2024 -0700
+
+    inspector: cell selection works again
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 446dcee1..fd7363f9 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -211,9 +211,6 @@ pub fn recordPtyRead(self: *Inspector, data: []const u8) !void {
+ 
+ /// Render the frame.
+ pub fn render(self: *Inspector) void {
+-    // TODO(paged-terminal)
+-    if (true) return;
+-
+     const dock_id = cimgui.c.igDockSpaceOverViewport(
+         cimgui.c.igGetMainViewport(),
+         cimgui.c.ImGuiDockNodeFlags_None,
+@@ -335,9 +332,10 @@ fn renderScreenWindow(self: *Inspector) void {
+                 0,
+             );
+             defer cimgui.c.igEndTable();
+-
+-            const palette = self.surface.io.terminal.color_palette.colors;
+-            inspector.cursor.renderInTable(&screen.cursor, &palette);
++            inspector.cursor.renderInTable(
++                self.surface.renderer_state.terminal,
++                &screen.cursor,
++            );
+         } // table
+ 
+         cimgui.c.igTextDisabled("(Any styles not shown are not currently set)");
+@@ -698,24 +696,25 @@ fn renderSizeWindow(self: *Inspector) void {
+         defer cimgui.c.igEndTable();
+ 
+         const mouse = &self.surface.mouse;
+-        const t = self.surface.renderer_state.terminal;
+-
+-        {
+-            const hover_point = self.mouse.last_point.toViewport(&t.screen);
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Hover Grid");
+-            }
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText(
+-                    "row=%d, col=%d",
+-                    hover_point.y,
+-                    hover_point.x,
+-                );
+-            }
+-        }
++        //const t = self.surface.renderer_state.terminal;
++
++        // TODO(paged-terminal)
++        // {
++        //     const hover_point = self.mouse.last_point.toViewport(&t.screen);
++        //     cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++        //     {
++        //         _ = cimgui.c.igTableSetColumnIndex(0);
++        //         cimgui.c.igText("Hover Grid");
++        //     }
++        //     {
++        //         _ = cimgui.c.igTableSetColumnIndex(1);
++        //         cimgui.c.igText(
++        //             "row=%d, col=%d",
++        //             hover_point.y,
++        //             hover_point.x,
++        //         );
++        //     }
++        // }
+ 
+         {
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+@@ -772,22 +771,23 @@ fn renderSizeWindow(self: *Inspector) void {
+             }
+         }
+ 
+-        {
+-            const left_click_point = mouse.left_click_point.toViewport(&t.screen);
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Click Grid");
+-            }
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText(
+-                    "row=%d, col=%d",
+-                    left_click_point.y,
+-                    left_click_point.x,
+-                );
+-            }
+-        }
++        // TODO(paged-terminal)
++        // {
++        //     const left_click_point = mouse.left_click_point.toViewport(&t.screen);
++        //     cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++        //     {
++        //         _ = cimgui.c.igTableSetColumnIndex(0);
++        //         cimgui.c.igText("Click Grid");
++        //     }
++        //     {
++        //         _ = cimgui.c.igTableSetColumnIndex(1);
++        //         cimgui.c.igText(
++        //             "row=%d, col=%d",
++        //             left_click_point.y,
++        //             left_click_point.x,
++        //         );
++        //     }
++        // }
+ 
+         {
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+@@ -862,136 +862,11 @@ fn renderCellWindow(self: *Inspector) void {
+     }
+ 
+     const selected = self.cell.selected;
+-
+-    {
+-        // We have a selected cell, show information about it.
+-        _ = cimgui.c.igBeginTable(
+-            "table_cursor",
+-            2,
+-            cimgui.c.ImGuiTableFlags_None,
+-            .{ .x = 0, .y = 0 },
+-            0,
+-        );
+-        defer cimgui.c.igEndTable();
+-
+-        {
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Grid Position");
+-            }
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText("row=%d col=%d", selected.row, selected.col);
+-            }
+-        }
+-
+-        // NOTE: we don't currently write the character itself because
+-        // we haven't hooked up imgui to our font system. That's hard! We
+-        // can/should instead hook up our renderer to imgui and just render
+-        // the single glyph in an image view so it looks _identical_ to the
+-        // terminal.
+-        codepoint: {
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText("Codepoint");
+-            }
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                if (selected.cell.char == 0) {
+-                    cimgui.c.igTextDisabled("(empty)");
+-                    break :codepoint;
+-                }
+-
+-                cimgui.c.igText("U+%X", selected.cell.char);
+-            }
+-        }
+-
+-        // If we have a color then we show the color
+-        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-        _ = cimgui.c.igTableSetColumnIndex(0);
+-        cimgui.c.igText("Foreground Color");
+-        _ = cimgui.c.igTableSetColumnIndex(1);
+-        switch (selected.cell.fg) {
+-            .none => cimgui.c.igText("default"),
+-            else => {
+-                const rgb = switch (selected.cell.fg) {
+-                    .none => unreachable,
+-                    .indexed => |idx| self.surface.io.terminal.color_palette.colors[idx],
+-                    .rgb => |rgb| rgb,
+-                };
+-
+-                if (selected.cell.fg == .indexed) {
+-                    cimgui.c.igValue_Int("Palette", selected.cell.fg.indexed);
+-                }
+-
+-                var color: [3]f32 = .{
+-                    @as(f32, @floatFromInt(rgb.r)) / 255,
+-                    @as(f32, @floatFromInt(rgb.g)) / 255,
+-                    @as(f32, @floatFromInt(rgb.b)) / 255,
+-                };
+-                _ = cimgui.c.igColorEdit3(
+-                    "color_fg",
+-                    &color,
+-                    cimgui.c.ImGuiColorEditFlags_NoPicker |
+-                        cimgui.c.ImGuiColorEditFlags_NoLabel,
+-                );
+-            },
+-        }
+-
+-        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-        _ = cimgui.c.igTableSetColumnIndex(0);
+-        cimgui.c.igText("Background Color");
+-        _ = cimgui.c.igTableSetColumnIndex(1);
+-        switch (selected.cell.bg) {
+-            .none => cimgui.c.igText("default"),
+-            else => {
+-                const rgb = switch (selected.cell.bg) {
+-                    .none => unreachable,
+-                    .indexed => |idx| self.surface.io.terminal.color_palette.colors[idx],
+-                    .rgb => |rgb| rgb,
+-                };
+-
+-                if (selected.cell.bg == .indexed) {
+-                    cimgui.c.igValue_Int("Palette", selected.cell.bg.indexed);
+-                }
+-
+-                var color: [3]f32 = .{
+-                    @as(f32, @floatFromInt(rgb.r)) / 255,
+-                    @as(f32, @floatFromInt(rgb.g)) / 255,
+-                    @as(f32, @floatFromInt(rgb.b)) / 255,
+-                };
+-                _ = cimgui.c.igColorEdit3(
+-                    "color_bg",
+-                    &color,
+-                    cimgui.c.ImGuiColorEditFlags_NoPicker |
+-                        cimgui.c.ImGuiColorEditFlags_NoLabel,
+-                );
+-            },
+-        }
+-
+-        // Boolean styles
+-        const styles = .{
+-            "bold",    "italic",    "faint",     "blink",
+-            "inverse", "invisible", "protected", "strikethrough",
+-        };
+-        inline for (styles) |style| style: {
+-            if (!@field(selected.cell.attrs, style)) break :style;
+-
+-            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(0);
+-                cimgui.c.igText(style.ptr);
+-            }
+-            {
+-                _ = cimgui.c.igTableSetColumnIndex(1);
+-                cimgui.c.igText("true");
+-            }
+-        }
+-    } // table
+-
+-    cimgui.c.igTextDisabled("(Any styles not shown are not currently set)");
++    selected.cell.renderTable(
++        self.surface.renderer_state.terminal,
++        selected.col,
++        selected.row,
++    );
+ }
+ 
+ fn renderKeyboardWindow(self: *Inspector) void {
+@@ -1164,8 +1039,10 @@ fn renderTermioWindow(self: *Inspector) void {
+                         0,
+                     );
+                     defer cimgui.c.igEndTable();
+-                    const palette = self.surface.io.terminal.color_palette.colors;
+-                    inspector.cursor.renderInTable(&ev.cursor, &palette);
++                    inspector.cursor.renderInTable(
++                        self.surface.renderer_state.terminal,
++                        &ev.cursor,
++                    );
+ 
+                     {
+                         cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+
+commit 172d62ca12083513d529d9db5ff0045b3f0c2c58
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 14 10:28:55 2024 -0700
+
+    inspector: get mouse points working
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index fd7363f9..1f36dd3b 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -37,8 +37,7 @@ mouse: struct {
+     last_ypos: f64 = 0,
+ 
+     // Last hovered screen point
+-    // TODO(paged-terminal)
+-    // last_point: terminal.point.ScreenPoint = .{},
++    last_point: ?terminal.Pin = null,
+ } = .{},
+ 
+ /// A selected cell.
+@@ -696,25 +695,32 @@ fn renderSizeWindow(self: *Inspector) void {
+         defer cimgui.c.igEndTable();
+ 
+         const mouse = &self.surface.mouse;
+-        //const t = self.surface.renderer_state.terminal;
+-
+-        // TODO(paged-terminal)
+-        // {
+-        //     const hover_point = self.mouse.last_point.toViewport(&t.screen);
+-        //     cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-        //     {
+-        //         _ = cimgui.c.igTableSetColumnIndex(0);
+-        //         cimgui.c.igText("Hover Grid");
+-        //     }
+-        //     {
+-        //         _ = cimgui.c.igTableSetColumnIndex(1);
+-        //         cimgui.c.igText(
+-        //             "row=%d, col=%d",
+-        //             hover_point.y,
+-        //             hover_point.x,
+-        //         );
+-        //     }
+-        // }
++        const t = self.surface.renderer_state.terminal;
++
++        {
++            const hover_point: terminal.point.Coordinate = pt: {
++                const p = self.mouse.last_point orelse break :pt .{};
++                const pt = t.screen.pages.pointFromPin(
++                    .active,
++                    p,
++                ) orelse break :pt .{};
++                break :pt pt.coord();
++            };
++
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Hover Grid");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "row=%d, col=%d",
++                    hover_point.y,
++                    hover_point.x,
++                );
++            }
++        }
+ 
+         {
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+@@ -771,23 +777,30 @@ fn renderSizeWindow(self: *Inspector) void {
+             }
+         }
+ 
+-        // TODO(paged-terminal)
+-        // {
+-        //     const left_click_point = mouse.left_click_point.toViewport(&t.screen);
+-        //     cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+-        //     {
+-        //         _ = cimgui.c.igTableSetColumnIndex(0);
+-        //         cimgui.c.igText("Click Grid");
+-        //     }
+-        //     {
+-        //         _ = cimgui.c.igTableSetColumnIndex(1);
+-        //         cimgui.c.igText(
+-        //             "row=%d, col=%d",
+-        //             left_click_point.y,
+-        //             left_click_point.x,
+-        //         );
+-        //     }
+-        // }
++        {
++            const left_click_point: terminal.point.Coordinate = pt: {
++                const p = mouse.left_click_pin orelse break :pt .{};
++                const pt = t.screen.pages.pointFromPin(
++                    .active,
++                    p.*,
++                ) orelse break :pt .{};
++                break :pt pt.coord();
++            };
++
++            cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++            {
++                _ = cimgui.c.igTableSetColumnIndex(0);
++                cimgui.c.igText("Click Grid");
++            }
++            {
++                _ = cimgui.c.igTableSetColumnIndex(1);
++                cimgui.c.igText(
++                    "row=%d, col=%d",
++                    left_click_point.y,
++                    left_click_point.x,
++                );
++            }
++        }
+ 
+         {
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+
+commit b677460258de8ca58170ec5a7ffe4203fb28128b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 14 10:57:27 2024 -0700
+
+    inspector: add page system details
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 1f36dd3b..d44d6786 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -491,6 +491,67 @@ fn renderScreenWindow(self: *Inspector) void {
+             }
+         } // table
+     } // kitty graphics
++
++    if (cimgui.c.igCollapsingHeader_TreeNodeFlags(
++        "Internal Terminal State",
++        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
++    )) {
++        const pages = &screen.pages;
++
++        {
++            _ = cimgui.c.igBeginTable(
++                "##terminal_state",
++                2,
++                cimgui.c.ImGuiTableFlags_None,
++                .{ .x = 0, .y = 0 },
++                0,
++            );
++            defer cimgui.c.igEndTable();
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Memory Usage");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%d bytes", pages.page_size);
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Memory Limit");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%d bytes", pages.max_size);
++                }
++            }
++
++            {
++                cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(0);
++                    cimgui.c.igText("Viewport Location");
++                }
++                {
++                    _ = cimgui.c.igTableSetColumnIndex(1);
++                    cimgui.c.igText("%s", @tagName(pages.viewport).ptr);
++                }
++            }
++        } // table
++        //
++        if (cimgui.c.igCollapsingHeader_TreeNodeFlags(
++            "Active Page",
++            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
++        )) {
++            inspector.page.render(&pages.pages.last.?.data);
++        }
++    } // terminal state
+ }
+ 
+ /// The modes window shows the currently active terminal modes and allows
+
+commit 07a27072dcc644c18350b95302bb18a0dd51d2d7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Mar 17 22:04:03 2024 -0700
+
+    inspector: needs to call new PageList.maxSize func
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index d44d6786..4f30318f 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -528,7 +528,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes", pages.max_size);
++                    cimgui.c.igText("%d bytes", pages.maxSize());
+                 }
+             }
+ 
+
+commit 8211e7e83af26406fd451afef03b9c6e2bb5017d
+Author: Tim Culverhouse <tim@timculverhouse.com>
+Date:   Mon Jul 22 05:56:18 2024 -0500
+
+    inspector: fix mode prefix by prepending '?' only to private modes
+    
+    The inspector lists modes by their parameter when used to enable or
+    disable the mode. Private modes are enabled by using a '?' in the
+    sequence - however this '?' character was prepended to the ANSI modes.
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 4f30318f..755a6961 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -596,7 +596,7 @@ fn renderModesWindow(self: *Inspector) void {
+             _ = cimgui.c.igTableSetColumnIndex(1);
+             cimgui.c.igText(
+                 "%s%d",
+-                if (tag.ansi) "?" else "",
++                if (tag.ansi) "" else "?",
+                 @as(u32, @intCast(tag.value)),
+             );
+         }
+
+commit 97db055b545cdcf4280e0c94c3abb6fc7f6a3693
+Author: Tim Culverhouse <tim@timculverhouse.com>
+Date:   Sun Aug 11 17:47:21 2024 -0500
+
+    fix(surface): account for padding in mouse pixel reports
+    
+    Padding was accounted for in cell reports, but not pixel reports. Update
+    inspector to report the pixel coordinates the terminal reports.
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 755a6961..1de666b0 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -784,6 +784,7 @@ fn renderSizeWindow(self: *Inspector) void {
+         }
+ 
+         {
++            const adjusted = self.surface.posAdjusted(self.mouse.last_xpos, self.mouse.last_ypos);
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+             {
+                 _ = cimgui.c.igTableSetColumnIndex(0);
+@@ -793,8 +794,8 @@ fn renderSizeWindow(self: *Inspector) void {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
+                 cimgui.c.igText(
+                     "(%dpx, %dpx)",
+-                    @as(u32, @intFromFloat(self.mouse.last_xpos)),
+-                    @as(u32, @intFromFloat(self.mouse.last_ypos)),
++                    @as(i64, @intFromFloat(adjusted.x)),
++                    @as(i64, @intFromFloat(adjusted.y)),
+                 );
+             }
+         }
+
+commit be3ae56bc8cdd8c6b15c3bcd885d572300b28953
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Oct 2 14:45:34 2024 -0700
+
+    font: add stylistic variants for built-in font, fix naming convention
+    
+    Fixes #2364
+    
+    This adds the bold, italic, and bold italic variants of JB Mono so it is
+    built-in. This also fixes up the naming convention for the embedded font
+    files across tests and removes redundant embedded font files.
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 1de666b0..14ebadf0 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
+ const builtin = @import("builtin");
+ const cimgui = @import("cimgui");
+ const Surface = @import("../Surface.zig");
++const font = @import("../font/main.zig");
+ const input = @import("../input.zig");
+ const terminal = @import("../terminal/main.zig");
+ const inspector = @import("main.zig");
+@@ -130,8 +131,8 @@ pub fn setup() void {
+         font_config.FontDataOwnedByAtlas = false;
+         _ = cimgui.c.ImFontAtlas_AddFontFromMemoryTTF(
+             io.Fonts,
+-            @constCast(@ptrCast(Surface.face_ttf)),
+-            Surface.face_ttf.len,
++            @constCast(@ptrCast(font.embedded.regular)),
++            font.embedded.regular.len,
+             font_size,
+             font_config,
+             null,
+
+commit bdf3d1cb5f0d1fbd42b88879e217e35ee567f7a9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 14 13:58:03 2024 -0800
+
+    apprt/embedded: fix new size struct
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 14ebadf0..7dd61c8a 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -11,6 +11,7 @@ const cimgui = @import("cimgui");
+ const Surface = @import("../Surface.zig");
+ const font = @import("../font/main.zig");
+ const input = @import("../input.zig");
++const renderer = @import("../renderer.zig");
+ const terminal = @import("../terminal/main.zig");
+ const inspector = @import("main.zig");
+ 
+@@ -641,8 +642,8 @@ fn renderSizeWindow(self: *Inspector) void {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
+                 cimgui.c.igText(
+                     "%dpx x %dpx",
+-                    self.surface.screen_size.width,
+-                    self.surface.screen_size.height,
++                    self.surface.size.screen.width,
++                    self.surface.size.screen.height,
+                 );
+             }
+         }
+@@ -656,10 +657,11 @@ fn renderSizeWindow(self: *Inspector) void {
+             }
+             {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
++                const grid_size = self.surface.size.grid();
+                 cimgui.c.igText(
+                     "%dc x %dr",
+-                    self.surface.grid_size.columns,
+-                    self.surface.grid_size.rows,
++                    grid_size.columns,
++                    grid_size.rows,
+                 );
+             }
+         }
+@@ -675,8 +677,8 @@ fn renderSizeWindow(self: *Inspector) void {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
+                 cimgui.c.igText(
+                     "%dpx x %dpx",
+-                    self.surface.cell_size.width,
+-                    self.surface.cell_size.height,
++                    self.surface.size.cell.width,
++                    self.surface.size.cell.height,
+                 );
+             }
+         }
+@@ -692,10 +694,10 @@ fn renderSizeWindow(self: *Inspector) void {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
+                 cimgui.c.igText(
+                     "T=%d B=%d L=%d R=%d px",
+-                    self.surface.padding.top,
+-                    self.surface.padding.bottom,
+-                    self.surface.padding.left,
+-                    self.surface.padding.right,
++                    self.surface.size.padding.top,
++                    self.surface.size.padding.bottom,
++                    self.surface.size.padding.left,
++                    self.surface.size.padding.right,
+                 );
+             }
+         }
+@@ -785,7 +787,13 @@ fn renderSizeWindow(self: *Inspector) void {
+         }
+ 
+         {
+-            const adjusted = self.surface.posAdjusted(self.mouse.last_xpos, self.mouse.last_ypos);
++            const coord: renderer.Coordinate.Terminal = (renderer.Coordinate{
++                .surface = .{
++                    .x = self.mouse.last_xpos,
++                    .y = self.mouse.last_ypos,
++                },
++            }).convert(.terminal, self.surface.size).terminal;
++
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+             {
+                 _ = cimgui.c.igTableSetColumnIndex(0);
+@@ -795,8 +803,8 @@ fn renderSizeWindow(self: *Inspector) void {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
+                 cimgui.c.igText(
+                     "(%dpx, %dpx)",
+-                    @as(i64, @intFromFloat(adjusted.x)),
+-                    @as(i64, @intFromFloat(adjusted.y)),
++                    @as(i64, @intFromFloat(coord.x)),
++                    @as(i64, @intFromFloat(coord.y)),
+                 );
+             }
+         }
+
+commit 6b4e6d2fa53c8cfae865356dcc780d9b49f7feae
+Author: Alexandre Antonio Juca <corextechnologies@gmail.com>
+Date:   Fri Jan 3 12:48:52 2025 +0100
+
+    feat: Display memory usage and and limit in both bytes and Kb for improved readability
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 7dd61c8a..eae881ec 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -285,6 +285,10 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
+     cimgui.c.igDockBuilderFinish(dock_id_main);
+ }
+ 
++fn bytesToKb(bytes: usize) usize {
++    return bytes / 1024;
++}
++
+ fn renderScreenWindow(self: *Inspector) void {
+     // Start our window. If we're collapsed we do nothing.
+     defer cimgui.c.igEnd();
+@@ -440,7 +444,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes", kitty_images.total_bytes);
++                    cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_bytes, bytesToKb(kitty_images.total_bytes));
+                 }
+             }
+ 
+@@ -452,7 +456,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes", kitty_images.total_limit);
++                    cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_limit, bytesToKb(kitty_images.total_limit));
+                 }
+             }
+ 
+@@ -518,7 +522,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes", pages.page_size);
++                    cimgui.c.igText("%d bytes (%d KB)", pages.page_size, bytesToKb(pages.page_size));
+                 }
+             }
+ 
+@@ -530,7 +534,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes", pages.maxSize());
++                    cimgui.c.igText("%d bytes (%d KB)", pages.maxSize(), bytesToKb(pages.maxSize()));
+                 }
+             }
+ 
+
+commit 78b914b3d87eede3f922a7973e01909f1faa207d
+Author: Kat <65649991+00-kat@users.noreply.github.com>
+Date:   Thu Jan 2 07:44:40 2025 +0000
+
+    Fix format string of font size in points in the inspector
+    
+    Credits to @gabydd who found this over at https://discord.com/channels/1005603569187160125/1324249888514506752/1324275061380874250.
+    
+    Co-authored-by:  Gabriel Dinner-David  <gabydinnerdavid@gmail.com>
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 7dd61c8a..f9c6e98d 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -724,7 +724,7 @@ fn renderSizeWindow(self: *Inspector) void {
+             {
+                 _ = cimgui.c.igTableSetColumnIndex(1);
+                 cimgui.c.igText(
+-                    "%d pt",
++                    "%.2f pt",
+                     self.surface.font_size.points,
+                 );
+             }
+
+commit 78cdc7d0deea97d7be3397d02334cfeba7e83ea7
+Merge: 6b4e6d2f e2f9eb6a
+Author: Alexandre Antonio Juca <corextechnologies@gmail.com>
+Date:   Fri Jan 3 12:49:35 2025 +0100
+
+    Merge branch 'main' of https://github.com/AlexJuca/ghostty into feature/display-memory-size-in-bytes-and-kb
+
+diff --cc src/inspector/Inspector.zig
+index eae881ec,f9c6e98d..bcdef1b4
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@@ -14,6 -14,6 +14,7 @@@ const input = @import("../input.zig")
+  const renderer = @import("../renderer.zig");
+  const terminal = @import("../terminal/main.zig");
+  const inspector = @import("main.zig");
+++const utils = @import("utils.zig");
+  
+  /// The window names. These are used with docking so we need to have access.
+  const window_cell = "Cell";
+@@@ -444,7 -440,7 +441,7 @@@ fn renderScreenWindow(self: *Inspector
+                  }
+                  {
+                      _ = cimgui.c.igTableSetColumnIndex(1);
+-                     cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_bytes, bytesToKb(kitty_images.total_bytes));
+ -                    cimgui.c.igText("%d bytes", kitty_images.total_bytes);
+++                    cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_bytes, utils.toKiloBytes(kitty_images.total_bytes));
+                  }
+              }
+  
+@@@ -456,7 -452,7 +453,7 @@@
+                  }
+                  {
+                      _ = cimgui.c.igTableSetColumnIndex(1);
+-                     cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_limit, bytesToKb(kitty_images.total_limit));
+ -                    cimgui.c.igText("%d bytes", kitty_images.total_limit);
+++                    cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_limit, utils.toKiloBytes(kitty_images.total_limit));
+                  }
+              }
+  
+@@@ -522,7 -518,7 +519,7 @@@
+                  }
+                  {
+                      _ = cimgui.c.igTableSetColumnIndex(1);
+-                     cimgui.c.igText("%d bytes (%d KB)", pages.page_size, bytesToKb(pages.page_size));
+ -                    cimgui.c.igText("%d bytes", pages.page_size);
+++                    cimgui.c.igText("%d bytes (%d KB)", pages.page_size, utils.toKiloBytes(pages.page_size));
+                  }
+              }
+  
+@@@ -534,7 -530,7 +531,7 @@@
+                  }
+                  {
+                      _ = cimgui.c.igTableSetColumnIndex(1);
+-                     cimgui.c.igText("%d bytes (%d KB)", pages.maxSize(), bytesToKb(pages.maxSize()));
+ -                    cimgui.c.igText("%d bytes", pages.maxSize());
+++                    cimgui.c.igText("%d bytes (%d KB)", pages.maxSize(), utils.toKiloBytes(pages.maxSize()));
+                  }
+              }
+  
+
+commit 0599f73fac18217a7118437fd72e73a68c48098c
+Author: Alexandre Antonio Juca <corextechnologies@gmail.com>
+Date:   Sat Jan 4 09:02:25 2025 +0100
+
+    chore: use KiB notation for representing memory size
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index bcdef1b4..73d06312 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -441,7 +441,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_bytes, utils.toKiloBytes(kitty_images.total_bytes));
++                    cimgui.c.igText("%d bytes (%d KiB)", kitty_images.total_bytes, utils.toKibiBytes(kitty_images.total_bytes));
+                 }
+             }
+ 
+@@ -453,7 +453,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KB)", kitty_images.total_limit, utils.toKiloBytes(kitty_images.total_limit));
++                    cimgui.c.igText("%d bytes (%d KiB)", kitty_images.total_limit, utils.toKibiBytes(kitty_images.total_limit));
+                 }
+             }
+ 
+@@ -519,7 +519,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KB)", pages.page_size, utils.toKiloBytes(pages.page_size));
++                    cimgui.c.igText("%d bytes (%d KiB)", pages.page_size, utils.toKibiBytes(pages.page_size));
+                 }
+             }
+ 
+@@ -531,7 +531,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KB)", pages.maxSize(), utils.toKiloBytes(pages.maxSize()));
++                    cimgui.c.igText("%d bytes (%d KiB)", pages.maxSize(), utils.toKibiBytes(pages.maxSize()));
+                 }
+             }
+ 
+
+commit 62fae29395b658b014b574623ae9c3eff61af91a
+Author: Alexandre Antonio Juca <corextechnologies@gmail.com>
+Date:   Sat Jan 4 23:37:54 2025 +0100
+
+    chore: rename file
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 73d06312..54d49b08 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -14,7 +14,7 @@ const input = @import("../input.zig");
+ const renderer = @import("../renderer.zig");
+ const terminal = @import("../terminal/main.zig");
+ const inspector = @import("main.zig");
+-const utils = @import("utils.zig");
++const units = @import("units.zig");
+ 
+ /// The window names. These are used with docking so we need to have access.
+ const window_cell = "Cell";
+@@ -441,7 +441,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KiB)", kitty_images.total_bytes, utils.toKibiBytes(kitty_images.total_bytes));
++                    cimgui.c.igText("%d bytes (%d KiB)", kitty_images.total_bytes, units.toKibiBytes(kitty_images.total_bytes));
+                 }
+             }
+ 
+@@ -453,7 +453,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KiB)", kitty_images.total_limit, utils.toKibiBytes(kitty_images.total_limit));
++                    cimgui.c.igText("%d bytes (%d KiB)", kitty_images.total_limit, units.toKibiBytes(kitty_images.total_limit));
+                 }
+             }
+ 
+@@ -519,7 +519,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KiB)", pages.page_size, utils.toKibiBytes(pages.page_size));
++                    cimgui.c.igText("%d bytes (%d KiB)", pages.page_size, units.toKibiBytes(pages.page_size));
+                 }
+             }
+ 
+@@ -531,7 +531,7 @@ fn renderScreenWindow(self: *Inspector) void {
+                 }
+                 {
+                     _ = cimgui.c.igTableSetColumnIndex(1);
+-                    cimgui.c.igText("%d bytes (%d KiB)", pages.maxSize(), utils.toKibiBytes(pages.maxSize()));
++                    cimgui.c.igText("%d bytes (%d KiB)", pages.maxSize(), units.toKibiBytes(pages.maxSize()));
+                 }
+             }
+ 
+
+commit 8da600a62e45776d6653da94bab132b28061f7a1
+Author: Bryan Lee <38807139+liby@users.noreply.github.com>
+Date:   Mon Dec 30 00:14:48 2024 +0800
+
+    Add keyboard navigation for Terminal IO window
+    
+    - Add J/K and arrow keys navigation in Terminal IO window
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 7dd61c8a..e2d70660 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -52,6 +52,22 @@ key_events: inspector.key.EventRing,
+ vt_events: inspector.termio.VTEventRing,
+ vt_stream: inspector.termio.Stream,
+ 
++/// The currently selected event sequence number for keyboard navigation
++selected_event_seq: ?u32 = null,
++
++/// Flag indicating whether we need to scroll to the selected item
++need_scroll_to_selected: bool = false,
++
++/// Flag indicating whether the selection was made by keyboard
++is_keyboard_selection: bool = false,
++
++/// Enum representing keyboard navigation actions
++const KeyAction = enum {
++    down,
++    none,
++    up,
++};
++
+ const CellInspect = union(enum) {
+     /// Idle, no cell inspection is requested
+     idle: void,
+@@ -1013,6 +1029,24 @@ fn renderKeyboardWindow(self: *Inspector) void {
+     } // table
+ }
+ 
++/// Helper function to check keyboard state and determine navigation action.
++fn getKeyAction(self: *Inspector) KeyAction {
++    _ = self;
++    const keys = .{
++        .{ .key = cimgui.c.ImGuiKey_J, .action = KeyAction.down },
++        .{ .key = cimgui.c.ImGuiKey_DownArrow, .action = KeyAction.down },
++        .{ .key = cimgui.c.ImGuiKey_K, .action = KeyAction.up },
++        .{ .key = cimgui.c.ImGuiKey_UpArrow, .action = KeyAction.up },
++    };
++
++    inline for (keys) |k| {
++        if (cimgui.c.igIsKeyPressed_Bool(k.key, false)) {
++            return k.action;
++        }
++    }
++    return .none;
++}
++
+ fn renderTermioWindow(self: *Inspector) void {
+     // Start our window. If we're collapsed we do nothing.
+     defer cimgui.c.igEnd();
+@@ -1089,6 +1123,60 @@ fn renderTermioWindow(self: *Inspector) void {
+             0,
+         );
+ 
++        // Handle keyboard navigation when window is focused
++        if (cimgui.c.igIsWindowFocused(cimgui.c.ImGuiFocusedFlags_RootAndChildWindows)) {
++            const key_pressed = self.getKeyAction();
++
++            switch (key_pressed) {
++                .none => {},
++                .up, .down => {
++                    // If no event is selected, select the first/last event based on direction
++                    if (self.selected_event_seq == null) {
++                        if (!self.vt_events.empty()) {
++                            var it = self.vt_events.iterator(if (key_pressed == .up) .forward else .reverse);
++                            if (it.next()) |ev| {
++                                self.selected_event_seq = @as(u32, @intCast(ev.seq));
++                            }
++                        }
++                    } else {
++                        // Find next/previous event based on current selection
++                        var it = self.vt_events.iterator(.reverse);
++                        switch (key_pressed) {
++                            .down => {
++                                var found = false;
++                                while (it.next()) |ev| {
++                                    if (found) {
++                                        self.selected_event_seq = @as(u32, @intCast(ev.seq));
++                                        break;
++                                    }
++                                    if (ev.seq == self.selected_event_seq.?) {
++                                        found = true;
++                                    }
++                                }
++                            },
++                            .up => {
++                                var prev_ev: ?*const inspector.termio.VTEvent = null;
++                                while (it.next()) |ev| {
++                                    if (ev.seq == self.selected_event_seq.?) {
++                                        if (prev_ev) |prev| {
++                                            self.selected_event_seq = @as(u32, @intCast(prev.seq));
++                                            break;
++                                        }
++                                    }
++                                    prev_ev = ev;
++                                }
++                            },
++                            .none => unreachable,
++                        }
++                    }
++
++                    // Mark that we need to scroll to the newly selected item
++                    self.need_scroll_to_selected = true;
++                    self.is_keyboard_selection = true;
++                },
++            }
++        }
++
+         var it = self.vt_events.iterator(.reverse);
+         while (it.next()) |ev| {
+             // Need to push an ID so that our selectable is unique.
+@@ -1097,12 +1185,32 @@ fn renderTermioWindow(self: *Inspector) void {
+ 
+             cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+             _ = cimgui.c.igTableNextColumn();
+-            _ = cimgui.c.igSelectable_BoolPtr(
++
++            // Store the previous selection state to detect changes
++            const was_selected = ev.imgui_selected;
++
++            // Update selection state based on keyboard navigation
++            if (self.selected_event_seq) |seq| {
++                ev.imgui_selected = (@as(u32, @intCast(ev.seq)) == seq);
++            }
++
++            // Handle selectable widget
++            if (cimgui.c.igSelectable_BoolPtr(
+                 "##select",
+                 &ev.imgui_selected,
+                 cimgui.c.ImGuiSelectableFlags_SpanAllColumns,
+                 .{ .x = 0, .y = 0 },
+-            );
++            )) {
++                // If selection state changed, update keyboard navigation state
++                if (ev.imgui_selected != was_selected) {
++                    self.selected_event_seq = if (ev.imgui_selected)
++                        @as(u32, @intCast(ev.seq))
++                    else
++                        null;
++                    self.is_keyboard_selection = false;
++                }
++            }
++
+             cimgui.c.igSameLine(0, 0);
+             cimgui.c.igText("%d", ev.seq);
+             _ = cimgui.c.igTableNextColumn();
+@@ -1158,6 +1266,12 @@ fn renderTermioWindow(self: *Inspector) void {
+                         cimgui.c.igText("%s", entry.value_ptr.ptr);
+                     }
+                 }
++
++                // If this is the selected event and scrolling is needed, scroll to it
++                if (self.need_scroll_to_selected and self.is_keyboard_selection) {
++                    cimgui.c.igSetScrollHereY(0.5);
++                    self.need_scroll_to_selected = false;
++                }
+             }
+         }
+     } // table
+
+commit 5ad348b23e283e16ee6494c1ab709d1f5eb7c346
+Merge: d1614f6b 8da600a6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Feb 11 12:46:18 2025 -0800
+
+    Add keyboard navigation for Terminal IO window (#3909)
+    
+    ## Changes
+    
+    - Add keyboard navigation support in Terminal IO window
+      - Use J/K keys for vim-style navigation
+      - Support arrow keys for traditional navigation
+    
+    
+    https://github.com/user-attachments/assets/e5d3bba1-1a47-49c9-ac59-c6195515605c
+    
+    Resolves https://github.com/ghostty-org/ghostty/issues/1096
+
+
+commit 0f4d2bb2375c707182dba8cf2dd7723a2e918e79
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 09:55:46 2025 -0700
+
+    Lots of 0.14 changes
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 1824f5ea..53a602ab 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -602,7 +602,7 @@ fn renderModesWindow(self: *Inspector) void {
+     }
+ 
+     const t = self.surface.renderer_state.terminal;
+-    inline for (@typeInfo(terminal.Mode).Enum.fields) |field| {
++    inline for (@typeInfo(terminal.Mode).@"enum".fields) |field| {
+         const tag: terminal.modes.ModeTag = @bitCast(@as(terminal.modes.ModeTag.Backing, field.value));
+ 
+         cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+@@ -1298,7 +1298,7 @@ fn renderTermioWindow(self: *Inspector) void {
+             );
+             defer cimgui.c.igEndTable();
+ 
+-            inline for (@typeInfo(terminal.Parser.Action.Tag).Enum.fields) |field| {
++            inline for (@typeInfo(terminal.Parser.Action.Tag).@"enum".fields) |field| {
+                 const tag = @field(terminal.Parser.Action.Tag, field.name);
+                 if (tag == .apc_put or tag == .dcs_put) continue;
+ 
+
+commit 7e9be00924144950ab6100cb7136e91c6abb403e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 10:13:31 2025 -0700
+
+    working on macos
+
+diff --git a/src/inspector/Inspector.zig b/src/inspector/Inspector.zig
+index 53a602ab..edc20488 100644
+--- a/src/inspector/Inspector.zig
++++ b/src/inspector/Inspector.zig
+@@ -390,7 +390,7 @@ fn renderScreenWindow(self: *Inspector) void {
+ 
+             if (kitty_flags.int() != 0) {
+                 const Flags = @TypeOf(kitty_flags);
+-                inline for (@typeInfo(Flags).Struct.fields) |field| {
++                inline for (@typeInfo(Flags).@"struct".fields) |field| {
+                     {
+                         const value = @field(kitty_flags, field.name);
+ 
+

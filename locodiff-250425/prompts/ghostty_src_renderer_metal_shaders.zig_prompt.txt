@@ -1,0 +1,2817 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/renderer/metal/shaders.zig
+
+commit 5229cb93d2e03cc7eb927450f26842536471a762
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 08:49:34 2023 -0700
+
+    renderer/metal: extract helpers for shaders/buffers
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+new file mode 100644
+index 00000000..cf1125a5
+--- /dev/null
++++ b/src/renderer/metal/shaders.zig
+@@ -0,0 +1,301 @@
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const assert = std.debug.assert;
++const macos = @import("macos");
++const objc = @import("objc");
++const math = @import("../../math.zig");
++
++const mtl = @import("api.zig");
++
++const log = std.log.scoped(.metal);
++
++/// This contains the state for the shaders used by the Metal renderer.
++pub const Shaders = struct {
++    library: objc.Object,
++    cell_pipeline: objc.Object,
++
++    pub fn init(device: objc.Object) !Shaders {
++        const library = try initLibrary(device);
++        errdefer library.msgSend(void, objc.sel("release"), .{});
++
++        const cell_pipeline = try initCellPipeline(device, library);
++        errdefer cell_pipeline.msgSend(void, objc.sel("release"), .{});
++
++        return .{
++            .library = library,
++            .cell_pipeline = cell_pipeline,
++        };
++    }
++
++    pub fn deinit(self: *Shaders) void {
++        self.cell_pipeline.msgSend(void, objc.sel("release"), .{});
++        self.library.msgSend(void, objc.sel("release"), .{});
++    }
++};
++
++/// This is a single parameter for the terminal cell shader.
++pub const Cell = extern struct {
++    mode: Mode,
++    grid_pos: [2]f32,
++    glyph_pos: [2]u32 = .{ 0, 0 },
++    glyph_size: [2]u32 = .{ 0, 0 },
++    glyph_offset: [2]i32 = .{ 0, 0 },
++    color: [4]u8,
++    cell_width: u8,
++
++    pub const Mode = enum(u8) {
++        bg = 1,
++        fg = 2,
++        fg_color = 7,
++        strikethrough = 8,
++    };
++};
++
++/// The uniforms that are passed to the terminal cell shader.
++pub const Uniforms = extern struct {
++    /// The projection matrix for turning world coordinates to normalized.
++    /// This is calculated based on the size of the screen.
++    projection_matrix: math.Mat,
++
++    /// Size of a single cell in pixels, unscaled.
++    cell_size: [2]f32,
++
++    /// Metrics for underline/strikethrough
++    strikethrough_position: f32,
++    strikethrough_thickness: f32,
++};
++
++/// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
++fn initLibrary(device: objc.Object) !objc.Object {
++    // Hardcoded since this file isn't meant to be reusable.
++    const data = @embedFile("../shaders/cell.metal");
++    const source = try macos.foundation.String.createWithBytes(
++        data,
++        .utf8,
++        false,
++    );
++    defer source.release();
++
++    var err: ?*anyopaque = null;
++    const library = device.msgSend(
++        objc.Object,
++        objc.sel("newLibraryWithSource:options:error:"),
++        .{
++            source,
++            @as(?*anyopaque, null),
++            &err,
++        },
++    );
++    try checkError(err);
++
++    return library;
++}
++
++/// Initialize the cell render pipeline for our shader library.
++fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
++    // Get our vertex and fragment functions
++    const func_vert = func_vert: {
++        const str = try macos.foundation.String.createWithBytes(
++            "uber_vertex",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_vert objc.Object.fromId(ptr.?);
++    };
++    const func_frag = func_frag: {
++        const str = try macos.foundation.String.createWithBytes(
++            "uber_fragment",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_frag objc.Object.fromId(ptr.?);
++    };
++
++    // Create the vertex descriptor. The vertex descriptor describves the
++    // data layout of the vertex inputs. We use indexed (or "instanced")
++    // rendering, so this makes it so that each instance gets a single
++    // Cell as input.
++    const vertex_desc = vertex_desc: {
++        const desc = init: {
++            const Class = objc.Class.getClass("MTLVertexDescriptor").?;
++            const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++            const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++            break :init id_init;
++        };
++
++        // Our attributes are the fields of the input
++        const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 0)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "mode")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 1)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "grid_pos")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 2)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "glyph_pos")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 3)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "glyph_size")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 4)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.int2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "glyph_offset")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 5)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "color")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 6)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "cell_width")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++
++        // The layout describes how and when we fetch the next vertex input.
++        const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
++        {
++            const layout = layouts.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 0)},
++            );
++
++            // Access each Cell per instance, not per vertex.
++            layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
++            layout.setProperty("stride", @as(c_ulong, @sizeOf(Cell)));
++        }
++
++        break :vertex_desc desc;
++    };
++
++    // Create our descriptor
++    const desc = init: {
++        const Class = objc.Class.getClass("MTLRenderPipelineDescriptor").?;
++        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++        break :init id_init;
++    };
++
++    // Set our properties
++    desc.setProperty("vertexFunction", func_vert);
++    desc.setProperty("fragmentFunction", func_frag);
++    desc.setProperty("vertexDescriptor", vertex_desc);
++
++    // Set our color attachment
++    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
++    {
++        const attachment = attachments.msgSend(
++            objc.Object,
++            objc.sel("objectAtIndexedSubscript:"),
++            .{@as(c_ulong, 0)},
++        );
++
++        // Value is MTLPixelFormatBGRA8Unorm
++        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++
++        // Blending. This is required so that our text we render on top
++        // of our drawable properly blends into the bg.
++        attachment.setProperty("blendingEnabled", true);
++        attachment.setProperty("rgbBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
++        attachment.setProperty("alphaBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
++        attachment.setProperty("sourceRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
++        attachment.setProperty("sourceAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
++        attachment.setProperty("destinationRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
++        attachment.setProperty("destinationAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
++    }
++
++    // Make our state
++    var err: ?*anyopaque = null;
++    const pipeline_state = device.msgSend(
++        objc.Object,
++        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
++        .{ desc, &err },
++    );
++    try checkError(err);
++
++    return pipeline_state;
++}
++
++fn checkError(err_: ?*anyopaque) !void {
++    const nserr = objc.Object.fromId(err_ orelse return);
++    const str = @as(
++        *macos.foundation.String,
++        @ptrCast(nserr.getProperty(?*anyopaque, "localizedDescription").?),
++    );
++
++    log.err("metal error={s}", .{str.cstringPtr(.ascii).?});
++    return error.MetalFailed;
++}
++
++// Intel macOS 13 doesn't like it when any field in a vertex buffer is not
++// aligned on the alignment of the struct. I don't understand it, I think
++// this must be some macOS 13 Metal GPU driver bug because it doesn't matter
++// on macOS 12 or Apple Silicon macOS 13.
++//
++// To be safe, we put this test in here.
++test "Cell offsets" {
++    const testing = std.testing;
++    const alignment = @alignOf(Cell);
++    inline for (@typeInfo(Cell).Struct.fields) |field| {
++        const offset = @offsetOf(Cell, field.name);
++        try testing.expectEqual(0, @mod(offset, alignment));
++    }
++}
+
+commit e665fc6741a5610bef204f45bba5aa96e281f7a0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 09:20:30 2023 -0700
+
+    renderer/metal: first pass at an image shader
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index cf1125a5..c57613fd 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -13,6 +13,7 @@ const log = std.log.scoped(.metal);
+ pub const Shaders = struct {
+     library: objc.Object,
+     cell_pipeline: objc.Object,
++    image_pipeline: objc.Object,
+ 
+     pub fn init(device: objc.Object) !Shaders {
+         const library = try initLibrary(device);
+@@ -21,14 +22,19 @@ pub const Shaders = struct {
+         const cell_pipeline = try initCellPipeline(device, library);
+         errdefer cell_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
++        const image_pipeline = try initImagePipeline(device, library);
++        errdefer image_pipeline.msgSend(void, objc.sel("release"), .{});
++
+         return .{
+             .library = library,
+             .cell_pipeline = cell_pipeline,
++            .image_pipeline = image_pipeline,
+         };
+     }
+ 
+     pub fn deinit(self: *Shaders) void {
+         self.cell_pipeline.msgSend(void, objc.sel("release"), .{});
++        self.image_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.library.msgSend(void, objc.sel("release"), .{});
+     }
+ };
+@@ -51,6 +57,11 @@ pub const Cell = extern struct {
+     };
+ };
+ 
++/// Single parameter for the image shader.
++pub const Image = extern struct {
++    grid_pos: [2]f32,
++};
++
+ /// The uniforms that are passed to the terminal cell shader.
+ pub const Uniforms = extern struct {
+     /// The projection matrix for turning world coordinates to normalized.
+@@ -117,7 +128,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+         break :func_frag objc.Object.fromId(ptr.?);
+     };
+ 
+-    // Create the vertex descriptor. The vertex descriptor describves the
++    // Create the vertex descriptor. The vertex descriptor describes the
+     // data layout of the vertex inputs. We use indexed (or "instanced")
+     // rendering, so this makes it so that each instance gets a single
+     // Cell as input.
+@@ -274,6 +285,123 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     return pipeline_state;
+ }
+ 
++/// Initialize the image render pipeline for our shader library.
++fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
++    // Get our vertex and fragment functions
++    const func_vert = func_vert: {
++        const str = try macos.foundation.String.createWithBytes(
++            "image_vertex",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_vert objc.Object.fromId(ptr.?);
++    };
++    const func_frag = func_frag: {
++        const str = try macos.foundation.String.createWithBytes(
++            "image_fragment",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_frag objc.Object.fromId(ptr.?);
++    };
++
++    // Create the vertex descriptor. The vertex descriptor describes the
++    // data layout of the vertex inputs. We use indexed (or "instanced")
++    // rendering, so this makes it so that each instance gets a single
++    // Image as input.
++    const vertex_desc = vertex_desc: {
++        const desc = init: {
++            const Class = objc.Class.getClass("MTLVertexDescriptor").?;
++            const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++            const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++            break :init id_init;
++        };
++
++        // Our attributes are the fields of the input
++        const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 1)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "grid_pos")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++
++        // The layout describes how and when we fetch the next vertex input.
++        const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
++        {
++            const layout = layouts.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 0)},
++            );
++
++            // Access each Image per instance, not per vertex.
++            layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
++            layout.setProperty("stride", @as(c_ulong, @sizeOf(Image)));
++        }
++
++        break :vertex_desc desc;
++    };
++
++    // Create our descriptor
++    const desc = init: {
++        const Class = objc.Class.getClass("MTLRenderPipelineDescriptor").?;
++        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++        break :init id_init;
++    };
++
++    // Set our properties
++    desc.setProperty("vertexFunction", func_vert);
++    desc.setProperty("fragmentFunction", func_frag);
++    desc.setProperty("vertexDescriptor", vertex_desc);
++
++    // Set our color attachment
++    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
++    {
++        const attachment = attachments.msgSend(
++            objc.Object,
++            objc.sel("objectAtIndexedSubscript:"),
++            .{@as(c_ulong, 0)},
++        );
++
++        // Value is MTLPixelFormatBGRA8Unorm
++        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++
++        // Blending. This is required so that our text we render on top
++        // of our drawable properly blends into the bg.
++        attachment.setProperty("blendingEnabled", true);
++        attachment.setProperty("rgbBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
++        attachment.setProperty("alphaBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
++        attachment.setProperty("sourceRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
++        attachment.setProperty("sourceAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
++        attachment.setProperty("destinationRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
++        attachment.setProperty("destinationAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
++    }
++
++    // Make our state
++    var err: ?*anyopaque = null;
++    const pipeline_state = device.msgSend(
++        objc.Object,
++        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
++        .{ desc, &err },
++    );
++    try checkError(err);
++
++    return pipeline_state;
++}
++
+ fn checkError(err_: ?*anyopaque) !void {
+     const nserr = objc.Object.fromId(err_ orelse return);
+     const str = @as(
+
+commit 5a9bbcbc2d122d3f527b057d815ecdb4a976f0ce
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 11:32:45 2023 -0700
+
+    renderer/metal: clip image if necessary off top of viewport (scrolling)
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index c57613fd..4119456b 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -57,9 +57,10 @@ pub const Cell = extern struct {
+     };
+ };
+ 
+-/// Single parameter for the image shader.
++/// Single parameter for the image shader. See shader for field details.
+ pub const Image = extern struct {
+     grid_pos: [2]f32,
++    offset_y: u32,
+ };
+ 
+ /// The uniforms that are passed to the terminal cell shader.
+@@ -336,6 +337,17 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "grid_pos")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 2)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "offset_y")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
+ 
+         // The layout describes how and when we fetch the next vertex input.
+         const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+
+commit 84c72bbe463179e420838c4201d67982cc03a8d6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 13:28:40 2023 -0700
+
+    renderer/metal: honor cell offset graphics command
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 4119456b..b080bfb8 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -60,6 +60,7 @@ pub const Cell = extern struct {
+ /// Single parameter for the image shader. See shader for field details.
+ pub const Image = extern struct {
+     grid_pos: [2]f32,
++    cell_offset: [2]f32,
+     offset_y: u32,
+ };
+ 
+@@ -344,6 +345,17 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+                 .{@as(c_ulong, 2)},
+             );
+ 
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "cell_offset")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 3)},
++            );
++
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint));
+             attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "offset_y")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+
+commit 3bbfee676b1d88cdcd1ae86db0d43613f37509e1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 14:33:41 2023 -0700
+
+    terminal/kitty-gfx: process source rectangle display params
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index b080bfb8..663be1bf 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -61,7 +61,7 @@ pub const Cell = extern struct {
+ pub const Image = extern struct {
+     grid_pos: [2]f32,
+     cell_offset: [2]f32,
+-    offset_y: u32,
++    source_rect: [4]f32,
+ };
+ 
+ /// The uniforms that are passed to the terminal cell shader.
+@@ -356,8 +356,8 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+                 .{@as(c_ulong, 3)},
+             );
+ 
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "offset_y")));
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float4));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "source_rect")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+ 
+
+commit 7ff76ca00d555bcec0fc74aff04e5850c4e1e69f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 14:43:50 2023 -0700
+
+    terminal/kitty-gfx: respect display c/r params
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 663be1bf..9001ede8 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -62,6 +62,7 @@ pub const Image = extern struct {
+     grid_pos: [2]f32,
+     cell_offset: [2]f32,
+     source_rect: [4]f32,
++    dest_size: [2]f32,
+ };
+ 
+ /// The uniforms that are passed to the terminal cell shader.
+@@ -360,6 +361,17 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "source_rect")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 4)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "dest_size")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
+ 
+         // The layout describes how and when we fetch the next vertex input.
+         const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+
+commit 67dce5ce0e7dfbb9dca356bc3072ba4fea25757c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 14 12:28:36 2023 -0800
+
+    update zig-objc
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 9001ede8..3338e48b 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -137,7 +137,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Cell as input.
+     const vertex_desc = vertex_desc: {
+         const desc = init: {
+-            const Class = objc.Class.getClass("MTLVertexDescriptor").?;
++            const Class = objc.getClass("MTLVertexDescriptor").?;
+             const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+             const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+             break :init id_init;
+@@ -242,7 +242,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+     // Create our descriptor
+     const desc = init: {
+-        const Class = objc.Class.getClass("MTLRenderPipelineDescriptor").?;
++        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+         const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+         const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+         break :init id_init;
+@@ -320,7 +320,7 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Image as input.
+     const vertex_desc = vertex_desc: {
+         const desc = init: {
+-            const Class = objc.Class.getClass("MTLVertexDescriptor").?;
++            const Class = objc.getClass("MTLVertexDescriptor").?;
+             const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+             const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+             break :init id_init;
+@@ -392,7 +392,7 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+     // Create our descriptor
+     const desc = init: {
+-        const Class = objc.Class.getClass("MTLRenderPipelineDescriptor").?;
++        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+         const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+         const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+         break :init id_init;
+
+commit 3095dce6850743cf67259eb56ae12725bff55ef1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 14 15:55:42 2023 -0800
+
+    renderer/metal: wip for loading custom shader pipelines
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 3338e48b..ba55eefb 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -12,10 +12,31 @@ const log = std.log.scoped(.metal);
+ /// This contains the state for the shaders used by the Metal renderer.
+ pub const Shaders = struct {
+     library: objc.Object,
++
++    /// The cell shader is the shader used to render the terminal cells.
++    /// It is a single shader that is used for both the background and
++    /// foreground.
+     cell_pipeline: objc.Object,
++
++    /// The image shader is the shader used to render images for things
++    /// like the Kitty image protocol.
+     image_pipeline: objc.Object,
+ 
+-    pub fn init(device: objc.Object) !Shaders {
++    /// Custom shaders to run against the final drawable texture. This
++    /// can be used to apply a lot of effects. Each shader is run in sequence
++    /// against the output of the previous shader.
++    post_pipelines: []const objc.Object,
++
++    /// Initialize our shader set.
++    ///
++    /// "post_shaders" is an optional list of postprocess shaders to run
++    /// against the final drawable texture. This is an array of shader source
++    /// code, not file paths.
++    pub fn init(
++        alloc: Allocator,
++        device: objc.Object,
++        post_shaders: []const [:0]const u8,
++    ) !Shaders {
+         const library = try initLibrary(device);
+         errdefer library.msgSend(void, objc.sel("release"), .{});
+ 
+@@ -25,17 +46,43 @@ pub const Shaders = struct {
+         const image_pipeline = try initImagePipeline(device, library);
+         errdefer image_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
++        const post_pipelines: []const objc.Object = initPostPipelines(
++            alloc,
++            device,
++            post_shaders,
++        ) catch |err| err: {
++            // If an error happens while building postprocess shaders we
++            // want to just not use any postprocess shaders since we don't
++            // want to block Ghostty from working.
++            log.warn("error initializing postprocess shaders err={}", .{err});
++            break :err &.{};
++        };
++        errdefer if (post_pipelines.len > 0) {
++            for (post_pipelines) |pipeline| pipeline.msgSend(void, objc.sel("release"), .{});
++            alloc.free(post_pipelines);
++        };
++
+         return .{
+             .library = library,
+             .cell_pipeline = cell_pipeline,
+             .image_pipeline = image_pipeline,
++            .post_pipelines = post_pipelines,
+         };
+     }
+ 
+-    pub fn deinit(self: *Shaders) void {
++    pub fn deinit(self: *Shaders, alloc: Allocator) void {
++        // Release our primary shaders
+         self.cell_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.image_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.library.msgSend(void, objc.sel("release"), .{});
++
++        // Release our postprocess shaders
++        if (self.post_pipelines.len > 0) {
++            for (self.post_pipelines) |pipeline| {
++                pipeline.msgSend(void, objc.sel("release"), .{});
++            }
++            alloc.free(self.post_pipelines);
++        }
+     }
+ };
+ 
+@@ -105,6 +152,68 @@ fn initLibrary(device: objc.Object) !objc.Object {
+     return library;
+ }
+ 
++/// Initialize our custom shader pipelines. The shaders argument is a
++/// set of shader source code, not file paths.
++fn initPostPipelines(
++    alloc: Allocator,
++    device: objc.Object,
++    shaders: []const [:0]const u8,
++) ![]const objc.Object {
++    // If we have no shaders, do nothing.
++    if (shaders.len == 0) return &.{};
++
++    // Keeps track of how many shaders we successfully wrote.
++    var i: usize = 0;
++
++    // Initialize our result set. If any error happens, we undo everything.
++    var pipelines = try alloc.alloc(objc.Object, shaders.len);
++    errdefer {
++        for (pipelines[0..i]) |pipeline| {
++            pipeline.msgSend(void, objc.sel("release"), .{});
++        }
++        alloc.free(pipelines);
++    }
++
++    // Build each shader. Note we don't use "0.." to build our index
++    // because we need to keep track of our length to clean up above.
++    for (shaders) |source| {
++        pipelines[i] = try initPostPipeline(device, source);
++        i += 1;
++    }
++
++    return pipelines;
++}
++
++/// Initialize a single custom shader pipeline from shader source.
++fn initPostPipeline(device: objc.Object, data: [:0]const u8) !objc.Object {
++    // Create our library which has the shader source
++    const library = library: {
++        const source = try macos.foundation.String.createWithBytes(
++            data,
++            .utf8,
++            false,
++        );
++        defer source.release();
++
++        var err: ?*anyopaque = null;
++        const library = device.msgSend(
++            objc.Object,
++            objc.sel("newLibraryWithSource:options:error:"),
++            .{ source, @as(?*anyopaque, null), &err },
++        );
++        try checkError(err);
++        errdefer library.msgSend(void, objc.sel("release"), .{});
++
++        break :library library;
++    };
++    // TODO: need to do this once we set the pipeline
++    //defer library.msgSend(void, objc.sel("release"), .{});
++
++    // TODO: need to implement the actual pipeline
++
++    return library;
++}
++
+ /// Initialize the cell render pipeline for our shader library.
+ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Get our vertex and fragment functions
+
+commit 28246a80b8180d14e393ea808ad06b5186f58f75
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 14 18:52:22 2023 -0800
+
+    renderer/metal: release some of our shader initialization objects
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index ba55eefb..05b9993b 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -348,6 +348,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+         break :vertex_desc desc;
+     };
++    defer vertex_desc.msgSend(void, objc.sel("release"), .{});
+ 
+     // Create our descriptor
+     const desc = init: {
+@@ -356,6 +357,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+         const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+         break :init id_init;
+     };
++    defer desc.msgSend(void, objc.sel("release"), .{});
+ 
+     // Set our properties
+     desc.setProperty("vertexFunction", func_vert);
+@@ -393,6 +395,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+         .{ desc, &err },
+     );
+     try checkError(err);
++    errdefer pipeline_state.msgSend(void, objc.sel("release"), .{});
+ 
+     return pipeline_state;
+ }
+
+commit c347148fd7fd11debb2a3525e1186567aa26a5b9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 14 22:40:40 2023 -0800
+
+    renderer/metal: CRT effect, ugly hacky code
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 05b9993b..4edb7eb9 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -49,6 +49,7 @@ pub const Shaders = struct {
+         const post_pipelines: []const objc.Object = initPostPipelines(
+             alloc,
+             device,
++            library,
+             post_shaders,
+         ) catch |err| err: {
+             // If an error happens while building postprocess shaders we
+@@ -126,6 +127,20 @@ pub const Uniforms = extern struct {
+     strikethrough_thickness: f32,
+ };
+ 
++/// The uniforms used for custom postprocess shaders.
++pub const PostUniforms = extern struct {
++    resolution: [3]f32 align(16),
++    time: f32 align(4),
++    time_delta: f32 align(4),
++    frame_rate: f32 align(4),
++    frame: i32 align(4),
++    channel_time: [4][4]f32 align(16),
++    channel_resolution: [4][4]f32 align(16),
++    mouse: [4]f32 align(16),
++    date: [4]f32 align(16),
++    sample_rate: f32 align(4),
++};
++
+ /// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
+ fn initLibrary(device: objc.Object) !objc.Object {
+     // Hardcoded since this file isn't meant to be reusable.
+@@ -157,6 +172,7 @@ fn initLibrary(device: objc.Object) !objc.Object {
+ fn initPostPipelines(
+     alloc: Allocator,
+     device: objc.Object,
++    library: objc.Object,
+     shaders: []const [:0]const u8,
+ ) ![]const objc.Object {
+     // If we have no shaders, do nothing.
+@@ -177,7 +193,7 @@ fn initPostPipelines(
+     // Build each shader. Note we don't use "0.." to build our index
+     // because we need to keep track of our length to clean up above.
+     for (shaders) |source| {
+-        pipelines[i] = try initPostPipeline(device, source);
++        pipelines[i] = try initPostPipeline(device, library, source);
+         i += 1;
+     }
+ 
+@@ -185,9 +201,13 @@ fn initPostPipelines(
+ }
+ 
+ /// Initialize a single custom shader pipeline from shader source.
+-fn initPostPipeline(device: objc.Object, data: [:0]const u8) !objc.Object {
++fn initPostPipeline(
++    device: objc.Object,
++    library: objc.Object,
++    data: [:0]const u8,
++) !objc.Object {
+     // Create our library which has the shader source
+-    const library = library: {
++    const post_library = library: {
+         const source = try macos.foundation.String.createWithBytes(
+             data,
+             .utf8,
+@@ -196,22 +216,75 @@ fn initPostPipeline(device: objc.Object, data: [:0]const u8) !objc.Object {
+         defer source.release();
+ 
+         var err: ?*anyopaque = null;
+-        const library = device.msgSend(
++        const post_library = device.msgSend(
+             objc.Object,
+             objc.sel("newLibraryWithSource:options:error:"),
+             .{ source, @as(?*anyopaque, null), &err },
+         );
+         try checkError(err);
+-        errdefer library.msgSend(void, objc.sel("release"), .{});
++        errdefer post_library.msgSend(void, objc.sel("release"), .{});
+ 
+-        break :library library;
++        break :library post_library;
+     };
+-    // TODO: need to do this once we set the pipeline
+-    //defer library.msgSend(void, objc.sel("release"), .{});
++    defer post_library.msgSend(void, objc.sel("release"), .{});
+ 
+-    // TODO: need to implement the actual pipeline
++    // Get our vertex and fragment functions
++    const func_vert = func_vert: {
++        const str = try macos.foundation.String.createWithBytes(
++            "post_vertex",
++            .utf8,
++            false,
++        );
++        defer str.release();
+ 
+-    return library;
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_vert objc.Object.fromId(ptr.?);
++    };
++    const func_frag = func_frag: {
++        const str = try macos.foundation.String.createWithBytes(
++            "main0",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = post_library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_frag objc.Object.fromId(ptr.?);
++    };
++
++    // Create our descriptor
++    const desc = init: {
++        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
++        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++        break :init id_init;
++    };
++    desc.setProperty("vertexFunction", func_vert);
++    desc.setProperty("fragmentFunction", func_frag);
++
++    // Set our color attachment
++    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
++    {
++        const attachment = attachments.msgSend(
++            objc.Object,
++            objc.sel("objectAtIndexedSubscript:"),
++            .{@as(c_ulong, 0)},
++        );
++
++        // Value is MTLPixelFormatBGRA8Unorm
++        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++    }
++
++    // Make our state
++    var err: ?*anyopaque = null;
++    const pipeline_state = device.msgSend(
++        objc.Object,
++        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
++        .{ desc, &err },
++    );
++    try checkError(err);
++
++    return pipeline_state;
+ }
+ 
+ /// Initialize the cell render pipeline for our shader library.
+
+commit 4742cd308d0c2895048f34f0dda13fd5dd90aeab
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 16 19:22:48 2023 -0800
+
+    renderer: animation timer if we have custom shaders
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 4edb7eb9..32f775a5 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -129,6 +129,9 @@ pub const Uniforms = extern struct {
+ 
+ /// The uniforms used for custom postprocess shaders.
+ pub const PostUniforms = extern struct {
++    // Note: all of the explicit aligmnments are copied from the
++    // MSL developer reference just so that we can be sure that we got
++    // it all exactly right.
+     resolution: [3]f32 align(16),
+     time: f32 align(4),
+     time_delta: f32 align(4),
+
+commit 5d7c47a4696f69e49a3085f9ea70397c47c0db4a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 17 20:55:36 2023 -0800
+
+    renderer/metal: clean up some memory management
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 32f775a5..030ae2b6 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -254,6 +254,8 @@ fn initPostPipeline(
+         const ptr = post_library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+         break :func_frag objc.Object.fromId(ptr.?);
+     };
++    defer func_vert.msgSend(void, objc.sel("release"), .{});
++    defer func_frag.msgSend(void, objc.sel("release"), .{});
+ 
+     // Create our descriptor
+     const desc = init: {
+@@ -262,6 +264,7 @@ fn initPostPipeline(
+         const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+         break :init id_init;
+     };
++    defer desc.msgSend(void, objc.sel("release"), .{});
+     desc.setProperty("vertexFunction", func_vert);
+     desc.setProperty("fragmentFunction", func_frag);
+ 
+@@ -315,6 +318,8 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+         const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+         break :func_frag objc.Object.fromId(ptr.?);
+     };
++    defer func_vert.msgSend(void, objc.sel("release"), .{});
++    defer func_frag.msgSend(void, objc.sel("release"), .{});
+ 
+     // Create the vertex descriptor. The vertex descriptor describes the
+     // data layout of the vertex inputs. We use indexed (or "instanced")
+@@ -501,6 +506,8 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+         const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+         break :func_frag objc.Object.fromId(ptr.?);
+     };
++    defer func_vert.msgSend(void, objc.sel("release"), .{});
++    defer func_frag.msgSend(void, objc.sel("release"), .{});
+ 
+     // Create the vertex descriptor. The vertex descriptor describes the
+     // data layout of the vertex inputs. We use indexed (or "instanced")
+@@ -577,6 +584,7 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+         break :vertex_desc desc;
+     };
++    defer vertex_desc.msgSend(void, objc.sel("release"), .{});
+ 
+     // Create our descriptor
+     const desc = init: {
+@@ -585,6 +593,7 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+         const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+         break :init id_init;
+     };
++    defer desc.msgSend(void, objc.sel("release"), .{});
+ 
+     // Set our properties
+     desc.setProperty("vertexFunction", func_vert);
+
+commit 6c859cca821d33f39351d1d2de06344b82421f43
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Dec 1 20:51:16 2023 -0800
+
+    renderer/metal: minimum contrast experiment
+    
+    This uses WCAG2 algorithms with a minimum ratio hardcoded of 3:1. This
+    is not shippable in its current state because we want the ratio to be
+    configurable and I'm not happy with the way data is being sent to the
+    shader.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 030ae2b6..6980a309 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -95,6 +95,7 @@ pub const Cell = extern struct {
+     glyph_size: [2]u32 = .{ 0, 0 },
+     glyph_offset: [2]i32 = .{ 0, 0 },
+     color: [4]u8,
++    bg_color: [4]u8,
+     cell_width: u8,
+ 
+     pub const Mode = enum(u8) {
+@@ -401,6 +402,17 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "color")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 7)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "bg_color")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
+         {
+             const attr = attrs.msgSend(
+                 objc.Object,
+
+commit 7af4009f27bb993f1b04717bfa65e973b85f5eaf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Dec 1 21:24:38 2023 -0800
+
+    renderer/metal: minimum contrast ratio is configurable
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 6980a309..bd938802 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -126,6 +126,10 @@ pub const Uniforms = extern struct {
+     /// Metrics for underline/strikethrough
+     strikethrough_position: f32,
+     strikethrough_thickness: f32,
++
++    /// The minimum contrast ratio for text. The contrast ratio is calculated
++    /// according to the WCAG 2.0 spec.
++    min_contrast: f32,
+ };
+ 
+ /// The uniforms used for custom postprocess shaders.
+
+commit 0b658c8217aaebd93315a2f68ac5ad93c3061a4d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Dec 16 20:07:25 2023 -0800
+
+    renderer/metal: constrain PUA glyphs if they aren't next to space
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index bd938802..5a3cd196 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -101,6 +101,7 @@ pub const Cell = extern struct {
+     pub const Mode = enum(u8) {
+         bg = 1,
+         fg = 2,
++        fg_constrained = 3,
+         fg_color = 7,
+         strikethrough = 8,
+     };
+
+commit ad08842e86d44c2db198b516e095a342550ff279
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Apr 22 10:26:51 2024 -0700
+
+    renderer/metal: remove strikethrough support from GPU
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 5a3cd196..d5a6bacc 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -103,7 +103,6 @@ pub const Cell = extern struct {
+         fg = 2,
+         fg_constrained = 3,
+         fg_color = 7,
+-        strikethrough = 8,
+     };
+ };
+ 
+@@ -124,10 +123,6 @@ pub const Uniforms = extern struct {
+     /// Size of a single cell in pixels, unscaled.
+     cell_size: [2]f32,
+ 
+-    /// Metrics for underline/strikethrough
+-    strikethrough_position: f32,
+-    strikethrough_thickness: f32,
+-
+     /// The minimum contrast ratio for text. The contrast ratio is calculated
+     /// according to the WCAG 2.0 spec.
+     min_contrast: f32,
+
+commit e8b623e82919f620d2e64f8eed00f2988fc073fd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Apr 22 10:01:59 2024 -0700
+
+    renderer/metal: dedicated cell bg shader
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index d5a6bacc..6d2e9add 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -18,6 +18,10 @@ pub const Shaders = struct {
+     /// foreground.
+     cell_pipeline: objc.Object,
+ 
++    /// The cell background shader is the shader used to render the
++    /// background of terminal cells.
++    cell_bg_pipeline: objc.Object,
++
+     /// The image shader is the shader used to render images for things
+     /// like the Kitty image protocol.
+     image_pipeline: objc.Object,
+@@ -43,6 +47,9 @@ pub const Shaders = struct {
+         const cell_pipeline = try initCellPipeline(device, library);
+         errdefer cell_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
++        const cell_bg_pipeline = try initCellBgPipeline(device, library);
++        errdefer cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
++
+         const image_pipeline = try initImagePipeline(device, library);
+         errdefer image_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
+@@ -66,6 +73,7 @@ pub const Shaders = struct {
+         return .{
+             .library = library,
+             .cell_pipeline = cell_pipeline,
++            .cell_bg_pipeline = cell_bg_pipeline,
+             .image_pipeline = image_pipeline,
+             .post_pipelines = post_pipelines,
+         };
+@@ -74,6 +82,7 @@ pub const Shaders = struct {
+     pub fn deinit(self: *Shaders, alloc: Allocator) void {
+         // Release our primary shaders
+         self.cell_pipeline.msgSend(void, objc.sel("release"), .{});
++        self.cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.image_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.library.msgSend(void, objc.sel("release"), .{});
+ 
+@@ -493,6 +502,173 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     return pipeline_state;
+ }
+ 
++/// This is a single parameter for the cell bg shader.
++pub const CellBg = extern struct {
++    mode: Mode,
++    grid_pos: [2]f32,
++    cell_width: u8,
++    color: [4]u8,
++
++    pub const Mode = enum(u8) {
++        rgb = 1,
++    };
++};
++
++/// Initialize the cell background render pipeline for our shader library.
++fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
++    // Get our vertex and fragment functions
++    const func_vert = func_vert: {
++        const str = try macos.foundation.String.createWithBytes(
++            "cell_bg_vertex",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_vert objc.Object.fromId(ptr.?);
++    };
++    defer func_vert.msgSend(void, objc.sel("release"), .{});
++    const func_frag = func_frag: {
++        const str = try macos.foundation.String.createWithBytes(
++            "cell_bg_fragment",
++            .utf8,
++            false,
++        );
++        defer str.release();
++
++        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
++        break :func_frag objc.Object.fromId(ptr.?);
++    };
++    defer func_frag.msgSend(void, objc.sel("release"), .{});
++
++    // Create the vertex descriptor. The vertex descriptor describes the
++    // data layout of the vertex inputs. We use indexed (or "instanced")
++    // rendering, so this makes it so that each instance gets a single
++    // Cell as input.
++    const vertex_desc = vertex_desc: {
++        const desc = init: {
++            const Class = objc.getClass("MTLVertexDescriptor").?;
++            const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++            const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++            break :init id_init;
++        };
++
++        // Our attributes are the fields of the input
++        const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 0)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "mode")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 1)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "grid_pos")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 2)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "cell_width")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++        {
++            const attr = attrs.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 3)},
++            );
++
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "color")));
++            attr.setProperty("bufferIndex", @as(c_ulong, 0));
++        }
++
++        // The layout describes how and when we fetch the next vertex input.
++        const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
++        {
++            const layout = layouts.msgSend(
++                objc.Object,
++                objc.sel("objectAtIndexedSubscript:"),
++                .{@as(c_ulong, 0)},
++            );
++
++            // Access each Cell per instance, not per vertex.
++            layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
++            layout.setProperty("stride", @as(c_ulong, @sizeOf(Cell)));
++        }
++
++        break :vertex_desc desc;
++    };
++    defer vertex_desc.msgSend(void, objc.sel("release"), .{});
++
++    // Create our descriptor
++    const desc = init: {
++        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
++        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
++        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
++        break :init id_init;
++    };
++    defer desc.msgSend(void, objc.sel("release"), .{});
++
++    // Set our properties
++    desc.setProperty("vertexFunction", func_vert);
++    desc.setProperty("fragmentFunction", func_frag);
++    desc.setProperty("vertexDescriptor", vertex_desc);
++
++    // Set our color attachment
++    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
++    {
++        const attachment = attachments.msgSend(
++            objc.Object,
++            objc.sel("objectAtIndexedSubscript:"),
++            .{@as(c_ulong, 0)},
++        );
++
++        // Value is MTLPixelFormatBGRA8Unorm
++        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++
++        // Blending. This is required so that our text we render on top
++        // of our drawable properly blends into the bg.
++        attachment.setProperty("blendingEnabled", true);
++        attachment.setProperty("rgbBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
++        attachment.setProperty("alphaBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
++        attachment.setProperty("sourceRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
++        attachment.setProperty("sourceAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
++        attachment.setProperty("destinationRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
++        attachment.setProperty("destinationAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
++    }
++
++    // Make our state
++    var err: ?*anyopaque = null;
++    const pipeline_state = device.msgSend(
++        objc.Object,
++        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
++        .{ desc, &err },
++    );
++    try checkError(err);
++    errdefer pipeline_state.msgSend(void, objc.sel("release"), .{});
++
++    return pipeline_state;
++}
++
+ /// Initialize the image render pipeline for our shader library.
+ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Get our vertex and fragment functions
+
+commit d12e3db599a95f1bb90187f0c840c5e4fc9b7d3e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Apr 22 10:58:23 2024 -0700
+
+    renderer/metal: dedicated cell fg shader
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 6d2e9add..40e04898 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -16,7 +16,7 @@ pub const Shaders = struct {
+     /// The cell shader is the shader used to render the terminal cells.
+     /// It is a single shader that is used for both the background and
+     /// foreground.
+-    cell_pipeline: objc.Object,
++    cell_text_pipeline: objc.Object,
+ 
+     /// The cell background shader is the shader used to render the
+     /// background of terminal cells.
+@@ -44,8 +44,8 @@ pub const Shaders = struct {
+         const library = try initLibrary(device);
+         errdefer library.msgSend(void, objc.sel("release"), .{});
+ 
+-        const cell_pipeline = try initCellPipeline(device, library);
+-        errdefer cell_pipeline.msgSend(void, objc.sel("release"), .{});
++        const cell_text_pipeline = try initCellTextPipeline(device, library);
++        errdefer cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
+         const cell_bg_pipeline = try initCellBgPipeline(device, library);
+         errdefer cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+@@ -72,7 +72,7 @@ pub const Shaders = struct {
+ 
+         return .{
+             .library = library,
+-            .cell_pipeline = cell_pipeline,
++            .cell_text_pipeline = cell_text_pipeline,
+             .cell_bg_pipeline = cell_bg_pipeline,
+             .image_pipeline = image_pipeline,
+             .post_pipelines = post_pipelines,
+@@ -81,7 +81,7 @@ pub const Shaders = struct {
+ 
+     pub fn deinit(self: *Shaders, alloc: Allocator) void {
+         // Release our primary shaders
+-        self.cell_pipeline.msgSend(void, objc.sel("release"), .{});
++        self.cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.image_pipeline.msgSend(void, objc.sel("release"), .{});
+         self.library.msgSend(void, objc.sel("release"), .{});
+@@ -96,25 +96,6 @@ pub const Shaders = struct {
+     }
+ };
+ 
+-/// This is a single parameter for the terminal cell shader.
+-pub const Cell = extern struct {
+-    mode: Mode,
+-    grid_pos: [2]f32,
+-    glyph_pos: [2]u32 = .{ 0, 0 },
+-    glyph_size: [2]u32 = .{ 0, 0 },
+-    glyph_offset: [2]i32 = .{ 0, 0 },
+-    color: [4]u8,
+-    bg_color: [4]u8,
+-    cell_width: u8,
+-
+-    pub const Mode = enum(u8) {
+-        bg = 1,
+-        fg = 2,
+-        fg_constrained = 3,
+-        fg_color = 7,
+-    };
+-};
+-
+ /// Single parameter for the image shader. See shader for field details.
+ pub const Image = extern struct {
+     grid_pos: [2]f32,
+@@ -303,12 +284,31 @@ fn initPostPipeline(
+     return pipeline_state;
+ }
+ 
++/// This is a single parameter for the terminal cell shader.
++pub const CellText = extern struct {
++    mode: Mode,
++    grid_pos: [2]f32,
++    glyph_pos: [2]u32 = .{ 0, 0 },
++    glyph_size: [2]u32 = .{ 0, 0 },
++    glyph_offset: [2]i32 = .{ 0, 0 },
++    color: [4]u8,
++    bg_color: [4]u8,
++    cell_width: u8,
++
++    pub const Mode = enum(u8) {
++        bg = 1,
++        fg = 2,
++        fg_constrained = 3,
++        fg_color = 7,
++    };
++};
++
+ /// Initialize the cell render pipeline for our shader library.
+-fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
++fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Get our vertex and fragment functions
+     const func_vert = func_vert: {
+         const str = try macos.foundation.String.createWithBytes(
+-            "uber_vertex",
++            "cell_text_vertex",
+             .utf8,
+             false,
+         );
+@@ -319,7 +319,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     };
+     const func_frag = func_frag: {
+         const str = try macos.foundation.String.createWithBytes(
+-            "uber_fragment",
++            "cell_text_fragment",
+             .utf8,
+             false,
+         );
+@@ -353,7 +353,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "mode")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "mode")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -364,7 +364,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "grid_pos")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "grid_pos")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -375,7 +375,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "glyph_pos")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "glyph_pos")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -386,7 +386,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "glyph_size")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "glyph_size")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -397,7 +397,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.int2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "glyph_offset")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "glyph_offset")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -408,7 +408,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "color")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "color")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -419,7 +419,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "bg_color")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "bg_color")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -430,7 +430,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "cell_width")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "cell_width")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+ 
+@@ -445,7 +445,7 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+             // Access each Cell per instance, not per vertex.
+             layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
+-            layout.setProperty("stride", @as(c_ulong, @sizeOf(Cell)));
++            layout.setProperty("stride", @as(c_ulong, @sizeOf(CellText)));
+         }
+ 
+         break :vertex_desc desc;
+@@ -506,8 +506,8 @@ fn initCellPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ pub const CellBg = extern struct {
+     mode: Mode,
+     grid_pos: [2]f32,
+-    cell_width: u8,
+     color: [4]u8,
++    cell_width: u8,
+ 
+     pub const Mode = enum(u8) {
+         rgb = 1,
+@@ -575,7 +575,7 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "grid_pos")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "grid_pos")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -586,7 +586,7 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "cell_width")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "cell_width")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+         {
+@@ -597,7 +597,7 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             );
+ 
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Cell, "color")));
++            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "color")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+ 
+@@ -612,7 +612,7 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+             // Access each Cell per instance, not per vertex.
+             layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
+-            layout.setProperty("stride", @as(c_ulong, @sizeOf(Cell)));
++            layout.setProperty("stride", @as(c_ulong, @sizeOf(CellBg)));
+         }
+ 
+         break :vertex_desc desc;
+@@ -840,11 +840,20 @@ fn checkError(err_: ?*anyopaque) !void {
+ // on macOS 12 or Apple Silicon macOS 13.
+ //
+ // To be safe, we put this test in here.
+-test "Cell offsets" {
++test "CellText offsets" {
++    const testing = std.testing;
++    const alignment = @alignOf(CellText);
++    inline for (@typeInfo(CellText).Struct.fields) |field| {
++        const offset = @offsetOf(CellText, field.name);
++        try testing.expectEqual(0, @mod(offset, alignment));
++    }
++}
++
++test "CellBg offsets" {
+     const testing = std.testing;
+-    const alignment = @alignOf(Cell);
+-    inline for (@typeInfo(Cell).Struct.fields) |field| {
+-        const offset = @offsetOf(Cell, field.name);
++    const alignment = @alignOf(CellBg);
++    inline for (@typeInfo(CellBg).Struct.fields) |field| {
++        const offset = @offsetOf(CellBg, field.name);
+         try testing.expectEqual(0, @mod(offset, alignment));
+     }
+ }
+
+commit ced8776120d2dbd7ebeab6d538a9958e44fb44ff
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Apr 25 19:16:40 2024 -0700
+
+    renderer/metal: grid pos for bg/text should be ushort2
+    
+    This saves 50% memory per vertex.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 40e04898..f764e490 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -287,7 +287,7 @@ fn initPostPipeline(
+ /// This is a single parameter for the terminal cell shader.
+ pub const CellText = extern struct {
+     mode: Mode,
+-    grid_pos: [2]f32,
++    grid_pos: [2]u16,
+     glyph_pos: [2]u32 = .{ 0, 0 },
+     glyph_size: [2]u32 = .{ 0, 0 },
+     glyph_offset: [2]i32 = .{ 0, 0 },
+@@ -363,7 +363,7 @@ fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object
+                 .{@as(c_ulong, 1)},
+             );
+ 
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.ushort2));
+             attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "grid_pos")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+@@ -505,7 +505,7 @@ fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object
+ /// This is a single parameter for the cell bg shader.
+ pub const CellBg = extern struct {
+     mode: Mode,
+-    grid_pos: [2]f32,
++    grid_pos: [2]u16,
+     color: [4]u8,
+     cell_width: u8,
+ 
+@@ -574,7 +574,7 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+                 .{@as(c_ulong, 1)},
+             );
+ 
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
++            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.ushort2));
+             attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "grid_pos")));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+
+commit 3f16234f72df9eb9a94ec81ad033400af6688039
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Apr 26 20:52:08 2024 -0700
+
+    terminal: Coordinate uses CellCountInt
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index f764e490..2d7fb970 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -287,12 +287,12 @@ fn initPostPipeline(
+ /// This is a single parameter for the terminal cell shader.
+ pub const CellText = extern struct {
+     mode: Mode,
+-    grid_pos: [2]u16,
+     glyph_pos: [2]u32 = .{ 0, 0 },
+     glyph_size: [2]u32 = .{ 0, 0 },
+     glyph_offset: [2]i32 = .{ 0, 0 },
+     color: [4]u8,
+     bg_color: [4]u8,
++    grid_pos: [2]u16,
+     cell_width: u8,
+ 
+     pub const Mode = enum(u8) {
+
+commit 3a7dc355a028c0350a4771ed00d45c98756dcb24
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 27 22:13:17 2024 -0700
+
+    renderer/metal: invert text under cursor again
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 2d7fb970..a6303c78 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -116,6 +116,10 @@ pub const Uniforms = extern struct {
+     /// The minimum contrast ratio for text. The contrast ratio is calculated
+     /// according to the WCAG 2.0 spec.
+     min_contrast: f32,
++
++    /// The cursor position and color.
++    cursor_pos: [2]u16,
++    cursor_color: [4]u8,
+ };
+ 
+ /// The uniforms used for custom postprocess shaders.
+@@ -296,10 +300,10 @@ pub const CellText = extern struct {
+     cell_width: u8,
+ 
+     pub const Mode = enum(u8) {
+-        bg = 1,
+-        fg = 2,
+-        fg_constrained = 3,
+-        fg_color = 7,
++        fg = 1,
++        fg_constrained = 2,
++        fg_color = 3,
++        cursor = 4,
+     };
+ };
+ 
+
+commit 5309f4d08058ecb721d30d9ef2822b66026ddb62
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Aug 3 15:39:02 2024 -0700
+
+    renderer/metal: extend background color of grid border into padding
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index a6303c78..5a9be3b7 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -106,20 +106,31 @@ pub const Image = extern struct {
+ 
+ /// The uniforms that are passed to the terminal cell shader.
+ pub const Uniforms = extern struct {
++    // Note: all of the explicit aligmnments are copied from the
++    // MSL developer reference just so that we can be sure that we got
++    // it all exactly right.
++
+     /// The projection matrix for turning world coordinates to normalized.
+     /// This is calculated based on the size of the screen.
+-    projection_matrix: math.Mat,
++    projection_matrix: math.Mat align(16),
+ 
+     /// Size of a single cell in pixels, unscaled.
+-    cell_size: [2]f32,
++    cell_size: [2]f32 align(8),
++
++    /// Size of the grid in columns and rows.
++    grid_size: [2]u16 align(4),
++
++    /// The padding around the terminal grid in pixels. In order:
++    /// top, right, bottom, left.
++    grid_padding: [4]f32 align(16),
+ 
+     /// The minimum contrast ratio for text. The contrast ratio is calculated
+     /// according to the WCAG 2.0 spec.
+-    min_contrast: f32,
++    min_contrast: f32 align(4),
+ 
+     /// The cursor position and color.
+-    cursor_pos: [2]u16,
+-    cursor_color: [4]u8,
++    cursor_pos: [2]u16 align(4),
++    cursor_color: [4]u8 align(4),
+ };
+ 
+ /// The uniforms used for custom postprocess shaders.
+
+commit ea551990eb1877617b329e1f9cf235e9ff0e08f2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Aug 3 21:35:56 2024 -0700
+
+    renderer: disable window-padding-color=extend in certain scenarios
+    
+    There are scenarios where this configuration looks bad. This commit
+    introduces some heuristics to prevent it. Here are the heuristics:
+    
+      * Extension is always enabled on alt screen.
+      * Extension is disabled if a row contains any default bg color. The
+        thinking is that in this scenario, using the default bg color looks
+        just fine.
+      * Extension is disabled if a row is marked as a prompt (using semantic
+        prompt sequences). The thinking here is that prompts often contain
+        perfect fit glyphs such as Powerline glyphs and those look bad when
+        extended.
+    
+    This introduces some CPU cost to the extension feature but it should be
+    minimal and respects dirty tracking. This is unfortunate but the feature
+    makes many terminal scenarios look much better and the performance cost
+    is minimal so I believe it is worth it.
+    
+    Further heuristics are likely warranted but this should be a good
+    starting set.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 5a9be3b7..082c5ba5 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -124,6 +124,10 @@ pub const Uniforms = extern struct {
+     /// top, right, bottom, left.
+     grid_padding: [4]f32 align(16),
+ 
++    /// True if vertical padding gets the extended color of the nearest row.
++    padding_extend_top: bool align(1),
++    padding_extend_bottom: bool align(1),
++
+     /// The minimum contrast ratio for text. The contrast ratio is calculated
+     /// according to the WCAG 2.0 spec.
+     min_contrast: f32 align(4),
+
+commit 503dfae6ffe1a10f5ebdad45d6b89060553d3cae
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Tue Aug 6 15:20:14 2024 +0800
+
+    renderer: exempt Powerline cells from minimum contrast requirements
+    
+    With a minimum contrast set, the colored glyphs that Powerline uses
+    would sometimes be set to white or black while the surrounding background
+    colors remain unchanged, breaking up contiguous colors on segments of
+    the Powerline.
+    
+    This no longer happens with this patch as Powerline glyphs are now
+    special-cased and exempt from the minimum contrast adjustment.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 082c5ba5..0652a3c9 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -319,6 +319,7 @@ pub const CellText = extern struct {
+         fg_constrained = 2,
+         fg_color = 3,
+         cursor = 4,
++        fg_powerline = 5,
+     };
+ };
+ 
+
+commit 14a42fcdb71f17c1362ff8cd122a224fea20aaa6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 6 15:05:10 2024 -0700
+
+    renderer/metal: load shaders from precompiled lib
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 0652a3c9..bbaf77dc 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -156,27 +156,29 @@ pub const PostUniforms = extern struct {
+ 
+ /// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
+ fn initLibrary(device: objc.Object) !objc.Object {
+-    // Hardcoded since this file isn't meant to be reusable.
+-    const data = @embedFile("../shaders/cell.metal");
+-    const source = try macos.foundation.String.createWithBytes(
+-        data,
+-        .utf8,
+-        false,
++    const start = try std.time.Instant.now();
++
++    const data = try macos.dispatch.Data.create(
++        @embedFile("../shaders/Ghostty.metallib"),
++        macos.dispatch.queue.getMain(),
++        macos.dispatch.Data.DESTRUCTOR_DEFAULT,
+     );
+-    defer source.release();
++    defer data.release();
+ 
+     var err: ?*anyopaque = null;
+     const library = device.msgSend(
+         objc.Object,
+-        objc.sel("newLibraryWithSource:options:error:"),
++        objc.sel("newLibraryWithData:error:"),
+         .{
+-            source,
+-            @as(?*anyopaque, null),
++            data,
+             &err,
+         },
+     );
+     try checkError(err);
+ 
++    const end = try std.time.Instant.now();
++    log.debug("shader library loaded time={}us", .{end.since(start) / std.time.ns_per_us});
++
+     return library;
+ }
+ 
+
+commit c116d147d6751045d0fccba928af651c6726f8d1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 6 15:30:48 2024 -0700
+
+    build: build metal lib
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index bbaf77dc..721cc6e1 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -159,7 +159,7 @@ fn initLibrary(device: objc.Object) !objc.Object {
+     const start = try std.time.Instant.now();
+ 
+     const data = try macos.dispatch.Data.create(
+-        @embedFile("../shaders/Ghostty.metallib"),
++        @embedFile("ghostty_metallib"),
+         macos.dispatch.queue.getMain(),
+         macos.dispatch.Data.DESTRUCTOR_DEFAULT,
+     );
+
+commit 6339f9bae959398f81f356ba923555b9fdf6462a
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Aug 7 17:39:31 2024 -0400
+
+    renderer: metal shaders rework
+    
+    - Significant changes to optimize memory usage.
+    - Adjusted formatting of the metal shader code to improve readability.
+    - Normalized naming conventions in shader code.
+    - Abstracted repetitive code for attribute descriptors to a helper
+    function.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 721cc6e1..9c9b4447 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -246,7 +246,7 @@ fn initPostPipeline(
+     // Get our vertex and fragment functions
+     const func_vert = func_vert: {
+         const str = try macos.foundation.String.createWithBytes(
+-            "post_vertex",
++            "full_screen_vertex",
+             .utf8,
+             false,
+         );
+@@ -307,14 +307,13 @@ fn initPostPipeline(
+ 
+ /// This is a single parameter for the terminal cell shader.
+ pub const CellText = extern struct {
+-    mode: Mode,
+-    glyph_pos: [2]u32 = .{ 0, 0 },
+-    glyph_size: [2]u32 = .{ 0, 0 },
+-    glyph_offset: [2]i32 = .{ 0, 0 },
+-    color: [4]u8,
+-    bg_color: [4]u8,
+-    grid_pos: [2]u16,
+-    cell_width: u8,
++    glyph_pos: [2]u32 align(8) = .{ 0, 0 },
++    glyph_size: [2]u32 align(8) = .{ 0, 0 },
++    bearings: [2]i16 align(4) = .{ 0, 0 },
++    grid_pos: [2]u16 align(4),
++    color: [4]u8 align(4),
++    mode: Mode align(1),
++    constraint_width: u8 align(1) = 0,
+ 
+     pub const Mode = enum(u8) {
+         fg = 1,
+@@ -323,6 +322,12 @@ pub const CellText = extern struct {
+         cursor = 4,
+         fg_powerline = 5,
+     };
++
++    test {
++        // Minimizing the size of this struct is important,
++        // so we test it in order to be aware of any changes.
++        try std.testing.expectEqual(32, @sizeOf(CellText));
++    }
+ };
+ 
+ /// Initialize the cell render pipeline for our shader library.
+@@ -367,94 +372,7 @@ fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object
+ 
+         // Our attributes are the fields of the input
+         const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 0)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "mode")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 1)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.ushort2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "grid_pos")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 2)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "glyph_pos")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 3)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uint2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "glyph_size")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 4)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.int2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "glyph_offset")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 5)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "color")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 7)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "bg_color")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 6)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellText, "cell_width")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
++        autoAttribute(CellText, attrs);
+ 
+         // The layout describes how and when we fetch the next vertex input.
+         const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+@@ -525,23 +443,14 @@ fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object
+ }
+ 
+ /// This is a single parameter for the cell bg shader.
+-pub const CellBg = extern struct {
+-    mode: Mode,
+-    grid_pos: [2]u16,
+-    color: [4]u8,
+-    cell_width: u8,
+-
+-    pub const Mode = enum(u8) {
+-        rgb = 1,
+-    };
+-};
++pub const CellBg = [4]u8;
+ 
+ /// Initialize the cell background render pipeline for our shader library.
+ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Get our vertex and fragment functions
+     const func_vert = func_vert: {
+         const str = try macos.foundation.String.createWithBytes(
+-            "cell_bg_vertex",
++            "full_screen_vertex",
+             .utf8,
+             false,
+         );
+@@ -585,41 +494,8 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+                 .{@as(c_ulong, 0)},
+             );
+ 
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "mode")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 1)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.ushort2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "grid_pos")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 2)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "cell_width")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 3)},
+-            );
+-
+             attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(CellBg, "color")));
++            attr.setProperty("offset", @as(c_ulong, 0));
+             attr.setProperty("bufferIndex", @as(c_ulong, 0));
+         }
+ 
+@@ -733,50 +609,7 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ 
+         // Our attributes are the fields of the input
+         const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 1)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "grid_pos")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 2)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "cell_offset")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 3)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float4));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "source_rect")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 4)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.float2));
+-            attr.setProperty("offset", @as(c_ulong, @offsetOf(Image, "dest_size")));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
++        autoAttribute(Image, attrs);
+ 
+         // The layout describes how and when we fetch the next vertex input.
+         const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+@@ -845,6 +678,41 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     return pipeline_state;
+ }
+ 
++fn autoAttribute(T: type, attrs: objc.Object) void {
++    inline for (@typeInfo(T).Struct.fields, 0..) |field, i| {
++        const offset = @offsetOf(T, field.name);
++
++        const FT = switch (@typeInfo(field.type)) {
++            .Enum => |e| e.tag_type,
++            else => field.type,
++        };
++
++        const format = switch (FT) {
++            [4]u8 => mtl.MTLVertexFormat.uchar4,
++            [2]u16 => mtl.MTLVertexFormat.ushort2,
++            [2]i16 => mtl.MTLVertexFormat.short2,
++            [2]f32 => mtl.MTLVertexFormat.float2,
++            [4]f32 => mtl.MTLVertexFormat.float4,
++            [2]i32 => mtl.MTLVertexFormat.int2,
++            u32 => mtl.MTLVertexFormat.uint,
++            [2]u32 => mtl.MTLVertexFormat.uint2,
++            [4]u32 => mtl.MTLVertexFormat.uint4,
++            u8 => mtl.MTLVertexFormat.uchar,
++            else => comptime unreachable,
++        };
++
++        const attr = attrs.msgSend(
++            objc.Object,
++            objc.sel("objectAtIndexedSubscript:"),
++            .{@as(c_ulong, i)},
++        );
++
++        attr.setProperty("format", @intFromEnum(format));
++        attr.setProperty("offset", @as(c_ulong, offset));
++        attr.setProperty("bufferIndex", @as(c_ulong, 0));
++    }
++}
++
+ fn checkError(err_: ?*anyopaque) !void {
+     const nserr = objc.Object.fromId(err_ orelse return);
+     const str = @as(
+@@ -855,27 +723,3 @@ fn checkError(err_: ?*anyopaque) !void {
+     log.err("metal error={s}", .{str.cstringPtr(.ascii).?});
+     return error.MetalFailed;
+ }
+-
+-// Intel macOS 13 doesn't like it when any field in a vertex buffer is not
+-// aligned on the alignment of the struct. I don't understand it, I think
+-// this must be some macOS 13 Metal GPU driver bug because it doesn't matter
+-// on macOS 12 or Apple Silicon macOS 13.
+-//
+-// To be safe, we put this test in here.
+-test "CellText offsets" {
+-    const testing = std.testing;
+-    const alignment = @alignOf(CellText);
+-    inline for (@typeInfo(CellText).Struct.fields) |field| {
+-        const offset = @offsetOf(CellText, field.name);
+-        try testing.expectEqual(0, @mod(offset, alignment));
+-    }
+-}
+-
+-test "CellBg offsets" {
+-    const testing = std.testing;
+-    const alignment = @alignOf(CellBg);
+-    inline for (@typeInfo(CellBg).Struct.fields) |field| {
+-        const offset = @offsetOf(CellBg, field.name);
+-        try testing.expectEqual(0, @mod(offset, alignment));
+-    }
+-}
+
+commit d68906563ecb08e5ebaa5e8c7ce7c7a80f7ac435
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Thu Aug 8 19:03:39 2024 -0400
+
+    renderer/metal: properly support padding color = background (not extend)
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 9c9b4447..6708a8be 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -124,9 +124,10 @@ pub const Uniforms = extern struct {
+     /// top, right, bottom, left.
+     grid_padding: [4]f32 align(16),
+ 
+-    /// True if vertical padding gets the extended color of the nearest row.
+-    padding_extend_top: bool align(1),
+-    padding_extend_bottom: bool align(1),
++    /// Bit mask defining which directions to
++    /// extend cell colors in to the padding.
++    /// Order, LSB first: left, right, up, down
++    padding_extend: PaddingExtend align(1),
+ 
+     /// The minimum contrast ratio for text. The contrast ratio is calculated
+     /// according to the WCAG 2.0 spec.
+@@ -135,6 +136,14 @@ pub const Uniforms = extern struct {
+     /// The cursor position and color.
+     cursor_pos: [2]u16 align(4),
+     cursor_color: [4]u8 align(4),
++
++    const PaddingExtend = packed struct(u8) {
++        left: bool = false,
++        right: bool = false,
++        up: bool = false,
++        down: bool = false,
++        _padding: u4 = 0,
++    };
+ };
+ 
+ /// The uniforms used for custom postprocess shaders.
+
+commit 861fe0379b143ae5de35de87d0466d96502fd6b3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Aug 9 15:10:58 2024 -0700
+
+    metal: cell bg pipeline no longer has vertex data, needs no vertex desc
+    
+    This happened to work in releases somehow but Xcode debug builds would
+    catch this as an assertion. Our cell bg pipeline now uses the "full
+    screen vertex shader" which takes no parameters, so we don't need a
+    vertex descriptor.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 6708a8be..2a202de3 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -482,50 +482,6 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     };
+     defer func_frag.msgSend(void, objc.sel("release"), .{});
+ 
+-    // Create the vertex descriptor. The vertex descriptor describes the
+-    // data layout of the vertex inputs. We use indexed (or "instanced")
+-    // rendering, so this makes it so that each instance gets a single
+-    // Cell as input.
+-    const vertex_desc = vertex_desc: {
+-        const desc = init: {
+-            const Class = objc.getClass("MTLVertexDescriptor").?;
+-            const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+-            const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+-            break :init id_init;
+-        };
+-
+-        // Our attributes are the fields of the input
+-        const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
+-        {
+-            const attr = attrs.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 0)},
+-            );
+-
+-            attr.setProperty("format", @intFromEnum(mtl.MTLVertexFormat.uchar4));
+-            attr.setProperty("offset", @as(c_ulong, 0));
+-            attr.setProperty("bufferIndex", @as(c_ulong, 0));
+-        }
+-
+-        // The layout describes how and when we fetch the next vertex input.
+-        const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+-        {
+-            const layout = layouts.msgSend(
+-                objc.Object,
+-                objc.sel("objectAtIndexedSubscript:"),
+-                .{@as(c_ulong, 0)},
+-            );
+-
+-            // Access each Cell per instance, not per vertex.
+-            layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
+-            layout.setProperty("stride", @as(c_ulong, @sizeOf(CellBg)));
+-        }
+-
+-        break :vertex_desc desc;
+-    };
+-    defer vertex_desc.msgSend(void, objc.sel("release"), .{});
+-
+     // Create our descriptor
+     const desc = init: {
+         const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+@@ -538,7 +494,6 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+     // Set our properties
+     desc.setProperty("vertexFunction", func_vert);
+     desc.setProperty("fragmentFunction", func_frag);
+-    desc.setProperty("vertexDescriptor", vertex_desc);
+ 
+     // Set our color attachment
+     const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
+
+commit dfc0894d5dacd7cc272e45346fd7cf8ad0f58198
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Oct 2 17:18:26 2024 -0400
+
+    fix(renderer): make all decorations and combining marks visible under cursor
+    
+    Metal needed to be changed to account for wide chars having decorations
+    on the right half and OpenGL needed to account for multiple glyphs being
+    under the cursor at once (decorations and combining marks) as well as
+    wide chars.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 2a202de3..c1c40384 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -137,6 +137,9 @@ pub const Uniforms = extern struct {
+     cursor_pos: [2]u16 align(4),
+     cursor_color: [4]u8 align(4),
+ 
++    // Whether the cursor is 2 cells wide.
++    wide_cursor: bool align(1),
++
+     const PaddingExtend = packed struct(u8) {
+         left: bool = false,
+         right: bool = false,
+
+commit 7aa2e2b24fa3b312750f3c4a998ab53d2c2e5d76
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Oct 2 15:43:54 2024 -0700
+
+    renderer: some tweaks
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index c1c40384..b909a2f2 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -138,7 +138,7 @@ pub const Uniforms = extern struct {
+     cursor_color: [4]u8 align(4),
+ 
+     // Whether the cursor is 2 cells wide.
+-    wide_cursor: bool align(1),
++    cursor_wide: bool align(1),
+ 
+     const PaddingExtend = packed struct(u8) {
+         left: bool = false,
+
+commit fca336c32d6e6659b04803c7e3a1f1ad1378b840
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Fri Jan 10 13:43:02 2025 -0500
+
+    Metal: blend in Display P3 color space, add option for linear blending
+    
+    This commit is quite large because it's fairly interconnected and can't
+    be split up in a logical way. The main part of this commit is that alpha
+    blending is now always done in the Display P3 color space, and depending
+    on the configured `window-colorspace` colors will be converted from sRGB
+    or assumed to already be Display P3 colors. In addition, a config option
+    `text-blending` has been added which allows the user to configure linear
+    blending (AKA "gamma correction"). Linear alpha blending also applies to
+    images and makes custom shaders receive linear colors rather than sRGB.
+    
+    In addition, an experimental option has been added which corrects linear
+    blending's tendency to make dark text look too thin and bright text look
+    too thick. Essentially it's a correction curve on the alpha channel that
+    depends on the luminance of the glyph being drawn.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index b909a2f2..62d36317 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -13,9 +13,7 @@ const log = std.log.scoped(.metal);
+ pub const Shaders = struct {
+     library: objc.Object,
+ 
+-    /// The cell shader is the shader used to render the terminal cells.
+-    /// It is a single shader that is used for both the background and
+-    /// foreground.
++    /// Renders cell foreground elements (text, decorations).
+     cell_text_pipeline: objc.Object,
+ 
+     /// The cell background shader is the shader used to render the
+@@ -40,17 +38,18 @@ pub const Shaders = struct {
+         alloc: Allocator,
+         device: objc.Object,
+         post_shaders: []const [:0]const u8,
++        pixel_format: mtl.MTLPixelFormat,
+     ) !Shaders {
+         const library = try initLibrary(device);
+         errdefer library.msgSend(void, objc.sel("release"), .{});
+ 
+-        const cell_text_pipeline = try initCellTextPipeline(device, library);
++        const cell_text_pipeline = try initCellTextPipeline(device, library, pixel_format);
+         errdefer cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
+-        const cell_bg_pipeline = try initCellBgPipeline(device, library);
++        const cell_bg_pipeline = try initCellBgPipeline(device, library, pixel_format);
+         errdefer cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
+-        const image_pipeline = try initImagePipeline(device, library);
++        const image_pipeline = try initImagePipeline(device, library, pixel_format);
+         errdefer image_pipeline.msgSend(void, objc.sel("release"), .{});
+ 
+         const post_pipelines: []const objc.Object = initPostPipelines(
+@@ -58,6 +57,7 @@ pub const Shaders = struct {
+             device,
+             library,
+             post_shaders,
++            pixel_format,
+         ) catch |err| err: {
+             // If an error happens while building postprocess shaders we
+             // want to just not use any postprocess shaders since we don't
+@@ -137,9 +137,29 @@ pub const Uniforms = extern struct {
+     cursor_pos: [2]u16 align(4),
+     cursor_color: [4]u8 align(4),
+ 
+-    // Whether the cursor is 2 cells wide.
++    /// The background color for the whole surface.
++    bg_color: [4]u8 align(4),
++
++    /// Whether the cursor is 2 cells wide.
+     cursor_wide: bool align(1),
+ 
++    /// Indicates that colors provided to the shader are already in
++    /// the P3 color space, so they don't need to be converted from
++    /// sRGB.
++    use_display_p3: bool align(1),
++
++    /// Indicates that the color attachments for the shaders have
++    /// an `*_srgb` pixel format, which means the shaders need to
++    /// output linear RGB colors rather than gamma encoded colors,
++    /// since blending will be performed in linear space and then
++    /// Metal itself will re-encode the colors for storage.
++    use_linear_blending: bool align(1),
++
++    /// Enables a weight correction step that makes text rendered
++    /// with linear alpha blending have a similar apparent weight
++    /// (thickness) to gamma-incorrect blending.
++    use_experimental_linear_correction: bool align(1) = false,
++
+     const PaddingExtend = packed struct(u8) {
+         left: bool = false,
+         right: bool = false,
+@@ -201,6 +221,7 @@ fn initPostPipelines(
+     device: objc.Object,
+     library: objc.Object,
+     shaders: []const [:0]const u8,
++    pixel_format: mtl.MTLPixelFormat,
+ ) ![]const objc.Object {
+     // If we have no shaders, do nothing.
+     if (shaders.len == 0) return &.{};
+@@ -220,7 +241,12 @@ fn initPostPipelines(
+     // Build each shader. Note we don't use "0.." to build our index
+     // because we need to keep track of our length to clean up above.
+     for (shaders) |source| {
+-        pipelines[i] = try initPostPipeline(device, library, source);
++        pipelines[i] = try initPostPipeline(
++            device,
++            library,
++            source,
++            pixel_format,
++        );
+         i += 1;
+     }
+ 
+@@ -232,6 +258,7 @@ fn initPostPipeline(
+     device: objc.Object,
+     library: objc.Object,
+     data: [:0]const u8,
++    pixel_format: mtl.MTLPixelFormat,
+ ) !objc.Object {
+     // Create our library which has the shader source
+     const post_library = library: {
+@@ -301,8 +328,7 @@ fn initPostPipeline(
+             .{@as(c_ulong, 0)},
+         );
+ 
+-        // Value is MTLPixelFormatBGRA8Unorm
+-        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+     }
+ 
+     // Make our state
+@@ -343,7 +369,11 @@ pub const CellText = extern struct {
+ };
+ 
+ /// Initialize the cell render pipeline for our shader library.
+-fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object {
++fn initCellTextPipeline(
++    device: objc.Object,
++    library: objc.Object,
++    pixel_format: mtl.MTLPixelFormat,
++) !objc.Object {
+     // Get our vertex and fragment functions
+     const func_vert = func_vert: {
+         const str = try macos.foundation.String.createWithBytes(
+@@ -427,8 +457,7 @@ fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object
+             .{@as(c_ulong, 0)},
+         );
+ 
+-        // Value is MTLPixelFormatBGRA8Unorm
+-        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+ 
+         // Blending. This is required so that our text we render on top
+         // of our drawable properly blends into the bg.
+@@ -458,11 +487,15 @@ fn initCellTextPipeline(device: objc.Object, library: objc.Object) !objc.Object
+ pub const CellBg = [4]u8;
+ 
+ /// Initialize the cell background render pipeline for our shader library.
+-fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
++fn initCellBgPipeline(
++    device: objc.Object,
++    library: objc.Object,
++    pixel_format: mtl.MTLPixelFormat,
++) !objc.Object {
+     // Get our vertex and fragment functions
+     const func_vert = func_vert: {
+         const str = try macos.foundation.String.createWithBytes(
+-            "full_screen_vertex",
++            "cell_bg_vertex",
+             .utf8,
+             false,
+         );
+@@ -507,8 +540,7 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             .{@as(c_ulong, 0)},
+         );
+ 
+-        // Value is MTLPixelFormatBGRA8Unorm
+-        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+ 
+         // Blending. This is required so that our text we render on top
+         // of our drawable properly blends into the bg.
+@@ -535,7 +567,11 @@ fn initCellBgPipeline(device: objc.Object, library: objc.Object) !objc.Object {
+ }
+ 
+ /// Initialize the image render pipeline for our shader library.
+-fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
++fn initImagePipeline(
++    device: objc.Object,
++    library: objc.Object,
++    pixel_format: mtl.MTLPixelFormat,
++) !objc.Object {
+     // Get our vertex and fragment functions
+     const func_vert = func_vert: {
+         const str = try macos.foundation.String.createWithBytes(
+@@ -619,8 +655,7 @@ fn initImagePipeline(device: objc.Object, library: objc.Object) !objc.Object {
+             .{@as(c_ulong, 0)},
+         );
+ 
+-        // Value is MTLPixelFormatBGRA8Unorm
+-        attachment.setProperty("pixelFormat", @as(c_ulong, 80));
++        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+ 
+         // Blending. This is required so that our text we render on top
+         // of our drawable properly blends into the bg.
+
+commit 5c8f984ea157bd40da631a17ddafcbf07a5b04db
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Mon Jan 27 19:15:18 2025 -0500
+
+    renderer/Metal: improve linear blending correction
+    
+    More mathematically sound approach, does a much better job of matching
+    the appearance of non-linear blending. Removed `experimental` from name
+    because it's not really an experiment anymore.
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 62d36317..b297de80 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -158,7 +158,7 @@ pub const Uniforms = extern struct {
+     /// Enables a weight correction step that makes text rendered
+     /// with linear alpha blending have a similar apparent weight
+     /// (thickness) to gamma-incorrect blending.
+-    use_experimental_linear_correction: bool align(1) = false,
++    use_linear_correction: bool align(1) = false,
+ 
+     const PaddingExtend = packed struct(u8) {
+         left: bool = false,
+
+commit 0f4d2bb2375c707182dba8cf2dd7723a2e918e79
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 09:55:46 2025 -0700
+
+    Lots of 0.14 changes
+
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index b297de80..8fa170bf 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -681,11 +681,11 @@ fn initImagePipeline(
+ }
+ 
+ fn autoAttribute(T: type, attrs: objc.Object) void {
+-    inline for (@typeInfo(T).Struct.fields, 0..) |field, i| {
++    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+         const offset = @offsetOf(T, field.name);
+ 
+         const FT = switch (@typeInfo(field.type)) {
+-            .Enum => |e| e.tag_type,
++            .@"enum" => |e| e.tag_type,
+             else => field.type,
+         };
+ 
+
