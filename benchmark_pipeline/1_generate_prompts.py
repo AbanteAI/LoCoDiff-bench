@@ -492,7 +492,7 @@ def get_detailed_existing_prompt_info(
     if not prompt_files:
         return []  # Return early if no files found
 
-    for filepath in tqdm(prompt_files, desc="Analyzing prompts"):
+    for filepath in tqdm(prompt_files, desc="Analyzing prompts", mininterval=3):
         filename = os.path.basename(filepath)
         # Attempt to extract the original extension
         # Format: org_repo_path_with_underscores_ext_prompt.txt
@@ -816,7 +816,7 @@ def generate_prompts_and_expected(
 
     # --- Process Files ---
     for full_path, rel_path in tqdm(
-        files_to_process, desc=f"Generating prompts for {full_repo_name}"
+        files_to_process, desc=f"Generating prompts for {full_repo_name}", mininterval=3
     ):
         try:  # Wrap processing for a single file to catch tokenization errors
             # 1. Date Filter Check
@@ -1026,7 +1026,7 @@ def sample_prompts(
         f"Sampling {num_to_sample} prompts from {len(available_items)} new candidates..."
     )
 
-    for i in tqdm(range(num_to_sample), desc="Sampling prompts to add"):
+    for i in tqdm(range(num_to_sample), desc="Sampling prompts to add", mininterval=3):
         if not available_items:
             print("\nWarning: Ran out of available items during sampling.")
             break
@@ -1079,7 +1079,7 @@ def copy_selected_files(
         print("No files to copy.")
         return
 
-    for prefix in tqdm(kept_prefixes, desc="Copying files"):
+    for prefix in tqdm(kept_prefixes, desc="Copying files", mininterval=3):
         prompt_filename = f"{prefix}_prompt.txt"
         expected_filename = f"{prefix}_expectedoutput.txt"
 
