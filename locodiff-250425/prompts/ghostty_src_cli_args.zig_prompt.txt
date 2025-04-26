@@ -1,0 +1,3543 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/cli/args.zig
+
+commit 9421bec3a1d17f4a8b63f5467f2d78f6e877545a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 23 22:46:16 2023 -0700
+
+    cli: move cli_args.zig to cli
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+new file mode 100644
+index 00000000..0a326fe8
+--- /dev/null
++++ b/src/cli/args.zig
+@@ -0,0 +1,678 @@
++const std = @import("std");
++const mem = std.mem;
++const assert = std.debug.assert;
++const Allocator = mem.Allocator;
++const ArenaAllocator = std.heap.ArenaAllocator;
++
++const ErrorList = @import("../config/ErrorList.zig");
++
++// TODO:
++//   - Only `--long=value` format is accepted. Do we want to allow
++//     `--long value`? Not currently allowed.
++
++/// The base errors for arg parsing. Additional errors can be returned due
++/// to type-specific parsing but these are always possible.
++pub const Error = error{
++    ValueRequired,
++    InvalidField,
++    InvalidValue,
++};
++
++/// Parse the command line arguments from iter into dst.
++///
++/// dst must be a struct. The fields and their types will be used to determine
++/// the valid CLI flags. See the tests in this file as an example. For field
++/// types that are structs, the struct can implement the `parseCLI` function
++/// to do custom parsing.
++///
++/// If the destination type has a field "_arena" of type `?ArenaAllocator`,
++/// an arena allocator will be created (or reused if set already) for any
++/// allocations. Allocations are necessary for certain types, like `[]const u8`.
++///
++/// If the destination type has a field "_errors" of type "ErrorList" then
++/// errors will be added to that list. In this case, the only error returned by
++/// parse are allocation errors.
++///
++/// Note: If the arena is already non-null, then it will be used. In this
++/// case, in the case of an error some memory might be leaked into the arena.
++pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
++    const info = @typeInfo(T);
++    assert(info == .Struct);
++
++    // Make an arena for all our allocations if we support it. Otherwise,
++    // use an allocator that always fails. If the arena is already set on
++    // the config, then we reuse that. See memory note in parse docs.
++    const arena_available = @hasField(T, "_arena");
++    var arena_owned: bool = false;
++    const arena_alloc = if (arena_available) arena: {
++        // If the arena is unset, we create it. We mark that we own it
++        // only so that we can clean it up on error.
++        if (dst._arena == null) {
++            dst._arena = ArenaAllocator.init(alloc);
++            arena_owned = true;
++        }
++
++        break :arena dst._arena.?.allocator();
++    } else fail: {
++        // Note: this is... not safe...
++        var fail = std.testing.FailingAllocator.init(alloc, 0);
++        break :fail fail.allocator();
++    };
++    errdefer if (arena_available and arena_owned) {
++        dst._arena.?.deinit();
++        dst._arena = null;
++    };
++
++    while (iter.next()) |arg| {
++        if (mem.startsWith(u8, arg, "--")) {
++            var key: []const u8 = arg[2..];
++            const value: ?[]const u8 = value: {
++                // If the arg has "=" then the value is after the "=".
++                if (mem.indexOf(u8, key, "=")) |idx| {
++                    defer key = key[0..idx];
++                    break :value key[idx + 1 ..];
++                }
++
++                break :value null;
++            };
++
++            parseIntoField(T, arena_alloc, dst, key, value) catch |err| {
++                if (comptime !canTrackErrors(T)) return err;
++
++                // The error set is dependent on comptime T, so we always add
++                // an extra error so we can have the "else" below.
++                const ErrSet = @TypeOf(err) || error{Unknown};
++                switch (@as(ErrSet, @errSetCast(err))) {
++                    // OOM is not recoverable since we need to allocate to
++                    // track more error messages.
++                    error.OutOfMemory => return err,
++
++                    error.InvalidField => try dst._errors.add(arena_alloc, .{
++                        .message = try std.fmt.allocPrintZ(
++                            arena_alloc,
++                            "{s}: unknown field",
++                            .{key},
++                        ),
++                    }),
++
++                    error.ValueRequired => try dst._errors.add(arena_alloc, .{
++                        .message = try std.fmt.allocPrintZ(
++                            arena_alloc,
++                            "{s}: value required",
++                            .{key},
++                        ),
++                    }),
++
++                    error.InvalidValue => try dst._errors.add(arena_alloc, .{
++                        .message = try std.fmt.allocPrintZ(
++                            arena_alloc,
++                            "{s}: invalid value",
++                            .{key},
++                        ),
++                    }),
++
++                    else => try dst._errors.add(arena_alloc, .{
++                        .message = try std.fmt.allocPrintZ(
++                            arena_alloc,
++                            "{s}: unknown error {}",
++                            .{ key, err },
++                        ),
++                    }),
++                }
++            };
++        }
++    }
++}
++
++/// Returns true if this type can track errors.
++fn canTrackErrors(comptime T: type) bool {
++    return @hasField(T, "_errors");
++}
++
++/// Parse a single key/value pair into the destination type T.
++///
++/// This may result in allocations. The allocations can only be freed by freeing
++/// all the memory associated with alloc. It is expected that alloc points to
++/// an arena.
++fn parseIntoField(
++    comptime T: type,
++    alloc: Allocator,
++    dst: *T,
++    key: []const u8,
++    value: ?[]const u8,
++) !void {
++    const info = @typeInfo(T);
++    assert(info == .Struct);
++
++    inline for (info.Struct.fields) |field| {
++        if (field.name[0] != '_' and mem.eql(u8, field.name, key)) {
++            // For optional fields, we just treat it as the child type.
++            // This lets optional fields default to null but get set by
++            // the CLI.
++            const Field = switch (@typeInfo(field.type)) {
++                .Optional => |opt| opt.child,
++                else => field.type,
++            };
++
++            // If we are a struct and have parseCLI, we call that and use
++            // that to set the value.
++            switch (@typeInfo(Field)) {
++                .Struct => if (@hasDecl(Field, "parseCLI")) {
++                    const fnInfo = @typeInfo(@TypeOf(Field.parseCLI)).Fn;
++                    switch (fnInfo.params.len) {
++                        // 1 arg = (input) => output
++                        1 => @field(dst, field.name) = try Field.parseCLI(value),
++
++                        // 2 arg = (self, input) => void
++                        2 => try @field(dst, field.name).parseCLI(value),
++
++                        // 3 arg = (self, alloc, input) => void
++                        3 => try @field(dst, field.name).parseCLI(alloc, value),
++
++                        // 4 arg = (self, alloc, errors, input) => void
++                        4 => if (comptime canTrackErrors(T)) {
++                            try @field(dst, field.name).parseCLI(alloc, &dst._errors, value);
++                        } else {
++                            var list: ErrorList = .{};
++                            try @field(dst, field.name).parseCLI(alloc, &list, value);
++                            if (!list.empty()) return error.InvalidValue;
++                        },
++
++                        else => @compileError("parseCLI invalid argument count"),
++                    }
++
++                    return;
++                },
++
++                .Enum => {
++                    @field(dst, field.name) = std.meta.stringToEnum(
++                        Field,
++                        value orelse return error.ValueRequired,
++                    ) orelse return error.InvalidValue;
++                    return;
++                },
++
++                else => {},
++            }
++
++            // No parseCLI, magic the value based on the type
++            @field(dst, field.name) = switch (Field) {
++                []const u8 => value: {
++                    const slice = value orelse return error.ValueRequired;
++                    const buf = try alloc.alloc(u8, slice.len);
++                    mem.copy(u8, buf, slice);
++                    break :value buf;
++                },
++
++                [:0]const u8 => value: {
++                    const slice = value orelse return error.ValueRequired;
++                    const buf = try alloc.allocSentinel(u8, slice.len, 0);
++                    mem.copy(u8, buf, slice);
++                    buf[slice.len] = 0;
++                    break :value buf;
++                },
++
++                bool => try parseBool(value orelse "t"),
++
++                u8 => std.fmt.parseInt(
++                    u8,
++                    value orelse return error.ValueRequired,
++                    0,
++                ) catch return error.InvalidValue,
++
++                u32 => std.fmt.parseInt(
++                    u32,
++                    value orelse return error.ValueRequired,
++                    0,
++                ) catch return error.InvalidValue,
++
++                f64 => std.fmt.parseFloat(
++                    f64,
++                    value orelse return error.ValueRequired,
++                ) catch return error.InvalidValue,
++
++                else => unreachable,
++            };
++
++            return;
++        }
++    }
++
++    return error.InvalidField;
++}
++
++fn parseBool(v: []const u8) !bool {
++    const t = &[_][]const u8{ "1", "t", "T", "true" };
++    const f = &[_][]const u8{ "0", "f", "F", "false" };
++
++    inline for (t) |str| {
++        if (mem.eql(u8, v, str)) return true;
++    }
++    inline for (f) |str| {
++        if (mem.eql(u8, v, str)) return false;
++    }
++
++    return error.InvalidValue;
++}
++
++test "parse: simple" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: []const u8 = "",
++        b: bool = false,
++        @"b-f": bool = true,
++
++        _arena: ?ArenaAllocator = null,
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var iter = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--a=42 --b --b-f=false",
++    );
++    defer iter.deinit();
++    try parse(@TypeOf(data), testing.allocator, &data, &iter);
++    try testing.expect(data._arena != null);
++    try testing.expectEqualStrings("42", data.a);
++    try testing.expect(data.b);
++    try testing.expect(!data.@"b-f");
++
++    // Reparsing works
++    var iter2 = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--a=84",
++    );
++    defer iter2.deinit();
++    try parse(@TypeOf(data), testing.allocator, &data, &iter2);
++    try testing.expect(data._arena != null);
++    try testing.expectEqualStrings("84", data.a);
++    try testing.expect(data.b);
++    try testing.expect(!data.@"b-f");
++}
++
++test "parse: quoted value" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: u8 = 0,
++        b: []const u8 = "",
++        _arena: ?ArenaAllocator = null,
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var iter = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--a=\"42\" --b=\"hello!\"",
++    );
++    defer iter.deinit();
++    try parse(@TypeOf(data), testing.allocator, &data, &iter);
++    try testing.expectEqual(@as(u8, 42), data.a);
++    try testing.expectEqualStrings("hello!", data.b);
++}
++
++test "parse: error tracking" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: []const u8 = "",
++        b: enum { one } = .one,
++
++        _arena: ?ArenaAllocator = null,
++        _errors: ErrorList = .{},
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var iter = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--what --a=42",
++    );
++    defer iter.deinit();
++    try parse(@TypeOf(data), testing.allocator, &data, &iter);
++    try testing.expect(data._arena != null);
++    try testing.expectEqualStrings("42", data.a);
++    try testing.expect(!data._errors.empty());
++}
++
++test "parseIntoField: ignore underscore-prefixed fields" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        _a: []const u8 = "12",
++    } = .{};
++
++    try testing.expectError(
++        error.InvalidField,
++        parseIntoField(@TypeOf(data), alloc, &data, "_a", "42"),
++    );
++    try testing.expectEqualStrings("12", data._a);
++}
++
++test "parseIntoField: string" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: []const u8,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "42");
++    try testing.expectEqualStrings("42", data.a);
++}
++
++test "parseIntoField: sentinel string" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: [:0]const u8,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "42");
++    try testing.expectEqualStrings("42", data.a);
++    try testing.expectEqual(@as(u8, 0), data.a[data.a.len]);
++}
++
++test "parseIntoField: bool" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: bool,
++    } = undefined;
++
++    // True
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "1");
++    try testing.expectEqual(true, data.a);
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "t");
++    try testing.expectEqual(true, data.a);
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "T");
++    try testing.expectEqual(true, data.a);
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "true");
++    try testing.expectEqual(true, data.a);
++
++    // False
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "0");
++    try testing.expectEqual(false, data.a);
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "f");
++    try testing.expectEqual(false, data.a);
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "F");
++    try testing.expectEqual(false, data.a);
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "false");
++    try testing.expectEqual(false, data.a);
++}
++
++test "parseIntoField: unsigned numbers" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        u8: u8,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "u8", "1");
++    try testing.expectEqual(@as(u8, 1), data.u8);
++}
++
++test "parseIntoField: floats" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        f64: f64,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "f64", "1");
++    try testing.expectEqual(@as(f64, 1.0), data.f64);
++}
++
++test "parseIntoField: enums" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    const Enum = enum { one, two, three };
++    var data: struct {
++        v: Enum,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "v", "two");
++    try testing.expectEqual(Enum.two, data.v);
++}
++
++test "parseIntoField: optional field" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: ?bool = null,
++    } = .{};
++
++    // True
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "1");
++    try testing.expectEqual(true, data.a.?);
++}
++
++test "parseIntoField: struct with parse func" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: struct {
++            const Self = @This();
++
++            v: []const u8,
++
++            pub fn parseCLI(value: ?[]const u8) !Self {
++                _ = value;
++                return Self{ .v = "HELLO!" };
++            }
++        },
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "42");
++    try testing.expectEqual(@as([]const u8, "HELLO!"), data.a.v);
++}
++
++test "parseIntoField: struct with parse func with error tracking" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: struct {
++            const Self = @This();
++
++            pub fn parseCLI(
++                _: Self,
++                parse_alloc: Allocator,
++                errors: *ErrorList,
++                value: ?[]const u8,
++            ) !void {
++                _ = value;
++                try errors.add(parse_alloc, .{ .message = "OH NO!" });
++            }
++        } = .{},
++
++        _errors: ErrorList = .{},
++    } = .{};
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "42");
++    try testing.expect(!data._errors.empty());
++}
++
++test "parseIntoField: struct with parse func with unsupported error tracking" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: struct {
++            const Self = @This();
++
++            pub fn parseCLI(
++                _: Self,
++                parse_alloc: Allocator,
++                errors: *ErrorList,
++                value: ?[]const u8,
++            ) !void {
++                _ = value;
++                try errors.add(parse_alloc, .{ .message = "OH NO!" });
++            }
++        } = .{},
++    } = .{};
++
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "a", "42"),
++    );
++}
++
++/// Returns an iterator (implements "next") that reads CLI args by line.
++/// Each CLI arg is expected to be a single line. This is used to implement
++/// configuration files.
++pub fn LineIterator(comptime ReaderType: type) type {
++    return struct {
++        const Self = @This();
++
++        /// The maximum size a single line can be. We don't expect any
++        /// CLI arg to exceed this size. Can't wait to git blame this in
++        /// like 4 years and be wrong about this.
++        pub const MAX_LINE_SIZE = 4096;
++
++        r: ReaderType,
++        entry: [MAX_LINE_SIZE]u8 = [_]u8{ '-', '-' } ++ ([_]u8{0} ** (MAX_LINE_SIZE - 2)),
++
++        pub fn next(self: *Self) ?[]const u8 {
++            // TODO: detect "--" prefixed lines and give a friendlier error
++            const buf = buf: {
++                while (true) {
++                    // Read the full line
++                    var entry = self.r.readUntilDelimiterOrEof(self.entry[2..], '\n') catch {
++                        // TODO: handle errors
++                        unreachable;
++                    } orelse return null;
++
++                    // Trim any whitespace around it
++                    const whitespace = " \t";
++                    const trim = std.mem.trim(u8, entry, whitespace);
++                    if (trim.len != entry.len) {
++                        std.mem.copy(u8, entry, trim);
++                        entry = entry[0..trim.len];
++                    }
++
++                    // Ignore blank lines and comments
++                    if (entry.len == 0 or entry[0] == '#') continue;
++
++                    // Trim spaces around '='
++                    if (mem.indexOf(u8, entry, "=")) |idx| {
++                        const key = std.mem.trim(u8, entry[0..idx], whitespace);
++                        const value = value: {
++                            var value = std.mem.trim(u8, entry[idx + 1 ..], whitespace);
++
++                            // Detect a quoted string.
++                            if (value.len >= 2 and
++                                value[0] == '"' and
++                                value[value.len - 1] == '"')
++                            {
++                                // Trim quotes since our CLI args processor expects
++                                // quotes to already be gone.
++                                value = value[1 .. value.len - 1];
++                            }
++
++                            break :value value;
++                        };
++
++                        const len = key.len + value.len + 1;
++                        if (entry.len != len) {
++                            std.mem.copy(u8, entry, key);
++                            entry[key.len] = '=';
++                            std.mem.copy(u8, entry[key.len + 1 ..], value);
++                            entry = entry[0..len];
++                        }
++                    }
++
++                    break :buf entry;
++                }
++            };
++
++            // We need to reslice so that we include our '--' at the beginning
++            // of our buffer so that we can trick the CLI parser to treat it
++            // as CLI args.
++            return self.entry[0 .. buf.len + 2];
++        }
++    };
++}
++
++// Constructs a LineIterator (see docs for that).
++pub fn lineIterator(reader: anytype) LineIterator(@TypeOf(reader)) {
++    return .{ .r = reader };
++}
++
++test "LineIterator" {
++    const testing = std.testing;
++    var fbs = std.io.fixedBufferStream(
++        \\A
++        \\B=42
++        \\C
++        \\
++        \\# A comment
++        \\D
++        \\
++        \\  # An indented comment
++        \\  E
++        \\
++        \\# A quoted string with whitespace
++        \\F=  "value "
++    );
++
++    var iter = lineIterator(fbs.reader());
++    try testing.expectEqualStrings("--A", iter.next().?);
++    try testing.expectEqualStrings("--B=42", iter.next().?);
++    try testing.expectEqualStrings("--C", iter.next().?);
++    try testing.expectEqualStrings("--D", iter.next().?);
++    try testing.expectEqualStrings("--E", iter.next().?);
++    try testing.expectEqualStrings("--F=value ", iter.next().?);
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++}
++
++test "LineIterator end in newline" {
++    const testing = std.testing;
++    var fbs = std.io.fixedBufferStream("A\n\n");
++
++    var iter = lineIterator(fbs.reader());
++    try testing.expectEqualStrings("--A", iter.next().?);
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++}
++
++test "LineIterator spaces around '='" {
++    const testing = std.testing;
++    var fbs = std.io.fixedBufferStream("A = B\n\n");
++
++    var iter = lineIterator(fbs.reader());
++    try testing.expectEqualStrings("--A=B", iter.next().?);
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++}
+
+commit 8214471e2c3d3085829a126ca6e7de6bb9e70a03
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 23 22:59:22 2023 -0700
+
+    cli/list-fonts: dumb implementation
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 0a326fe8..833914c8 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -55,7 +55,7 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+         break :arena dst._arena.?.allocator();
+     } else fail: {
+         // Note: this is... not safe...
+-        var fail = std.testing.FailingAllocator.init(alloc, 0);
++        var fail = std.testing.FailingAllocator.init(alloc, .{});
+         break :fail fail.allocator();
+     };
+     errdefer if (arena_available and arena_owned) {
+
+commit 08954feb5929efa0915163159ff35c930253c9f7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Sep 26 08:45:20 2023 -0700
+
+    cli: args can parse unions
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 833914c8..9eb09b3c 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -154,10 +154,11 @@ fn parseIntoField(
+                 else => field.type,
+             };
+ 
+-            // If we are a struct and have parseCLI, we call that and use
+-            // that to set the value.
+-            switch (@typeInfo(Field)) {
+-                .Struct => if (@hasDecl(Field, "parseCLI")) {
++            // If we are a type that can have decls and have a parseCLI decl,
++            // we call that and use that to set the value.
++            const fieldInfo = @typeInfo(Field);
++            if (fieldInfo == .Struct or fieldInfo == .Union or fieldInfo == .Enum) {
++                if (@hasDecl(Field, "parseCLI")) {
+                     const fnInfo = @typeInfo(@TypeOf(Field.parseCLI)).Fn;
+                     switch (fnInfo.params.len) {
+                         // 1 arg = (input) => output
+@@ -182,8 +183,10 @@ fn parseIntoField(
+                     }
+ 
+                     return;
+-                },
++                }
++            }
+ 
++            switch (fieldInfo) {
+                 .Enum => {
+                     @field(dst, field.name) = std.meta.stringToEnum(
+                         Field,
+
+commit 2b281068374eab491c92fa9b6ddb2cdd706001cd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 2 08:17:42 2023 -0700
+
+    update zig
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 9eb09b3c..fcb4c039 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -82,7 +82,7 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+                 // The error set is dependent on comptime T, so we always add
+                 // an extra error so we can have the "else" below.
+                 const ErrSet = @TypeOf(err) || error{Unknown};
+-                switch (@as(ErrSet, @errSetCast(err))) {
++                switch (@as(ErrSet, @errorCast(err))) {
+                     // OOM is not recoverable since we need to allocate to
+                     // track more error messages.
+                     error.OutOfMemory => return err,
+
+commit 4104f78cba322da7210124aa3b8dc82e1ac5f545
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 27 15:57:20 2023 -0700
+
+    cli: handle "-e" as the command to execute
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index fcb4c039..eb91c43a 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -64,6 +64,11 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+     };
+ 
+     while (iter.next()) |arg| {
++        // Do manual parsing if we have a hook for it.
++        if (@hasDecl(T, "parseManuallyHook")) {
++            if (!try dst.parseManuallyHook(arena_alloc, arg, iter)) return;
++        }
++
+         if (mem.startsWith(u8, arg, "--")) {
+             var key: []const u8 = arg[2..];
+             const value: ?[]const u8 = value: {
+
+commit 8cd3b65d0adad0a343842709997772afaa860a7f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 7 15:59:56 2023 -0800
+
+    config: packed struct of bools supported as config field
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index eb91c43a..678c44b1 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -10,6 +10,9 @@ const ErrorList = @import("../config/ErrorList.zig");
+ //   - Only `--long=value` format is accepted. Do we want to allow
+ //     `--long value`? Not currently allowed.
+ 
++// For trimming
++const whitespace = " \t";
++
+ /// The base errors for arg parsing. Additional errors can be returned due
+ /// to type-specific parsing but these are always possible.
+ pub const Error = error{
+@@ -191,18 +194,6 @@ fn parseIntoField(
+                 }
+             }
+ 
+-            switch (fieldInfo) {
+-                .Enum => {
+-                    @field(dst, field.name) = std.meta.stringToEnum(
+-                        Field,
+-                        value orelse return error.ValueRequired,
+-                    ) orelse return error.InvalidValue;
+-                    return;
+-                },
+-
+-                else => {},
+-            }
+-
+             // No parseCLI, magic the value based on the type
+             @field(dst, field.name) = switch (Field) {
+                 []const u8 => value: {
+@@ -239,7 +230,19 @@ fn parseIntoField(
+                     value orelse return error.ValueRequired,
+                 ) catch return error.InvalidValue,
+ 
+-                else => unreachable,
++                else => switch (fieldInfo) {
++                    .Enum => std.meta.stringToEnum(
++                        Field,
++                        value orelse return error.ValueRequired,
++                    ) orelse return error.InvalidValue,
++
++                    .Struct => try parsePackedStruct(
++                        Field,
++                        value orelse return error.ValueRequired,
++                    ),
++
++                    else => unreachable,
++                },
+             };
+ 
+             return;
+@@ -249,6 +252,42 @@ fn parseIntoField(
+     return error.InvalidField;
+ }
+ 
++fn parsePackedStruct(comptime T: type, v: []const u8) !T {
++    const info = @typeInfo(T).Struct;
++    assert(info.layout == .Packed);
++
++    var result: T = .{};
++
++    // We split each value by ","
++    var iter = std.mem.splitSequence(u8, v, ",");
++    loop: while (iter.next()) |part_raw| {
++        // Determine the field we're looking for and the value. If the
++        // field is prefixed with "no-" then we set the value to false.
++        const part, const value = part: {
++            const negation_prefix = "no-";
++            const trimmed = std.mem.trim(u8, part_raw, whitespace);
++            if (std.mem.startsWith(u8, trimmed, negation_prefix)) {
++                break :part .{ trimmed[negation_prefix.len..], false };
++            } else {
++                break :part .{ trimmed, true };
++            }
++        };
++
++        inline for (info.fields) |field| {
++            assert(field.type == bool);
++            if (std.mem.eql(u8, field.name, part)) {
++                @field(result, field.name) = value;
++                continue :loop;
++            }
++        }
++
++        // No field matched
++        return error.InvalidValue;
++    }
++
++    return result;
++}
++
+ fn parseBool(v: []const u8) !bool {
+     const t = &[_][]const u8{ "1", "t", "T", "true" };
+     const f = &[_][]const u8{ "0", "f", "F", "false" };
+@@ -462,6 +501,63 @@ test "parseIntoField: enums" {
+     try testing.expectEqual(Enum.two, data.v);
+ }
+ 
++test "parseIntoField: packed struct" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    const Field = packed struct {
++        a: bool = false,
++        b: bool = true,
++    };
++    var data: struct {
++        v: Field,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "v", "b");
++    try testing.expect(!data.v.a);
++    try testing.expect(data.v.b);
++}
++
++test "parseIntoField: packed struct negation" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    const Field = packed struct {
++        a: bool = false,
++        b: bool = true,
++    };
++    var data: struct {
++        v: Field,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "v", "a,no-b");
++    try testing.expect(data.v.a);
++    try testing.expect(!data.v.b);
++}
++
++test "parseIntoField: packed struct whitespace" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    const Field = packed struct {
++        a: bool = false,
++        b: bool = true,
++    };
++    var data: struct {
++        v: Field,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "v", " a, no-b ");
++    try testing.expect(data.v.a);
++    try testing.expect(!data.v.b);
++}
++
+ test "parseIntoField: optional field" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+@@ -582,7 +678,6 @@ pub fn LineIterator(comptime ReaderType: type) type {
+                     } orelse return null;
+ 
+                     // Trim any whitespace around it
+-                    const whitespace = " \t";
+                     const trim = std.mem.trim(u8, entry, whitespace);
+                     if (trim.len != entry.len) {
+                         std.mem.copy(u8, entry, trim);
+
+commit 0dc5516ac66285bc4ec6b32ff77cb9f78a7dc997
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 22 21:08:39 2023 -0800
+
+    config: add "theme" config, track inputs
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 678c44b1..d8b67085 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -67,6 +67,11 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+     };
+ 
+     while (iter.next()) |arg| {
++        // If an _inputs fields exist we keep track of the inputs.
++        if (@hasField(T, "_inputs")) {
++            try dst._inputs.append(arena_alloc, try arena_alloc.dupe(u8, arg));
++        }
++
+         // Do manual parsing if we have a hook for it.
+         if (@hasDecl(T, "parseManuallyHook")) {
+             if (!try dst.parseManuallyHook(arena_alloc, arg, iter)) return;
+@@ -381,6 +386,30 @@ test "parse: error tracking" {
+     try testing.expect(!data._errors.empty());
+ }
+ 
++test "parse: input tracking" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: []const u8 = "",
++        b: enum { one } = .one,
++
++        _arena: ?ArenaAllocator = null,
++        _errors: ErrorList = .{},
++        _inputs: std.ArrayListUnmanaged([]const u8) = .{},
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var iter = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--what --a=42",
++    );
++    defer iter.deinit();
++    try parse(@TypeOf(data), testing.allocator, &data, &iter);
++    try testing.expect(data._arena != null);
++    try testing.expect(data._inputs.items.len == 2);
++    try testing.expectEqualStrings("--what", data._inputs.items[0]);
++    try testing.expectEqualStrings("--a=42", data._inputs.items[1]);
++}
+ test "parseIntoField: ignore underscore-prefixed fields" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+@@ -732,6 +761,25 @@ pub fn lineIterator(reader: anytype) LineIterator(@TypeOf(reader)) {
+     return .{ .r = reader };
+ }
+ 
++/// An iterator valid for arg parsing from a slice.
++pub const SliceIterator = struct {
++    const Self = @This();
++
++    slice: []const []const u8,
++    idx: usize = 0,
++
++    pub fn next(self: *Self) ?[]const u8 {
++        if (self.idx >= self.slice.len) return null;
++        defer self.idx += 1;
++        return self.slice[self.idx];
++    }
++};
++
++/// Construct a SliceIterator from a slice.
++pub fn sliceIterator(slice: []const []const u8) SliceIterator {
++    return .{ .slice = slice };
++}
++
+ test "LineIterator" {
+     const testing = std.testing;
+     var fbs = std.io.fixedBufferStream(
+
+commit 0750698b62eef62a64b41f0a8c6ec78012882c50
+Author: Krzysztof Wolicki <der.teufel.mail@gmail.com>
+Date:   Thu Nov 30 21:23:28 2023 +0100
+
+    Update to latest master,
+    update libxev dependency,
+    change mach_glfw to an updated fork until upstream updates
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index d8b67085..99e6f7aa 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -204,14 +204,14 @@ fn parseIntoField(
+                 []const u8 => value: {
+                     const slice = value orelse return error.ValueRequired;
+                     const buf = try alloc.alloc(u8, slice.len);
+-                    mem.copy(u8, buf, slice);
++                    @memcpy(buf, slice);
+                     break :value buf;
+                 },
+ 
+                 [:0]const u8 => value: {
+                     const slice = value orelse return error.ValueRequired;
+                     const buf = try alloc.allocSentinel(u8, slice.len, 0);
+-                    mem.copy(u8, buf, slice);
++                    @memcpy(buf, slice);
+                     buf[slice.len] = 0;
+                     break :value buf;
+                 },
+@@ -709,7 +709,7 @@ pub fn LineIterator(comptime ReaderType: type) type {
+                     // Trim any whitespace around it
+                     const trim = std.mem.trim(u8, entry, whitespace);
+                     if (trim.len != entry.len) {
+-                        std.mem.copy(u8, entry, trim);
++                        std.mem.copyForwards(u8, entry, trim);
+                         entry = entry[0..trim.len];
+                     }
+ 
+@@ -737,9 +737,9 @@ pub fn LineIterator(comptime ReaderType: type) type {
+ 
+                         const len = key.len + value.len + 1;
+                         if (entry.len != len) {
+-                            std.mem.copy(u8, entry, key);
++                            std.mem.copyForwards(u8, entry, key);
+                             entry[key.len] = '=';
+-                            std.mem.copy(u8, entry[key.len + 1 ..], value);
++                            std.mem.copyForwards(u8, entry[key.len + 1 ..], value);
+                             entry = entry[0..len];
+                         }
+                     }
+
+commit 4ef8d099a7092c44035df283e605d1e617dbdee4
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Dec 30 22:52:47 2023 -0600
+
+    Make the abnormal runtime threshold configurable.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 99e6f7aa..6444400a 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -230,6 +230,12 @@ fn parseIntoField(
+                     0,
+                 ) catch return error.InvalidValue,
+ 
++                u64 => std.fmt.parseInt(
++                    u64,
++                    value orelse return error.ValueRequired,
++                    0,
++                ) catch return error.InvalidValue,
++
+                 f64 => std.fmt.parseFloat(
+                     f64,
+                     value orelse return error.ValueRequired,
+
+commit 5fe2d03e96c94b031a4ae2a5bb315a21e9844117
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Fri Jan 5 09:21:34 2024 -0600
+
+    cli: strip CR in line iterator
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 6444400a..c226493f 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -712,8 +712,8 @@ pub fn LineIterator(comptime ReaderType: type) type {
+                         unreachable;
+                     } orelse return null;
+ 
+-                    // Trim any whitespace around it
+-                    const trim = std.mem.trim(u8, entry, whitespace);
++                    // Trim any whitespace (including CR) around it
++                    const trim = std.mem.trim(u8, entry, whitespace ++ "\r");
+                     if (trim.len != entry.len) {
+                         std.mem.copyForwards(u8, entry, trim);
+                         entry = entry[0..trim.len];
+@@ -833,3 +833,14 @@ test "LineIterator spaces around '='" {
+     try testing.expectEqual(@as(?[]const u8, null), iter.next());
+     try testing.expectEqual(@as(?[]const u8, null), iter.next());
+ }
++
++test "LineIterator with CRLF line endings" {
++    const testing = std.testing;
++    var fbs = std.io.fixedBufferStream("A\r\nB = C\r\n");
++
++    var iter = lineIterator(fbs.reader());
++    try testing.expectEqualStrings("--A", iter.next().?);
++    try testing.expectEqualStrings("--B=C", iter.next().?);
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++}
+
+commit b438998fb82d07e7f29a71cec30e1f46a7a7a0fc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 20 09:29:26 2024 -0800
+
+    cli: support --help and -h for actions
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index c226493f..773457cf 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -77,6 +77,17 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+             if (!try dst.parseManuallyHook(arena_alloc, arg, iter)) return;
+         }
+ 
++        // If the destination supports help then we check for it, call
++        // the help function and return.
++        if (@hasDecl(T, "help")) {
++            if (mem.eql(u8, arg, "--help") or
++                mem.eql(u8, arg, "-h"))
++            {
++                try dst.help();
++                return;
++            }
++        }
++
+         if (mem.startsWith(u8, arg, "--")) {
+             var key: []const u8 = arg[2..];
+             const value: ?[]const u8 = value: {
+
+commit 9369baac60508d492b3e97bc9343983e11e5a31f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 20 12:50:11 2024 -0800
+
+    cli: empty field resets optionals to null
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 773457cf..abca087e 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -170,6 +170,22 @@ fn parseIntoField(
+ 
+     inline for (info.Struct.fields) |field| {
+         if (field.name[0] != '_' and mem.eql(u8, field.name, key)) {
++            // If the field is optional then consider scenarios we reset
++            // the value to being unset. We allow unsetting optionals
++            // whenever the value is "".
++            //
++            // At the time of writing this, empty string isn't a desirable
++            // value for any optional field under any realistic scenario.
++            //
++            // We don't allow unset values to set optional fields to
++            // null because unset value for booleans always means true.
++            if (@typeInfo(field.type) == .Optional) optional: {
++                if (std.mem.eql(u8, "", value orelse break :optional)) {
++                    @field(dst, field.name) = null;
++                    return;
++                }
++            }
++
+             // For optional fields, we just treat it as the child type.
+             // This lets optional fields default to null but get set by
+             // the CLI.
+@@ -617,6 +633,10 @@ test "parseIntoField: optional field" {
+     // True
+     try parseIntoField(@TypeOf(data), alloc, &data, "a", "1");
+     try testing.expectEqual(true, data.a.?);
++
++    // Unset
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "");
++    try testing.expect(data.a == null);
+ }
+ 
+ test "parseIntoField: struct with parse func" {
+
+commit c9371500c98c690070343d1a7e95b51cf990f92a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 23 18:57:33 2024 -0800
+
+    empty cli or config args reset the value to the default
+    
+    Fixes #1367
+    
+    We previously special-cased optionals but we should do better and have
+    this reset ANY type to the defined default value on the struct.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index abca087e..61dbc509 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -170,20 +170,14 @@ fn parseIntoField(
+ 
+     inline for (info.Struct.fields) |field| {
+         if (field.name[0] != '_' and mem.eql(u8, field.name, key)) {
+-            // If the field is optional then consider scenarios we reset
+-            // the value to being unset. We allow unsetting optionals
+-            // whenever the value is "".
+-            //
+-            // At the time of writing this, empty string isn't a desirable
+-            // value for any optional field under any realistic scenario.
+-            //
+-            // We don't allow unset values to set optional fields to
+-            // null because unset value for booleans always means true.
+-            if (@typeInfo(field.type) == .Optional) optional: {
+-                if (std.mem.eql(u8, "", value orelse break :optional)) {
+-                    @field(dst, field.name) = null;
+-                    return;
+-                }
++            // If the value is empty string (set but empty string),
++            // then we reset the value to the default.
++            if (value) |v| default: {
++                if (v.len != 0) break :default;
++                const raw = field.default_value orelse break :default;
++                const ptr: *const field.type = @alignCast(@ptrCast(raw));
++                @field(dst, field.name) = ptr.*;
++                return;
+             }
+ 
+             // For optional fields, we just treat it as the child type.
+@@ -396,6 +390,26 @@ test "parse: quoted value" {
+     try testing.expectEqualStrings("hello!", data.b);
+ }
+ 
++test "parse: empty value resets to default" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: u8 = 42,
++        b: bool = false,
++        _arena: ?ArenaAllocator = null,
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var iter = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--a= --b=",
++    );
++    defer iter.deinit();
++    try parse(@TypeOf(data), testing.allocator, &data, &iter);
++    try testing.expectEqual(@as(u8, 42), data.a);
++    try testing.expect(!data.b);
++}
++
+ test "parse: error tracking" {
+     const testing = std.testing;
+ 
+@@ -865,6 +879,15 @@ test "LineIterator spaces around '='" {
+     try testing.expectEqual(@as(?[]const u8, null), iter.next());
+ }
+ 
++test "LineIterator no value" {
++    const testing = std.testing;
++    var fbs = std.io.fixedBufferStream("A = \n\n");
++
++    var iter = lineIterator(fbs.reader());
++    try testing.expectEqualStrings("--A=", iter.next().?);
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++}
++
+ test "LineIterator with CRLF line endings" {
+     const testing = std.testing;
+     var fbs = std.io.fixedBufferStream("A\r\nB = C\r\n");
+
+commit 0f133ae4a774518e61111d32bac72e53ac5de2cc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 23 21:49:16 2024 -0800
+
+    config: re-expand relative paths correctly when reloading config
+    
+    Fixes #1366
+    
+    When we use `loadTheme`, we "replay" the configuration so that the theme
+    is the base configuration and everything else can override everything
+    the theme sets. During this process, we were not properly re-expanding
+    all the relative paths.
+    
+    This fix works by changing our input tracking from solely tracking args
+    to tracking operations such as expansion as well. When we "replay" the
+    configuration we also replay operations such as path expansion with the
+    correct base path.
+    
+    This also removes the `_inputs` special mechanism `cli/args.zig` had
+    because we can already do that ourselves using `parseManuallyHook`.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 61dbc509..128b2954 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -67,11 +67,6 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+     };
+ 
+     while (iter.next()) |arg| {
+-        // If an _inputs fields exist we keep track of the inputs.
+-        if (@hasField(T, "_inputs")) {
+-            try dst._inputs.append(arena_alloc, try arena_alloc.dupe(u8, arg));
+-        }
+-
+         // Do manual parsing if we have a hook for it.
+         if (@hasDecl(T, "parseManuallyHook")) {
+             if (!try dst.parseManuallyHook(arena_alloc, arg, iter)) return;
+@@ -433,30 +428,6 @@ test "parse: error tracking" {
+     try testing.expect(!data._errors.empty());
+ }
+ 
+-test "parse: input tracking" {
+-    const testing = std.testing;
+-
+-    var data: struct {
+-        a: []const u8 = "",
+-        b: enum { one } = .one,
+-
+-        _arena: ?ArenaAllocator = null,
+-        _errors: ErrorList = .{},
+-        _inputs: std.ArrayListUnmanaged([]const u8) = .{},
+-    } = .{};
+-    defer if (data._arena) |arena| arena.deinit();
+-
+-    var iter = try std.process.ArgIteratorGeneral(.{}).init(
+-        testing.allocator,
+-        "--what --a=42",
+-    );
+-    defer iter.deinit();
+-    try parse(@TypeOf(data), testing.allocator, &data, &iter);
+-    try testing.expect(data._arena != null);
+-    try testing.expect(data._inputs.items.len == 2);
+-    try testing.expectEqualStrings("--what", data._inputs.items[0]);
+-    try testing.expectEqualStrings("--a=42", data._inputs.items[1]);
+-}
+ test "parseIntoField: ignore underscore-prefixed fields" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+
+commit b48d24a5469d7d3545cc3c7a17652ce1aba5516e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 13 09:14:12 2024 -0700
+
+    update zig
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 128b2954..0363ba9b 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -281,7 +281,7 @@ fn parseIntoField(
+ 
+ fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+     const info = @typeInfo(T).Struct;
+-    assert(info.layout == .Packed);
++    assert(info.layout == .@"packed");
+ 
+     var result: T = .{};
+ 
+
+commit 0c888af4709eacf99bd67c002316968db616abc2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Feb 28 21:57:07 2024 -0800
+
+    cli: arg parsing supports more int types
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 0363ba9b..49c5152a 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -234,20 +234,18 @@ fn parseIntoField(
+ 
+                 bool => try parseBool(value orelse "t"),
+ 
+-                u8 => std.fmt.parseInt(
+-                    u8,
+-                    value orelse return error.ValueRequired,
+-                    0,
+-                ) catch return error.InvalidValue,
+-
+-                u32 => std.fmt.parseInt(
+-                    u32,
+-                    value orelse return error.ValueRequired,
+-                    0,
+-                ) catch return error.InvalidValue,
+-
+-                u64 => std.fmt.parseInt(
+-                    u64,
++                inline u8,
++                u16,
++                u32,
++                u64,
++                usize,
++                i8,
++                i16,
++                i32,
++                i64,
++                isize,
++                => |Int| std.fmt.parseInt(
++                    Int,
+                     value orelse return error.ValueRequired,
+                     0,
+                 ) catch return error.InvalidValue,
+
+commit d4a75492225e571f91fcd6ef79662563fad9be94
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed May 8 14:23:20 2024 -0400
+
+    feat(font): Non-integer point sizes
+    
+    Allows for high dpi displays to get odd numbered pixel sizes, for
+    example, 13.5pt @ 2px/pt for 27px font. This implementation performs
+    all the sizing calculations with f32, rounding to the nearest pixel
+    size when it comes to rendering. In the future this can be enhanced
+    by adding fractional scaling to support fractional pixel sizes.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 49c5152a..707416e3 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -250,8 +250,10 @@ fn parseIntoField(
+                     0,
+                 ) catch return error.InvalidValue,
+ 
+-                f64 => std.fmt.parseFloat(
+-                    f64,
++                f32,
++                f64,
++                => |Float| std.fmt.parseFloat(
++                    Float,
+                     value orelse return error.ValueRequired,
+                 ) catch return error.InvalidValue,
+ 
+
+commit 9de940cbbfd5ada9e17298cd5feb103db6a8a979
+Author: Jon Parise <jon@indelible.org>
+Date:   Tue Jul 9 09:03:23 2024 -0400
+
+    cli: boolean value support for packed structs
+    
+    Allow standalone boolean values like "true" and "false" to turn on or
+    off all of the struct's fields.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 707416e3..0f21ea79 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -285,6 +285,17 @@ fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+ 
+     var result: T = .{};
+ 
++    // Allow standalone boolean values like "true" and "false" to
++    // turn on or off all of the struct's fields.
++    bools: {
++        const b = parseBool(v) catch break :bools;
++        inline for (info.fields) |field| {
++            assert(field.type == bool);
++            @field(result, field.name) = b;
++        }
++        return result;
++    }
++
+     // We split each value by ","
+     var iter = std.mem.splitSequence(u8, v, ",");
+     loop: while (iter.next()) |part_raw| {
+@@ -586,6 +597,34 @@ test "parseIntoField: packed struct negation" {
+     try testing.expect(!data.v.b);
+ }
+ 
++test "parseIntoField: packed struct true/false" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    const Field = packed struct {
++        a: bool = false,
++        b: bool = true,
++    };
++    var data: struct {
++        v: Field,
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "v", "true");
++    try testing.expect(data.v.a);
++    try testing.expect(data.v.b);
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "v", "false");
++    try testing.expect(!data.v.a);
++    try testing.expect(!data.v.b);
++
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "v", "true,a"),
++    );
++}
++
+ test "parseIntoField: packed struct whitespace" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+
+commit a389987ada7fcd976c443c950390b4743ca1b545
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Sep 16 10:51:40 2024 -0700
+
+    cli: config structure supports tagged unions
+    
+    The syntax of tagged unions is `tag:value`. This matches the tagged
+    union parsing syntax for keybindings (i.e. `new_split:right`).
+    
+    I'm adding this now on its own without a user-facing feature because
+    I can see some places we might use this and I want to separate this out.
+    There is already a PR open now that can utilize this (#2231).
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 0f21ea79..2244a801 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -268,7 +268,13 @@ fn parseIntoField(
+                         value orelse return error.ValueRequired,
+                     ),
+ 
+-                    else => unreachable,
++                    .Union => try parseTaggedUnion(
++                        Field,
++                        alloc,
++                        value orelse return error.ValueRequired,
++                    ),
++
++                    else => @compileError("unsupported field type"),
+                 },
+             };
+ 
+@@ -279,6 +285,52 @@ fn parseIntoField(
+     return error.InvalidField;
+ }
+ 
++fn parseTaggedUnion(comptime T: type, alloc: Allocator, v: []const u8) !T {
++    const info = @typeInfo(T).Union;
++    assert(@typeInfo(info.tag_type.?) == .Enum);
++
++    // Get the union tag that is being set. We support values with no colon
++    // if the value is void so its not an error to have no colon.
++    const colon_idx = mem.indexOf(u8, v, ":") orelse v.len;
++    const tag_str = std.mem.trim(u8, v[0..colon_idx], whitespace);
++    const value = if (colon_idx < v.len) v[colon_idx + 1 ..] else "";
++
++    // Find the field in the union that matches the tag.
++    inline for (info.fields) |field| {
++        if (mem.eql(u8, field.name, tag_str)) {
++            // Special case void types where we don't need a value.
++            if (field.type == void) {
++                if (value.len > 0) return error.InvalidValue;
++                return @unionInit(T, field.name, {});
++            }
++
++            // We need to create a struct that looks like this union field.
++            // This lets us use parseIntoField as if its a dedicated struct.
++            const Target = @Type(.{ .Struct = .{
++                .layout = .auto,
++                .fields = &.{.{
++                    .name = field.name,
++                    .type = field.type,
++                    .default_value = null,
++                    .is_comptime = false,
++                    .alignment = @alignOf(field.type),
++                }},
++                .decls = &.{},
++                .is_tuple = false,
++            } });
++
++            // Parse the value into the struct
++            var t: Target = undefined;
++            try parseIntoField(Target, alloc, &t, field.name, value);
++
++            // Build our union
++            return @unionInit(T, field.name, @field(t, field.name));
++        }
++    }
++
++    return error.InvalidValue;
++}
++
+ fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+     const info = @typeInfo(T).Struct;
+     assert(info.layout == .@"packed");
+@@ -742,6 +794,99 @@ test "parseIntoField: struct with parse func with unsupported error tracking" {
+     );
+ }
+ 
++test "parseIntoField: tagged union" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        value: union(enum) {
++            a: u8,
++            b: u8,
++            c: void,
++            d: []const u8,
++        } = undefined,
++    } = .{};
++
++    // Set one field
++    try parseIntoField(@TypeOf(data), alloc, &data, "value", "a:1");
++    try testing.expectEqual(1, data.value.a);
++
++    // Set another
++    try parseIntoField(@TypeOf(data), alloc, &data, "value", "b:2");
++    try testing.expectEqual(2, data.value.b);
++
++    // Set void field
++    try parseIntoField(@TypeOf(data), alloc, &data, "value", "c");
++    try testing.expectEqual({}, data.value.c);
++
++    // Set string field
++    try parseIntoField(@TypeOf(data), alloc, &data, "value", "d:hello");
++    try testing.expectEqualStrings("hello", data.value.d);
++}
++
++test "parseIntoField: tagged union unknown filed" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        value: union(enum) {
++            a: u8,
++            b: u8,
++        } = undefined,
++    } = .{};
++
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "value", "c:1"),
++    );
++}
++
++test "parseIntoField: tagged union invalid field value" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        value: union(enum) {
++            a: u8,
++            b: u8,
++        } = undefined,
++    } = .{};
++
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "value", "a:hello"),
++    );
++}
++
++test "parseIntoField: tagged union missing tag" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        value: union(enum) {
++            a: u8,
++            b: u8,
++        } = undefined,
++    } = .{};
++
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "value", "a"),
++    );
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "value", ":a"),
++    );
++}
++
+ /// Returns an iterator (implements "next") that reads CLI args by line.
+ /// Each CLI arg is expected to be a single line. This is used to implement
+ /// configuration files.
+
+commit a4e14631ef6eb57382ff3c15134d90617c8fd264
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Oct 16 16:45:38 2024 -0700
+
+    config: richer diagnostics for errors
+    
+    Rather than storing a list of errors we now store a list of
+    "diagnostics." Each diagnostic has a richer set of structured
+    information, including a message, a key, the location where it occurred.
+    
+    This lets us show more detailed messages, more human friendly messages, and
+    also let's us filter by key or location. We don't take advantage of
+    all of this capability in this initial commit, but we do use every field
+    for something.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 2244a801..c5355251 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -3,8 +3,9 @@ const mem = std.mem;
+ const assert = std.debug.assert;
+ const Allocator = mem.Allocator;
+ const ArenaAllocator = std.heap.ArenaAllocator;
+-
+-const ErrorList = @import("../config/ErrorList.zig");
++const diags = @import("diagnostics.zig");
++const Diagnostic = diags.Diagnostic;
++const DiagnosticList = diags.DiagnosticList;
+ 
+ // TODO:
+ //   - Only `--long=value` format is accepted. Do we want to allow
+@@ -32,13 +33,18 @@ pub const Error = error{
+ /// an arena allocator will be created (or reused if set already) for any
+ /// allocations. Allocations are necessary for certain types, like `[]const u8`.
+ ///
+-/// If the destination type has a field "_errors" of type "ErrorList" then
+-/// errors will be added to that list. In this case, the only error returned by
+-/// parse are allocation errors.
++/// If the destination type has a field "_diagnostics", it must be of type
++/// "DiagnosticList" and any diagnostic messages will be added to that list.
++/// When diagnostics are present, only allocation errors will be returned.
+ ///
+ /// Note: If the arena is already non-null, then it will be used. In this
+ /// case, in the case of an error some memory might be leaked into the arena.
+-pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
++pub fn parse(
++    comptime T: type,
++    alloc: Allocator,
++    dst: *T,
++    iter: anytype,
++) !void {
+     const info = @typeInfo(T);
+     assert(info == .Struct);
+ 
+@@ -69,7 +75,11 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+     while (iter.next()) |arg| {
+         // Do manual parsing if we have a hook for it.
+         if (@hasDecl(T, "parseManuallyHook")) {
+-            if (!try dst.parseManuallyHook(arena_alloc, arg, iter)) return;
++            if (!try dst.parseManuallyHook(
++                arena_alloc,
++                arg,
++                iter,
++            )) return;
+         }
+ 
+         // If the destination supports help then we check for it, call
+@@ -96,56 +106,39 @@ pub fn parse(comptime T: type, alloc: Allocator, dst: *T, iter: anytype) !void {
+             };
+ 
+             parseIntoField(T, arena_alloc, dst, key, value) catch |err| {
+-                if (comptime !canTrackErrors(T)) return err;
++                if (comptime !canTrackDiags(T)) return err;
+ 
+                 // The error set is dependent on comptime T, so we always add
+                 // an extra error so we can have the "else" below.
+                 const ErrSet = @TypeOf(err) || error{Unknown};
+-                switch (@as(ErrSet, @errorCast(err))) {
++                const message: [:0]const u8 = switch (@as(ErrSet, @errorCast(err))) {
+                     // OOM is not recoverable since we need to allocate to
+                     // track more error messages.
+                     error.OutOfMemory => return err,
+-
+-                    error.InvalidField => try dst._errors.add(arena_alloc, .{
+-                        .message = try std.fmt.allocPrintZ(
+-                            arena_alloc,
+-                            "{s}: unknown field",
+-                            .{key},
+-                        ),
+-                    }),
+-
+-                    error.ValueRequired => try dst._errors.add(arena_alloc, .{
+-                        .message = try std.fmt.allocPrintZ(
+-                            arena_alloc,
+-                            "{s}: value required",
+-                            .{key},
+-                        ),
+-                    }),
+-
+-                    error.InvalidValue => try dst._errors.add(arena_alloc, .{
+-                        .message = try std.fmt.allocPrintZ(
+-                            arena_alloc,
+-                            "{s}: invalid value",
+-                            .{key},
+-                        ),
+-                    }),
+-
+-                    else => try dst._errors.add(arena_alloc, .{
+-                        .message = try std.fmt.allocPrintZ(
+-                            arena_alloc,
+-                            "{s}: unknown error {}",
+-                            .{ key, err },
+-                        ),
+-                    }),
+-                }
++                    error.InvalidField => "unknown field",
++                    error.ValueRequired => "value required",
++                    error.InvalidValue => "invalid value",
++                    else => try std.fmt.allocPrintZ(
++                        arena_alloc,
++                        "unknown error {}",
++                        .{err},
++                    ),
++                };
++
++                // Add our diagnostic
++                try dst._diagnostics.append(arena_alloc, .{
++                    .key = try arena_alloc.dupeZ(u8, key),
++                    .message = message,
++                    .location = Diagnostic.Location.fromIter(iter),
++                });
+             };
+         }
+     }
+ }
+ 
+-/// Returns true if this type can track errors.
+-fn canTrackErrors(comptime T: type) bool {
+-    return @hasField(T, "_errors");
++/// Returns true if this type can track diagnostics.
++fn canTrackDiags(comptime T: type) bool {
++    return @hasField(T, "_diagnostics");
+ }
+ 
+ /// Parse a single key/value pair into the destination type T.
+@@ -199,15 +192,6 @@ fn parseIntoField(
+                         // 3 arg = (self, alloc, input) => void
+                         3 => try @field(dst, field.name).parseCLI(alloc, value),
+ 
+-                        // 4 arg = (self, alloc, errors, input) => void
+-                        4 => if (comptime canTrackErrors(T)) {
+-                            try @field(dst, field.name).parseCLI(alloc, &dst._errors, value);
+-                        } else {
+-                            var list: ErrorList = .{};
+-                            try @field(dst, field.name).parseCLI(alloc, &list, value);
+-                            if (!list.empty()) return error.InvalidValue;
+-                        },
+-
+                         else => @compileError("parseCLI invalid argument count"),
+                     }
+ 
+@@ -468,7 +452,7 @@ test "parse: empty value resets to default" {
+     try testing.expect(!data.b);
+ }
+ 
+-test "parse: error tracking" {
++test "parse: diagnostic tracking" {
+     const testing = std.testing;
+ 
+     var data: struct {
+@@ -476,7 +460,7 @@ test "parse: error tracking" {
+         b: enum { one } = .one,
+ 
+         _arena: ?ArenaAllocator = null,
+-        _errors: ErrorList = .{},
++        _diagnostics: DiagnosticList = .{},
+     } = .{};
+     defer if (data._arena) |arena| arena.deinit();
+ 
+@@ -488,7 +472,48 @@ test "parse: error tracking" {
+     try parse(@TypeOf(data), testing.allocator, &data, &iter);
+     try testing.expect(data._arena != null);
+     try testing.expectEqualStrings("42", data.a);
+-    try testing.expect(!data._errors.empty());
++    try testing.expect(data._diagnostics.items().len == 1);
++    {
++        const diag = data._diagnostics.items()[0];
++        try testing.expectEqual(Diagnostic.Location.none, diag.location);
++        try testing.expectEqualStrings("what", diag.key);
++        try testing.expectEqualStrings("unknown field", diag.message);
++    }
++}
++
++test "parse: diagnostic location" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: []const u8 = "",
++        b: enum { one, two } = .one,
++
++        _arena: ?ArenaAllocator = null,
++        _diagnostics: DiagnosticList = .{},
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var fbs = std.io.fixedBufferStream(
++        \\a=42
++        \\what
++        \\b=two
++    );
++    const r = fbs.reader();
++
++    const Iter = LineIterator(@TypeOf(r));
++    var iter: Iter = .{ .r = r, .filepath = "test" };
++    try parse(@TypeOf(data), testing.allocator, &data, &iter);
++    try testing.expect(data._arena != null);
++    try testing.expectEqualStrings("42", data.a);
++    try testing.expect(data.b == .two);
++    try testing.expect(data._diagnostics.items().len == 1);
++    {
++        const diag = data._diagnostics.items()[0];
++        try testing.expectEqualStrings("what", diag.key);
++        try testing.expectEqualStrings("unknown field", diag.message);
++        try testing.expectEqualStrings("test", diag.location.file.path);
++        try testing.expectEqual(2, diag.location.file.line);
++    }
+ }
+ 
+ test "parseIntoField: ignore underscore-prefixed fields" {
+@@ -738,62 +763,6 @@ test "parseIntoField: struct with parse func" {
+     try testing.expectEqual(@as([]const u8, "HELLO!"), data.a.v);
+ }
+ 
+-test "parseIntoField: struct with parse func with error tracking" {
+-    const testing = std.testing;
+-    var arena = ArenaAllocator.init(testing.allocator);
+-    defer arena.deinit();
+-    const alloc = arena.allocator();
+-
+-    var data: struct {
+-        a: struct {
+-            const Self = @This();
+-
+-            pub fn parseCLI(
+-                _: Self,
+-                parse_alloc: Allocator,
+-                errors: *ErrorList,
+-                value: ?[]const u8,
+-            ) !void {
+-                _ = value;
+-                try errors.add(parse_alloc, .{ .message = "OH NO!" });
+-            }
+-        } = .{},
+-
+-        _errors: ErrorList = .{},
+-    } = .{};
+-
+-    try parseIntoField(@TypeOf(data), alloc, &data, "a", "42");
+-    try testing.expect(!data._errors.empty());
+-}
+-
+-test "parseIntoField: struct with parse func with unsupported error tracking" {
+-    const testing = std.testing;
+-    var arena = ArenaAllocator.init(testing.allocator);
+-    defer arena.deinit();
+-    const alloc = arena.allocator();
+-
+-    var data: struct {
+-        a: struct {
+-            const Self = @This();
+-
+-            pub fn parseCLI(
+-                _: Self,
+-                parse_alloc: Allocator,
+-                errors: *ErrorList,
+-                value: ?[]const u8,
+-            ) !void {
+-                _ = value;
+-                try errors.add(parse_alloc, .{ .message = "OH NO!" });
+-            }
+-        } = .{},
+-    } = .{};
+-
+-    try testing.expectError(
+-        error.InvalidValue,
+-        parseIntoField(@TypeOf(data), alloc, &data, "a", "42"),
+-    );
+-}
+-
+ test "parseIntoField: tagged union" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+@@ -899,7 +868,21 @@ pub fn LineIterator(comptime ReaderType: type) type {
+         /// like 4 years and be wrong about this.
+         pub const MAX_LINE_SIZE = 4096;
+ 
++        /// Our stateful reader.
+         r: ReaderType,
++
++        /// Filepath that is used for diagnostics. This is only used for
++        /// diagnostic messages so it can be formatted however you want.
++        /// It is prefixed to the messages followed by the line number.
++        filepath: []const u8 = "",
++
++        /// The current line that we're on. This is 1-indexed because
++        /// lines are generally 1-indexed in the real world. The value
++        /// can be zero if we haven't read any lines yet.
++        line: usize = 0,
++
++        /// This is the buffer where we store the current entry that
++        /// is formatted to be compatible with the parse function.
+         entry: [MAX_LINE_SIZE]u8 = [_]u8{ '-', '-' } ++ ([_]u8{0} ** (MAX_LINE_SIZE - 2)),
+ 
+         pub fn next(self: *Self) ?[]const u8 {
+@@ -912,6 +895,9 @@ pub fn LineIterator(comptime ReaderType: type) type {
+                         unreachable;
+                     } orelse return null;
+ 
++                    // Increment our line counter
++                    self.line += 1;
++
+                     // Trim any whitespace (including CR) around it
+                     const trim = std.mem.trim(u8, entry, whitespace ++ "\r");
+                     if (trim.len != entry.len) {
+@@ -959,6 +945,18 @@ pub fn LineIterator(comptime ReaderType: type) type {
+             // as CLI args.
+             return self.entry[0 .. buf.len + 2];
+         }
++
++        /// Modify the diagnostic so it includes richer context about
++        /// the location of the error.
++        pub fn location(self: *const Self) ?Diagnostic.Location {
++            // If we have no filepath then we have no location.
++            if (self.filepath.len == 0) return null;
++
++            return .{ .file = .{
++                .path = self.filepath,
++                .line = self.line,
++            } };
++        }
+     };
+ }
+ 
+
+commit f24098cbd8e757e2f73cd1ab07b46b5b4f85374d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 17 07:32:54 2024 -0700
+
+    config: show filepath and line numbers for config errors
+    
+    Fixes #1063
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index c5355251..b1fa9104 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -961,7 +961,7 @@ pub fn LineIterator(comptime ReaderType: type) type {
+ }
+ 
+ // Constructs a LineIterator (see docs for that).
+-pub fn lineIterator(reader: anytype) LineIterator(@TypeOf(reader)) {
++fn lineIterator(reader: anytype) LineIterator(@TypeOf(reader)) {
+     return .{ .r = reader };
+ }
+ 
+
+commit a12b33662cf3a51b06fb8cfd95920eca56d6d35f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 17 07:55:02 2024 -0700
+
+    config: track the location of CLI argument errors
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index b1fa9104..da8685e2 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -856,6 +856,34 @@ test "parseIntoField: tagged union missing tag" {
+     );
+ }
+ 
++/// An iterator that considers its location to be CLI args. It
++/// iterates through an underlying iterator and increments a counter
++/// to track the current CLI arg index.
++pub fn ArgsIterator(comptime Iterator: type) type {
++    return struct {
++        const Self = @This();
++
++        /// The underlying args iterator.
++        iterator: Iterator,
++
++        /// Our current index into the iterator. This is 1-indexed.
++        /// The 0 value is used to indicate that we haven't read any
++        /// values yet.
++        index: usize = 0,
++
++        pub fn next(self: *Self) ?[]const u8 {
++            const value = self.iterator.next() orelse return null;
++            self.index += 1;
++            return value;
++        }
++
++        /// Returns a location for a diagnostic message.
++        pub fn location(self: *const Self) ?Diagnostic.Location {
++            return .{ .cli = self.index };
++        }
++    };
++}
++
+ /// Returns an iterator (implements "next") that reads CLI args by line.
+ /// Each CLI arg is expected to be a single line. This is used to implement
+ /// configuration files.
+@@ -946,8 +974,7 @@ pub fn LineIterator(comptime ReaderType: type) type {
+             return self.entry[0 .. buf.len + 2];
+         }
+ 
+-        /// Modify the diagnostic so it includes richer context about
+-        /// the location of the error.
++        /// Returns a location for a diagnostic message.
+         pub fn location(self: *const Self) ?Diagnostic.Location {
+             // If we have no filepath then we have no location.
+             if (self.filepath.len == 0) return null;
+
+commit 70c175e2a6fc47b612f764199920b9a0daf99d3a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 17 08:02:28 2024 -0700
+
+    c: remove the config load string API
+    
+    It was unused and doesn't match our diagnostic API.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index da8685e2..ab66ba4f 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -129,7 +129,7 @@ pub fn parse(
+                 try dst._diagnostics.append(arena_alloc, .{
+                     .key = try arena_alloc.dupeZ(u8, key),
+                     .message = message,
+-                    .location = Diagnostic.Location.fromIter(iter),
++                    .location = diags.Location.fromIter(iter),
+                 });
+             };
+         }
+@@ -475,7 +475,7 @@ test "parse: diagnostic tracking" {
+     try testing.expect(data._diagnostics.items().len == 1);
+     {
+         const diag = data._diagnostics.items()[0];
+-        try testing.expectEqual(Diagnostic.Location.none, diag.location);
++        try testing.expectEqual(diags.Location.none, diag.location);
+         try testing.expectEqualStrings("what", diag.key);
+         try testing.expectEqualStrings("unknown field", diag.message);
+     }
+@@ -878,7 +878,7 @@ pub fn ArgsIterator(comptime Iterator: type) type {
+         }
+ 
+         /// Returns a location for a diagnostic message.
+-        pub fn location(self: *const Self) ?Diagnostic.Location {
++        pub fn location(self: *const Self) ?diags.Location {
+             return .{ .cli = self.index };
+         }
+     };
+@@ -975,7 +975,7 @@ pub fn LineIterator(comptime ReaderType: type) type {
+         }
+ 
+         /// Returns a location for a diagnostic message.
+-        pub fn location(self: *const Self) ?Diagnostic.Location {
++        pub fn location(self: *const Self) ?diags.Location {
+             // If we have no filepath then we have no location.
+             if (self.filepath.len == 0) return null;
+ 
+
+commit 940a46d41f8cc6a92f2f8f93b108d556410e22f2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 17 21:39:34 2024 -0700
+
+    cli: positional arguments are invalid when parsing configuration
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index ab66ba4f..3dcc08da 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -93,46 +93,60 @@ pub fn parse(
+             }
+         }
+ 
+-        if (mem.startsWith(u8, arg, "--")) {
+-            var key: []const u8 = arg[2..];
+-            const value: ?[]const u8 = value: {
+-                // If the arg has "=" then the value is after the "=".
+-                if (mem.indexOf(u8, key, "=")) |idx| {
+-                    defer key = key[0..idx];
+-                    break :value key[idx + 1 ..];
+-                }
++        // If this doesn't start with "--" then it isn't a config
++        // flag. We don't support positional arguments or configuration
++        // values set with spaces so this is an error.
++        if (!mem.startsWith(u8, arg, "--")) {
++            if (comptime !canTrackDiags(T)) return Error.InvalidField;
++
++            // Add our diagnostic
++            try dst._diagnostics.append(arena_alloc, .{
++                .key = try arena_alloc.dupeZ(u8, arg),
++                .message = "invalid field",
++                .location = diags.Location.fromIter(iter),
++            });
++
++            continue;
++        }
+ 
+-                break :value null;
+-            };
++        var key: []const u8 = arg[2..];
++        const value: ?[]const u8 = value: {
++            // If the arg has "=" then the value is after the "=".
++            if (mem.indexOf(u8, key, "=")) |idx| {
++                defer key = key[0..idx];
++                break :value key[idx + 1 ..];
++            }
+ 
+-            parseIntoField(T, arena_alloc, dst, key, value) catch |err| {
+-                if (comptime !canTrackDiags(T)) return err;
+-
+-                // The error set is dependent on comptime T, so we always add
+-                // an extra error so we can have the "else" below.
+-                const ErrSet = @TypeOf(err) || error{Unknown};
+-                const message: [:0]const u8 = switch (@as(ErrSet, @errorCast(err))) {
+-                    // OOM is not recoverable since we need to allocate to
+-                    // track more error messages.
+-                    error.OutOfMemory => return err,
+-                    error.InvalidField => "unknown field",
+-                    error.ValueRequired => "value required",
+-                    error.InvalidValue => "invalid value",
+-                    else => try std.fmt.allocPrintZ(
+-                        arena_alloc,
+-                        "unknown error {}",
+-                        .{err},
+-                    ),
+-                };
+-
+-                // Add our diagnostic
+-                try dst._diagnostics.append(arena_alloc, .{
+-                    .key = try arena_alloc.dupeZ(u8, key),
+-                    .message = message,
+-                    .location = diags.Location.fromIter(iter),
+-                });
++            break :value null;
++        };
++
++        parseIntoField(T, arena_alloc, dst, key, value) catch |err| {
++            if (comptime !canTrackDiags(T)) return err;
++
++            // The error set is dependent on comptime T, so we always add
++            // an extra error so we can have the "else" below.
++            const ErrSet = @TypeOf(err) || error{Unknown};
++            const message: [:0]const u8 = switch (@as(ErrSet, @errorCast(err))) {
++                // OOM is not recoverable since we need to allocate to
++                // track more error messages.
++                error.OutOfMemory => return err,
++                error.InvalidField => "unknown field",
++                error.ValueRequired => "value required",
++                error.InvalidValue => "invalid value",
++                else => try std.fmt.allocPrintZ(
++                    arena_alloc,
++                    "unknown error {}",
++                    .{err},
++                ),
+             };
+-        }
++
++            // Add our diagnostic
++            try dst._diagnostics.append(arena_alloc, .{
++                .key = try arena_alloc.dupeZ(u8, key),
++                .message = message,
++                .location = diags.Location.fromIter(iter),
++            });
++        };
+     }
+ }
+ 
+@@ -452,6 +466,27 @@ test "parse: empty value resets to default" {
+     try testing.expect(!data.b);
+ }
+ 
++test "parse: positional arguments are invalid" {
++    const testing = std.testing;
++
++    var data: struct {
++        a: u8 = 42,
++        _arena: ?ArenaAllocator = null,
++    } = .{};
++    defer if (data._arena) |arena| arena.deinit();
++
++    var iter = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--a=84 what",
++    );
++    defer iter.deinit();
++    try testing.expectError(
++        error.InvalidField,
++        parse(@TypeOf(data), testing.allocator, &data, &iter),
++    );
++    try testing.expectEqual(@as(u8, 84), data.a);
++}
++
+ test "parse: diagnostic tracking" {
+     const testing = std.testing;
+ 
+
+commit c90ed293417add9bab0ac52ccef9eae0efd3e0cb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 18 12:53:32 2024 -0700
+
+    cli: skip argv0 and actions when parsing CLI flags
+    
+    This fixes a regression from #2454. In that PR, we added an error when
+    positional arguments are detected. I believe that's correct, but we
+    were silently relying on the previous behavior in the CLI commands.
+    
+    This commit changes the CLI commands to use a new argsIterator function
+    that creates an iterator that skips the first argument (argv0). This is
+    the same behavior that the config parsing does and now uses this shared
+    logic.
+    
+    This also makes it so the argsIterator ignores actions (`+things`)
+    and we document that we expect those to be handled earlier.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 3dcc08da..bfd40c63 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -4,6 +4,7 @@ const assert = std.debug.assert;
+ const Allocator = mem.Allocator;
+ const ArenaAllocator = std.heap.ArenaAllocator;
+ const diags = @import("diagnostics.zig");
++const internal_os = @import("../os/main.zig");
+ const Diagnostic = diags.Diagnostic;
+ const DiagnosticList = diags.DiagnosticList;
+ 
+@@ -894,6 +895,9 @@ test "parseIntoField: tagged union missing tag" {
+ /// An iterator that considers its location to be CLI args. It
+ /// iterates through an underlying iterator and increments a counter
+ /// to track the current CLI arg index.
++///
++/// This also ignores any argument that starts with `+`. It assumes that
++/// actions were parsed out before this iterator was created.
+ pub fn ArgsIterator(comptime Iterator: type) type {
+     return struct {
+         const Self = @This();
+@@ -906,9 +910,21 @@ pub fn ArgsIterator(comptime Iterator: type) type {
+         /// values yet.
+         index: usize = 0,
+ 
++        pub fn deinit(self: *Self) void {
++            if (@hasDecl(Iterator, "deinit")) {
++                self.iterator.deinit();
++            }
++        }
++
+         pub fn next(self: *Self) ?[]const u8 {
+             const value = self.iterator.next() orelse return null;
+             self.index += 1;
++
++            // We ignore any argument that starts with "+". This is used
++            // to indicate actions and are expected to be parsed out before
++            // this iterator is created.
++            if (value.len > 0 and value[0] == '+') return self.next();
++
+             return value;
+         }
+ 
+@@ -919,6 +935,31 @@ pub fn ArgsIterator(comptime Iterator: type) type {
+     };
+ }
+ 
++/// Create an args iterator for the process args. This will skip argv0.
++pub fn argsIterator(alloc_gpa: Allocator) internal_os.args.ArgIterator.InitError!ArgsIterator(internal_os.args.ArgIterator) {
++    var iter = try internal_os.args.iterator(alloc_gpa);
++    errdefer iter.deinit();
++    _ = iter.next(); // skip argv0
++    return .{ .iterator = iter };
++}
++
++test "ArgsIterator" {
++    const testing = std.testing;
++
++    const child = try std.process.ArgIteratorGeneral(.{}).init(
++        testing.allocator,
++        "--what +list-things --a=42",
++    );
++    const Iter = ArgsIterator(@TypeOf(child));
++    var iter: Iter = .{ .iterator = child };
++    defer iter.deinit();
++
++    try testing.expectEqualStrings("--what", iter.next().?);
++    try testing.expectEqualStrings("--a=42", iter.next().?);
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++    try testing.expectEqual(@as(?[]const u8, null), iter.next());
++}
++
+ /// Returns an iterator (implements "next") that reads CLI args by line.
+ /// Each CLI arg is expected to be a single line. This is used to implement
+ /// configuration files.
+
+commit ca844ca3c064cfdd51a9c29a20dcbfe314c0d712
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Nov 2 23:30:21 2024 -0500
+
+    core: list valid options if an invalid value is detected parsing an enum
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index bfd40c63..9a8d1ae4 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -133,7 +133,29 @@ pub fn parse(
+                 error.OutOfMemory => return err,
+                 error.InvalidField => "unknown field",
+                 error.ValueRequired => "value required",
+-                error.InvalidValue => "invalid value",
++                error.InvalidValue => msg: {
++                    var buf = std.ArrayList(u8).init(arena_alloc);
++                    errdefer buf.deinit();
++                    const writer = buf.writer();
++                    try writer.print("invalid value \"{?s}\"", .{value});
++                    const typeinfo = @typeInfo(T);
++                    inline for (typeinfo.Struct.fields) |f| {
++                        if (std.mem.eql(u8, key, f.name)) {
++                            switch (@typeInfo(f.type)) {
++                                .Enum => |e| {
++                                    try writer.print(", valid values are: ", .{});
++                                    inline for (e.fields, 0..) |field, i| {
++                                        if (i != 0) try writer.print(", ", .{});
++                                        try writer.print("{s}", .{field.name});
++                                    }
++                                },
++                                else => {},
++                            }
++                            break;
++                        }
++                    }
++                    break :msg try buf.toOwnedSliceSentinel(0);
++                },
+                 else => try std.fmt.allocPrintZ(
+                     arena_alloc,
+                     "unknown error {}",
+
+commit 3eef6d205e508557d05a3e619400689a81f9aacf
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Nov 9 12:49:40 2024 -0600
+
+    core: address review comments
+    
+    - break formatting values out into a function so that we can
+      catch errors and never fail
+    - eliminate the use of toOwnedSentinelSlice since we are using
+      an arena to clean up memory
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 9a8d1ae4..5fdaf6d8 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -132,30 +132,8 @@ pub fn parse(
+                 // track more error messages.
+                 error.OutOfMemory => return err,
+                 error.InvalidField => "unknown field",
+-                error.ValueRequired => "value required",
+-                error.InvalidValue => msg: {
+-                    var buf = std.ArrayList(u8).init(arena_alloc);
+-                    errdefer buf.deinit();
+-                    const writer = buf.writer();
+-                    try writer.print("invalid value \"{?s}\"", .{value});
+-                    const typeinfo = @typeInfo(T);
+-                    inline for (typeinfo.Struct.fields) |f| {
+-                        if (std.mem.eql(u8, key, f.name)) {
+-                            switch (@typeInfo(f.type)) {
+-                                .Enum => |e| {
+-                                    try writer.print(", valid values are: ", .{});
+-                                    inline for (e.fields, 0..) |field, i| {
+-                                        if (i != 0) try writer.print(", ", .{});
+-                                        try writer.print("{s}", .{field.name});
+-                                    }
+-                                },
+-                                else => {},
+-                            }
+-                            break;
+-                        }
+-                    }
+-                    break :msg try buf.toOwnedSliceSentinel(0);
+-                },
++                error.ValueRequired => formatValueRequired(T, arena_alloc, key) catch "value required",
++                error.InvalidValue => formatInvalidValue(T, arena_alloc, key, value) catch "invalid value",
+                 else => try std.fmt.allocPrintZ(
+                     arena_alloc,
+                     "unknown error {}",
+@@ -173,6 +151,54 @@ pub fn parse(
+     }
+ }
+ 
++fn formatValueRequired(
++    comptime T: type,
++    arena_alloc: std.mem.Allocator,
++    key: []const u8,
++) std.mem.Allocator.Error![:0]const u8 {
++    var buf = std.ArrayList(u8).init(arena_alloc);
++    errdefer buf.deinit();
++    const writer = buf.writer();
++    try writer.print("value required", .{});
++    try formatValues(T, key, writer);
++    try writer.writeByte(0);
++    return buf.items[0 .. buf.items.len - 1 :0];
++}
++
++fn formatInvalidValue(
++    comptime T: type,
++    arena_alloc: std.mem.Allocator,
++    key: []const u8,
++    value: ?[]const u8,
++) std.mem.Allocator.Error![:0]const u8 {
++    var buf = std.ArrayList(u8).init(arena_alloc);
++    errdefer buf.deinit();
++    const writer = buf.writer();
++    try writer.print("invalid value \"{?s}\"", .{value});
++    try formatValues(T, key, writer);
++    try writer.writeByte(0);
++    return buf.items[0 .. buf.items.len - 1 :0];
++}
++
++fn formatValues(comptime T: type, key: []const u8, writer: anytype) std.mem.Allocator.Error!void {
++    const typeinfo = @typeInfo(T);
++    inline for (typeinfo.Struct.fields) |f| {
++        if (std.mem.eql(u8, key, f.name)) {
++            switch (@typeInfo(f.type)) {
++                .Enum => |e| {
++                    try writer.print(", valid values are: ", .{});
++                    inline for (e.fields, 0..) |field, i| {
++                        if (i != 0) try writer.print(", ", .{});
++                        try writer.print("{s}", .{field.name});
++                    }
++                },
++                else => {},
++            }
++            break;
++        }
++    }
++}
++
+ /// Returns true if this type can track diagnostics.
+ fn canTrackDiags(comptime T: type) bool {
+     return @hasField(T, "_diagnostics");
+
+commit d2cdc4f717b6169a885185868c12eeba3209c642
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 19 10:46:11 2024 -0800
+
+    cli: parse auto structs
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 5fdaf6d8..e26ea975 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -310,8 +310,9 @@ fn parseIntoField(
+                         value orelse return error.ValueRequired,
+                     ) orelse return error.InvalidValue,
+ 
+-                    .Struct => try parsePackedStruct(
++                    .Struct => try parseStruct(
+                         Field,
++                        alloc,
+                         value orelse return error.ValueRequired,
+                     ),
+ 
+@@ -378,9 +379,79 @@ fn parseTaggedUnion(comptime T: type, alloc: Allocator, v: []const u8) !T {
+     return error.InvalidValue;
+ }
+ 
++fn parseStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
++    return switch (@typeInfo(T).Struct.layout) {
++        .auto => parseAutoStruct(T, alloc, v),
++        .@"packed" => parsePackedStruct(T, v),
++        else => @compileError("unsupported struct layout"),
++    };
++}
++
++fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
++    const info = @typeInfo(T).Struct;
++    comptime assert(info.layout == .auto);
++
++    // We start our result as undefined so we don't get an error for required
++    // fields. We track required fields below and we validate that we set them
++    // all at the bottom of this function (in addition to setting defaults for
++    // optionals).
++    var result: T = undefined;
++
++    // Keep track of which fields were set so we can error if a required
++    // field was not set.
++    const FieldSet = std.StaticBitSet(info.fields.len);
++    var fields_set: FieldSet = FieldSet.initEmpty();
++
++    // We split each value by ","
++    var iter = std.mem.splitSequence(u8, v, ",");
++    loop: while (iter.next()) |entry| {
++        // Find the key/value, trimming whitespace. The value may be quoted
++        // which we strip the quotes from.
++        const idx = mem.indexOf(u8, entry, ":") orelse return error.InvalidValue;
++        const key = std.mem.trim(u8, entry[0..idx], whitespace);
++        const value = value: {
++            var value = std.mem.trim(u8, entry[idx + 1 ..], whitespace);
++
++            // Detect a quoted string.
++            if (value.len >= 2 and
++                value[0] == '"' and
++                value[value.len - 1] == '"')
++            {
++                // Trim quotes since our CLI args processor expects
++                // quotes to already be gone.
++                value = value[1 .. value.len - 1];
++            }
++
++            break :value value;
++        };
++
++        inline for (info.fields, 0..) |field, i| {
++            if (std.mem.eql(u8, field.name, key)) {
++                try parseIntoField(T, alloc, &result, key, value);
++                fields_set.set(i);
++                continue :loop;
++            }
++        }
++
++        // No field matched
++        return error.InvalidValue;
++    }
++
++    // Ensure all required fields are set
++    inline for (info.fields, 0..) |field, i| {
++        if (!fields_set.isSet(i)) {
++            const default_ptr = field.default_value orelse return error.InvalidValue;
++            const typed_ptr: *const field.type = @alignCast(@ptrCast(default_ptr));
++            @field(result, field.name) = typed_ptr.*;
++        }
++    }
++
++    return result;
++}
++
+ fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+     const info = @typeInfo(T).Struct;
+-    assert(info.layout == .@"packed");
++    comptime assert(info.layout == .@"packed");
+ 
+     var result: T = .{};
+ 
+@@ -847,6 +918,39 @@ test "parseIntoField: struct with parse func" {
+     try testing.expectEqual(@as([]const u8, "HELLO!"), data.a.v);
+ }
+ 
++test "parseIntoField: struct with basic fields" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        value: struct {
++            a: []const u8,
++            b: u32,
++            c: u8 = 12,
++        } = undefined,
++    } = .{};
++
++    // Set required fields
++    try parseIntoField(@TypeOf(data), alloc, &data, "value", "a:hello,b:42");
++    try testing.expectEqualStrings("hello", data.value.a);
++    try testing.expectEqual(42, data.value.b);
++    try testing.expectEqual(12, data.value.c);
++
++    // Set all fields
++    try parseIntoField(@TypeOf(data), alloc, &data, "value", "a:world,b:84,c:24");
++    try testing.expectEqualStrings("world", data.value.a);
++    try testing.expectEqual(84, data.value.b);
++    try testing.expectEqual(24, data.value.c);
++
++    // Missing require dfield
++    try testing.expectError(
++        error.InvalidValue,
++        parseIntoField(@TypeOf(data), alloc, &data, "value", "a:hello"),
++    );
++}
++
+ test "parseIntoField: tagged union" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+
+commit 7d2dee2bc30723fa2fd647417f05b6fc3381fc7b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 19 11:05:11 2024 -0800
+
+    cli: parseCLI form works with optionals
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index e26ea975..076137dd 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -13,7 +13,7 @@ const DiagnosticList = diags.DiagnosticList;
+ //     `--long value`? Not currently allowed.
+ 
+ // For trimming
+-const whitespace = " \t";
++pub const whitespace = " \t";
+ 
+ /// The base errors for arg parsing. Additional errors can be returned due
+ /// to type-specific parsing but these are always possible.
+@@ -209,7 +209,7 @@ fn canTrackDiags(comptime T: type) bool {
+ /// This may result in allocations. The allocations can only be freed by freeing
+ /// all the memory associated with alloc. It is expected that alloc points to
+ /// an arena.
+-fn parseIntoField(
++pub fn parseIntoField(
+     comptime T: type,
+     alloc: Allocator,
+     dst: *T,
+@@ -250,10 +250,32 @@ fn parseIntoField(
+                         1 => @field(dst, field.name) = try Field.parseCLI(value),
+ 
+                         // 2 arg = (self, input) => void
+-                        2 => try @field(dst, field.name).parseCLI(value),
++                        2 => switch (@typeInfo(field.type)) {
++                            .Struct,
++                            .Union,
++                            .Enum,
++                            => try @field(dst, field.name).parseCLI(value),
++
++                            .Optional => {
++                                @field(dst, field.name) = undefined;
++                                try @field(dst, field.name).?.parseCLI(value);
++                            },
++                            else => @compileError("unexpected field type"),
++                        },
+ 
+                         // 3 arg = (self, alloc, input) => void
+-                        3 => try @field(dst, field.name).parseCLI(alloc, value),
++                        3 => switch (@typeInfo(field.type)) {
++                            .Struct,
++                            .Union,
++                            .Enum,
++                            => try @field(dst, field.name).parseCLI(alloc, value),
++
++                            .Optional => {
++                                @field(dst, field.name) = undefined;
++                                try @field(dst, field.name).?.parseCLI(alloc, value);
++                            },
++                            else => @compileError("unexpected field type"),
++                        },
+ 
+                         else => @compileError("parseCLI invalid argument count"),
+                     }
+@@ -387,7 +409,7 @@ fn parseStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+     };
+ }
+ 
+-fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
++pub fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+     const info = @typeInfo(T).Struct;
+     comptime assert(info.layout == .auto);
+ 
+@@ -918,6 +940,29 @@ test "parseIntoField: struct with parse func" {
+     try testing.expectEqual(@as([]const u8, "HELLO!"), data.a.v);
+ }
+ 
++test "parseIntoField: optional struct with parse func" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: ?struct {
++            const Self = @This();
++
++            v: []const u8,
++
++            pub fn parseCLI(self: *Self, _: Allocator, value: ?[]const u8) !void {
++                _ = value;
++                self.* = .{ .v = "HELLO!" };
++            }
++        } = null,
++    } = .{};
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "42");
++    try testing.expectEqual(@as([]const u8, "HELLO!"), data.a.?.v);
++}
++
+ test "parseIntoField: struct with basic fields" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+
+commit 4ef2240618d94cbbf53d873d1dd43c8a37f3483e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 20 19:03:49 2024 -0800
+
+    cli: parseCLI for optionals should not be null in release modes
+    
+    Fixes #2747
+    
+    I admit I don't fully understand this. But somehow, doing `var x: ?T =
+    undefined` in release fast mode makes `x` act as if its unset. I am
+    guessing since undefined does nothing to the memory, the memory layout
+    is such that it looks null for zeroed stack memory. This is a guess.
+    
+    To fix this, I now initialize the type `T` and set it onto the optional
+    later. This commit also fixes an issue where calling `parseCLI` multiple
+    times on an optional would not modify the previous value if set.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 076137dd..3e378f34 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -256,10 +256,20 @@ pub fn parseIntoField(
+                             .Enum,
+                             => try @field(dst, field.name).parseCLI(value),
+ 
+-                            .Optional => {
+-                                @field(dst, field.name) = undefined;
+-                                try @field(dst, field.name).?.parseCLI(value);
++                            // If the field is optional and set, then we use
++                            // the pointer value directly into it. If its not
++                            // set we need to create a new instance.
++                            .Optional => if (@field(dst, field.name)) |*v| {
++                                try v.parseCLI(value);
++                            } else {
++                                // Note: you cannot do @field(dst, name) = undefined
++                                // because this causes the value to be "null"
++                                // in ReleaseFast modes.
++                                var tmp: Field = undefined;
++                                try tmp.parseCLI(value);
++                                @field(dst, field.name) = tmp;
+                             },
++
+                             else => @compileError("unexpected field type"),
+                         },
+ 
+@@ -270,10 +280,14 @@ pub fn parseIntoField(
+                             .Enum,
+                             => try @field(dst, field.name).parseCLI(alloc, value),
+ 
+-                            .Optional => {
+-                                @field(dst, field.name) = undefined;
+-                                try @field(dst, field.name).?.parseCLI(alloc, value);
++                            .Optional => if (@field(dst, field.name)) |*v| {
++                                try v.parseCLI(alloc, value);
++                            } else {
++                                var tmp: Field = undefined;
++                                try tmp.parseCLI(alloc, value);
++                                @field(dst, field.name) = tmp;
+                             },
++
+                             else => @compileError("unexpected field type"),
+                         },
+ 
+
+commit 5b01cb353de47a0053c313e3bc20170cbece679e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 27 08:46:03 2024 -0800
+
+    config: need to dupe filepath for diagnostics
+    
+    Fixes #2800
+    
+    The source string with the filepath is not guaranteed to exist beyond
+    the lifetime of the parse operation. We must copy it.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 3e378f34..454ca360 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -104,7 +104,7 @@ pub fn parse(
+             try dst._diagnostics.append(arena_alloc, .{
+                 .key = try arena_alloc.dupeZ(u8, arg),
+                 .message = "invalid field",
+-                .location = diags.Location.fromIter(iter),
++                .location = try diags.Location.fromIter(iter, arena_alloc),
+             });
+ 
+             continue;
+@@ -145,7 +145,7 @@ pub fn parse(
+             try dst._diagnostics.append(arena_alloc, .{
+                 .key = try arena_alloc.dupeZ(u8, key),
+                 .message = message,
+-                .location = diags.Location.fromIter(iter),
++                .location = try diags.Location.fromIter(iter, arena_alloc),
+             });
+         };
+     }
+@@ -1140,7 +1140,7 @@ pub fn ArgsIterator(comptime Iterator: type) type {
+         }
+ 
+         /// Returns a location for a diagnostic message.
+-        pub fn location(self: *const Self) ?diags.Location {
++        pub fn location(self: *const Self, _: Allocator) error{}!?diags.Location {
+             return .{ .cli = self.index };
+         }
+     };
+@@ -1262,12 +1262,15 @@ pub fn LineIterator(comptime ReaderType: type) type {
+         }
+ 
+         /// Returns a location for a diagnostic message.
+-        pub fn location(self: *const Self) ?diags.Location {
++        pub fn location(
++            self: *const Self,
++            alloc: Allocator,
++        ) Allocator.Error!?diags.Location {
+             // If we have no filepath then we have no location.
+             if (self.filepath.len == 0) return null;
+ 
+             return .{ .file = .{
+-                .path = self.filepath,
++                .path = try alloc.dupe(u8, self.filepath),
+                 .line = self.line,
+             } };
+         }
+
+commit 97a2b94c9b7d46e3466bdd7f823ed855fcf2571c
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Tue Dec 17 13:07:48 2024 -0600
+
+    core: allow cli actions to use arg parsing diagnostics
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 454ca360..ea0549da 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -126,7 +126,7 @@ pub fn parse(
+ 
+             // The error set is dependent on comptime T, so we always add
+             // an extra error so we can have the "else" below.
+-            const ErrSet = @TypeOf(err) || error{Unknown};
++            const ErrSet = @TypeOf(err) || error{ Unknown, OutOfMemory };
+             const message: [:0]const u8 = switch (@as(ErrSet, @errorCast(err))) {
+                 // OOM is not recoverable since we need to allocate to
+                 // track more error messages.
+
+commit 813c48cb1219e94b99994e482e74816199d6129f
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Tue Dec 17 13:08:48 2024 -0600
+
+    core: allow u21 as a cli argument type
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index ea0549da..be71b909 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -319,6 +319,7 @@ pub fn parseIntoField(
+ 
+                 inline u8,
+                 u16,
++                u21,
+                 u32,
+                 u64,
+                 usize,
+
+commit f2c357a2099420043edcb26b38b142ff3da0259f
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Sat Jan 4 14:11:35 2025 +0800
+
+    config: allow booleans for `background-blur-radius`
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index be71b909..23dcf773 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -533,7 +533,7 @@ fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+     return result;
+ }
+ 
+-fn parseBool(v: []const u8) !bool {
++pub fn parseBool(v: []const u8) !bool {
+     const t = &[_][]const u8{ "1", "t", "T", "true" };
+     const f = &[_][]const u8{ "0", "f", "F", "false" };
+ 
+
+commit e854b38872adc38050c39b6f2e8f580268d1e08c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Jan 23 14:11:10 2025 -0800
+
+    cli: allow renaming config fields to maintain backwards compatibility
+    
+    Fixes #4631
+    
+    This introduces a mechanism by which parsed config fields can be renamed
+    to maintain backwards compatibility. This already has a use case --
+    implemented in this commit -- for `background-blur-radius` to be renamed
+    to `background-blur`.
+    
+    The remapping is comptime-known which lets us do some comptime
+    validation. The remap check isn't done unless no fields match which
+    means for well-formed config files, there's no overhead.
+    
+    For future improvements:
+    
+    - We should update our config help generator to note renamed fields.
+    - We could offer automatic migration of config files be rewriting them.
+    - We can enrich the value type with more metadata to help with
+      config gen or other tooling.
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 23dcf773..166b2daf 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -38,6 +38,12 @@ pub const Error = error{
+ /// "DiagnosticList" and any diagnostic messages will be added to that list.
+ /// When diagnostics are present, only allocation errors will be returned.
+ ///
++/// If the destination type has a decl "renamed", it must be of type
++/// std.StaticStringMap([]const u8) and contains a mapping from the old
++/// field name to the new field name. This is used to allow renaming fields
++/// while still supporting the old name. If a renamed field is set, parsing
++/// will automatically set the new field name.
++///
+ /// Note: If the arena is already non-null, then it will be used. In this
+ /// case, in the case of an error some memory might be leaked into the arena.
+ pub fn parse(
+@@ -49,6 +55,24 @@ pub fn parse(
+     const info = @typeInfo(T);
+     assert(info == .Struct);
+ 
++    comptime {
++        // Verify all renamed fields are valid (source does not exist,
++        // destination does exist).
++        if (@hasDecl(T, "renamed")) {
++            for (T.renamed.keys(), T.renamed.values()) |key, value| {
++                if (@hasField(T, key)) {
++                    @compileLog(key);
++                    @compileError("renamed field source exists");
++                }
++
++                if (!@hasField(T, value)) {
++                    @compileLog(value);
++                    @compileError("renamed field destination does not exist");
++                }
++            }
++        }
++    }
++
+     // Make an arena for all our allocations if we support it. Otherwise,
+     // use an allocator that always fails. If the arena is already set on
+     // the config, then we reuse that. See memory note in parse docs.
+@@ -367,6 +391,16 @@ pub fn parseIntoField(
+         }
+     }
+ 
++    // Unknown field, is the field renamed?
++    if (@hasDecl(T, "renamed")) {
++        for (T.renamed.keys(), T.renamed.values()) |old, new| {
++            if (mem.eql(u8, old, key)) {
++                try parseIntoField(T, alloc, dst, new, value);
++                return;
++            }
++        }
++    }
++
+     return error.InvalidField;
+ }
+ 
+@@ -1104,6 +1138,24 @@ test "parseIntoField: tagged union missing tag" {
+     );
+ }
+ 
++test "parseIntoField: renamed field" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: []const u8,
++
++        const renamed = std.StaticStringMap([]const u8).initComptime(&.{
++            .{ "old", "a" },
++        });
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "old", "42");
++    try testing.expectEqualStrings("42", data.a);
++}
++
+ /// An iterator that considers its location to be CLI args. It
+ /// iterates through an underlying iterator and increments a counter
+ /// to track the current CLI arg index.
+
+commit 1947ba9c68446f3ec793906923d1d95e654ae649
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Fri Feb 7 22:20:37 2025 -0600
+
+    core: protect against crashes and hangs when themes are not files
+    
+    If a theme was not a file or a directory you could get a crash or a hang
+    (depending on platform) if the theme references a directory. This patch
+    also prevents attempts to load from other non-file sources.
+    
+    Fixes: #5596
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 166b2daf..7385e6a3 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -8,6 +8,8 @@ const internal_os = @import("../os/main.zig");
+ const Diagnostic = diags.Diagnostic;
+ const DiagnosticList = diags.DiagnosticList;
+ 
++const log = std.log.scoped(.cli);
++
+ // TODO:
+ //   - Only `--long=value` format is accepted. Do we want to allow
+ //     `--long value`? Not currently allowed.
+@@ -1258,9 +1260,11 @@ pub fn LineIterator(comptime ReaderType: type) type {
+             const buf = buf: {
+                 while (true) {
+                     // Read the full line
+-                    var entry = self.r.readUntilDelimiterOrEof(self.entry[2..], '\n') catch {
+-                        // TODO: handle errors
+-                        unreachable;
++                    var entry = self.r.readUntilDelimiterOrEof(self.entry[2..], '\n') catch |err| switch (err) {
++                        inline else => |e| {
++                            log.warn("cannot read from \"{s}\": {}", .{ self.filepath, e });
++                            return null;
++                        },
+                     } orelse return null;
+ 
+                     // Increment our line counter
+
+commit 8fadb54e65cd3567663f4abab90ab0c8950a5865
+Author: David Mo <david@dmo.ooo>
+Date:   Mon Feb 24 19:39:42 2025 -0500
+
+    set default keybinds when parsing empty keybind config
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 7385e6a3..a27b9898 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -247,28 +247,34 @@ pub fn parseIntoField(
+ 
+     inline for (info.Struct.fields) |field| {
+         if (field.name[0] != '_' and mem.eql(u8, field.name, key)) {
++            // For optional fields, we just treat it as the child type.
++            // This lets optional fields default to null but get set by
++            // the CLI.
++            const Field = switch (@typeInfo(field.type)) {
++                .Optional => |opt| opt.child,
++                else => field.type,
++            };
++            const fieldInfo = @typeInfo(Field);
++            const canHaveDecls = fieldInfo == .Struct or fieldInfo == .Union or fieldInfo == .Enum;
++
+             // If the value is empty string (set but empty string),
+             // then we reset the value to the default.
+             if (value) |v| default: {
+                 if (v.len != 0) break :default;
++                // Set default value if possible.
++                if (canHaveDecls and @hasDecl(Field, "setToDefault")) {
++                    try @field(dst, field.name).setToDefault(alloc);
++                    return;
++                }
+                 const raw = field.default_value orelse break :default;
+                 const ptr: *const field.type = @alignCast(@ptrCast(raw));
+                 @field(dst, field.name) = ptr.*;
+                 return;
+             }
+ 
+-            // For optional fields, we just treat it as the child type.
+-            // This lets optional fields default to null but get set by
+-            // the CLI.
+-            const Field = switch (@typeInfo(field.type)) {
+-                .Optional => |opt| opt.child,
+-                else => field.type,
+-            };
+-
+             // If we are a type that can have decls and have a parseCLI decl,
+             // we call that and use that to set the value.
+-            const fieldInfo = @typeInfo(Field);
+-            if (fieldInfo == .Struct or fieldInfo == .Union or fieldInfo == .Enum) {
++            if (canHaveDecls) {
+                 if (@hasDecl(Field, "parseCLI")) {
+                     const fnInfo = @typeInfo(@TypeOf(Field.parseCLI)).Fn;
+                     switch (fnInfo.params.len) {
+
+commit 22d99f2533571f1a4c4bf0535ba5c7fcaa387e9e
+Author: David Mo <david@dmo.ooo>
+Date:   Mon Feb 24 23:39:01 2025 -0500
+
+    add test for `setToDefault`
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index a27b9898..420a014d 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -767,6 +767,29 @@ test "parseIntoField: ignore underscore-prefixed fields" {
+     try testing.expectEqualStrings("12", data._a);
+ }
+ 
++test "parseIntoField: struct with default func" {
++    const testing = std.testing;
++    var arena = ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++
++    var data: struct {
++        a: struct {
++            const Self = @This();
++
++            v: []const u8,
++
++            pub fn setToDefault(self: *Self, _alloc: Allocator) !void {
++                _ = _alloc;
++                self.v = "HELLO!";
++            }
++        },
++    } = undefined;
++
++    try parseIntoField(@TypeOf(data), alloc, &data, "a", "");
++    try testing.expectEqual(@as([]const u8, "HELLO!"), data.a.v);
++}
++
+ test "parseIntoField: string" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+
+commit af2d710000cbe42068f419356f3d2f1511a3326b
+Author: David Mo <david@dmo.ooo>
+Date:   Tue Feb 25 10:15:58 2025 -0500
+
+    rename `setToDefault` to `init`
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 420a014d..bf927a41 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -262,8 +262,8 @@ pub fn parseIntoField(
+             if (value) |v| default: {
+                 if (v.len != 0) break :default;
+                 // Set default value if possible.
+-                if (canHaveDecls and @hasDecl(Field, "setToDefault")) {
+-                    try @field(dst, field.name).setToDefault(alloc);
++                if (canHaveDecls and @hasDecl(Field, "init")) {
++                    try @field(dst, field.name).init(alloc);
+                     return;
+                 }
+                 const raw = field.default_value orelse break :default;
+@@ -767,7 +767,7 @@ test "parseIntoField: ignore underscore-prefixed fields" {
+     try testing.expectEqualStrings("12", data._a);
+ }
+ 
+-test "parseIntoField: struct with default func" {
++test "parseIntoField: struct with init func" {
+     const testing = std.testing;
+     var arena = ArenaAllocator.init(testing.allocator);
+     defer arena.deinit();
+@@ -779,7 +779,7 @@ test "parseIntoField: struct with default func" {
+ 
+             v: []const u8,
+ 
+-            pub fn setToDefault(self: *Self, _alloc: Allocator) !void {
++            pub fn init(self: *Self, _alloc: Allocator) !void {
+                 _ = _alloc;
+                 self.v = "HELLO!";
+             }
+
+commit df9de1523cceb36ad4f8990c6425c43a14da4e8f
+Author: David Mo <david@dmo.ooo>
+Date:   Tue Feb 25 11:53:01 2025 -0500
+
+    fix test
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index bf927a41..5ff7de2d 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -781,7 +781,7 @@ test "parseIntoField: struct with init func" {
+ 
+             pub fn init(self: *Self, _alloc: Allocator) !void {
+                 _ = _alloc;
+-                self.v = "HELLO!";
++                self.* = .{ .v = "HELLO!" };
+             }
+         },
+     } = undefined;
+
+commit 0f4d2bb2375c707182dba8cf2dd7723a2e918e79
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 09:55:46 2025 -0700
+
+    Lots of 0.14 changes
+
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 5ff7de2d..4860cdd7 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -55,7 +55,7 @@ pub fn parse(
+     iter: anytype,
+ ) !void {
+     const info = @typeInfo(T);
+-    assert(info == .Struct);
++    assert(info == .@"struct");
+ 
+     comptime {
+         // Verify all renamed fields are valid (source does not exist,
+@@ -208,10 +208,10 @@ fn formatInvalidValue(
+ 
+ fn formatValues(comptime T: type, key: []const u8, writer: anytype) std.mem.Allocator.Error!void {
+     const typeinfo = @typeInfo(T);
+-    inline for (typeinfo.Struct.fields) |f| {
++    inline for (typeinfo.@"struct".fields) |f| {
+         if (std.mem.eql(u8, key, f.name)) {
+             switch (@typeInfo(f.type)) {
+-                .Enum => |e| {
++                .@"enum" => |e| {
+                     try writer.print(", valid values are: ", .{});
+                     inline for (e.fields, 0..) |field, i| {
+                         if (i != 0) try writer.print(", ", .{});
+@@ -243,19 +243,21 @@ pub fn parseIntoField(
+     value: ?[]const u8,
+ ) !void {
+     const info = @typeInfo(T);
+-    assert(info == .Struct);
++    assert(info == .@"struct");
+ 
+-    inline for (info.Struct.fields) |field| {
++    inline for (info.@"struct".fields) |field| {
+         if (field.name[0] != '_' and mem.eql(u8, field.name, key)) {
+             // For optional fields, we just treat it as the child type.
+             // This lets optional fields default to null but get set by
+             // the CLI.
+             const Field = switch (@typeInfo(field.type)) {
+-                .Optional => |opt| opt.child,
++                .optional => |opt| opt.child,
+                 else => field.type,
+             };
+             const fieldInfo = @typeInfo(Field);
+-            const canHaveDecls = fieldInfo == .Struct or fieldInfo == .Union or fieldInfo == .Enum;
++            const canHaveDecls = fieldInfo == .@"struct" or
++                fieldInfo == .@"union" or
++                fieldInfo == .@"enum";
+ 
+             // If the value is empty string (set but empty string),
+             // then we reset the value to the default.
+@@ -266,7 +268,7 @@ pub fn parseIntoField(
+                     try @field(dst, field.name).init(alloc);
+                     return;
+                 }
+-                const raw = field.default_value orelse break :default;
++                const raw = field.default_value_ptr orelse break :default;
+                 const ptr: *const field.type = @alignCast(@ptrCast(raw));
+                 @field(dst, field.name) = ptr.*;
+                 return;
+@@ -276,22 +278,22 @@ pub fn parseIntoField(
+             // we call that and use that to set the value.
+             if (canHaveDecls) {
+                 if (@hasDecl(Field, "parseCLI")) {
+-                    const fnInfo = @typeInfo(@TypeOf(Field.parseCLI)).Fn;
++                    const fnInfo = @typeInfo(@TypeOf(Field.parseCLI)).@"fn";
+                     switch (fnInfo.params.len) {
+                         // 1 arg = (input) => output
+                         1 => @field(dst, field.name) = try Field.parseCLI(value),
+ 
+                         // 2 arg = (self, input) => void
+                         2 => switch (@typeInfo(field.type)) {
+-                            .Struct,
+-                            .Union,
+-                            .Enum,
++                            .@"struct",
++                            .@"union",
++                            .@"enum",
+                             => try @field(dst, field.name).parseCLI(value),
+ 
+                             // If the field is optional and set, then we use
+                             // the pointer value directly into it. If its not
+                             // set we need to create a new instance.
+-                            .Optional => if (@field(dst, field.name)) |*v| {
++                            .optional => if (@field(dst, field.name)) |*v| {
+                                 try v.parseCLI(value);
+                             } else {
+                                 // Note: you cannot do @field(dst, name) = undefined
+@@ -307,12 +309,12 @@ pub fn parseIntoField(
+ 
+                         // 3 arg = (self, alloc, input) => void
+                         3 => switch (@typeInfo(field.type)) {
+-                            .Struct,
+-                            .Union,
+-                            .Enum,
++                            .@"struct",
++                            .@"union",
++                            .@"enum",
+                             => try @field(dst, field.name).parseCLI(alloc, value),
+ 
+-                            .Optional => if (@field(dst, field.name)) |*v| {
++                            .optional => if (@field(dst, field.name)) |*v| {
+                                 try v.parseCLI(alloc, value);
+                             } else {
+                                 var tmp: Field = undefined;
+@@ -374,18 +376,18 @@ pub fn parseIntoField(
+                 ) catch return error.InvalidValue,
+ 
+                 else => switch (fieldInfo) {
+-                    .Enum => std.meta.stringToEnum(
++                    .@"enum" => std.meta.stringToEnum(
+                         Field,
+                         value orelse return error.ValueRequired,
+                     ) orelse return error.InvalidValue,
+ 
+-                    .Struct => try parseStruct(
++                    .@"struct" => try parseStruct(
+                         Field,
+                         alloc,
+                         value orelse return error.ValueRequired,
+                     ),
+ 
+-                    .Union => try parseTaggedUnion(
++                    .@"union" => try parseTaggedUnion(
+                         Field,
+                         alloc,
+                         value orelse return error.ValueRequired,
+@@ -413,8 +415,8 @@ pub fn parseIntoField(
+ }
+ 
+ fn parseTaggedUnion(comptime T: type, alloc: Allocator, v: []const u8) !T {
+-    const info = @typeInfo(T).Union;
+-    assert(@typeInfo(info.tag_type.?) == .Enum);
++    const info = @typeInfo(T).@"union";
++    assert(@typeInfo(info.tag_type.?) == .@"enum");
+ 
+     // Get the union tag that is being set. We support values with no colon
+     // if the value is void so its not an error to have no colon.
+@@ -433,12 +435,12 @@ fn parseTaggedUnion(comptime T: type, alloc: Allocator, v: []const u8) !T {
+ 
+             // We need to create a struct that looks like this union field.
+             // This lets us use parseIntoField as if its a dedicated struct.
+-            const Target = @Type(.{ .Struct = .{
++            const Target = @Type(.{ .@"struct" = .{
+                 .layout = .auto,
+                 .fields = &.{.{
+                     .name = field.name,
+                     .type = field.type,
+-                    .default_value = null,
++                    .default_value_ptr = null,
+                     .is_comptime = false,
+                     .alignment = @alignOf(field.type),
+                 }},
+@@ -459,7 +461,7 @@ fn parseTaggedUnion(comptime T: type, alloc: Allocator, v: []const u8) !T {
+ }
+ 
+ fn parseStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+-    return switch (@typeInfo(T).Struct.layout) {
++    return switch (@typeInfo(T).@"struct".layout) {
+         .auto => parseAutoStruct(T, alloc, v),
+         .@"packed" => parsePackedStruct(T, v),
+         else => @compileError("unsupported struct layout"),
+@@ -467,7 +469,7 @@ fn parseStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+ }
+ 
+ pub fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+-    const info = @typeInfo(T).Struct;
++    const info = @typeInfo(T).@"struct";
+     comptime assert(info.layout == .auto);
+ 
+     // We start our result as undefined so we don't get an error for required
+@@ -519,7 +521,7 @@ pub fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+     // Ensure all required fields are set
+     inline for (info.fields, 0..) |field, i| {
+         if (!fields_set.isSet(i)) {
+-            const default_ptr = field.default_value orelse return error.InvalidValue;
++            const default_ptr = field.default_value_ptr orelse return error.InvalidValue;
+             const typed_ptr: *const field.type = @alignCast(@ptrCast(default_ptr));
+             @field(result, field.name) = typed_ptr.*;
+         }
+@@ -529,7 +531,7 @@ pub fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+ }
+ 
+ fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+-    const info = @typeInfo(T).Struct;
++    const info = @typeInfo(T).@"struct";
+     comptime assert(info.layout == .@"packed");
+ 
+     var result: T = .{};
+

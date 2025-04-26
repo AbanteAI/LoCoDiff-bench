@@ -1,0 +1,2707 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/termio/Thread.zig
+
+commit 35c1decd58af93efcd693d195ce5010706a6bf5a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 3 13:30:30 2022 -0700
+
+    Start pulling out IO thread and IO implementation
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+new file mode 100644
+index 00000000..ac30fb07
+--- /dev/null
++++ b/src/termio/Thread.zig
+@@ -0,0 +1,140 @@
++//! Represents the IO thread logic. The IO thread is responsible for
++//! the child process and pty management.
++pub const Thread = @This();
++
++const std = @import("std");
++const builtin = @import("builtin");
++const libuv = @import("libuv");
++const termio = @import("../termio.zig");
++
++const Allocator = std.mem.Allocator;
++const log = std.log.scoped(.io_thread);
++
++/// The main event loop for the thread. The user data of this loop
++/// is always the allocator used to create the loop. This is a convenience
++/// so that users of the loop always have an allocator.
++loop: libuv.Loop,
++
++/// This can be used to wake up the thread.
++wakeup: libuv.Async,
++
++/// This can be used to stop the thread on the next loop iteration.
++stop: libuv.Async,
++
++/// The underlying IO implementation.
++impl: *termio.Impl,
++
++/// Initialize the thread. This does not START the thread. This only sets
++/// up all the internal state necessary prior to starting the thread. It
++/// is up to the caller to start the thread with the threadMain entrypoint.
++pub fn init(
++    alloc: Allocator,
++    impl: *termio.Impl,
++) !Thread {
++    // We always store allocator pointer on the loop data so that
++    // handles can use our global allocator.
++    const allocPtr = try alloc.create(Allocator);
++    errdefer alloc.destroy(allocPtr);
++    allocPtr.* = alloc;
++
++    // Create our event loop.
++    var loop = try libuv.Loop.init(alloc);
++    errdefer loop.deinit(alloc);
++    loop.setData(allocPtr);
++
++    // This async handle is used to "wake up" the renderer and force a render.
++    var wakeup_h = try libuv.Async.init(alloc, loop, wakeupCallback);
++    errdefer wakeup_h.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const loop_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(loop_alloc);
++        }
++    }).callback);
++
++    // This async handle is used to stop the loop and force the thread to end.
++    var stop_h = try libuv.Async.init(alloc, loop, stopCallback);
++    errdefer stop_h.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const loop_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(loop_alloc);
++        }
++    }).callback);
++
++    return Thread{
++        .loop = loop,
++        .wakeup = wakeup_h,
++        .stop = stop_h,
++        .impl = impl,
++    };
++}
++
++/// Clean up the thread. This is only safe to call once the thread
++/// completes executing; the caller must join prior to this.
++pub fn deinit(self: *Thread) void {
++    // Get a copy to our allocator
++    const alloc_ptr = self.loop.getData(Allocator).?;
++    const alloc = alloc_ptr.*;
++
++    // Schedule our handles to close
++    self.stop.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
++    self.wakeup.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
++
++    // Run the loop one more time, because destroying our other things
++    // like windows usually cancel all our event loop stuff and we need
++    // one more run through to finalize all the closes.
++    _ = self.loop.run(.default) catch |err|
++        log.err("error finalizing event loop: {}", .{err});
++
++    // Dealloc our allocator copy
++    alloc.destroy(alloc_ptr);
++
++    self.loop.deinit(alloc);
++}
++
++/// The main entrypoint for the thread.
++pub fn threadMain(self: *Thread) void {
++    // Call child function so we can use errors...
++    self.threadMain_() catch |err| {
++        // In the future, we should expose this on the thread struct.
++        log.warn("error in io thread err={}", .{err});
++    };
++}
++
++fn threadMain_(self: *Thread) !void {
++    // Run our thread start/end callbacks. This allows the implementation
++    // to hook into the event loop as needed.
++    try self.impl.threadEnter(self.loop);
++    defer self.impl.threadExit();
++
++    // Set up our async handler to support rendering
++    self.wakeup.setData(self);
++    defer self.wakeup.setData(null);
++
++    // Run
++    log.debug("starting IO thread", .{});
++    defer log.debug("exiting IO thread", .{});
++    _ = try self.loop.run(.default);
++}
++
++fn wakeupCallback(h: *libuv.Async) void {
++    _ = h;
++    // const t = h.getData(Thread) orelse {
++    //     // This shouldn't happen so we log it.
++    //     log.warn("render callback fired without data set", .{});
++    //     return;
++    // };
++}
++
++fn stopCallback(h: *libuv.Async) void {
++    h.loop().stop();
++}
+
+commit 9b3d22e55e2fef2697a75f06b59d31c87ae5bf0f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 3 15:07:51 2022 -0700
+
+    IO thread has more state setup
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index ac30fb07..9e81aa48 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -113,8 +113,9 @@ pub fn threadMain(self: *Thread) void {
+ fn threadMain_(self: *Thread) !void {
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+-    try self.impl.threadEnter(self.loop);
+-    defer self.impl.threadExit();
++    var data = try self.impl.threadEnter(self.loop);
++    defer data.deinit();
++    defer self.impl.threadExit(data);
+ 
+     // Set up our async handler to support rendering
+     self.wakeup.setData(self);
+
+commit b100406a6eaaaf6f92b0711141102e03f8f103bc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 4 20:27:48 2022 -0700
+
+    termio: start the thread mailbox, hook up resize
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 9e81aa48..12949edc 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -6,10 +6,16 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const libuv = @import("libuv");
+ const termio = @import("../termio.zig");
++const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.io_thread);
+ 
++/// The type used for sending messages to the IO thread. For now this is
++/// hardcoded with a capacity. We can make this a comptime parameter in
++/// the future if we want it configurable.
++const Mailbox = BlockingQueue(termio.message.IO, 64);
++
+ /// The main event loop for the thread. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+ /// so that users of the loop always have an allocator.
+@@ -24,6 +30,10 @@ stop: libuv.Async,
+ /// The underlying IO implementation.
+ impl: *termio.Impl,
+ 
++/// The mailbox that can be used to send this thread messages. Note
++/// this is a blocking queue so if it is full you will get errors (or block).
++mailbox: *Mailbox,
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+@@ -60,11 +70,16 @@ pub fn init(
+         }
+     }).callback);
+ 
++    // The mailbox for messaging this thread
++    var mailbox = try Mailbox.create(alloc);
++    errdefer mailbox.destroy(alloc);
++
+     return Thread{
+         .loop = loop,
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+         .impl = impl,
++        .mailbox = mailbox,
+     };
+ }
+ 
+@@ -95,6 +110,9 @@ pub fn deinit(self: *Thread) void {
+     _ = self.loop.run(.default) catch |err|
+         log.err("error finalizing event loop: {}", .{err});
+ 
++    // Nothing can possibly access the mailbox anymore, destroy it.
++    self.mailbox.destroy(alloc);
++
+     // Dealloc our allocator copy
+     alloc.destroy(alloc_ptr);
+ 
+@@ -127,13 +145,33 @@ fn threadMain_(self: *Thread) !void {
+     _ = try self.loop.run(.default);
+ }
+ 
++/// Drain the mailbox, handling all the messages in our terminal implementation.
++fn drainMailbox(self: *Thread) !void {
++    // This holds the mailbox lock for the duration of the drain. The
++    // expectation is that all our message handlers will be non-blocking
++    // ENOUGH to not mess up throughput on producers.
++    var drain = self.mailbox.drain();
++    defer drain.deinit();
++
++    while (drain.next()) |message| {
++        log.debug("mailbox message={}", .{message});
++        switch (message) {
++            .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
++        }
++    }
++}
++
+ fn wakeupCallback(h: *libuv.Async) void {
+-    _ = h;
+-    // const t = h.getData(Thread) orelse {
+-    //     // This shouldn't happen so we log it.
+-    //     log.warn("render callback fired without data set", .{});
+-    //     return;
+-    // };
++    const t = h.getData(Thread) orelse {
++        // This shouldn't happen so we log it.
++        log.warn("wakeup callback fired without data set", .{});
++        return;
++    };
++
++    // When we wake up, we check the mailbox. Mailbox producers should
++    // wake up our thread after publishing.
++    t.drainMailbox() catch |err|
++        log.err("error draining mailbox err={}", .{err});
+ }
+ 
+ fn stopCallback(h: *libuv.Async) void {
+
+commit 1a7b9f7465302ed55511b79535208960807cc6f1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 4 20:47:01 2022 -0700
+
+    termio: clear selection
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 12949edc..d0dd76cf 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -150,15 +150,28 @@ fn drainMailbox(self: *Thread) !void {
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+-    var drain = self.mailbox.drain();
+-    defer drain.deinit();
+-
+-    while (drain.next()) |message| {
+-        log.debug("mailbox message={}", .{message});
+-        switch (message) {
+-            .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
++    var redraw: bool = false;
++    {
++        var drain = self.mailbox.drain();
++        defer drain.deinit();
++
++        while (drain.next()) |message| {
++            // If we have a message we always redraw
++            redraw = true;
++
++            log.debug("mailbox message={}", .{message});
++            switch (message) {
++                .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
++                .clear_selection => try self.impl.clearSelection(),
++            }
+         }
+     }
++
++    // Trigger a redraw after we've drained so we don't waste cyces
++    // messaging a redraw.
++    if (redraw) {
++        try self.impl.renderer_wakeup.send();
++    }
+ }
+ 
+ fn wakeupCallback(h: *libuv.Async) void {
+
+commit 989046a06cda2b915e487b4bc63f8bb062eafcd3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 4 22:13:37 2022 -0700
+
+    More IO events
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d0dd76cf..c05f3dbb 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -163,6 +163,8 @@ fn drainMailbox(self: *Thread) !void {
+             switch (message) {
+                 .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
+                 .clear_selection => try self.impl.clearSelection(),
++                .scroll_viewport => |v| try self.impl.scrollViewport(v),
++                .small_write => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             }
+         }
+     }
+
+commit 5cb6ebe34d4df575836e92ca2447359062497f57
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 4 22:32:06 2022 -0700
+
+    Actually, we'll manage selection and viewports on the windowing thread
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index c05f3dbb..0338617f 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -162,8 +162,6 @@ fn drainMailbox(self: *Thread) !void {
+             log.debug("mailbox message={}", .{message});
+             switch (message) {
+                 .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
+-                .clear_selection => try self.impl.clearSelection(),
+-                .scroll_viewport => |v| try self.impl.scrollViewport(v),
+                 .small_write => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             }
+         }
+
+commit f2d9475d5d9ebc21f5a95f1ba1ac32ecaa357116
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Nov 5 09:39:56 2022 -0700
+
+    Switch over to the IO thread. A messy commit!
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 0338617f..7201101d 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -162,7 +162,8 @@ fn drainMailbox(self: *Thread) !void {
+             log.debug("mailbox message={}", .{message});
+             switch (message) {
+                 .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
+-                .small_write => |v| try self.impl.queueWrite(v.data[0..v.len]),
++                .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
++                .write_stable => |v| try self.impl.queueWrite(v),
+             }
+         }
+     }
+
+commit 95d054b185503e649754640c5f27e3d62b0b9b5a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Nov 5 17:37:21 2022 -0700
+
+    allocate data for paste data if its too large
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 7201101d..9859138a 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -164,6 +164,10 @@ fn drainMailbox(self: *Thread) !void {
+                 .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
+                 .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+                 .write_stable => |v| try self.impl.queueWrite(v),
++                .write_alloc => |v| {
++                    defer v.alloc.free(v.data);
++                    try self.impl.queueWrite(v.data);
++                },
+             }
+         }
+     }
+
+commit 8f1fcc64e84490b929afc5ece2593825b5cdd9e2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Nov 5 19:34:41 2022 -0700
+
+    rename termio thread message struct
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 9859138a..2dcfe947 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -14,7 +14,7 @@ const log = std.log.scoped(.io_thread);
+ /// The type used for sending messages to the IO thread. For now this is
+ /// hardcoded with a capacity. We can make this a comptime parameter in
+ /// the future if we want it configurable.
+-const Mailbox = BlockingQueue(termio.message.IO, 64);
++const Mailbox = BlockingQueue(termio.Message, 64);
+ 
+ /// The main event loop for the thread. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+
+commit e0db46ac979b384a8e1e16dd586aeb08e8b633de
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 6 16:23:36 2022 -0800
+
+    clean up some resources better on error
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 2dcfe947..af175aea 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -49,7 +49,11 @@ pub fn init(
+ 
+     // Create our event loop.
+     var loop = try libuv.Loop.init(alloc);
+-    errdefer loop.deinit(alloc);
++    errdefer {
++        // Run the loop once to close any of our handles
++        _ = loop.run(.nowait) catch 0;
++        loop.deinit(alloc);
++    }
+     loop.setData(allocPtr);
+ 
+     // This async handle is used to "wake up" the renderer and force a render.
+
+commit 5b52333e51042053d17dee8122bd36953fd66b68
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Nov 7 07:45:46 2022 -0800
+
+    name threads and add more tracing
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index af175aea..e8db4d3f 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -7,6 +7,8 @@ const builtin = @import("builtin");
+ const libuv = @import("libuv");
+ const termio = @import("../termio.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
++const tracy = @import("tracy");
++const trace = tracy.trace;
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.io_thread);
+@@ -133,6 +135,8 @@ pub fn threadMain(self: *Thread) void {
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
++    tracy.setThreadName("pty io");
++
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+     var data = try self.impl.threadEnter(self.loop);
+@@ -151,6 +155,9 @@ fn threadMain_(self: *Thread) !void {
+ 
+ /// Drain the mailbox, handling all the messages in our terminal implementation.
+ fn drainMailbox(self: *Thread) !void {
++    const zone = trace(@src());
++    defer zone.end();
++
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+@@ -184,6 +191,9 @@ fn drainMailbox(self: *Thread) !void {
+ }
+ 
+ fn wakeupCallback(h: *libuv.Async) void {
++    const zone = trace(@src());
++    defer zone.end();
++
+     const t = h.getData(Thread) orelse {
+         // This shouldn't happen so we log it.
+         log.warn("wakeup callback fired without data set", .{});
+
+commit 860fbc3aee45e6e49fd9156e3913e9dd09f61288
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Nov 14 17:25:35 2022 -0800
+
+    padding needs to be sent to termio
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index e8db4d3f..7c75d960 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -172,7 +172,7 @@ fn drainMailbox(self: *Thread) !void {
+ 
+             log.debug("mailbox message={}", .{message});
+             switch (message) {
+-                .resize => |v| try self.impl.resize(v.grid_size, v.screen_size),
++                .resize => |v| try self.impl.resize(v.grid_size, v.screen_size, v.padding),
+                 .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+                 .write_stable => |v| try self.impl.queueWrite(v),
+                 .write_alloc => |v| {
+
+commit a15afa8211e30b2215b0be5fce700481fd37a729
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 20 20:16:40 2022 -0800
+
+    do not block channel send while draining channel
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 7c75d960..78968de4 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -162,24 +162,19 @@ fn drainMailbox(self: *Thread) !void {
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+     var redraw: bool = false;
+-    {
+-        var drain = self.mailbox.drain();
+-        defer drain.deinit();
+-
+-        while (drain.next()) |message| {
+-            // If we have a message we always redraw
+-            redraw = true;
+-
+-            log.debug("mailbox message={}", .{message});
+-            switch (message) {
+-                .resize => |v| try self.impl.resize(v.grid_size, v.screen_size, v.padding),
+-                .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+-                .write_stable => |v| try self.impl.queueWrite(v),
+-                .write_alloc => |v| {
+-                    defer v.alloc.free(v.data);
+-                    try self.impl.queueWrite(v.data);
+-                },
+-            }
++    while (self.mailbox.pop()) |message| {
++        // If we have a message we always redraw
++        redraw = true;
++
++        log.debug("mailbox message={}", .{message});
++        switch (message) {
++            .resize => |v| try self.impl.resize(v.grid_size, v.screen_size, v.padding),
++            .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
++            .write_stable => |v| try self.impl.queueWrite(v),
++            .write_alloc => |v| {
++                defer v.alloc.free(v.data);
++                try self.impl.queueWrite(v.data);
++            },
+         }
+     }
+ 
+
+commit 127352704831ef874f5c6ebf33963f94d6de0125
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Feb 1 15:52:22 2023 -0800
+
+    renderer uses libxev
+    
+    Still some bugs and TODOs, but it is workable.
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 78968de4..c086ef51 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -181,7 +181,7 @@ fn drainMailbox(self: *Thread) !void {
+     // Trigger a redraw after we've drained so we don't waste cyces
+     // messaging a redraw.
+     if (redraw) {
+-        try self.impl.renderer_wakeup.send();
++        try self.impl.renderer_wakeup.notify();
+     }
+ }
+ 
+
+commit 7e6a86f0659c0fdcd49293faf5b5de01864afeaf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 4 11:47:51 2023 -0800
+
+    termio: use libxev (with TODOs)
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index c086ef51..8dc350bd 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -4,6 +4,7 @@ pub const Thread = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const xev = @import("xev");
+ const libuv = @import("libuv");
+ const termio = @import("../termio.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+@@ -18,16 +19,21 @@ const log = std.log.scoped(.io_thread);
+ /// the future if we want it configurable.
+ const Mailbox = BlockingQueue(termio.Message, 64);
+ 
++/// Allocator used for some state
++alloc: std.mem.Allocator,
++
+ /// The main event loop for the thread. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+ /// so that users of the loop always have an allocator.
+-loop: libuv.Loop,
++loop: xev.Loop,
+ 
+ /// This can be used to wake up the thread.
+-wakeup: libuv.Async,
++wakeup: xev.Async,
++wakeup_c: xev.Completion = .{},
+ 
+ /// This can be used to stop the thread on the next loop iteration.
+-stop: libuv.Async,
++stop: xev.Async,
++stop_c: xev.Completion = .{},
+ 
+ /// The underlying IO implementation.
+ impl: *termio.Impl,
+@@ -43,44 +49,24 @@ pub fn init(
+     alloc: Allocator,
+     impl: *termio.Impl,
+ ) !Thread {
+-    // We always store allocator pointer on the loop data so that
+-    // handles can use our global allocator.
+-    const allocPtr = try alloc.create(Allocator);
+-    errdefer alloc.destroy(allocPtr);
+-    allocPtr.* = alloc;
+-
+     // Create our event loop.
+-    var loop = try libuv.Loop.init(alloc);
+-    errdefer {
+-        // Run the loop once to close any of our handles
+-        _ = loop.run(.nowait) catch 0;
+-        loop.deinit(alloc);
+-    }
+-    loop.setData(allocPtr);
++    var loop = try xev.Loop.init(.{});
++    errdefer loop.deinit();
+ 
+     // This async handle is used to "wake up" the renderer and force a render.
+-    var wakeup_h = try libuv.Async.init(alloc, loop, wakeupCallback);
+-    errdefer wakeup_h.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const loop_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(loop_alloc);
+-        }
+-    }).callback);
++    var wakeup_h = try xev.Async.init();
++    errdefer wakeup_h.deinit();
+ 
+     // This async handle is used to stop the loop and force the thread to end.
+-    var stop_h = try libuv.Async.init(alloc, loop, stopCallback);
+-    errdefer stop_h.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const loop_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(loop_alloc);
+-        }
+-    }).callback);
++    var stop_h = try xev.Async.init();
++    errdefer stop_h.deinit();
+ 
+     // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+ 
+     return Thread{
++        .alloc = alloc,
+         .loop = loop,
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+@@ -92,37 +78,12 @@ pub fn init(
+ /// Clean up the thread. This is only safe to call once the thread
+ /// completes executing; the caller must join prior to this.
+ pub fn deinit(self: *Thread) void {
+-    // Get a copy to our allocator
+-    const alloc_ptr = self.loop.getData(Allocator).?;
+-    const alloc = alloc_ptr.*;
+-
+-    // Schedule our handles to close
+-    self.stop.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const handle_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(handle_alloc);
+-        }
+-    }).callback);
+-    self.wakeup.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const handle_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(handle_alloc);
+-        }
+-    }).callback);
+-
+-    // Run the loop one more time, because destroying our other things
+-    // like windows usually cancel all our event loop stuff and we need
+-    // one more run through to finalize all the closes.
+-    _ = self.loop.run(.default) catch |err|
+-        log.err("error finalizing event loop: {}", .{err});
++    self.stop.deinit();
++    self.wakeup.deinit();
++    self.loop.deinit();
+ 
+     // Nothing can possibly access the mailbox anymore, destroy it.
+-    self.mailbox.destroy(alloc);
+-
+-    // Dealloc our allocator copy
+-    alloc.destroy(alloc_ptr);
+-
+-    self.loop.deinit(alloc);
++    self.mailbox.destroy(self.alloc);
+ }
+ 
+ /// The main entrypoint for the thread.
+@@ -139,18 +100,18 @@ fn threadMain_(self: *Thread) !void {
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+-    var data = try self.impl.threadEnter(self.loop);
++    var data = try self.impl.threadEnter(&self.loop);
+     defer data.deinit();
+     defer self.impl.threadExit(data);
+ 
+-    // Set up our async handler to support rendering
+-    self.wakeup.setData(self);
+-    defer self.wakeup.setData(null);
++    // Start the async handlers
++    self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
++    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
+ 
+     // Run
+     log.debug("starting IO thread", .{});
+     defer log.debug("exiting IO thread", .{});
+-    _ = try self.loop.run(.default);
++    try self.loop.run(.until_done);
+ }
+ 
+ /// Drain the mailbox, handling all the messages in our terminal implementation.
+@@ -185,22 +146,37 @@ fn drainMailbox(self: *Thread) !void {
+     }
+ }
+ 
+-fn wakeupCallback(h: *libuv.Async) void {
++fn wakeupCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Async.WaitError!void,
++) xev.CallbackAction {
++    _ = r catch |err| {
++        log.err("error in wakeup err={}", .{err});
++        return .rearm;
++    };
++
+     const zone = trace(@src());
+     defer zone.end();
+ 
+-    const t = h.getData(Thread) orelse {
+-        // This shouldn't happen so we log it.
+-        log.warn("wakeup callback fired without data set", .{});
+-        return;
+-    };
++    const t = self_.?;
+ 
+     // When we wake up, we check the mailbox. Mailbox producers should
+     // wake up our thread after publishing.
+     t.drainMailbox() catch |err|
+         log.err("error draining mailbox err={}", .{err});
++
++    return .rearm;
+ }
+ 
+-fn stopCallback(h: *libuv.Async) void {
+-    h.loop().stop();
++fn stopCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Async.WaitError!void,
++) xev.CallbackAction {
++    _ = r catch unreachable;
++    self_.?.loop.stop();
++    return .disarm;
+ }
+
+commit f07e21c22e0f5e872fe8fc57249251597f1bce0c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 4 17:37:51 2023 -0800
+
+    remove libuv from build
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 8dc350bd..d4140bb8 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -5,7 +5,6 @@ pub const Thread = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const xev = @import("xev");
+-const libuv = @import("libuv");
+ const termio = @import("../termio.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ const tracy = @import("tracy");
+
+commit 11d6e9122845ab55d4e28d0114c7a24b1b4c0c76
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Feb 6 14:52:24 2023 -0800
+
+    termio: reader thread is thread-safe for writing to writer
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d4140bb8..48dd4a35 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -16,7 +16,7 @@ const log = std.log.scoped(.io_thread);
+ /// The type used for sending messages to the IO thread. For now this is
+ /// hardcoded with a capacity. We can make this a comptime parameter in
+ /// the future if we want it configurable.
+-const Mailbox = BlockingQueue(termio.Message, 64);
++pub const Mailbox = BlockingQueue(termio.Message, 64);
+ 
+ /// Allocator used for some state
+ alloc: std.mem.Allocator,
+@@ -99,7 +99,7 @@ fn threadMain_(self: *Thread) !void {
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+-    var data = try self.impl.threadEnter(&self.loop);
++    var data = try self.impl.threadEnter(self);
+     defer data.deinit();
+     defer self.impl.threadExit(data);
+ 
+
+commit fc3802e632425a943bc9dc7ef9fb7eac2a864bd9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 25 22:36:20 2023 -0800
+
+    termio: use host-spawn for pty
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 48dd4a35..aa2a9c56 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -95,6 +95,7 @@ pub fn threadMain(self: *Thread) void {
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
++    defer log.debug("IO thread exited", .{});
+     tracy.setThreadName("pty io");
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+@@ -109,7 +110,7 @@ fn threadMain_(self: *Thread) !void {
+ 
+     // Run
+     log.debug("starting IO thread", .{});
+-    defer log.debug("exiting IO thread", .{});
++    defer log.debug("starting IO thread shutdown", .{});
+     try self.loop.run(.until_done);
+ }
+ 
+
+commit 89d07fcd83379a0c5c93391e2402982110438bb1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 3 09:27:47 2023 -0800
+
+    clear_history binding, default Cmd+K
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index aa2a9c56..49ae661c 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -130,6 +130,7 @@ fn drainMailbox(self: *Thread) !void {
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
+             .resize => |v| try self.impl.resize(v.grid_size, v.screen_size, v.padding),
++            .clear_screen => |v| try self.impl.clearScreen(v.history),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             .write_stable => |v| try self.impl.queueWrite(v),
+             .write_alloc => |v| {
+
+commit 15b7e7fcd783459834015597aa651232631c8a7f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 8 08:43:42 2023 -0800
+
+    termio: coalesce resize events
+    
+    On macOS, we were seeing resize events dropped by child processes if
+    too many SIGWNCH events were generated.
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 49ae661c..b1c03cc6 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -18,6 +18,15 @@ const log = std.log.scoped(.io_thread);
+ /// the future if we want it configurable.
+ pub const Mailbox = BlockingQueue(termio.Message, 64);
+ 
++/// This stores the information that is coalesced.
++const Coalesce = struct {
++    /// The number of milliseconds to coalesce certain messages like resize for.
++    /// Not all message types are coalesced.
++    const min_ms = 25;
++
++    resize: ?termio.Message.Resize = null,
++};
++
+ /// Allocator used for some state
+ alloc: std.mem.Allocator,
+ 
+@@ -34,6 +43,12 @@ wakeup_c: xev.Completion = .{},
+ stop: xev.Async,
+ stop_c: xev.Completion = .{},
+ 
++/// This is used to coalesce resize events.
++coalesce: xev.Timer,
++coalesce_c: xev.Completion = .{},
++coalesce_cancel_c: xev.Completion = .{},
++coalesce_data: Coalesce = .{},
++
+ /// The underlying IO implementation.
+ impl: *termio.Impl,
+ 
+@@ -60,6 +75,10 @@ pub fn init(
+     var stop_h = try xev.Async.init();
+     errdefer stop_h.deinit();
+ 
++    // This timer is used to coalesce resize events.
++    var coalesce_h = try xev.Timer.init();
++    errdefer coalesce_h.deinit();
++
+     // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+@@ -69,6 +88,7 @@ pub fn init(
+         .loop = loop,
+         .wakeup = wakeup_h,
+         .stop = stop_h,
++        .coalesce = coalesce_h,
+         .impl = impl,
+         .mailbox = mailbox,
+     };
+@@ -77,6 +97,7 @@ pub fn init(
+ /// Clean up the thread. This is only safe to call once the thread
+ /// completes executing; the caller must join prior to this.
+ pub fn deinit(self: *Thread) void {
++    self.coalesce.deinit();
+     self.stop.deinit();
+     self.wakeup.deinit();
+     self.loop.deinit();
+@@ -129,7 +150,7 @@ fn drainMailbox(self: *Thread) !void {
+ 
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
+-            .resize => |v| try self.impl.resize(v.grid_size, v.screen_size, v.padding),
++            .resize => |v| self.handleResize(v),
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             .write_stable => |v| try self.impl.queueWrite(v),
+@@ -147,6 +168,51 @@ fn drainMailbox(self: *Thread) !void {
+     }
+ }
+ 
++fn handleResize(self: *Thread, resize: termio.Message.Resize) void {
++    self.coalesce_data.resize = resize;
++
++    // If the timer is already active we just return. In the future we want
++    // to reset the timer up to a maximum wait time but for now this ensures
++    // relatively smooth resizing.
++    if (self.coalesce_c.state() == .active) return;
++
++    self.coalesce.reset(
++        &self.loop,
++        &self.coalesce_c,
++        &self.coalesce_cancel_c,
++        Coalesce.min_ms,
++        Thread,
++        self,
++        coalesceCallback,
++    );
++}
++
++fn coalesceCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
++    _ = r catch |err| switch (err) {
++        error.Canceled => {},
++        else => {
++            log.warn("error during coalesce callback err={}", .{err});
++            return .disarm;
++        },
++    };
++
++    const self = self_ orelse return .disarm;
++
++    if (self.coalesce_data.resize) |v| {
++        self.coalesce_data.resize = null;
++        self.impl.resize(v.grid_size, v.screen_size, v.padding) catch |err| {
++            log.warn("error during resize err={}", .{err});
++        };
++    }
++
++    return .disarm;
++}
++
+ fn wakeupCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+
+commit 8f0be3ad9efd289f0bc27422fcd2bebd1e7f5bdd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Mar 19 10:09:17 2023 -0700
+
+    termio: use DerivedConfig
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index b1c03cc6..72656f00 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -150,6 +150,7 @@ fn drainMailbox(self: *Thread) !void {
+ 
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
++            .change_config => |config| try self.impl.changeConfig(config),
+             .resize => |v| self.handleResize(v),
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+
+commit b0b3b0af2d7b73c9c0cb0e1d54b125360495892f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Mar 19 10:48:42 2023 -0700
+
+    update config messages use pointers now to make messages small again
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 72656f00..d034ede3 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -150,7 +150,10 @@ fn drainMailbox(self: *Thread) !void {
+ 
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
+-            .change_config => |config| try self.impl.changeConfig(config),
++            .change_config => |config| {
++                defer config.alloc.destroy(config.ptr);
++                try self.impl.changeConfig(config.ptr);
++            },
+             .resize => |v| self.handleResize(v),
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+
+commit 9f86c48fd88eef9634942f95cf2eb63fbc3f4a48
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Jul 6 10:30:29 2023 -0700
+
+    keybinding jump_to_prompt for semantic prompts
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d034ede3..d6420079 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -156,6 +156,7 @@ fn drainMailbox(self: *Thread) !void {
+             },
+             .resize => |v| self.handleResize(v),
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
++            .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             .write_stable => |v| try self.impl.queueWrite(v),
+             .write_alloc => |v| {
+
+commit a8380e937dce4bfb5b920d917e773dca337c07b3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 9 07:24:11 2023 -0700
+
+    scroll top, bot, page up, page down binding actions
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d6420079..2c32d459 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -156,6 +156,7 @@ fn drainMailbox(self: *Thread) !void {
+             },
+             .resize => |v| self.handleResize(v),
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
++            .scroll_viewport => |v| try self.impl.scrollViewport(v),
+             .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             .write_stable => |v| try self.impl.queueWrite(v),
+
+commit 2cc1e4371651ccd692f3e8e8ba5a5cf731b2e21f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 28 11:35:40 2023 -0700
+
+    termio: handle all the synchronized output setting, timer
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 2c32d459..6f2a4af3 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -27,6 +27,10 @@ const Coalesce = struct {
+     resize: ?termio.Message.Resize = null,
+ };
+ 
++/// The number of milliseconds before we reset the synchronized output flag
++/// if the running program hasn't already.
++const sync_reset_ms = 5000;
++
+ /// Allocator used for some state
+ alloc: std.mem.Allocator,
+ 
+@@ -49,6 +53,12 @@ coalesce_c: xev.Completion = .{},
+ coalesce_cancel_c: xev.Completion = .{},
+ coalesce_data: Coalesce = .{},
+ 
++/// This timer is used to reset synchronized output modes so that
++/// the terminal doesn't freeze with a bad actor.
++sync_reset: xev.Timer,
++sync_reset_c: xev.Completion = .{},
++sync_reset_cancel_c: xev.Completion = .{},
++
+ /// The underlying IO implementation.
+ impl: *termio.Impl,
+ 
+@@ -79,6 +89,10 @@ pub fn init(
+     var coalesce_h = try xev.Timer.init();
+     errdefer coalesce_h.deinit();
+ 
++    // This timer is used to reset synchronized output modes.
++    var sync_reset_h = try xev.Timer.init();
++    errdefer sync_reset_h.deinit();
++
+     // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+@@ -89,6 +103,7 @@ pub fn init(
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+         .coalesce = coalesce_h,
++        .sync_reset = sync_reset_h,
+         .impl = impl,
+         .mailbox = mailbox,
+     };
+@@ -98,6 +113,7 @@ pub fn init(
+ /// completes executing; the caller must join prior to this.
+ pub fn deinit(self: *Thread) void {
+     self.coalesce.deinit();
++    self.sync_reset.deinit();
+     self.stop.deinit();
+     self.wakeup.deinit();
+     self.loop.deinit();
+@@ -158,6 +174,7 @@ fn drainMailbox(self: *Thread) !void {
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
+             .scroll_viewport => |v| try self.impl.scrollViewport(v),
+             .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
++            .start_synchronized_output => self.startSynchronizedOutput(),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+             .write_stable => |v| try self.impl.queueWrite(v),
+             .write_alloc => |v| {
+@@ -174,6 +191,18 @@ fn drainMailbox(self: *Thread) !void {
+     }
+ }
+ 
++fn startSynchronizedOutput(self: *Thread) void {
++    self.sync_reset.reset(
++        &self.loop,
++        &self.sync_reset_c,
++        &self.sync_reset_cancel_c,
++        sync_reset_ms,
++        Thread,
++        self,
++        syncResetCallback,
++    );
++}
++
+ fn handleResize(self: *Thread, resize: termio.Message.Resize) void {
+     self.coalesce_data.resize = resize;
+ 
+@@ -193,6 +222,25 @@ fn handleResize(self: *Thread, resize: termio.Message.Resize) void {
+     );
+ }
+ 
++fn syncResetCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
++    _ = r catch |err| switch (err) {
++        error.Canceled => {},
++        else => {
++            log.warn("error during sync reset callback err={}", .{err});
++            return .disarm;
++        },
++    };
++
++    const self = self_ orelse return .disarm;
++    self.impl.resetSynchronizedOutput();
++    return .disarm;
++}
++
+ fn coalesceCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+
+commit 5168dc76453c706cebaf735ff7fcad233aa72934
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 28 11:38:11 2023 -0700
+
+    renderer: do not render if synchronized output is on
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 6f2a4af3..0b345ac1 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -29,7 +29,7 @@ const Coalesce = struct {
+ 
+ /// The number of milliseconds before we reset the synchronized output flag
+ /// if the running program hasn't already.
+-const sync_reset_ms = 5000;
++const sync_reset_ms = 1000;
+ 
+ /// Allocator used for some state
+ alloc: std.mem.Allocator,
+
+commit 5ce50d08a1bd1d2adf338109d78ef8f13b4ee27c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Oct 12 20:46:26 2023 -0700
+
+    terminal: linefeed mode
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 0b345ac1..459cec97 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -62,6 +62,10 @@ sync_reset_cancel_c: xev.Completion = .{},
+ /// The underlying IO implementation.
+ impl: *termio.Impl,
+ 
++/// True if linefeed mode is enabled. This is duplicated here so that the
++/// write thread doesn't need to grab a lock to check this on every write.
++linefeed_mode: bool = false,
++
+ /// The mailbox that can be used to send this thread messages. Note
+ /// this is a blocking queue so if it is full you will get errors (or block).
+ mailbox: *Mailbox,
+@@ -175,11 +179,12 @@ fn drainMailbox(self: *Thread) !void {
+             .scroll_viewport => |v| try self.impl.scrollViewport(v),
+             .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
+             .start_synchronized_output => self.startSynchronizedOutput(),
+-            .write_small => |v| try self.impl.queueWrite(v.data[0..v.len]),
+-            .write_stable => |v| try self.impl.queueWrite(v),
++            .linefeed_mode => |v| self.linefeed_mode = v,
++            .write_small => |v| try self.impl.queueWrite(v.data[0..v.len], self.linefeed_mode),
++            .write_stable => |v| try self.impl.queueWrite(v, self.linefeed_mode),
+             .write_alloc => |v| {
+                 defer v.alloc.free(v.data);
+-                try self.impl.queueWrite(v.data);
++                try self.impl.queueWrite(v.data, self.linefeed_mode);
+             },
+         }
+     }
+
+commit 5a299e14e48cd3987453c56a0c661dbc783c48b7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Oct 22 08:46:30 2023 -0700
+
+    all threads are notified of inspector state, trigger render
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 459cec97..93faa38d 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -62,14 +62,19 @@ sync_reset_cancel_c: xev.Completion = .{},
+ /// The underlying IO implementation.
+ impl: *termio.Impl,
+ 
+-/// True if linefeed mode is enabled. This is duplicated here so that the
+-/// write thread doesn't need to grab a lock to check this on every write.
+-linefeed_mode: bool = false,
+-
+ /// The mailbox that can be used to send this thread messages. Note
+ /// this is a blocking queue so if it is full you will get errors (or block).
+ mailbox: *Mailbox,
+ 
++flags: packed struct {
++    /// True if linefeed mode is enabled. This is duplicated here so that the
++    /// write thread doesn't need to grab a lock to check this on every write.
++    linefeed_mode: bool = false,
++
++    /// This is true when the inspector is active.
++    has_inspector: bool = false,
++} = .{},
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+@@ -174,17 +179,18 @@ fn drainMailbox(self: *Thread) !void {
+                 defer config.alloc.destroy(config.ptr);
+                 try self.impl.changeConfig(config.ptr);
+             },
++            .inspector => |v| self.flags.has_inspector = v,
+             .resize => |v| self.handleResize(v),
+             .clear_screen => |v| try self.impl.clearScreen(v.history),
+             .scroll_viewport => |v| try self.impl.scrollViewport(v),
+             .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
+             .start_synchronized_output => self.startSynchronizedOutput(),
+-            .linefeed_mode => |v| self.linefeed_mode = v,
+-            .write_small => |v| try self.impl.queueWrite(v.data[0..v.len], self.linefeed_mode),
+-            .write_stable => |v| try self.impl.queueWrite(v, self.linefeed_mode),
++            .linefeed_mode => |v| self.flags.linefeed_mode = v,
++            .write_small => |v| try self.impl.queueWrite(v.data[0..v.len], self.flags.linefeed_mode),
++            .write_stable => |v| try self.impl.queueWrite(v, self.flags.linefeed_mode),
+             .write_alloc => |v| {
+                 defer v.alloc.free(v.data);
+-                try self.impl.queueWrite(v.data, self.linefeed_mode);
++                try self.impl.queueWrite(v.data, self.flags.linefeed_mode);
+             },
+         }
+     }
+
+commit f3aaa884c60c440f06f7886416c1eb7f249aca7e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Dec 30 17:51:34 2023 -0800
+
+    termio/exec: use message to writer thread so we can output failed cmd
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 93faa38d..516102f3 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -186,6 +186,7 @@ fn drainMailbox(self: *Thread) !void {
+             .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
+             .start_synchronized_output => self.startSynchronizedOutput(),
+             .linefeed_mode => |v| self.flags.linefeed_mode = v,
++            .child_exited_abnormally => try self.impl.childExitedAbnormally(),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len], self.flags.linefeed_mode),
+             .write_stable => |v| try self.impl.queueWrite(v, self.flags.linefeed_mode),
+             .write_alloc => |v| {
+
+commit 792284fb69fc5dea5f92d5efcd1b2786ca12f1a3
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Dec 30 22:24:25 2023 -0600
+
+    Add exit code and runtime to abnormal exit error message.
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 516102f3..61b2e3fb 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -186,7 +186,7 @@ fn drainMailbox(self: *Thread) !void {
+             .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
+             .start_synchronized_output => self.startSynchronizedOutput(),
+             .linefeed_mode => |v| self.flags.linefeed_mode = v,
+-            .child_exited_abnormally => try self.impl.childExitedAbnormally(),
++            .child_exited_abnormally => |v| try self.impl.childExitedAbnormally(v.exit_code, v.runtime_ms),
+             .write_small => |v| try self.impl.queueWrite(v.data[0..v.len], self.flags.linefeed_mode),
+             .write_stable => |v| try self.impl.queueWrite(v, self.flags.linefeed_mode),
+             .write_alloc => |v| {
+
+commit adb7958f6177dfe5df69bc2202da98c566f389b9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 13 15:06:08 2024 -0800
+
+    remove tracy usage from all files
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 61b2e3fb..2698f806 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -7,8 +7,6 @@ const builtin = @import("builtin");
+ const xev = @import("xev");
+ const termio = @import("../termio.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+-const tracy = @import("tracy");
+-const trace = tracy.trace;
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.io_thread);
+@@ -142,7 +140,6 @@ pub fn threadMain(self: *Thread) void {
+ 
+ fn threadMain_(self: *Thread) !void {
+     defer log.debug("IO thread exited", .{});
+-    tracy.setThreadName("pty io");
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+@@ -162,9 +159,6 @@ fn threadMain_(self: *Thread) !void {
+ 
+ /// Drain the mailbox, handling all the messages in our terminal implementation.
+ fn drainMailbox(self: *Thread) !void {
+-    const zone = trace(@src());
+-    defer zone.end();
+-
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+@@ -290,9 +284,6 @@ fn wakeupCallback(
+         return .rearm;
+     };
+ 
+-    const zone = trace(@src());
+-    defer zone.end();
+-
+     const t = self_.?;
+ 
+     // When we wake up, we check the mailbox. Mailbox producers should
+
+commit b87bbd55c5467c49bfaa44bb3c44a506bc11668f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Jan 15 19:58:29 2024 -0800
+
+    termio: handle termio thread failure by showing a message in window
+    
+    Fixes #1301
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 2698f806..450f3229 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -3,6 +3,7 @@
+ pub const Thread = @This();
+ 
+ const std = @import("std");
++const ArenaAllocator = std.heap.ArenaAllocator;
+ const builtin = @import("builtin");
+ const xev = @import("xev");
+ const termio = @import("../termio.zig");
+@@ -65,6 +66,10 @@ impl: *termio.Impl,
+ mailbox: *Mailbox,
+ 
+ flags: packed struct {
++    /// This is set to true only when an abnormal exit is detected. It
++    /// tells our mailbox system to drain and ignore all messages.
++    drain: bool = false,
++
+     /// True if linefeed mode is enabled. This is duplicated here so that the
+     /// write thread doesn't need to grab a lock to check this on every write.
+     linefeed_mode: bool = false,
+@@ -133,24 +138,98 @@ pub fn deinit(self: *Thread) void {
+ pub fn threadMain(self: *Thread) void {
+     // Call child function so we can use errors...
+     self.threadMain_() catch |err| {
+-        // In the future, we should expose this on the thread struct.
+         log.warn("error in io thread err={}", .{err});
++
++        // Use an arena to simplify memory management below
++        var arena = ArenaAllocator.init(self.alloc);
++        defer arena.deinit();
++        const alloc = arena.allocator();
++
++        // If there is an error, we replace our terminal screen with
++        // the error message. It might be better in the future to send
++        // the error to the surface thread and let the apprt deal with it
++        // in some way but this works for now. Without this, the user would
++        // just see a blank terminal window.
++        self.impl.renderer_state.mutex.lock();
++        defer self.impl.renderer_state.mutex.unlock();
++        const t = self.impl.renderer_state.terminal;
++
++        // Hide the cursor
++        t.modes.set(.cursor_visible, false);
++
++        // This is weird but just ensures that no matter what our underlying
++        // implementation we have the errors below. For example, Windows doesn't
++        // have "OpenptyFailed".
++        const Err = @TypeOf(err) || error{
++            OpenptyFailed,
++        };
++
++        switch (@as(Err, @errorCast(err))) {
++            error.OpenptyFailed => {
++                const str =
++                    \\Your system cannot allocate any more pty devices.
++                    \\
++                    \\Ghostty requires a pty device to launch a new terminal.
++                    \\This error is usually due to having too many terminal
++                    \\windows open or having another program that is using too
++                    \\many pty devices.
++                    \\
++                    \\Please free up some pty devices and try again.
++                ;
++
++                t.eraseDisplay(alloc, .complete, false);
++                t.printString(str) catch {};
++            },
++
++            else => {
++                const str = std.fmt.allocPrint(
++                    alloc,
++                    \\error starting IO thread: {}
++                    \\
++                    \\The underlying shell or command was unable to be started.
++                    \\This error is usually due to exhausting a system resource.
++                    \\If this looks like a bug, please report it.
++                    \\
++                    \\This terminal is non-functional. Please close it and try again.
++                ,
++                    .{err},
++                ) catch
++                    \\Out of memory. This terminal is non-functional. Please close it and try again.
++                ;
++
++                t.eraseDisplay(alloc, .complete, false);
++                t.printString(str) catch {};
++            },
++        }
+     };
++
++    // If our loop is not stopped, then we need to keep running so that
++    // messages are drained and we can wait for the surface to send a stop
++    // message.
++    if (!self.loop.flags.stopped) {
++        log.warn("abrupt io thread exit detected, starting xev to drain mailbox", .{});
++        defer log.debug("io thread fully exiting after abnormal failure", .{});
++        self.flags.drain = true;
++        self.loop.run(.until_done) catch |err| {
++            log.err("failed to start xev loop for draining err={}", .{err});
++        };
++    }
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
+     defer log.debug("IO thread exited", .{});
+ 
++    // Start the async handlers. We start these first so that they're
++    // registered even if anything below fails so we can drain the mailbox.
++    self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
++    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
++
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+     var data = try self.impl.threadEnter(self);
+     defer data.deinit();
+     defer self.impl.threadExit(data);
+ 
+-    // Start the async handlers
+-    self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
+-    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
+-
+     // Run
+     log.debug("starting IO thread", .{});
+     defer log.debug("starting IO thread shutdown", .{});
+@@ -159,6 +238,12 @@ fn threadMain_(self: *Thread) !void {
+ 
+ /// Drain the mailbox, handling all the messages in our terminal implementation.
+ fn drainMailbox(self: *Thread) !void {
++    // If we're draining, we just drain the mailbox and return.
++    if (self.flags.drain) {
++        while (self.mailbox.pop()) |_| {}
++        return;
++    }
++
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+
+commit 25d84d697aa981df77fcb5f264a46e5cbcfdbca0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 20:47:16 2024 -0800
+
+    termio/exec: get compiler errors gone
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 450f3229..45b9fd1a 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -177,7 +177,7 @@ pub fn threadMain(self: *Thread) void {
+                     \\Please free up some pty devices and try again.
+                 ;
+ 
+-                t.eraseDisplay(alloc, .complete, false);
++                t.eraseDisplay(.complete, false);
+                 t.printString(str) catch {};
+             },
+ 
+@@ -197,7 +197,7 @@ pub fn threadMain(self: *Thread) void {
+                     \\Out of memory. This terminal is non-functional. Please close it and try again.
+                 ;
+ 
+-                t.eraseDisplay(alloc, .complete, false);
++                t.eraseDisplay(.complete, false);
+                 t.printString(str) catch {};
+             },
+         }
+
+commit 49c92fd0e67592fc9eebab4540db7de426b0283e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jul 13 09:29:54 2024 -0700
+
+    termio: rename Exec to Termio throughout
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 45b9fd1a..aceeaa63 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -58,8 +58,8 @@ sync_reset: xev.Timer,
+ sync_reset_c: xev.Completion = .{},
+ sync_reset_cancel_c: xev.Completion = .{},
+ 
+-/// The underlying IO implementation.
+-impl: *termio.Impl,
++/// The main termio state.
++termio: *termio.Termio,
+ 
+ /// The mailbox that can be used to send this thread messages. Note
+ /// this is a blocking queue so if it is full you will get errors (or block).
+@@ -83,7 +83,7 @@ flags: packed struct {
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
+-    impl: *termio.Impl,
++    t: *termio.Termio,
+ ) !Thread {
+     // Create our event loop.
+     var loop = try xev.Loop.init(.{});
+@@ -116,7 +116,7 @@ pub fn init(
+         .stop = stop_h,
+         .coalesce = coalesce_h,
+         .sync_reset = sync_reset_h,
+-        .impl = impl,
++        .termio = t,
+         .mailbox = mailbox,
+     };
+ }
+@@ -150,9 +150,9 @@ pub fn threadMain(self: *Thread) void {
+         // the error to the surface thread and let the apprt deal with it
+         // in some way but this works for now. Without this, the user would
+         // just see a blank terminal window.
+-        self.impl.renderer_state.mutex.lock();
+-        defer self.impl.renderer_state.mutex.unlock();
+-        const t = self.impl.renderer_state.terminal;
++        self.termio.renderer_state.mutex.lock();
++        defer self.termio.renderer_state.mutex.unlock();
++        const t = self.termio.renderer_state.terminal;
+ 
+         // Hide the cursor
+         t.modes.set(.cursor_visible, false);
+@@ -226,9 +226,9 @@ fn threadMain_(self: *Thread) !void {
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed.
+-    var data = try self.impl.threadEnter(self);
++    var data = try self.termio.threadEnter(self);
+     defer data.deinit();
+-    defer self.impl.threadExit(data);
++    defer self.termio.threadExit(data);
+ 
+     // Run
+     log.debug("starting IO thread", .{});
+@@ -256,21 +256,21 @@ fn drainMailbox(self: *Thread) !void {
+         switch (message) {
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.ptr);
+-                try self.impl.changeConfig(config.ptr);
++                try self.termio.changeConfig(config.ptr);
+             },
+             .inspector => |v| self.flags.has_inspector = v,
+             .resize => |v| self.handleResize(v),
+-            .clear_screen => |v| try self.impl.clearScreen(v.history),
+-            .scroll_viewport => |v| try self.impl.scrollViewport(v),
+-            .jump_to_prompt => |v| try self.impl.jumpToPrompt(v),
++            .clear_screen => |v| try self.termio.clearScreen(v.history),
++            .scroll_viewport => |v| try self.termio.scrollViewport(v),
++            .jump_to_prompt => |v| try self.termio.jumpToPrompt(v),
+             .start_synchronized_output => self.startSynchronizedOutput(),
+             .linefeed_mode => |v| self.flags.linefeed_mode = v,
+-            .child_exited_abnormally => |v| try self.impl.childExitedAbnormally(v.exit_code, v.runtime_ms),
+-            .write_small => |v| try self.impl.queueWrite(v.data[0..v.len], self.flags.linefeed_mode),
+-            .write_stable => |v| try self.impl.queueWrite(v, self.flags.linefeed_mode),
++            .child_exited_abnormally => |v| try self.termio.childExitedAbnormally(v.exit_code, v.runtime_ms),
++            .write_small => |v| try self.termio.queueWrite(v.data[0..v.len], self.flags.linefeed_mode),
++            .write_stable => |v| try self.termio.queueWrite(v, self.flags.linefeed_mode),
+             .write_alloc => |v| {
+                 defer v.alloc.free(v.data);
+-                try self.impl.queueWrite(v.data, self.flags.linefeed_mode);
++                try self.termio.queueWrite(v.data, self.flags.linefeed_mode);
+             },
+         }
+     }
+@@ -278,7 +278,7 @@ fn drainMailbox(self: *Thread) !void {
+     // Trigger a redraw after we've drained so we don't waste cyces
+     // messaging a redraw.
+     if (redraw) {
+-        try self.impl.renderer_wakeup.notify();
++        try self.termio.renderer_wakeup.notify();
+     }
+ }
+ 
+@@ -328,7 +328,7 @@ fn syncResetCallback(
+     };
+ 
+     const self = self_ orelse return .disarm;
+-    self.impl.resetSynchronizedOutput();
++    self.termio.resetSynchronizedOutput();
+     return .disarm;
+ }
+ 
+@@ -350,7 +350,7 @@ fn coalesceCallback(
+ 
+     if (self.coalesce_data.resize) |v| {
+         self.coalesce_data.resize = null;
+-        self.impl.resize(v.grid_size, v.screen_size, v.padding) catch |err| {
++        self.termio.resize(v.grid_size, v.screen_size, v.padding) catch |err| {
+             log.warn("error during resize err={}", .{err});
+         };
+     }
+
+commit c4484938c565030bd10b10a77a8e80602e3001ca
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jul 13 10:35:46 2024 -0700
+
+    termio: wip but it builds
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index aceeaa63..97acb2ac 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -219,16 +219,21 @@ pub fn threadMain(self: *Thread) void {
+ fn threadMain_(self: *Thread) !void {
+     defer log.debug("IO thread exited", .{});
+ 
+-    // Start the async handlers. We start these first so that they're
+-    // registered even if anything below fails so we can drain the mailbox.
+-    self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
+-    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
++    // This is the data sent to xev callbacks. We want a pointer to both
++    // ourselves and the thread data so we can thread that through (pun intended).
++    var cb: CallbackData = .{ .self = self };
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+-    // to hook into the event loop as needed.
+-    var data = try self.termio.threadEnter(self);
+-    defer data.deinit();
+-    defer self.termio.threadExit(data);
++    // to hook into the event loop as needed. The thread data is created
++    // on the stack here so that it has a stable pointer throughout the
++    // lifetime of the thread.
++    try self.termio.threadEnter(self, &cb.data);
++    defer cb.data.deinit();
++    defer self.termio.threadExit(&cb.data);
++
++    // Start the async handlers.
++    self.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
++    self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+ 
+     // Run
+     log.debug("starting IO thread", .{});
+@@ -236,8 +241,14 @@ fn threadMain_(self: *Thread) !void {
+     try self.loop.run(.until_done);
+ }
+ 
++/// This is the data passed to xev callbacks on the thread.
++const CallbackData = struct {
++    self: *Thread,
++    data: termio.Termio.ThreadData = undefined,
++};
++
+ /// Drain the mailbox, handling all the messages in our terminal implementation.
+-fn drainMailbox(self: *Thread) !void {
++fn drainMailbox(self: *Thread, data: *termio.Termio.ThreadData) !void {
+     // If we're draining, we just drain the mailbox and return.
+     if (self.flags.drain) {
+         while (self.mailbox.pop()) |_| {}
+@@ -256,21 +267,33 @@ fn drainMailbox(self: *Thread) !void {
+         switch (message) {
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.ptr);
+-                try self.termio.changeConfig(config.ptr);
++                try self.termio.changeConfig(data, config.ptr);
+             },
+             .inspector => |v| self.flags.has_inspector = v,
+             .resize => |v| self.handleResize(v),
+-            .clear_screen => |v| try self.termio.clearScreen(v.history),
++            .clear_screen => |v| try self.termio.clearScreen(data, v.history),
+             .scroll_viewport => |v| try self.termio.scrollViewport(v),
+             .jump_to_prompt => |v| try self.termio.jumpToPrompt(v),
+             .start_synchronized_output => self.startSynchronizedOutput(),
+             .linefeed_mode => |v| self.flags.linefeed_mode = v,
+             .child_exited_abnormally => |v| try self.termio.childExitedAbnormally(v.exit_code, v.runtime_ms),
+-            .write_small => |v| try self.termio.queueWrite(v.data[0..v.len], self.flags.linefeed_mode),
+-            .write_stable => |v| try self.termio.queueWrite(v, self.flags.linefeed_mode),
++            .write_small => |v| try self.termio.queueWrite(
++                data,
++                v.data[0..v.len],
++                self.flags.linefeed_mode,
++            ),
++            .write_stable => |v| try self.termio.queueWrite(
++                data,
++                v,
++                self.flags.linefeed_mode,
++            ),
+             .write_alloc => |v| {
+                 defer v.alloc.free(v.data);
+-                try self.termio.queueWrite(v.data, self.flags.linefeed_mode);
++                try self.termio.queueWrite(
++                    data,
++                    v.data,
++                    self.flags.linefeed_mode,
++                );
+             },
+         }
+     }
+@@ -359,7 +382,7 @@ fn coalesceCallback(
+ }
+ 
+ fn wakeupCallback(
+-    self_: ?*Thread,
++    cb_: ?*CallbackData,
+     _: *xev.Loop,
+     _: *xev.Completion,
+     r: xev.Async.WaitError!void,
+@@ -369,23 +392,23 @@ fn wakeupCallback(
+         return .rearm;
+     };
+ 
+-    const t = self_.?;
++    const cb = cb_ orelse return .rearm;
+ 
+     // When we wake up, we check the mailbox. Mailbox producers should
+     // wake up our thread after publishing.
+-    t.drainMailbox() catch |err|
++    cb.self.drainMailbox(&cb.data) catch |err|
+         log.err("error draining mailbox err={}", .{err});
+ 
+     return .rearm;
+ }
+ 
+ fn stopCallback(
+-    self_: ?*Thread,
++    cb_: ?*CallbackData,
+     _: *xev.Loop,
+     _: *xev.Completion,
+     r: xev.Async.WaitError!void,
+ ) xev.CallbackAction {
+     _ = r catch unreachable;
+-    self_.?.loop.stop();
++    cb_.?.self.loop.stop();
+     return .disarm;
+ }
+
+commit 31144da8456cdb4a1d1d7765a02f38ac814765a1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jul 14 10:27:58 2024 -0700
+
+    termio: Thread doesn't need to hold termio pointer
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 97acb2ac..44d85199 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -1,5 +1,14 @@
+-//! Represents the IO thread logic. The IO thread is responsible for
+-//! the child process and pty management.
++//! Represents the "writer" thread for terminal IO. The reader side is
++//! handled by the Termio struct itself and dependent on the underlying
++//! implementation (i.e. if its a pty, manual, etc.).
++//!
++//! The writer thread does handle writing bytes to the pty but also handles
++//! different events such as starting synchronized output, changing some
++//! modes (like linefeed), etc. The goal is to offload as much from the
++//! reader thread as possible since it is the hot path in parsing VT
++//! sequences and updating terminal state.
++//!
++//! This thread state can only be used by one thread at a time.
+ pub const Thread = @This();
+ 
+ const std = @import("std");
+@@ -58,9 +67,6 @@ sync_reset: xev.Timer,
+ sync_reset_c: xev.Completion = .{},
+ sync_reset_cancel_c: xev.Completion = .{},
+ 
+-/// The main termio state.
+-termio: *termio.Termio,
+-
+ /// The mailbox that can be used to send this thread messages. Note
+ /// this is a blocking queue so if it is full you will get errors (or block).
+ mailbox: *Mailbox,
+@@ -83,7 +89,6 @@ flags: packed struct {
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
+-    t: *termio.Termio,
+ ) !Thread {
+     // Create our event loop.
+     var loop = try xev.Loop.init(.{});
+@@ -116,7 +121,6 @@ pub fn init(
+         .stop = stop_h,
+         .coalesce = coalesce_h,
+         .sync_reset = sync_reset_h,
+-        .termio = t,
+         .mailbox = mailbox,
+     };
+ }
+@@ -135,9 +139,9 @@ pub fn deinit(self: *Thread) void {
+ }
+ 
+ /// The main entrypoint for the thread.
+-pub fn threadMain(self: *Thread) void {
++pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+     // Call child function so we can use errors...
+-    self.threadMain_() catch |err| {
++    self.threadMain_(io) catch |err| {
+         log.warn("error in io thread err={}", .{err});
+ 
+         // Use an arena to simplify memory management below
+@@ -150,9 +154,9 @@ pub fn threadMain(self: *Thread) void {
+         // the error to the surface thread and let the apprt deal with it
+         // in some way but this works for now. Without this, the user would
+         // just see a blank terminal window.
+-        self.termio.renderer_state.mutex.lock();
+-        defer self.termio.renderer_state.mutex.unlock();
+-        const t = self.termio.renderer_state.terminal;
++        io.renderer_state.mutex.lock();
++        defer io.renderer_state.mutex.unlock();
++        const t = io.renderer_state.terminal;
+ 
+         // Hide the cursor
+         t.modes.set(.cursor_visible, false);
+@@ -216,20 +220,20 @@ pub fn threadMain(self: *Thread) void {
+     }
+ }
+ 
+-fn threadMain_(self: *Thread) !void {
++fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer log.debug("IO thread exited", .{});
+ 
+     // This is the data sent to xev callbacks. We want a pointer to both
+     // ourselves and the thread data so we can thread that through (pun intended).
+-    var cb: CallbackData = .{ .self = self };
++    var cb: CallbackData = .{ .self = self, .io = io };
+ 
+     // Run our thread start/end callbacks. This allows the implementation
+     // to hook into the event loop as needed. The thread data is created
+     // on the stack here so that it has a stable pointer throughout the
+     // lifetime of the thread.
+-    try self.termio.threadEnter(self, &cb.data);
++    try io.threadEnter(self, &cb.data);
+     defer cb.data.deinit();
+-    defer self.termio.threadExit(&cb.data);
++    defer io.threadExit(&cb.data);
+ 
+     // Start the async handlers.
+     self.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
+@@ -244,17 +248,24 @@ fn threadMain_(self: *Thread) !void {
+ /// This is the data passed to xev callbacks on the thread.
+ const CallbackData = struct {
+     self: *Thread,
++    io: *termio.Termio,
+     data: termio.Termio.ThreadData = undefined,
+ };
+ 
+ /// Drain the mailbox, handling all the messages in our terminal implementation.
+-fn drainMailbox(self: *Thread, data: *termio.Termio.ThreadData) !void {
++fn drainMailbox(
++    self: *Thread,
++    cb: *CallbackData,
++) !void {
+     // If we're draining, we just drain the mailbox and return.
+     if (self.flags.drain) {
+         while (self.mailbox.pop()) |_| {}
+         return;
+     }
+ 
++    const io = cb.io;
++    const data = &cb.data;
++
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+@@ -267,29 +278,29 @@ fn drainMailbox(self: *Thread, data: *termio.Termio.ThreadData) !void {
+         switch (message) {
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.ptr);
+-                try self.termio.changeConfig(data, config.ptr);
++                try io.changeConfig(data, config.ptr);
+             },
+             .inspector => |v| self.flags.has_inspector = v,
+-            .resize => |v| self.handleResize(v),
+-            .clear_screen => |v| try self.termio.clearScreen(data, v.history),
+-            .scroll_viewport => |v| try self.termio.scrollViewport(v),
+-            .jump_to_prompt => |v| try self.termio.jumpToPrompt(v),
+-            .start_synchronized_output => self.startSynchronizedOutput(),
++            .resize => |v| self.handleResize(cb, v),
++            .clear_screen => |v| try io.clearScreen(data, v.history),
++            .scroll_viewport => |v| try io.scrollViewport(v),
++            .jump_to_prompt => |v| try io.jumpToPrompt(v),
++            .start_synchronized_output => self.startSynchronizedOutput(cb),
+             .linefeed_mode => |v| self.flags.linefeed_mode = v,
+-            .child_exited_abnormally => |v| try self.termio.childExitedAbnormally(v.exit_code, v.runtime_ms),
+-            .write_small => |v| try self.termio.queueWrite(
++            .child_exited_abnormally => |v| try io.childExitedAbnormally(v.exit_code, v.runtime_ms),
++            .write_small => |v| try io.queueWrite(
+                 data,
+                 v.data[0..v.len],
+                 self.flags.linefeed_mode,
+             ),
+-            .write_stable => |v| try self.termio.queueWrite(
++            .write_stable => |v| try io.queueWrite(
+                 data,
+                 v,
+                 self.flags.linefeed_mode,
+             ),
+             .write_alloc => |v| {
+                 defer v.alloc.free(v.data);
+-                try self.termio.queueWrite(
++                try io.queueWrite(
+                     data,
+                     v.data,
+                     self.flags.linefeed_mode,
+@@ -301,23 +312,23 @@ fn drainMailbox(self: *Thread, data: *termio.Termio.ThreadData) !void {
+     // Trigger a redraw after we've drained so we don't waste cyces
+     // messaging a redraw.
+     if (redraw) {
+-        try self.termio.renderer_wakeup.notify();
++        try io.renderer_wakeup.notify();
+     }
+ }
+ 
+-fn startSynchronizedOutput(self: *Thread) void {
++fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
+     self.sync_reset.reset(
+         &self.loop,
+         &self.sync_reset_c,
+         &self.sync_reset_cancel_c,
+         sync_reset_ms,
+-        Thread,
+-        self,
++        CallbackData,
++        cb,
+         syncResetCallback,
+     );
+ }
+ 
+-fn handleResize(self: *Thread, resize: termio.Message.Resize) void {
++fn handleResize(self: *Thread, cb: *CallbackData, resize: termio.Message.Resize) void {
+     self.coalesce_data.resize = resize;
+ 
+     // If the timer is already active we just return. In the future we want
+@@ -330,14 +341,14 @@ fn handleResize(self: *Thread, resize: termio.Message.Resize) void {
+         &self.coalesce_c,
+         &self.coalesce_cancel_c,
+         Coalesce.min_ms,
+-        Thread,
+-        self,
++        CallbackData,
++        cb,
+         coalesceCallback,
+     );
+ }
+ 
+ fn syncResetCallback(
+-    self_: ?*Thread,
++    cb_: ?*CallbackData,
+     _: *xev.Loop,
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+@@ -350,13 +361,13 @@ fn syncResetCallback(
+         },
+     };
+ 
+-    const self = self_ orelse return .disarm;
+-    self.termio.resetSynchronizedOutput();
++    const cb = cb_ orelse return .disarm;
++    cb.io.resetSynchronizedOutput();
+     return .disarm;
+ }
+ 
+ fn coalesceCallback(
+-    self_: ?*Thread,
++    cb_: ?*CallbackData,
+     _: *xev.Loop,
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+@@ -369,11 +380,11 @@ fn coalesceCallback(
+         },
+     };
+ 
+-    const self = self_ orelse return .disarm;
++    const cb = cb_ orelse return .disarm;
+ 
+-    if (self.coalesce_data.resize) |v| {
+-        self.coalesce_data.resize = null;
+-        self.termio.resize(v.grid_size, v.screen_size, v.padding) catch |err| {
++    if (cb.self.coalesce_data.resize) |v| {
++        cb.self.coalesce_data.resize = null;
++        cb.io.resize(v.grid_size, v.screen_size, v.padding) catch |err| {
+             log.warn("error during resize err={}", .{err});
+         };
+     }
+@@ -392,11 +403,10 @@ fn wakeupCallback(
+         return .rearm;
+     };
+ 
+-    const cb = cb_ orelse return .rearm;
+-
+     // When we wake up, we check the mailbox. Mailbox producers should
+     // wake up our thread after publishing.
+-    cb.self.drainMailbox(&cb.data) catch |err|
++    const cb = cb_ orelse return .rearm;
++    cb.self.drainMailbox(cb) catch |err|
+         log.err("error draining mailbox err={}", .{err});
+ 
+     return .rearm;
+
+commit af7adedb50dd954d94adde976b613cf9634aa3fd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jul 14 14:48:48 2024 -0700
+
+    termio: writer abstraction
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 44d85199..f24fcf0d 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -21,11 +21,6 @@ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.io_thread);
+ 
+-/// The type used for sending messages to the IO thread. For now this is
+-/// hardcoded with a capacity. We can make this a comptime parameter in
+-/// the future if we want it configurable.
+-pub const Mailbox = BlockingQueue(termio.Message, 64);
+-
+ /// This stores the information that is coalesced.
+ const Coalesce = struct {
+     /// The number of milliseconds to coalesce certain messages like resize for.
+@@ -47,8 +42,8 @@ alloc: std.mem.Allocator,
+ /// so that users of the loop always have an allocator.
+ loop: xev.Loop,
+ 
+-/// This can be used to wake up the thread.
+-wakeup: xev.Async,
++/// The completion to use for the wakeup async handle that is present
++/// on the termio.Writer.
+ wakeup_c: xev.Completion = .{},
+ 
+ /// This can be used to stop the thread on the next loop iteration.
+@@ -67,10 +62,6 @@ sync_reset: xev.Timer,
+ sync_reset_c: xev.Completion = .{},
+ sync_reset_cancel_c: xev.Completion = .{},
+ 
+-/// The mailbox that can be used to send this thread messages. Note
+-/// this is a blocking queue so if it is full you will get errors (or block).
+-mailbox: *Mailbox,
+-
+ flags: packed struct {
+     /// This is set to true only when an abnormal exit is detected. It
+     /// tells our mailbox system to drain and ignore all messages.
+@@ -94,10 +85,6 @@ pub fn init(
+     var loop = try xev.Loop.init(.{});
+     errdefer loop.deinit();
+ 
+-    // This async handle is used to "wake up" the renderer and force a render.
+-    var wakeup_h = try xev.Async.init();
+-    errdefer wakeup_h.deinit();
+-
+     // This async handle is used to stop the loop and force the thread to end.
+     var stop_h = try xev.Async.init();
+     errdefer stop_h.deinit();
+@@ -110,18 +97,12 @@ pub fn init(
+     var sync_reset_h = try xev.Timer.init();
+     errdefer sync_reset_h.deinit();
+ 
+-    // The mailbox for messaging this thread
+-    var mailbox = try Mailbox.create(alloc);
+-    errdefer mailbox.destroy(alloc);
+-
+     return Thread{
+         .alloc = alloc,
+         .loop = loop,
+-        .wakeup = wakeup_h,
+         .stop = stop_h,
+         .coalesce = coalesce_h,
+         .sync_reset = sync_reset_h,
+-        .mailbox = mailbox,
+     };
+ }
+ 
+@@ -131,11 +112,7 @@ pub fn deinit(self: *Thread) void {
+     self.coalesce.deinit();
+     self.sync_reset.deinit();
+     self.stop.deinit();
+-    self.wakeup.deinit();
+     self.loop.deinit();
+-
+-    // Nothing can possibly access the mailbox anymore, destroy it.
+-    self.mailbox.destroy(self.alloc);
+ }
+ 
+ /// The main entrypoint for the thread.
+@@ -223,6 +200,12 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer log.debug("IO thread exited", .{});
+ 
++    // Get the writer. This must be a mailbox writer for threading.
++    const writer = switch (io.writer) {
++        .mailbox => |v| v,
++        // else => return error.TermioUnsupportedWriter,
++    };
++
+     // This is the data sent to xev callbacks. We want a pointer to both
+     // ourselves and the thread data so we can thread that through (pun intended).
+     var cb: CallbackData = .{ .self = self, .io = io };
+@@ -236,7 +219,7 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer io.threadExit(&cb.data);
+ 
+     // Start the async handlers.
+-    self.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
++    writer.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
+     self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+ 
+     // Run
+@@ -257,20 +240,22 @@ fn drainMailbox(
+     self: *Thread,
+     cb: *CallbackData,
+ ) !void {
++    // We assert when starting the thread that this is the state
++    const mailbox = cb.io.writer.mailbox.mailbox;
++    const io = cb.io;
++    const data = &cb.data;
++
+     // If we're draining, we just drain the mailbox and return.
+     if (self.flags.drain) {
+-        while (self.mailbox.pop()) |_| {}
++        while (mailbox.pop()) |_| {}
+         return;
+     }
+ 
+-    const io = cb.io;
+-    const data = &cb.data;
+-
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+     var redraw: bool = false;
+-    while (self.mailbox.pop()) |message| {
++    while (mailbox.pop()) |message| {
+         // If we have a message we always redraw
+         redraw = true;
+ 
+
+commit 485346c69446296499296c6e0854e4c33e7c4b00
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jul 14 18:15:19 2024 -0700
+
+    termio: more windows fixes
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index f24fcf0d..d61301f5 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -202,7 +202,7 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+ 
+     // Get the writer. This must be a mailbox writer for threading.
+     const writer = switch (io.writer) {
+-        .mailbox => |v| v,
++        .mailbox => |*v| v,
+         // else => return error.TermioUnsupportedWriter,
+     };
+ 
+
+commit 835d622baa9d0026798f9f23fbc09abcc41eaf5f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Jul 15 10:23:09 2024 -0700
+
+    termio: writer => mailbox
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d61301f5..73e384f5 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -200,10 +200,10 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer log.debug("IO thread exited", .{});
+ 
+-    // Get the writer. This must be a mailbox writer for threading.
+-    const writer = switch (io.writer) {
+-        .mailbox => |*v| v,
+-        // else => return error.TermioUnsupportedWriter,
++    // Get the mailbox. This must be an SPSC mailbox for threading.
++    const mailbox = switch (io.mailbox) {
++        .spsc => |*v| v,
++        // else => return error.TermioUnsupportedMailbox,
+     };
+ 
+     // This is the data sent to xev callbacks. We want a pointer to both
+@@ -219,7 +219,7 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer io.threadExit(&cb.data);
+ 
+     // Start the async handlers.
+-    writer.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
++    mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
+     self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+ 
+     // Run
+@@ -241,7 +241,7 @@ fn drainMailbox(
+     cb: *CallbackData,
+ ) !void {
+     // We assert when starting the thread that this is the state
+-    const mailbox = cb.io.writer.mailbox.mailbox;
++    const mailbox = cb.io.mailbox.spsc.queue;
+     const io = cb.io;
+     const data = &cb.data;
+ 
+
+commit 137ba662114424e4a5c8e76417d1a8f100009364
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Jul 17 10:18:15 2024 -0700
+
+    terminal: implement in-band size reports (Mode 2048)
+    
+    https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 73e384f5..1dc24082 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -267,6 +267,7 @@ fn drainMailbox(
+             },
+             .inspector => |v| self.flags.has_inspector = v,
+             .resize => |v| self.handleResize(cb, v),
++            .size_report => try io.sizeReport(data),
+             .clear_screen => |v| try io.clearScreen(data, v.history),
+             .scroll_viewport => |v| try io.scrollViewport(v),
+             .jump_to_prompt => |v| try io.jumpToPrompt(v),
+@@ -369,7 +370,12 @@ fn coalesceCallback(
+ 
+     if (cb.self.coalesce_data.resize) |v| {
+         cb.self.coalesce_data.resize = null;
+-        cb.io.resize(v.grid_size, v.screen_size, v.padding) catch |err| {
++        cb.io.resize(
++            &cb.data,
++            v.grid_size,
++            v.screen_size,
++            v.padding,
++        ) catch |err| {
+             log.warn("error during resize err={}", .{err});
+         };
+     }
+
+commit ce5e55d4aa87f0bcf2562281b972015bfa5eb01a
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Wed Aug 7 00:12:20 2024 -0500
+
+    Implement the XTWINOPS (CSI t) control sequences that "make sense".
+    
+    These sequences were implemented:
+    
+    CSI 14 t - report the text area size in pixels
+    CSI 16 t - report the cell size in pixels
+    CSI 18 t - report the text area size in cells
+    CSI 21 t - report the window title
+    
+    These sequences were not implemented because they manuipulate the window
+    state in ways that we do not want.
+    
+    CSI 1 t
+    CSI 2 t
+    CSI 3 ; x ; y t
+    CSI 4 ; height ; width ; t
+    CSI 5 t
+    CSI 6 t
+    CSI 7 t
+    CSI 8 ; height ; width ; t
+    CSI 9 ; 0 t
+    CSI 9 ; 1 t
+    CSI 9 ; 2 t
+    CSI 9 ; 3 t
+    CSI 10 ; 0 t
+    CSI 10 ; 1 t
+    CSI 10 ; 2 t
+    CSI 24 t
+    
+    These sequences were not implemented because they do not make sense in
+    a Wayland context:
+    
+    CSI 11 t
+    CSI 13 t
+    CSI 14 ; 2 t
+    
+    These sequences were not implemented because they provide information
+    about the screen that is unnecessary.
+    
+    CSI 15 t
+    CSI 19 t
+    
+    These sequences were not implemeted because Ghostty does not maintain an
+    icon title for windows.
+    
+    CSI 20 t
+    CSI 22 ; 0 t
+    CSI 22 ; 1 t
+    CSI 23 ; 0 t
+    CSI 23 ; 1 t
+    
+    These sequences were not implemented because of the additional
+    complexity of maintaining a stack of window titles.
+    
+    CSI 22 ; 2 t
+    CSI 23 ; 2 t
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 1dc24082..94650aef 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -267,7 +267,7 @@ fn drainMailbox(
+             },
+             .inspector => |v| self.flags.has_inspector = v,
+             .resize => |v| self.handleResize(cb, v),
+-            .size_report => try io.sizeReport(data),
++            .size_report => |v| try io.sizeReport(data, v),
+             .clear_screen => |v| try io.clearScreen(data, v.history),
+             .scroll_viewport => |v| try io.scrollViewport(v),
+             .jump_to_prompt => |v| try io.jumpToPrompt(v),
+
+commit 8f477b00da8a503ef597099119e6957f663587d9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 1 10:59:19 2024 -0700
+
+    renderer/termio attach thread local state for crash capture
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 94650aef..d38c6a1c 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -15,6 +15,7 @@ const std = @import("std");
+ const ArenaAllocator = std.heap.ArenaAllocator;
+ const builtin = @import("builtin");
+ const xev = @import("xev");
++const crash = @import("../crash/main.zig");
+ const termio = @import("../termio.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ 
+@@ -200,6 +201,12 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer log.debug("IO thread exited", .{});
+ 
++    // Setup our crash metadata
++    crash.sentry.thread_state = .{
++        .surface = io.surface_mailbox.surface,
++    };
++    defer crash.sentry.thread_state = null;
++
+     // Get the mailbox. This must be an SPSC mailbox for threading.
+     const mailbox = switch (io.mailbox) {
+         .spsc => |*v| v,
+
+commit d499f7795bf9608e6aa0ec700fbd0879f0daeb4f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 1 21:00:12 2024 -0700
+
+    input: crash binding can configure which thread to crash
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d38c6a1c..d72a1044 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -268,6 +268,7 @@ fn drainMailbox(
+ 
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
++            .crash => @panic("crash request, crashing intentionally"),
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.ptr);
+                 try io.changeConfig(data, config.ptr);
+
+commit bae12993b3c1d71f104b88eae3380dcddd10f378
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Sep 2 09:59:19 2024 -0700
+
+    crash: tag the thread type
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d72a1044..a62e0b8d 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -203,6 +203,7 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+ 
+     // Setup our crash metadata
+     crash.sentry.thread_state = .{
++        .type = .io,
+         .surface = io.surface_mailbox.surface,
+     };
+     defer crash.sentry.thread_state = null;
+
+commit df0669789986ed549b51900b11d09e559cd9999f
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Sat Aug 31 19:40:19 2024 -0500
+
+    termio: send initial focus reports
+    
+    When the focus reporting mode (1004) is enabled, send the current focus
+    state. This allows applications to track their own focus state without
+    first having to wait for a focus event (or query
+    it by sending a DECSET followed by a DECRST).
+    
+    Ghostty's focus state is stored only in the renderer, where the termio
+    thread cannot access it. We duplicate the focus state tracking in the
+    Terminal struct with the addition of a new (1-bit) flag. We duplicate
+    the state because the renderer uses the focus state for its own purposes
+    (in particular, the Metal renderer uses the focus state to manage
+    its DisplayLink), and synchronizing access to the shared terminal state
+    is more cumbersome than simply tracking the focus state in the renderer
+    in addition to the terminal.
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index a62e0b8d..4c75b3b9 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -283,6 +283,7 @@ fn drainMailbox(
+             .start_synchronized_output => self.startSynchronizedOutput(cb),
+             .linefeed_mode => |v| self.flags.linefeed_mode = v,
+             .child_exited_abnormally => |v| try io.childExitedAbnormally(v.exit_code, v.runtime_ms),
++            .focused => |v| try io.focusGained(data, v),
+             .write_small => |v| try io.queueWrite(
+                 data,
+                 v.data[0..v.len],
+
+commit 4f1cee8eb904a7100ee0718b22b0ecb82b7e5c76
+Author: Tim Culverhouse <tim@timculverhouse.com>
+Date:   Fri Oct 18 22:29:52 2024 -0500
+
+    fix: report correct screen pixel size
+    
+    Mode 2048 and CSI 14 t are size report control sequences which contain
+    the text area size in pixels. The text area is defined to be the extents
+    of the grid (rows and columns). Ghostty calculates the available size
+    for the text area by setting the available padding, and then filling as
+    much of the remaining space as possible. However, if there are remainder
+    pixels these are still reported as part of the text area size.
+    
+    Pass the cell_size geometry through so that we can always report the
+    correct value: columns * cell width and rows * cell height.
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 4c75b3b9..0f9cd782 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -383,6 +383,7 @@ fn coalesceCallback(
+         cb.io.resize(
+             &cb.data,
+             v.grid_size,
++            v.cell_size,
+             v.screen_size,
+             v.padding,
+         ) catch |err| {
+
+commit a436bd0af62a4bdc5af14774b955f7b46ccd9deb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 7 14:38:54 2024 -0800
+
+    move datastructures to dedicated "datastruct" package
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 0f9cd782..3d316e39 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -17,7 +17,7 @@ const builtin = @import("builtin");
+ const xev = @import("xev");
+ const crash = @import("../crash/main.zig");
+ const termio = @import("../termio.zig");
+-const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
++const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.io_thread);
+
+commit dcb1ce83770df11b77fc7615ac3d9b9534043808
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 14 13:23:11 2024 -0800
+
+    termio: change resize message to use new size struct
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index 3d316e39..d8004673 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -17,6 +17,7 @@ const builtin = @import("builtin");
+ const xev = @import("xev");
+ const crash = @import("../crash/main.zig");
+ const termio = @import("../termio.zig");
++const renderer = @import("../renderer.zig");
+ const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
+ 
+ const Allocator = std.mem.Allocator;
+@@ -28,7 +29,7 @@ const Coalesce = struct {
+     /// Not all message types are coalesced.
+     const min_ms = 25;
+ 
+-    resize: ?termio.Message.Resize = null,
++    resize: ?renderer.Size = null,
+ };
+ 
+ /// The number of milliseconds before we reset the synchronized output flag
+@@ -324,7 +325,7 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
+     );
+ }
+ 
+-fn handleResize(self: *Thread, cb: *CallbackData, resize: termio.Message.Resize) void {
++fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
+     self.coalesce_data.resize = resize;
+ 
+     // If the timer is already active we just return. In the future we want
+@@ -380,13 +381,7 @@ fn coalesceCallback(
+ 
+     if (cb.self.coalesce_data.resize) |v| {
+         cb.self.coalesce_data.resize = null;
+-        cb.io.resize(
+-            &cb.data,
+-            v.grid_size,
+-            v.cell_size,
+-            v.screen_size,
+-            v.padding,
+-        ) catch |err| {
++        cb.io.resize(&cb.data, v) catch |err| {
+             log.warn("error during resize err={}", .{err});
+         };
+     }
+
+commit d532a6e260960fd427e438ff55ff74f14edc518c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Feb 20 21:38:49 2025 -0800
+
+    Update libxev to use dynamic backend, support Linux configurability
+    
+    Related to #3224
+    
+    Previously, Ghostty used a static API for async event handling: io_uring
+    on Linux, kqueue on macOS. This commit changes the backend to be dynamic
+    on Linux so that epoll will be used if io_uring isn't available, or if
+    the user explicitly chooses it.
+    
+    This introduces a new config `async-backend` (default "auto") which can
+    be set by the user to change the async backend in use. This is a
+    best-effort setting: if the user requests io_uring but it isn't
+    available, Ghostty will fall back to something that is and that choice
+    is up to us.
+    
+    Basic benchmarking both in libxev and Ghostty (vtebench) show no
+    noticeable performance differences introducing the dynamic API, nor
+    choosing epoll over io_uring.
+
+diff --git a/src/termio/Thread.zig b/src/termio/Thread.zig
+index d8004673..d8018341 100644
+--- a/src/termio/Thread.zig
++++ b/src/termio/Thread.zig
+@@ -14,7 +14,7 @@ pub const Thread = @This();
+ const std = @import("std");
+ const ArenaAllocator = std.heap.ArenaAllocator;
+ const builtin = @import("builtin");
+-const xev = @import("xev");
++const xev = @import("../global.zig").xev;
+ const crash = @import("../crash/main.zig");
+ const termio = @import("../termio.zig");
+ const renderer = @import("../renderer.zig");
+@@ -189,7 +189,7 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+     // If our loop is not stopped, then we need to keep running so that
+     // messages are drained and we can wait for the surface to send a stop
+     // message.
+-    if (!self.loop.flags.stopped) {
++    if (!self.loop.stopped()) {
+         log.warn("abrupt io thread exit detected, starting xev to drain mailbox", .{});
+         defer log.debug("io thread fully exiting after abnormal failure", .{});
+         self.flags.drain = true;
+

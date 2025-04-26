@@ -1,0 +1,3725 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/renderer/Thread.zig
+
+commit 9913bba2e805cd6647bf050feeabea95b90e4f25
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Oct 23 20:18:10 2022 -0700
+
+    introduce renderer thread logic (not starting it yet)
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+new file mode 100644
+index 00000000..729198fc
+--- /dev/null
++++ b/src/renderer/Thread.zig
+@@ -0,0 +1,113 @@
++//! Represents the renderer thread logic. The renderer thread is able to
++//! be woken up to render.
++pub const Thread = @This();
++
++const std = @import("std");
++const builtin = @import("builtin");
++const glfw = @import("glfw");
++const libuv = @import("libuv");
++const renderer = @import("../renderer.zig");
++const gl = @import("../opengl.zig");
++
++const Allocator = std.mem.Allocator;
++const log = std.log.named(.renderer_thread);
++
++/// The main event loop for the application. The user data of this loop
++/// is always the allocator used to create the loop. This is a convenience
++/// so that users of the loop always have an allocator.
++loop: libuv.Loop,
++
++/// This can be used to wake up the renderer and force a render safely from
++/// any thread.
++wakeup: libuv.Async,
++
++/// Initialize the thread. This does not START the thread. This only sets
++/// up all the internal state necessary prior to starting the thread. It
++/// is up to the caller to start the thread with the threadMain entrypoint.
++pub fn init(alloc: Allocator) !Thread {
++    // We always store allocator pointer on the loop data so that
++    // handles can use our global allocator.
++    const allocPtr = try alloc.create(Allocator);
++    errdefer alloc.destroy(allocPtr);
++    allocPtr.* = alloc;
++
++    // Create our event loop.
++    var loop = try libuv.Loop.init(alloc);
++    errdefer loop.deinit(alloc);
++    loop.setData(allocPtr);
++
++    // This async handle is used to "wake up" the renderer and force a render.
++    var async_h = try libuv.Async.init(alloc, loop, (struct {
++        fn callback(_: *libuv.Async) void {}
++    }).callback);
++    errdefer async_h.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const loop_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(loop_alloc);
++        }
++    }).callback);
++
++    return Thread{
++        .alloc = alloc,
++        .loop = loop,
++        .notifier = async_h,
++    };
++}
++
++/// Clean up the thread. This is only safe to call once the thread
++/// completes executing; the caller must join prior to this.
++pub fn deinit(self: *Thread) void {
++    // Get a copy to our allocator
++    const alloc_ptr = self.loop.getData(Allocator).?;
++    const alloc = alloc_ptr.*;
++
++    // Run the loop one more time, because destroying our other things
++    // like windows usually cancel all our event loop stuff and we need
++    // one more run through to finalize all the closes.
++    _ = self.loop.run(.default) catch |err|
++        log.err("error finalizing event loop: {}", .{err});
++
++    // Dealloc our allocator copy
++    alloc.destroy(alloc_ptr);
++
++    self.loop.deinit(alloc);
++}
++
++/// The main entrypoint for the thread.
++pub fn threadMain(
++    window: glfw.Window,
++    renderer_impl: *const renderer.OpenGL,
++) void {
++    // Call child function so we can use errors...
++    threadMain_(
++        window,
++        renderer_impl,
++    ) catch |err| {
++        // In the future, we should expose this on the thread struct.
++        log.warn("error in renderer err={}", .{err});
++    };
++}
++
++fn threadMain_(
++    self: *const Thread,
++    window: glfw.Window,
++    renderer_impl: *const renderer.OpenGL,
++) !void {
++    const Renderer = switch (@TypeOf(renderer_impl)) {
++        .Pointer => |p| p.child,
++        .Struct => |s| s,
++    };
++
++    // Run our thread start/end callbacks. This is important because some
++    // renderers have to do per-thread setup. For example, OpenGL has to set
++    // some thread-local state since that is how it works.
++    if (@hasDecl(Renderer, "threadEnter")) try renderer_impl.threadEnter(window);
++    defer if (@hasDecl(Renderer, "threadExit")) renderer_impl.threadExit();
++
++    // Setup our timer handle which is used to perform the actual render.
++    // TODO
++
++    // Run
++    log.debug("starting renderer thread", .{});
++    try self.loop.run(.default);
++}
+
+commit aa3d13294737b41fccddc4a6c215e6dabe52c146
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 24 09:02:11 2022 -0700
+
+    run rendering on another real thread (still bugs)
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 729198fc..4cb12f99 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -10,7 +10,7 @@ const renderer = @import("../renderer.zig");
+ const gl = @import("../opengl.zig");
+ 
+ const Allocator = std.mem.Allocator;
+-const log = std.log.named(.renderer_thread);
++const log = std.log.scoped(.renderer_thread);
+ 
+ /// The main event loop for the application. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+@@ -21,10 +21,27 @@ loop: libuv.Loop,
+ /// any thread.
+ wakeup: libuv.Async,
+ 
++/// This can be used to stop the renderer on the next loop iteration.
++stop: libuv.Async,
++
++/// The windo we're rendering to.
++window: glfw.Window,
++
++/// The underlying renderer implementation.
++renderer: *renderer.OpenGL,
++
++/// Pointer to the shared state that is used to generate the final render.
++state: *const renderer.State,
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+-pub fn init(alloc: Allocator) !Thread {
++pub fn init(
++    alloc: Allocator,
++    window: glfw.Window,
++    renderer_impl: *renderer.OpenGL,
++    state: *const renderer.State,
++) !Thread {
+     // We always store allocator pointer on the loop data so that
+     // handles can use our global allocator.
+     const allocPtr = try alloc.create(Allocator);
+@@ -37,10 +54,17 @@ pub fn init(alloc: Allocator) !Thread {
+     loop.setData(allocPtr);
+ 
+     // This async handle is used to "wake up" the renderer and force a render.
+-    var async_h = try libuv.Async.init(alloc, loop, (struct {
+-        fn callback(_: *libuv.Async) void {}
++    var wakeup_h = try libuv.Async.init(alloc, loop, renderCallback);
++    errdefer wakeup_h.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const loop_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(loop_alloc);
++        }
+     }).callback);
+-    errdefer async_h.close((struct {
++
++    // This async handle is used to stop the loop and force the thread to end.
++    var stop_h = try libuv.Async.init(alloc, loop, stopCallback);
++    errdefer stop_h.close((struct {
+         fn callback(h: *libuv.Async) void {
+             const loop_alloc = h.loop().getData(Allocator).?.*;
+             h.deinit(loop_alloc);
+@@ -48,9 +72,12 @@ pub fn init(alloc: Allocator) !Thread {
+     }).callback);
+ 
+     return Thread{
+-        .alloc = alloc,
+         .loop = loop,
+-        .notifier = async_h,
++        .wakeup = wakeup_h,
++        .stop = stop_h,
++        .window = window,
++        .renderer = renderer_impl,
++        .state = state,
+     };
+ }
+ 
+@@ -61,6 +88,20 @@ pub fn deinit(self: *Thread) void {
+     const alloc_ptr = self.loop.getData(Allocator).?;
+     const alloc = alloc_ptr.*;
+ 
++    // Schedule our handles to close
++    self.stop.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
++    self.wakeup.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
++
+     // Run the loop one more time, because destroying our other things
+     // like windows usually cancel all our event loop stuff and we need
+     // one more run through to finalize all the closes.
+@@ -74,40 +115,54 @@ pub fn deinit(self: *Thread) void {
+ }
+ 
+ /// The main entrypoint for the thread.
+-pub fn threadMain(
+-    window: glfw.Window,
+-    renderer_impl: *const renderer.OpenGL,
+-) void {
++pub fn threadMain(self: *Thread) void {
+     // Call child function so we can use errors...
+-    threadMain_(
+-        window,
+-        renderer_impl,
+-    ) catch |err| {
++    self.threadMain_() catch |err| {
+         // In the future, we should expose this on the thread struct.
+         log.warn("error in renderer err={}", .{err});
+     };
+ }
+ 
+-fn threadMain_(
+-    self: *const Thread,
+-    window: glfw.Window,
+-    renderer_impl: *const renderer.OpenGL,
+-) !void {
+-    const Renderer = switch (@TypeOf(renderer_impl)) {
+-        .Pointer => |p| p.child,
+-        .Struct => |s| s,
+-    };
+-
++fn threadMain_(self: *Thread) !void {
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+     // some thread-local state since that is how it works.
+-    if (@hasDecl(Renderer, "threadEnter")) try renderer_impl.threadEnter(window);
+-    defer if (@hasDecl(Renderer, "threadExit")) renderer_impl.threadExit();
++    const Renderer = RendererType();
++    if (@hasDecl(Renderer, "threadEnter")) try self.renderer.threadEnter(self.window);
++    defer if (@hasDecl(Renderer, "threadExit")) self.renderer.threadExit();
+ 
+-    // Setup our timer handle which is used to perform the actual render.
+-    // TODO
++    // Set up our async handler to support rendering
++    self.wakeup.setData(self);
++    defer self.wakeup.setData(null);
+ 
+     // Run
+     log.debug("starting renderer thread", .{});
+-    try self.loop.run(.default);
++    defer log.debug("exiting renderer thread", .{});
++    _ = try self.loop.run(.default);
++}
++
++fn renderCallback(h: *libuv.Async) void {
++    const t = h.getData(Thread) orelse {
++        // This shouldn't happen so we log it.
++        log.warn("render callback fired without data set", .{});
++        return;
++    };
++
++    t.renderer.render(t.window, t.state.*) catch |err|
++        log.warn("error rendering err={}", .{err});
++}
++
++fn stopCallback(h: *libuv.Async) void {
++    h.loop().stop();
++}
++
++// This is unnecessary right now but is logic we'll need for when we
++// abstract renderers out.
++fn RendererType() type {
++    const self: Thread = undefined;
++    return switch (@typeInfo(@TypeOf(self.renderer))) {
++        .Pointer => |p| p.child,
++        .Struct => |s| s,
++        else => unreachable,
++    };
+ }
+
+commit dc908cb73d89482193c1dfdb8a379a16fe25ba27
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 24 09:52:08 2022 -0700
+
+    support screen size, rip out shared state
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 4cb12f99..ed598ec4 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -31,7 +31,7 @@ window: glfw.Window,
+ renderer: *renderer.OpenGL,
+ 
+ /// Pointer to the shared state that is used to generate the final render.
+-state: *const renderer.State,
++state: *renderer.State,
+ 
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+@@ -40,7 +40,7 @@ pub fn init(
+     alloc: Allocator,
+     window: glfw.Window,
+     renderer_impl: *renderer.OpenGL,
+-    state: *const renderer.State,
++    state: *renderer.State,
+ ) !Thread {
+     // We always store allocator pointer on the loop data so that
+     // handles can use our global allocator.
+@@ -148,7 +148,7 @@ fn renderCallback(h: *libuv.Async) void {
+         return;
+     };
+ 
+-    t.renderer.render(t.window, t.state.*) catch |err|
++    t.renderer.render(t.window, t.state) catch |err|
+         log.warn("error rendering err={}", .{err});
+ }
+ 
+
+commit c0f96f591bb4c0d83fd43a6ea52e5ae4898f1368
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 24 10:50:42 2022 -0700
+
+    remove render timer from window
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index ed598ec4..9a6b7160 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -24,6 +24,9 @@ wakeup: libuv.Async,
+ /// This can be used to stop the renderer on the next loop iteration.
+ stop: libuv.Async,
+ 
++/// The timer used for rendering
++render_h: libuv.Timer,
++
+ /// The windo we're rendering to.
+ window: glfw.Window,
+ 
+@@ -54,7 +57,7 @@ pub fn init(
+     loop.setData(allocPtr);
+ 
+     // This async handle is used to "wake up" the renderer and force a render.
+-    var wakeup_h = try libuv.Async.init(alloc, loop, renderCallback);
++    var wakeup_h = try libuv.Async.init(alloc, loop, wakeupCallback);
+     errdefer wakeup_h.close((struct {
+         fn callback(h: *libuv.Async) void {
+             const loop_alloc = h.loop().getData(Allocator).?.*;
+@@ -71,10 +74,20 @@ pub fn init(
+         }
+     }).callback);
+ 
++    // The primary timer for rendering.
++    var render_h = try libuv.Timer.init(alloc, loop);
++    errdefer render_h.close((struct {
++        fn callback(h: *libuv.Timer) void {
++            const loop_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(loop_alloc);
++        }
++    }).callback);
++
+     return Thread{
+         .loop = loop,
+         .wakeup = wakeup_h,
+         .stop = stop_h,
++        .render_h = render_h,
+         .window = window,
+         .renderer = renderer_impl,
+         .state = state,
+@@ -101,6 +114,12 @@ pub fn deinit(self: *Thread) void {
+             h.deinit(handle_alloc);
+         }
+     }).callback);
++    self.render_h.close((struct {
++        fn callback(h: *libuv.Timer) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
+ 
+     // Run the loop one more time, because destroying our other things
+     // like windows usually cancel all our event loop stuff and we need
+@@ -124,6 +143,10 @@ pub fn threadMain(self: *Thread) void {
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
++    // Get a copy to our allocator
++    // const alloc_ptr = self.loop.getData(Allocator).?;
++    // const alloc = alloc_ptr.*;
++
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+     // some thread-local state since that is how it works.
+@@ -135,13 +158,34 @@ fn threadMain_(self: *Thread) !void {
+     self.wakeup.setData(self);
+     defer self.wakeup.setData(null);
+ 
++    // Set up our timer and start it for rendering
++    self.render_h.setData(self);
++    defer self.render_h.setData(null);
++    try self.wakeup.send();
++
+     // Run
+     log.debug("starting renderer thread", .{});
+     defer log.debug("exiting renderer thread", .{});
+     _ = try self.loop.run(.default);
+ }
+ 
+-fn renderCallback(h: *libuv.Async) void {
++fn wakeupCallback(h: *libuv.Async) void {
++    const t = h.getData(Thread) orelse {
++        // This shouldn't happen so we log it.
++        log.warn("render callback fired without data set", .{});
++        return;
++    };
++
++    // If the timer is already active then we don't have to do anything.
++    const active = t.render_h.isActive() catch true;
++    if (active) return;
++
++    // Timer is not active, let's start it
++    t.render_h.start(renderCallback, 10, 0) catch |err|
++        log.warn("render timer failed to start err={}", .{err});
++}
++
++fn renderCallback(h: *libuv.Timer) void {
+     const t = h.getData(Thread) orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+
+commit 07271a6cfdcd96c8cc5abe3d75ffecd166a660d2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 28 14:48:36 2022 -0700
+
+    Initial metal abstraction (noop)
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 9a6b7160..5fb10420 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -31,7 +31,7 @@ render_h: libuv.Timer,
+ window: glfw.Window,
+ 
+ /// The underlying renderer implementation.
+-renderer: *renderer.OpenGL,
++renderer: *renderer.Renderer,
+ 
+ /// Pointer to the shared state that is used to generate the final render.
+ state: *renderer.State,
+@@ -42,7 +42,7 @@ state: *renderer.State,
+ pub fn init(
+     alloc: Allocator,
+     window: glfw.Window,
+-    renderer_impl: *renderer.OpenGL,
++    renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
+ ) !Thread {
+     // We always store allocator pointer on the loop data so that
+@@ -143,16 +143,11 @@ pub fn threadMain(self: *Thread) void {
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
+-    // Get a copy to our allocator
+-    // const alloc_ptr = self.loop.getData(Allocator).?;
+-    // const alloc = alloc_ptr.*;
+-
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+     // some thread-local state since that is how it works.
+-    const Renderer = RendererType();
+-    if (@hasDecl(Renderer, "threadEnter")) try self.renderer.threadEnter(self.window);
+-    defer if (@hasDecl(Renderer, "threadExit")) self.renderer.threadExit();
++    try self.renderer.threadEnter(self.window);
++    defer self.renderer.threadExit();
+ 
+     // Set up our async handler to support rendering
+     self.wakeup.setData(self);
+@@ -199,14 +194,3 @@ fn renderCallback(h: *libuv.Timer) void {
+ fn stopCallback(h: *libuv.Async) void {
+     h.loop().stop();
+ }
+-
+-// This is unnecessary right now but is logic we'll need for when we
+-// abstract renderers out.
+-fn RendererType() type {
+-    const self: Thread = undefined;
+-    return switch (@typeInfo(@TypeOf(self.renderer))) {
+-        .Pointer => |p| p.child,
+-        .Struct => |s| s,
+-        else => unreachable,
+-    };
+-}
+
+commit e2d8ffc3c1a12acaa39e9e751aefc033a610347c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Nov 5 18:51:39 2022 -0700
+
+    renderer mailbox, focus message
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 5fb10420..feb31ebd 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -7,11 +7,16 @@ const builtin = @import("builtin");
+ const glfw = @import("glfw");
+ const libuv = @import("libuv");
+ const renderer = @import("../renderer.zig");
+-const gl = @import("../opengl.zig");
++const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.renderer_thread);
+ 
++/// The type used for sending messages to the IO thread. For now this is
++/// hardcoded with a capacity. We can make this a comptime parameter in
++/// the future if we want it configurable.
++const Mailbox = BlockingQueue(renderer.Message, 64);
++
+ /// The main event loop for the application. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+ /// so that users of the loop always have an allocator.
+@@ -36,6 +41,10 @@ renderer: *renderer.Renderer,
+ /// Pointer to the shared state that is used to generate the final render.
+ state: *renderer.State,
+ 
++/// The mailbox that can be used to send this thread messages. Note
++/// this is a blocking queue so if it is full you will get errors (or block).
++mailbox: *Mailbox,
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+@@ -83,6 +92,10 @@ pub fn init(
+         }
+     }).callback);
+ 
++    // The mailbox for messaging this thread
++    var mailbox = try Mailbox.create(alloc);
++    errdefer mailbox.destroy(alloc);
++
+     return Thread{
+         .loop = loop,
+         .wakeup = wakeup_h,
+@@ -91,6 +104,7 @@ pub fn init(
+         .window = window,
+         .renderer = renderer_impl,
+         .state = state,
++        .mailbox = mailbox,
+     };
+ }
+ 
+@@ -127,6 +141,9 @@ pub fn deinit(self: *Thread) void {
+     _ = self.loop.run(.default) catch |err|
+         log.err("error finalizing event loop: {}", .{err});
+ 
++    // Nothing can possibly access the mailbox anymore, destroy it.
++    self.mailbox.destroy(alloc);
++
+     // Dealloc our allocator copy
+     alloc.destroy(alloc_ptr);
+ 
+@@ -164,6 +181,23 @@ fn threadMain_(self: *Thread) !void {
+     _ = try self.loop.run(.default);
+ }
+ 
++/// Drain the mailbox.
++fn drainMailbox(self: *Thread) !void {
++    // This holds the mailbox lock for the duration of the drain. The
++    // expectation is that all our message handlers will be non-blocking
++    // ENOUGH to not mess up throughput on producers.
++
++    var drain = self.mailbox.drain();
++    defer drain.deinit();
++
++    while (drain.next()) |message| {
++        log.debug("mailbox message={}", .{message});
++        switch (message) {
++            .focus => |v| try self.renderer.setFocus(v),
++        }
++    }
++}
++
+ fn wakeupCallback(h: *libuv.Async) void {
+     const t = h.getData(Thread) orelse {
+         // This shouldn't happen so we log it.
+@@ -171,6 +205,11 @@ fn wakeupCallback(h: *libuv.Async) void {
+         return;
+     };
+ 
++    // When we wake up, we check the mailbox. Mailbox producers should
++    // wake up our thread after publishing.
++    t.drainMailbox() catch |err|
++        log.err("error draining mailbox err={}", .{err});
++
+     // If the timer is already active then we don't have to do anything.
+     const active = t.render_h.isActive() catch true;
+     if (active) return;
+
+commit aa98e3ca3aaf121b3a8f2933a91ad6453ccc8880
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Nov 5 19:18:22 2022 -0700
+
+    Move cursor timer to renderer
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index feb31ebd..8aff8c7e 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -32,6 +32,9 @@ stop: libuv.Async,
+ /// The timer used for rendering
+ render_h: libuv.Timer,
+ 
++/// The timer used for cursor blinking
++cursor_h: libuv.Timer,
++
+ /// The windo we're rendering to.
+ window: glfw.Window,
+ 
+@@ -92,6 +95,15 @@ pub fn init(
+         }
+     }).callback);
+ 
++    // Setup a timer for blinking the cursor
++    var cursor_timer = try libuv.Timer.init(alloc, loop);
++    errdefer cursor_timer.close((struct {
++        fn callback(t: *libuv.Timer) void {
++            const alloc_h = t.loop().getData(Allocator).?.*;
++            t.deinit(alloc_h);
++        }
++    }).callback);
++
+     // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+@@ -101,6 +113,7 @@ pub fn init(
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+         .render_h = render_h,
++        .cursor_h = cursor_timer,
+         .window = window,
+         .renderer = renderer_impl,
+         .state = state,
+@@ -134,6 +147,12 @@ pub fn deinit(self: *Thread) void {
+             h.deinit(handle_alloc);
+         }
+     }).callback);
++    self.cursor_h.close((struct {
++        fn callback(h: *libuv.Timer) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
+ 
+     // Run the loop one more time, because destroying our other things
+     // like windows usually cancel all our event loop stuff and we need
+@@ -175,6 +194,10 @@ fn threadMain_(self: *Thread) !void {
+     defer self.render_h.setData(null);
+     try self.wakeup.send();
+ 
++    // Setup a timer for blinking the cursor
++    self.cursor_h.setData(self);
++    try self.cursor_h.start(cursorTimerCallback, 600, 600);
++
+     // Run
+     log.debug("starting renderer thread", .{});
+     defer log.debug("exiting renderer thread", .{});
+@@ -193,7 +216,25 @@ fn drainMailbox(self: *Thread) !void {
+     while (drain.next()) |message| {
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
+-            .focus => |v| try self.renderer.setFocus(v),
++            .focus => |v| {
++                // Set it on the renderer
++                try self.renderer.setFocus(v);
++
++                if (!v) {
++                    // If we're not focused, then we stop the cursor blink
++                    try self.cursor_h.stop();
++                } else {
++                    // If we're focused, we immediately show the cursor again
++                    // and then restart the timer.
++                    if (!try self.cursor_h.isActive()) {
++                        try self.cursor_h.start(
++                            cursorTimerCallback,
++                            0,
++                            self.cursor_h.getRepeat(),
++                        );
++                    }
++                }
++            },
+         }
+     }
+ }
+@@ -230,6 +271,17 @@ fn renderCallback(h: *libuv.Timer) void {
+         log.warn("error rendering err={}", .{err});
+ }
+ 
++fn cursorTimerCallback(h: *libuv.Timer) void {
++    const t = h.getData(Thread) orelse {
++        // This shouldn't happen so we log it.
++        log.warn("render callback fired without data set", .{});
++        return;
++    };
++
++    t.renderer.blinkCursor();
++    t.wakeup.send() catch {};
++}
++
+ fn stopCallback(h: *libuv.Async) void {
+     h.loop().stop();
+ }
+
+commit 746858cea63ef58ca997d3969678a27cfce06f64
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Nov 5 19:26:42 2022 -0700
+
+    implement cursor reset when data comes in pty
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 8aff8c7e..ebc06fd8 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -15,7 +15,7 @@ const log = std.log.scoped(.renderer_thread);
+ /// The type used for sending messages to the IO thread. For now this is
+ /// hardcoded with a capacity. We can make this a comptime parameter in
+ /// the future if we want it configurable.
+-const Mailbox = BlockingQueue(renderer.Message, 64);
++pub const Mailbox = BlockingQueue(renderer.Message, 64);
+ 
+ /// The main event loop for the application. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+@@ -227,14 +227,22 @@ fn drainMailbox(self: *Thread) !void {
+                     // If we're focused, we immediately show the cursor again
+                     // and then restart the timer.
+                     if (!try self.cursor_h.isActive()) {
++                        self.renderer.blinkCursor(true);
+                         try self.cursor_h.start(
+                             cursorTimerCallback,
+-                            0,
++                            self.cursor_h.getRepeat(),
+                             self.cursor_h.getRepeat(),
+                         );
+                     }
+                 }
+             },
++
++            .reset_cursor_blink => {
++                self.renderer.blinkCursor(true);
++                if (try self.cursor_h.isActive()) {
++                    _ = try self.cursor_h.again();
++                }
++            },
+         }
+     }
+ }
+@@ -278,7 +286,7 @@ fn cursorTimerCallback(h: *libuv.Timer) void {
+         return;
+     };
+ 
+-    t.renderer.blinkCursor();
++    t.renderer.blinkCursor(false);
+     t.wakeup.send() catch {};
+ }
+ 
+
+commit e0db46ac979b384a8e1e16dd586aeb08e8b633de
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 6 16:23:36 2022 -0800
+
+    clean up some resources better on error
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index ebc06fd8..68808de9 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -65,7 +65,11 @@ pub fn init(
+ 
+     // Create our event loop.
+     var loop = try libuv.Loop.init(alloc);
+-    errdefer loop.deinit(alloc);
++    errdefer {
++        // Run the loop once to close any of our handles
++        _ = loop.run(.nowait) catch 0;
++        loop.deinit(alloc);
++    }
+     loop.setData(allocPtr);
+ 
+     // This async handle is used to "wake up" the renderer and force a render.
+
+commit 5b52333e51042053d17dee8122bd36953fd66b68
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Nov 7 07:45:46 2022 -0800
+
+    name threads and add more tracing
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 68808de9..a8ad1f66 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -8,6 +8,8 @@ const glfw = @import("glfw");
+ const libuv = @import("libuv");
+ const renderer = @import("../renderer.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
++const tracy = @import("tracy");
++const trace = tracy.trace;
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.renderer_thread);
+@@ -183,6 +185,8 @@ pub fn threadMain(self: *Thread) void {
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
++    tracy.setThreadName("renderer");
++
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+     // some thread-local state since that is how it works.
+@@ -202,6 +206,27 @@ fn threadMain_(self: *Thread) !void {
+     self.cursor_h.setData(self);
+     try self.cursor_h.start(cursorTimerCallback, 600, 600);
+ 
++    // If we are using tracy, then we setup a prepare handle so that
++    // we can mark the frame.
++    var frame_h: libuv.Prepare = if (!tracy.enabled) undefined else frame_h: {
++        const alloc_ptr = self.loop.getData(Allocator).?;
++        const alloc = alloc_ptr.*;
++        const h = try libuv.Prepare.init(alloc, self.loop);
++        h.setData(self);
++        try h.start(prepFrameCallback);
++
++        break :frame_h h;
++    };
++    defer if (tracy.enabled) {
++        frame_h.close((struct {
++            fn callback(h: *libuv.Prepare) void {
++                const alloc_h = h.loop().getData(Allocator).?.*;
++                h.deinit(alloc_h);
++            }
++        }).callback);
++        _ = self.loop.run(.nowait) catch {};
++    };
++
+     // Run
+     log.debug("starting renderer thread", .{});
+     defer log.debug("exiting renderer thread", .{});
+@@ -210,6 +235,9 @@ fn threadMain_(self: *Thread) !void {
+ 
+ /// Drain the mailbox.
+ fn drainMailbox(self: *Thread) !void {
++    const zone = trace(@src());
++    defer zone.end();
++
+     // This holds the mailbox lock for the duration of the drain. The
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+@@ -252,6 +280,9 @@ fn drainMailbox(self: *Thread) !void {
+ }
+ 
+ fn wakeupCallback(h: *libuv.Async) void {
++    const zone = trace(@src());
++    defer zone.end();
++
+     const t = h.getData(Thread) orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+@@ -273,6 +304,9 @@ fn wakeupCallback(h: *libuv.Async) void {
+ }
+ 
+ fn renderCallback(h: *libuv.Timer) void {
++    const zone = trace(@src());
++    defer zone.end();
++
+     const t = h.getData(Thread) orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+@@ -284,6 +318,9 @@ fn renderCallback(h: *libuv.Timer) void {
+ }
+ 
+ fn cursorTimerCallback(h: *libuv.Timer) void {
++    const zone = trace(@src());
++    defer zone.end();
++
+     const t = h.getData(Thread) orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+@@ -294,6 +331,12 @@ fn cursorTimerCallback(h: *libuv.Timer) void {
+     t.wakeup.send() catch {};
+ }
+ 
++fn prepFrameCallback(h: *libuv.Prepare) void {
++    _ = h;
++
++    tracy.frameMark();
++}
++
+ fn stopCallback(h: *libuv.Async) void {
+     h.loop().stop();
+ }
+
+commit 657c8540c845b7843b88195b0c303d0bf4d20b4d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 15 19:48:32 2022 -0800
+
+    renderer: font size changed event, OpenGL impl
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index a8ad1f66..87a949a4 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -275,6 +275,10 @@ fn drainMailbox(self: *Thread) !void {
+                     _ = try self.cursor_h.again();
+                 }
+             },
++
++            .font_size => |size| {
++                try self.renderer.setFontSize(size);
++            },
+         }
+     }
+ }
+
+commit 4521efb83df715cdfc6abc804c6fd5ddab81a7a5
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 17 13:55:04 2022 -0800
+
+    move screen resize to a renderer mailbox message
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 87a949a4..34944b8b 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -279,6 +279,10 @@ fn drainMailbox(self: *Thread) !void {
+             .font_size => |size| {
+                 try self.renderer.setFontSize(size);
+             },
++
++            .screen_size => |size| {
++                try self.renderer.setScreenSize(size);
++            },
+         }
+     }
+ }
+
+commit a15afa8211e30b2215b0be5fce700481fd37a729
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 20 20:16:40 2022 -0800
+
+    do not block channel send while draining channel
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 34944b8b..04846b79 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -238,14 +238,7 @@ fn drainMailbox(self: *Thread) !void {
+     const zone = trace(@src());
+     defer zone.end();
+ 
+-    // This holds the mailbox lock for the duration of the drain. The
+-    // expectation is that all our message handlers will be non-blocking
+-    // ENOUGH to not mess up throughput on producers.
+-
+-    var drain = self.mailbox.drain();
+-    defer drain.deinit();
+-
+-    while (drain.next()) |message| {
++    while (self.mailbox.pop()) |message| {
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
+             .focus => |v| {
+
+commit e1cd6502450ec72fe540a9a1e6c0f31f87c42521
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Dec 29 14:51:56 2022 -0800
+
+    window: abstract more, it starts
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 04846b79..d4fe8930 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -4,9 +4,9 @@ pub const Thread = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const glfw = @import("glfw");
+ const libuv = @import("libuv");
+ const renderer = @import("../renderer.zig");
++const window = @import("../window.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ const tracy = @import("tracy");
+ const trace = tracy.trace;
+@@ -37,8 +37,8 @@ render_h: libuv.Timer,
+ /// The timer used for cursor blinking
+ cursor_h: libuv.Timer,
+ 
+-/// The windo we're rendering to.
+-window: glfw.Window,
++/// The window  we're rendering to.
++window: window.System,
+ 
+ /// The underlying renderer implementation.
+ renderer: *renderer.Renderer,
+@@ -55,7 +55,7 @@ mailbox: *Mailbox,
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
+-    window: glfw.Window,
++    win: window.System,
+     renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
+ ) !Thread {
+@@ -120,7 +120,7 @@ pub fn init(
+         .stop = stop_h,
+         .render_h = render_h,
+         .cursor_h = cursor_timer,
+-        .window = window,
++        .window = win,
+         .renderer = renderer_impl,
+         .state = state,
+         .mailbox = mailbox,
+
+commit 11a3577ef1e993af19cfd71e4b79c41940ac77fb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Dec 29 15:11:03 2022 -0800
+
+    rename window package to apprt
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index d4fe8930..5028096a 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -6,7 +6,7 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const libuv = @import("libuv");
+ const renderer = @import("../renderer.zig");
+-const window = @import("../window.zig");
++const apprt = @import("../apprt.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ const tracy = @import("tracy");
+ const trace = tracy.trace;
+@@ -38,7 +38,7 @@ render_h: libuv.Timer,
+ cursor_h: libuv.Timer,
+ 
+ /// The window  we're rendering to.
+-window: window.System,
++window: apprt.runtime.Window,
+ 
+ /// The underlying renderer implementation.
+ renderer: *renderer.Renderer,
+@@ -55,7 +55,7 @@ mailbox: *Mailbox,
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
+-    win: window.System,
++    win: apprt.runtime.Window,
+     renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
+ ) !Thread {
+
+commit 127352704831ef874f5c6ebf33963f94d6de0125
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Feb 1 15:52:22 2023 -0800
+
+    renderer uses libxev
+    
+    Still some bugs and TODOs, but it is workable.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 5028096a..534561fa 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -4,7 +4,7 @@ pub const Thread = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const libuv = @import("libuv");
++const xev = @import("xev");
+ const renderer = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+@@ -14,28 +14,38 @@ const trace = tracy.trace;
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.renderer_thread);
+ 
++const CURSOR_BLINK_INTERVAL = 600;
++
+ /// The type used for sending messages to the IO thread. For now this is
+ /// hardcoded with a capacity. We can make this a comptime parameter in
+ /// the future if we want it configurable.
+ pub const Mailbox = BlockingQueue(renderer.Message, 64);
+ 
++/// Allocator used for some state
++alloc: std.mem.Allocator,
++
+ /// The main event loop for the application. The user data of this loop
+ /// is always the allocator used to create the loop. This is a convenience
+ /// so that users of the loop always have an allocator.
+-loop: libuv.Loop,
++loop: xev.Loop,
+ 
+ /// This can be used to wake up the renderer and force a render safely from
+ /// any thread.
+-wakeup: libuv.Async,
++wakeup: xev.Async,
++wakeup_c: xev.Completion = .{},
+ 
+ /// This can be used to stop the renderer on the next loop iteration.
+-stop: libuv.Async,
++stop: xev.Async,
++stop_c: xev.Completion = .{},
+ 
+ /// The timer used for rendering
+-render_h: libuv.Timer,
++render_h: xev.Timer,
++render_c: xev.Completion = .{},
+ 
+ /// The timer used for cursor blinking
+-cursor_h: libuv.Timer,
++cursor_h: xev.Timer,
++cursor_c: xev.Completion = .{},
++cursor_c_cancel: xev.Completion = .{},
+ 
+ /// The window  we're rendering to.
+ window: apprt.runtime.Window,
+@@ -59,62 +69,32 @@ pub fn init(
+     renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
+ ) !Thread {
+-    // We always store allocator pointer on the loop data so that
+-    // handles can use our global allocator.
+-    const allocPtr = try alloc.create(Allocator);
+-    errdefer alloc.destroy(allocPtr);
+-    allocPtr.* = alloc;
+-
+     // Create our event loop.
+-    var loop = try libuv.Loop.init(alloc);
+-    errdefer {
+-        // Run the loop once to close any of our handles
+-        _ = loop.run(.nowait) catch 0;
+-        loop.deinit(alloc);
+-    }
+-    loop.setData(allocPtr);
++    var loop = try xev.Loop.init(.{});
++    errdefer loop.deinit();
+ 
+     // This async handle is used to "wake up" the renderer and force a render.
+-    var wakeup_h = try libuv.Async.init(alloc, loop, wakeupCallback);
+-    errdefer wakeup_h.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const loop_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(loop_alloc);
+-        }
+-    }).callback);
++    var wakeup_h = try xev.Async.init();
++    errdefer wakeup_h.deinit();
+ 
+     // This async handle is used to stop the loop and force the thread to end.
+-    var stop_h = try libuv.Async.init(alloc, loop, stopCallback);
+-    errdefer stop_h.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const loop_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(loop_alloc);
+-        }
+-    }).callback);
++    var stop_h = try xev.Async.init();
++    errdefer stop_h.deinit();
+ 
+     // The primary timer for rendering.
+-    var render_h = try libuv.Timer.init(alloc, loop);
+-    errdefer render_h.close((struct {
+-        fn callback(h: *libuv.Timer) void {
+-            const loop_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(loop_alloc);
+-        }
+-    }).callback);
++    var render_h = try xev.Timer.init();
++    errdefer render_h.deinit();
+ 
+     // Setup a timer for blinking the cursor
+-    var cursor_timer = try libuv.Timer.init(alloc, loop);
+-    errdefer cursor_timer.close((struct {
+-        fn callback(t: *libuv.Timer) void {
+-            const alloc_h = t.loop().getData(Allocator).?.*;
+-            t.deinit(alloc_h);
+-        }
+-    }).callback);
++    var cursor_timer = try xev.Timer.init();
++    errdefer cursor_timer.deinit();
+ 
+     // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+ 
+     return Thread{
++        .alloc = alloc,
+         .loop = loop,
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+@@ -130,49 +110,14 @@ pub fn init(
+ /// Clean up the thread. This is only safe to call once the thread
+ /// completes executing; the caller must join prior to this.
+ pub fn deinit(self: *Thread) void {
+-    // Get a copy to our allocator
+-    const alloc_ptr = self.loop.getData(Allocator).?;
+-    const alloc = alloc_ptr.*;
+-
+-    // Schedule our handles to close
+-    self.stop.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const handle_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(handle_alloc);
+-        }
+-    }).callback);
+-    self.wakeup.close((struct {
+-        fn callback(h: *libuv.Async) void {
+-            const handle_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(handle_alloc);
+-        }
+-    }).callback);
+-    self.render_h.close((struct {
+-        fn callback(h: *libuv.Timer) void {
+-            const handle_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(handle_alloc);
+-        }
+-    }).callback);
+-    self.cursor_h.close((struct {
+-        fn callback(h: *libuv.Timer) void {
+-            const handle_alloc = h.loop().getData(Allocator).?.*;
+-            h.deinit(handle_alloc);
+-        }
+-    }).callback);
+-
+-    // Run the loop one more time, because destroying our other things
+-    // like windows usually cancel all our event loop stuff and we need
+-    // one more run through to finalize all the closes.
+-    _ = self.loop.run(.default) catch |err|
+-        log.err("error finalizing event loop: {}", .{err});
++    self.stop.deinit();
++    self.wakeup.deinit();
++    self.render_h.deinit();
++    self.cursor_h.deinit();
++    self.loop.deinit();
+ 
+     // Nothing can possibly access the mailbox anymore, destroy it.
+-    self.mailbox.destroy(alloc);
+-
+-    // Dealloc our allocator copy
+-    alloc.destroy(alloc_ptr);
+-
+-    self.loop.deinit(alloc);
++    self.mailbox.destroy(self.alloc);
+ }
+ 
+ /// The main entrypoint for the thread.
+@@ -193,44 +138,49 @@ fn threadMain_(self: *Thread) !void {
+     try self.renderer.threadEnter(self.window);
+     defer self.renderer.threadExit();
+ 
+-    // Set up our async handler to support rendering
+-    self.wakeup.setData(self);
+-    defer self.wakeup.setData(null);
++    // Start the async handlers
++    self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
++    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
+ 
+-    // Set up our timer and start it for rendering
+-    self.render_h.setData(self);
+-    defer self.render_h.setData(null);
+-    try self.wakeup.send();
++    // Send an initial wakeup message so that we render right away.
++    try self.wakeup.notify();
+ 
+-    // Setup a timer for blinking the cursor
+-    self.cursor_h.setData(self);
+-    try self.cursor_h.start(cursorTimerCallback, 600, 600);
++    // Start blinking the cursor.
++    self.cursor_h.run(
++        &self.loop,
++        &self.cursor_c,
++        CURSOR_BLINK_INTERVAL,
++        Thread,
++        self,
++        cursorTimerCallback,
++    );
+ 
+     // If we are using tracy, then we setup a prepare handle so that
+     // we can mark the frame.
+-    var frame_h: libuv.Prepare = if (!tracy.enabled) undefined else frame_h: {
+-        const alloc_ptr = self.loop.getData(Allocator).?;
+-        const alloc = alloc_ptr.*;
+-        const h = try libuv.Prepare.init(alloc, self.loop);
+-        h.setData(self);
+-        try h.start(prepFrameCallback);
+-
+-        break :frame_h h;
+-    };
+-    defer if (tracy.enabled) {
+-        frame_h.close((struct {
+-            fn callback(h: *libuv.Prepare) void {
+-                const alloc_h = h.loop().getData(Allocator).?.*;
+-                h.deinit(alloc_h);
+-            }
+-        }).callback);
+-        _ = self.loop.run(.nowait) catch {};
+-    };
++    // TODO
++    // var frame_h: libuv.Prepare = if (!tracy.enabled) undefined else frame_h: {
++    //     const alloc_ptr = self.loop.getData(Allocator).?;
++    //     const alloc = alloc_ptr.*;
++    //     const h = try libuv.Prepare.init(alloc, self.loop);
++    //     h.setData(self);
++    //     try h.start(prepFrameCallback);
++    //
++    //     break :frame_h h;
++    // };
++    // defer if (tracy.enabled) {
++    //     frame_h.close((struct {
++    //         fn callback(h: *libuv.Prepare) void {
++    //             const alloc_h = h.loop().getData(Allocator).?.*;
++    //             h.deinit(alloc_h);
++    //         }
++    //     }).callback);
++    //     _ = self.loop.run(.nowait) catch {};
++    // };
+ 
+     // Run
+     log.debug("starting renderer thread", .{});
+     defer log.debug("exiting renderer thread", .{});
+-    _ = try self.loop.run(.default);
++    _ = try self.loop.run(.until_done);
+ }
+ 
+ /// Drain the mailbox.
+@@ -247,16 +197,30 @@ fn drainMailbox(self: *Thread) !void {
+ 
+                 if (!v) {
+                     // If we're not focused, then we stop the cursor blink
+-                    try self.cursor_h.stop();
++                    if (self.cursor_c.state() == .active and
++                        self.cursor_c_cancel.state() == .dead)
++                    {
++                        self.cursor_h.cancel(
++                            &self.loop,
++                            &self.cursor_c,
++                            &self.cursor_c_cancel,
++                            void,
++                            null,
++                            cursorCancelCallback,
++                        );
++                    }
+                 } else {
+                     // If we're focused, we immediately show the cursor again
+                     // and then restart the timer.
+-                    if (!try self.cursor_h.isActive()) {
++                    if (self.cursor_c.state() != .active) {
+                         self.renderer.blinkCursor(true);
+-                        try self.cursor_h.start(
++                        self.cursor_h.run(
++                            &self.loop,
++                            &self.cursor_c,
++                            CURSOR_BLINK_INTERVAL,
++                            Thread,
++                            self,
+                             cursorTimerCallback,
+-                            self.cursor_h.getRepeat(),
+-                            self.cursor_h.getRepeat(),
+                         );
+                     }
+                 }
+@@ -264,8 +228,16 @@ fn drainMailbox(self: *Thread) !void {
+ 
+             .reset_cursor_blink => {
+                 self.renderer.blinkCursor(true);
+-                if (try self.cursor_h.isActive()) {
+-                    _ = try self.cursor_h.again();
++                if (self.cursor_c.state() == .active) {
++                    self.cursor_h.reset(
++                        &self.loop,
++                        &self.cursor_c,
++                        &self.cursor_c_cancel,
++                        CURSOR_BLINK_INTERVAL,
++                        Thread,
++                        self,
++                        cursorTimerCallback,
++                    );
+                 }
+             },
+ 
+@@ -280,15 +252,21 @@ fn drainMailbox(self: *Thread) !void {
+     }
+ }
+ 
+-fn wakeupCallback(h: *libuv.Async) void {
++fn wakeupCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Async.WaitError!void,
++) xev.CallbackAction {
++    _ = r catch |err| {
++        log.err("error in wakeup err={}", .{err});
++        return .rearm;
++    };
++
+     const zone = trace(@src());
+     defer zone.end();
+ 
+-    const t = h.getData(Thread) orelse {
+-        // This shouldn't happen so we log it.
+-        log.warn("render callback fired without data set", .{});
+-        return;
+-    };
++    const t = self_.?;
+ 
+     // When we wake up, we check the mailbox. Mailbox producers should
+     // wake up our thread after publishing.
+@@ -296,48 +274,104 @@ fn wakeupCallback(h: *libuv.Async) void {
+         log.err("error draining mailbox err={}", .{err});
+ 
+     // If the timer is already active then we don't have to do anything.
+-    const active = t.render_h.isActive() catch true;
+-    if (active) return;
++    if (t.render_c.state() == .active) return .rearm;
+ 
+     // Timer is not active, let's start it
+-    t.render_h.start(renderCallback, 10, 0) catch |err|
+-        log.warn("render timer failed to start err={}", .{err});
++    t.render_h.run(
++        &t.loop,
++        &t.render_c,
++        10,
++        Thread,
++        t,
++        renderCallback,
++    );
++
++    return .rearm;
+ }
+ 
+-fn renderCallback(h: *libuv.Timer) void {
++fn renderCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
+     const zone = trace(@src());
+     defer zone.end();
+ 
+-    const t = h.getData(Thread) orelse {
++    _ = r catch unreachable;
++    const t = self_ orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+-        return;
++        return .disarm;
+     };
+ 
+     t.renderer.render(t.window, t.state) catch |err|
+         log.warn("error rendering err={}", .{err});
++    return .disarm;
+ }
+ 
+-fn cursorTimerCallback(h: *libuv.Timer) void {
++fn cursorTimerCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
+     const zone = trace(@src());
+     defer zone.end();
+ 
+-    const t = h.getData(Thread) orelse {
++    _ = r catch |err| switch (err) {
++        // This is sent when our timer is canceled. That's fine.
++        error.Canceled => return .disarm,
++
++        else => {
++            log.warn("error in cursor timer callback err={}", .{err});
++            unreachable;
++        },
++    };
++
++    const t = self_ orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+-        return;
++        return .disarm;
+     };
+ 
+     t.renderer.blinkCursor(false);
+-    t.wakeup.send() catch {};
++    t.wakeup.notify() catch {};
++
++    t.cursor_h.run(&t.loop, &t.cursor_c, CURSOR_BLINK_INTERVAL, Thread, t, cursorTimerCallback);
++    return .disarm;
+ }
+ 
+-fn prepFrameCallback(h: *libuv.Prepare) void {
+-    _ = h;
++fn cursorCancelCallback(
++    _: ?*void,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.CancelError!void,
++) xev.CallbackAction {
++    _ = r catch |err| switch (err) {
++        error.NotFound => {},
++        else => {
++            log.warn("error in cursor cancel callback err={}", .{err});
++            unreachable;
++        },
++    };
+ 
+-    tracy.frameMark();
++    return .disarm;
+ }
+ 
+-fn stopCallback(h: *libuv.Async) void {
+-    h.loop().stop();
++// fn prepFrameCallback(h: *libuv.Prepare) void {
++//     _ = h;
++//
++//     tracy.frameMark();
++// }
++
++fn stopCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Async.WaitError!void,
++) xev.CallbackAction {
++    _ = r catch unreachable;
++    self_.?.loop.stop();
++    return .disarm;
+ }
+
+commit fbe35c226bf354d7c256d2bb5970f434d567889a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Feb 22 14:37:37 2023 -0800
+
+    Integrating new surface
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 534561fa..2ffd0a1d 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -47,8 +47,8 @@ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+ cursor_c_cancel: xev.Completion = .{},
+ 
+-/// The window  we're rendering to.
+-window: apprt.runtime.Window,
++/// The surface we're rendering to.
++surface: *apprt.Surface,
+ 
+ /// The underlying renderer implementation.
+ renderer: *renderer.Renderer,
+@@ -65,7 +65,7 @@ mailbox: *Mailbox,
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
+-    win: apprt.runtime.Window,
++    surface: *apprt.Surface,
+     renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
+ ) !Thread {
+@@ -100,7 +100,7 @@ pub fn init(
+         .stop = stop_h,
+         .render_h = render_h,
+         .cursor_h = cursor_timer,
+-        .window = win,
++        .surface = surface,
+         .renderer = renderer_impl,
+         .state = state,
+         .mailbox = mailbox,
+@@ -135,7 +135,7 @@ fn threadMain_(self: *Thread) !void {
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+     // some thread-local state since that is how it works.
+-    try self.renderer.threadEnter(self.window);
++    try self.renderer.threadEnter(self.surface);
+     defer self.renderer.threadExit();
+ 
+     // Start the async handlers
+@@ -305,7 +305,7 @@ fn renderCallback(
+         return .disarm;
+     };
+ 
+-    t.renderer.render(t.window, t.state) catch |err|
++    t.renderer.render(t.surface, t.state) catch |err|
+         log.warn("error rendering err={}", .{err});
+     return .disarm;
+ }
+
+commit 6acf67ec662c124a11debdf0669b822f84b1508b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Feb 23 11:19:51 2023 -0800
+
+    gtk: render!
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 2ffd0a1d..12424272 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -10,6 +10,7 @@ const apprt = @import("../apprt.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ const tracy = @import("tracy");
+ const trace = tracy.trace;
++const App = @import("../App.zig");
+ 
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.renderer_thread);
+@@ -60,6 +61,9 @@ state: *renderer.State,
+ /// this is a blocking queue so if it is full you will get errors (or block).
+ mailbox: *Mailbox,
+ 
++/// Mailbox to send messages to the app thread
++app_mailbox: App.Mailbox,
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+@@ -68,6 +72,7 @@ pub fn init(
+     surface: *apprt.Surface,
+     renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
++    app_mailbox: App.Mailbox,
+ ) !Thread {
+     // Create our event loop.
+     var loop = try xev.Loop.init(.{});
+@@ -104,6 +109,7 @@ pub fn init(
+         .renderer = renderer_impl,
+         .state = state,
+         .mailbox = mailbox,
++        .app_mailbox = app_mailbox,
+     };
+ }
+ 
+@@ -307,6 +313,15 @@ fn renderCallback(
+ 
+     t.renderer.render(t.surface, t.state) catch |err|
+         log.warn("error rendering err={}", .{err});
++
++    // If we're doing single-threaded GPU calls then we also wake up the
++    // app thread to redraw at this point.
++    if (renderer.Renderer == renderer.OpenGL and
++        renderer.OpenGL.single_threaded_draw)
++    {
++        _ = t.app_mailbox.push(.{ .redraw_surface = t.surface }, .{ .instant = {} });
++    }
++
+     return .disarm;
+ }
+ 
+
+commit fc3802e632425a943bc9dc7ef9fb7eac2a864bd9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 25 22:36:20 2023 -0800
+
+    termio: use host-spawn for pty
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 12424272..099c71cd 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -136,6 +136,7 @@ pub fn threadMain(self: *Thread) void {
+ }
+ 
+ fn threadMain_(self: *Thread) !void {
++    defer log.debug("renderer thread exited", .{});
+     tracy.setThreadName("renderer");
+ 
+     // Run our thread start/end callbacks. This is important because some
+@@ -185,7 +186,7 @@ fn threadMain_(self: *Thread) !void {
+ 
+     // Run
+     log.debug("starting renderer thread", .{});
+-    defer log.debug("exiting renderer thread", .{});
++    defer log.debug("starting renderer thread shutdown", .{});
+     _ = try self.loop.run(.until_done);
+ }
+ 
+
+commit 7eda21d5449305b4759c15a2aef25f62904fb6cb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 16 17:03:57 2023 -0700
+
+    surface propagates new config to renderer
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 099c71cd..ba956dda 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -255,6 +255,10 @@ fn drainMailbox(self: *Thread) !void {
+             .screen_size => |size| {
+                 try self.renderer.setScreenSize(size);
+             },
++
++            .change_config => |config| {
++                try self.renderer.changeConfig(config);
++            },
+         }
+     }
+ }
+
+commit b0b3b0af2d7b73c9c0cb0e1d54b125360495892f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Mar 19 10:48:42 2023 -0700
+
+    update config messages use pointers now to make messages small again
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index ba956dda..a4eac3b1 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -257,7 +257,8 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .change_config => |config| {
+-                try self.renderer.changeConfig(config);
++                defer config.alloc.destroy(config.ptr);
++                try self.renderer.changeConfig(config.ptr);
+             },
+         }
+     }
+
+commit e33f6c71de6ed9e53491c05a046841802bf0f8ae
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 9 08:18:43 2023 -0700
+
+    update libxev to fix split writes on large writes (i.e. big paste)
+    
+    Fixes #258
+    
+    This was an upstream bug in libxev where partial the queueWrite
+    mechanism would not correctly handle partial write results:
+    https://github.com/mitchellh/libxev/pull/60
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index a4eac3b1..866cdf34 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -370,11 +370,11 @@ fn cursorCancelCallback(
+     r: xev.Timer.CancelError!void,
+ ) xev.CallbackAction {
+     _ = r catch |err| switch (err) {
+-        error.NotFound => {},
+-        else => {
+-            log.warn("error in cursor cancel callback err={}", .{err});
+-            unreachable;
+-        },
++        error.Canceled => {},
++        // else => {
++        //     log.warn("error in cursor cancel callback err={}", .{err});
++        //     unreachable;
++        // },
+     };
+ 
+     return .disarm;
+
+commit e15b5ab42cbac6a372845d718283b82c62addc4a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 9 10:05:48 2023 -0700
+
+    fix error set for libxev cross-platform
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 866cdf34..e198a8c1 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -369,12 +369,19 @@ fn cursorCancelCallback(
+     _: *xev.Completion,
+     r: xev.Timer.CancelError!void,
+ ) xev.CallbackAction {
+-    _ = r catch |err| switch (err) {
++    // This makes it easier to work across platforms where different platforms
++    // support different sets of errors, so we just unify it.
++    const CancelError = xev.Timer.CancelError || error{
++        Canceled,
++        Unexpected,
++    };
++
++    _ = r catch |err| switch (@as(CancelError, @errSetCast(err))) {
+         error.Canceled => {},
+-        // else => {
+-        //     log.warn("error in cursor cancel callback err={}", .{err});
+-        //     unreachable;
+-        // },
++        else => {
++            log.warn("error in cursor cancel callback err={}", .{err});
++            unreachable;
++        },
+     };
+ 
+     return .disarm;
+
+commit 22eb5334735f1ce4b68113ffe2a77e261759feda
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 2 10:59:50 2023 -0700
+
+    content scale change events should also impact viewport padding
+    
+    This calculates the new padding pixel values and propogates those
+    changes to the renderer.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index e198a8c1..41218791 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -252,8 +252,8 @@ fn drainMailbox(self: *Thread) !void {
+                 try self.renderer.setFontSize(size);
+             },
+ 
+-            .screen_size => |size| {
+-                try self.renderer.setScreenSize(size);
++            .resize => |v| {
++                try self.renderer.setScreenSize(v.screen_size, v.padding);
+             },
+ 
+             .change_config => |config| {
+
+commit d9cfd00e9fc77d123fc20fa51fa9554af31c09d3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Sep 9 20:17:55 2023 -0700
+
+    Big Cursor State Refactor
+    
+    This makes a few major changes:
+    
+      - cursor style on terminal is single source of stylistic truth
+      - cursor style is split between style and style request
+      - cursor blinking is handled by the renderer thread
+      - cursor style/visibility is no longer stored as persistent state on
+        renderers
+      - cursor style computation is extracted to be shared by all renderers
+      - mode 12 "cursor_blinking" is now source of truth on whether blinking
+        is enabled or not
+      - CSI q and mode 12 are synced like xterm
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 41218791..d193246b 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -48,6 +48,11 @@ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+ cursor_c_cancel: xev.Completion = .{},
+ 
++/// This is true when a blinking cursor should be visible and false
++/// when it should not be visible. This is toggled on a timer by the
++/// thread automatically.
++cursor_blink_visible: bool = false,
++
+ /// The surface we're rendering to.
+ surface: *apprt.Surface,
+ 
+@@ -220,7 +225,7 @@ fn drainMailbox(self: *Thread) !void {
+                     // If we're focused, we immediately show the cursor again
+                     // and then restart the timer.
+                     if (self.cursor_c.state() != .active) {
+-                        self.renderer.blinkCursor(true);
++                        self.cursor_blink_visible = true;
+                         self.cursor_h.run(
+                             &self.loop,
+                             &self.cursor_c,
+@@ -234,7 +239,7 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .reset_cursor_blink => {
+-                self.renderer.blinkCursor(true);
++                self.cursor_blink_visible = true;
+                 if (self.cursor_c.state() == .active) {
+                     self.cursor_h.reset(
+                         &self.loop,
+@@ -317,7 +322,11 @@ fn renderCallback(
+         return .disarm;
+     };
+ 
+-    t.renderer.render(t.surface, t.state) catch |err|
++    t.renderer.render(
++        t.surface,
++        t.state,
++        t.cursor_blink_visible,
++    ) catch |err|
+         log.warn("error rendering err={}", .{err});
+ 
+     // If we're doing single-threaded GPU calls then we also wake up the
+@@ -356,7 +365,7 @@ fn cursorTimerCallback(
+         return .disarm;
+     };
+ 
+-    t.renderer.blinkCursor(false);
++    t.cursor_blink_visible = !t.cursor_blink_visible;
+     t.wakeup.notify() catch {};
+ 
+     t.cursor_h.run(&t.loop, &t.cursor_c, CURSOR_BLINK_INTERVAL, Thread, t, cursorTimerCallback);
+
+commit 2b281068374eab491c92fa9b6ddb2cdd706001cd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Oct 2 08:17:42 2023 -0700
+
+    update zig
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index d193246b..90d8c337 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -385,7 +385,7 @@ fn cursorCancelCallback(
+         Unexpected,
+     };
+ 
+-    _ = r catch |err| switch (@as(CancelError, @errSetCast(err))) {
++    _ = r catch |err| switch (@as(CancelError, @errorCast(err))) {
+         error.Canceled => {},
+         else => {
+             log.warn("error in cursor cancel callback err={}", .{err});
+
+commit 78b5c1db7720d126d48aa2e6248919bd50c846cf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Oct 15 21:35:13 2023 -0700
+
+    renderer: handle error.NotFound for timer cancellation
+    
+    Fixes #685
+    
+    This is expected in very rare scenarios where under heavy load, a timer
+    could complete before a cancellation request is processed, resulting in
+    a "not found".
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 90d8c337..df3001b4 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -382,11 +382,13 @@ fn cursorCancelCallback(
+     // support different sets of errors, so we just unify it.
+     const CancelError = xev.Timer.CancelError || error{
+         Canceled,
++        NotFound,
+         Unexpected,
+     };
+ 
+     _ = r catch |err| switch (@as(CancelError, @errorCast(err))) {
+-        error.Canceled => {},
++        error.Canceled => {}, // success
++        error.NotFound => {}, // completed before it could cancel
+         else => {
+             log.warn("error in cursor cancel callback err={}", .{err});
+             unreachable;
+
+commit 5a299e14e48cd3987453c56a0c661dbc783c48b7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Oct 22 08:46:30 2023 -0700
+
+    all threads are notified of inspector state, trigger render
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index df3001b4..f1c2280c 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -48,11 +48,6 @@ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+ cursor_c_cancel: xev.Completion = .{},
+ 
+-/// This is true when a blinking cursor should be visible and false
+-/// when it should not be visible. This is toggled on a timer by the
+-/// thread automatically.
+-cursor_blink_visible: bool = false,
+-
+ /// The surface we're rendering to.
+ surface: *apprt.Surface,
+ 
+@@ -69,6 +64,16 @@ mailbox: *Mailbox,
+ /// Mailbox to send messages to the app thread
+ app_mailbox: App.Mailbox,
+ 
++flags: packed struct {
++    /// This is true when a blinking cursor should be visible and false
++    /// when it should not be visible. This is toggled on a timer by the
++    /// thread automatically.
++    cursor_blink_visible: bool = false,
++
++    /// This is true when the inspector is active.
++    has_inspector: bool = false,
++} = .{},
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+@@ -225,7 +230,7 @@ fn drainMailbox(self: *Thread) !void {
+                     // If we're focused, we immediately show the cursor again
+                     // and then restart the timer.
+                     if (self.cursor_c.state() != .active) {
+-                        self.cursor_blink_visible = true;
++                        self.flags.cursor_blink_visible = true;
+                         self.cursor_h.run(
+                             &self.loop,
+                             &self.cursor_c,
+@@ -239,7 +244,7 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .reset_cursor_blink => {
+-                self.cursor_blink_visible = true;
++                self.flags.cursor_blink_visible = true;
+                 if (self.cursor_c.state() == .active) {
+                     self.cursor_h.reset(
+                         &self.loop,
+@@ -265,6 +270,8 @@ fn drainMailbox(self: *Thread) !void {
+                 defer config.alloc.destroy(config.ptr);
+                 try self.renderer.changeConfig(config.ptr);
+             },
++
++            .inspector => |v| self.flags.has_inspector = v,
+         }
+     }
+ }
+@@ -322,10 +329,15 @@ fn renderCallback(
+         return .disarm;
+     };
+ 
++    // If we have an inspector, let the app know we want to rerender that.
++    if (t.flags.has_inspector) {
++        _ = t.app_mailbox.push(.{ .redraw_inspector = t.surface }, .{ .instant = {} });
++    }
++
+     t.renderer.render(
+         t.surface,
+         t.state,
+-        t.cursor_blink_visible,
++        t.flags.cursor_blink_visible,
+     ) catch |err|
+         log.warn("error rendering err={}", .{err});
+ 
+@@ -365,7 +377,7 @@ fn cursorTimerCallback(
+         return .disarm;
+     };
+ 
+-    t.cursor_blink_visible = !t.cursor_blink_visible;
++    t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
+     t.wakeup.notify() catch {};
+ 
+     t.cursor_h.run(&t.loop, &t.cursor_c, CURSOR_BLINK_INTERVAL, Thread, t, cursorTimerCallback);
+
+commit 006e93bd08ca998c108457587088c0179a7a8327
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Thu Nov 9 11:50:00 2023 -0600
+
+    core: implement setting colors with OSC 4, 10, and 11
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index f1c2280c..35d0ee08 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -262,6 +262,14 @@ fn drainMailbox(self: *Thread) !void {
+                 try self.renderer.setFontSize(size);
+             },
+ 
++            .foreground_color => |color| {
++                self.renderer.config.foreground = color;
++            },
++
++            .background_color => |color| {
++                self.renderer.config.background = color;
++            },
++
+             .resize => |v| {
+                 try self.renderer.setScreenSize(v.screen_size, v.padding);
+             },
+
+commit 1c0b79c40fc683aed06a7f49ec86701986256d38
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Thu Nov 9 14:08:14 2023 -0600
+
+    core: separate default colors from modifiable colors
+    
+    Default colors are those set by the user in the config file, or an
+    actual default value if unset. The actual colors are modifiable and can
+    be changed using the OSC 4, 10, and 11 sequences.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 35d0ee08..654f370a 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -263,11 +263,11 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .foreground_color => |color| {
+-                self.renderer.config.foreground = color;
++                self.renderer.foreground_color = color;
+             },
+ 
+             .background_color => |color| {
+-                self.renderer.config.background = color;
++                self.renderer.background_color = color;
+             },
+ 
+             .resize => |v| {
+
+commit 171292a0630162930a015f0cba3efd693f90023b
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Thu Nov 9 16:10:43 2023 -0600
+
+    core: implement OSC 12 and OSC 112 to query/set/reset cursor color
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 654f370a..17abd632 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -270,6 +270,10 @@ fn drainMailbox(self: *Thread) !void {
+                 self.renderer.background_color = color;
+             },
+ 
++            .cursor_color => |color| {
++                self.renderer.cursor_color = color;
++            },
++
+             .resize => |v| {
+                 try self.renderer.setScreenSize(v.screen_size, v.padding);
+             },
+
+commit 0e92f68228c09a8775b112dcfede0f573d185bdb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 14 14:13:39 2023 -0800
+
+    renderer: separate update frame data from draw
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 17abd632..3a41f593 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -346,7 +346,8 @@ fn renderCallback(
+         _ = t.app_mailbox.push(.{ .redraw_inspector = t.surface }, .{ .instant = {} });
+     }
+ 
+-    t.renderer.render(
++    // Update our frame data
++    t.renderer.updateFrame(
+         t.surface,
+         t.state,
+         t.flags.cursor_blink_visible,
+@@ -359,8 +360,13 @@ fn renderCallback(
+         renderer.OpenGL.single_threaded_draw)
+     {
+         _ = t.app_mailbox.push(.{ .redraw_surface = t.surface }, .{ .instant = {} });
++        return .disarm;
+     }
+ 
++    // Draw
++    t.renderer.drawFrame() catch |err|
++        log.warn("error drawing err={}", .{err});
++
+     return .disarm;
+ }
+ 
+
+commit 389712a698c6fc1188d7faa7c21afc4379e2ef32
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Nov 14 14:17:30 2023 -0800
+
+    renderer/opengl: switch to new update vs draw
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 3a41f593..926bd8e4 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -364,7 +364,7 @@ fn renderCallback(
+     }
+ 
+     // Draw
+-    t.renderer.drawFrame() catch |err|
++    t.renderer.drawFrame(t.surface) catch |err|
+         log.warn("error drawing err={}", .{err});
+ 
+     return .disarm;
+
+commit 4742cd308d0c2895048f34f0dda13fd5dd90aeab
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 16 19:22:48 2023 -0800
+
+    renderer: animation timer if we have custom shaders
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 926bd8e4..e6d0809a 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -15,6 +15,7 @@ const App = @import("../App.zig");
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.renderer_thread);
+ 
++const DRAW_INTERVAL = 33; // 30 FPS
+ const CURSOR_BLINK_INTERVAL = 600;
+ 
+ /// The type used for sending messages to the IO thread. For now this is
+@@ -43,6 +44,13 @@ stop_c: xev.Completion = .{},
+ render_h: xev.Timer,
+ render_c: xev.Completion = .{},
+ 
++/// The timer used for draw calls. Draw calls don't update from the
++/// terminal state so they're much cheaper. They're used for animation
++/// and are paused when the terminal is not focused.
++draw_h: xev.Timer,
++draw_c: xev.Completion = .{},
++draw_active: bool = false,
++
+ /// The timer used for cursor blinking
+ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+@@ -100,6 +108,10 @@ pub fn init(
+     var render_h = try xev.Timer.init();
+     errdefer render_h.deinit();
+ 
++    // Draw timer, see comments.
++    var draw_h = try xev.Timer.init();
++    errdefer draw_h.deinit();
++
+     // Setup a timer for blinking the cursor
+     var cursor_timer = try xev.Timer.init();
+     errdefer cursor_timer.deinit();
+@@ -114,6 +126,7 @@ pub fn init(
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+         .render_h = render_h,
++        .draw_h = draw_h,
+         .cursor_h = cursor_timer,
+         .surface = surface,
+         .renderer = renderer_impl,
+@@ -129,6 +142,7 @@ pub fn deinit(self: *Thread) void {
+     self.stop.deinit();
+     self.wakeup.deinit();
+     self.render_h.deinit();
++    self.draw_h.deinit();
+     self.cursor_h.deinit();
+     self.loop.deinit();
+ 
+@@ -172,27 +186,8 @@ fn threadMain_(self: *Thread) !void {
+         cursorTimerCallback,
+     );
+ 
+-    // If we are using tracy, then we setup a prepare handle so that
+-    // we can mark the frame.
+-    // TODO
+-    // var frame_h: libuv.Prepare = if (!tracy.enabled) undefined else frame_h: {
+-    //     const alloc_ptr = self.loop.getData(Allocator).?;
+-    //     const alloc = alloc_ptr.*;
+-    //     const h = try libuv.Prepare.init(alloc, self.loop);
+-    //     h.setData(self);
+-    //     try h.start(prepFrameCallback);
+-    //
+-    //     break :frame_h h;
+-    // };
+-    // defer if (tracy.enabled) {
+-    //     frame_h.close((struct {
+-    //         fn callback(h: *libuv.Prepare) void {
+-    //             const alloc_h = h.loop().getData(Allocator).?.*;
+-    //             h.deinit(alloc_h);
+-    //         }
+-    //     }).callback);
+-    //     _ = self.loop.run(.nowait) catch {};
+-    // };
++    // Start the draw timer
++    self.startDrawTimer();
+ 
+     // Run
+     log.debug("starting renderer thread", .{});
+@@ -200,6 +195,34 @@ fn threadMain_(self: *Thread) !void {
+     _ = try self.loop.run(.until_done);
+ }
+ 
++fn startDrawTimer(self: *Thread) void {
++    // If our renderer doesn't suppoort animations then we never run this.
++    if (!@hasDecl(renderer.Renderer, "hasAnimations")) return;
++    if (!self.renderer.hasAnimations()) return;
++
++    // Set our active state so it knows we're running. We set this before
++    // even checking the active state in case we have a pending shutdown.
++    self.draw_active = true;
++
++    // If our draw timer is already active, then we don't have to do anything.
++    if (self.draw_c.state() == .active) return;
++
++    // Start the timer which loops
++    self.draw_h.run(
++        &self.loop,
++        &self.draw_c,
++        DRAW_INTERVAL,
++        Thread,
++        self,
++        drawCallback,
++    );
++}
++
++fn stopDrawTimer(self: *Thread) void {
++    // This will stop the draw on the next iteration.
++    self.draw_active = false;
++}
++
+ /// Drain the mailbox.
+ fn drainMailbox(self: *Thread) !void {
+     const zone = trace(@src());
+@@ -213,6 +236,9 @@ fn drainMailbox(self: *Thread) !void {
+                 try self.renderer.setFocus(v);
+ 
+                 if (!v) {
++                    // Stop the draw timer
++                    self.stopDrawTimer();
++
+                     // If we're not focused, then we stop the cursor blink
+                     if (self.cursor_c.state() == .active and
+                         self.cursor_c_cancel.state() == .dead)
+@@ -227,6 +253,9 @@ fn drainMailbox(self: *Thread) !void {
+                         );
+                     }
+                 } else {
++                    // Start the draw timer
++                    self.startDrawTimer();
++
+                     // If we're focused, we immediately show the cursor again
+                     // and then restart the timer.
+                     if (self.cursor_c.state() != .active) {
+@@ -325,6 +354,41 @@ fn wakeupCallback(
+     return .rearm;
+ }
+ 
++fn drawCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
++    _ = r catch unreachable;
++    const t = self_ orelse {
++        // This shouldn't happen so we log it.
++        log.warn("render callback fired without data set", .{});
++        return .disarm;
++    };
++
++    // If we're doing single-threaded GPU calls then we just wake up the
++    // app thread to redraw at this point.
++    if (renderer.Renderer == renderer.OpenGL and
++        renderer.OpenGL.single_threaded_draw)
++    {
++        _ = t.app_mailbox.push(
++            .{ .redraw_surface = t.surface },
++            .{ .instant = {} },
++        );
++    } else {
++        t.renderer.drawFrame(t.surface) catch |err|
++            log.warn("error drawing err={}", .{err});
++    }
++
++    // Only continue if we're still active
++    if (t.draw_active) {
++        t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
++    }
++
++    return .disarm;
++}
++
+ fn renderCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+
+commit a64d12d3cbe8e96df09ee013d125f9cde24948b9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Nov 17 20:56:31 2023 -0800
+
+    renderer: animations should stop if config changes them
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index e6d0809a..156d6cd6 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -310,6 +310,11 @@ fn drainMailbox(self: *Thread) !void {
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.ptr);
+                 try self.renderer.changeConfig(config.ptr);
++
++                // Stop and start the draw timer to capture the new
++                // hasAnimations value.
++                self.stopDrawTimer();
++                self.startDrawTimer();
+             },
+ 
+             .inspector => |v| self.flags.has_inspector = v,
+
+commit 96d33fef20dbe2742ae718beccd6cc42719016ba
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 9 09:21:15 2024 -0800
+
+    custom shader animation can be set to "always" to always remain active
+    
+    Fixes #1225
+    
+    The `custom-shader-animation` configuration can now be set to "always"
+    which keeps animation active even if the terminal is unfocused.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 156d6cd6..178dca14 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -7,6 +7,7 @@ const builtin = @import("builtin");
+ const xev = @import("xev");
+ const renderer = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
++const configpkg = @import("../config.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+ const tracy = @import("tracy");
+ const trace = tracy.trace;
+@@ -72,6 +73,9 @@ mailbox: *Mailbox,
+ /// Mailbox to send messages to the app thread
+ app_mailbox: App.Mailbox,
+ 
++/// Configuration we need derived from the main config.
++config: DerivedConfig,
++
+ flags: packed struct {
+     /// This is true when a blinking cursor should be visible and false
+     /// when it should not be visible. This is toggled on a timer by the
+@@ -82,11 +86,22 @@ flags: packed struct {
+     has_inspector: bool = false,
+ } = .{},
+ 
++pub const DerivedConfig = struct {
++    custom_shader_animation: configpkg.CustomShaderAnimation,
++
++    pub fn init(config: *const configpkg.Config) DerivedConfig {
++        return .{
++            .custom_shader_animation = config.@"custom-shader-animation",
++        };
++    }
++};
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
++    config: *const configpkg.Config,
+     surface: *apprt.Surface,
+     renderer_impl: *renderer.Renderer,
+     state: *renderer.State,
+@@ -122,6 +137,7 @@ pub fn init(
+ 
+     return Thread{
+         .alloc = alloc,
++        .config = DerivedConfig.init(config),
+         .loop = loop,
+         .wakeup = wakeup_h,
+         .stop = stop_h,
+@@ -199,6 +215,7 @@ fn startDrawTimer(self: *Thread) void {
+     // If our renderer doesn't suppoort animations then we never run this.
+     if (!@hasDecl(renderer.Renderer, "hasAnimations")) return;
+     if (!self.renderer.hasAnimations()) return;
++    if (self.config.custom_shader_animation == .false) return;
+ 
+     // Set our active state so it knows we're running. We set this before
+     // even checking the active state in case we have a pending shutdown.
+@@ -236,8 +253,10 @@ fn drainMailbox(self: *Thread) !void {
+                 try self.renderer.setFocus(v);
+ 
+                 if (!v) {
+-                    // Stop the draw timer
+-                    self.stopDrawTimer();
++                    if (self.config.custom_shader_animation != .always) {
++                        // Stop the draw timer
++                        self.stopDrawTimer();
++                    }
+ 
+                     // If we're not focused, then we stop the cursor blink
+                     if (self.cursor_c.state() == .active and
+@@ -308,8 +327,9 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .change_config => |config| {
+-                defer config.alloc.destroy(config.ptr);
+-                try self.renderer.changeConfig(config.ptr);
++                defer message.deinit();
++                try self.changeConfig(config.thread);
++                try self.renderer.changeConfig(config.impl);
+ 
+                 // Stop and start the draw timer to capture the new
+                 // hasAnimations value.
+@@ -322,6 +342,10 @@ fn drainMailbox(self: *Thread) !void {
+     }
+ }
+ 
++fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
++    self.config = config.*;
++}
++
+ fn wakeupCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+
+commit fc30fdfb2be945f4afc296fb5a6cb189981b51ee
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 9 21:05:27 2024 -0800
+
+    renderer: do not free new configuration on change
+    
+    Fixes #1271
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 178dca14..447d54d1 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -327,7 +327,8 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .change_config => |config| {
+-                defer message.deinit();
++                defer config.alloc.destroy(config.thread);
++                defer config.alloc.destroy(config.impl);
+                 try self.changeConfig(config.thread);
+                 try self.renderer.changeConfig(config.impl);
+ 
+
+commit adb7958f6177dfe5df69bc2202da98c566f389b9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 13 15:06:08 2024 -0800
+
+    remove tracy usage from all files
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 447d54d1..2ad4145c 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -9,8 +9,6 @@ const renderer = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+ const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
+-const tracy = @import("tracy");
+-const trace = tracy.trace;
+ const App = @import("../App.zig");
+ 
+ const Allocator = std.mem.Allocator;
+@@ -177,7 +175,6 @@ pub fn threadMain(self: *Thread) void {
+ 
+ fn threadMain_(self: *Thread) !void {
+     defer log.debug("renderer thread exited", .{});
+-    tracy.setThreadName("renderer");
+ 
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+@@ -242,9 +239,6 @@ fn stopDrawTimer(self: *Thread) void {
+ 
+ /// Drain the mailbox.
+ fn drainMailbox(self: *Thread) !void {
+-    const zone = trace(@src());
+-    defer zone.end();
+-
+     while (self.mailbox.pop()) |message| {
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
+@@ -358,9 +352,6 @@ fn wakeupCallback(
+         return .rearm;
+     };
+ 
+-    const zone = trace(@src());
+-    defer zone.end();
+-
+     const t = self_.?;
+ 
+     // When we wake up, we check the mailbox. Mailbox producers should
+@@ -425,9 +416,6 @@ fn renderCallback(
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+ ) xev.CallbackAction {
+-    const zone = trace(@src());
+-    defer zone.end();
+-
+     _ = r catch unreachable;
+     const t = self_ orelse {
+         // This shouldn't happen so we log it.
+@@ -470,9 +458,6 @@ fn cursorTimerCallback(
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+ ) xev.CallbackAction {
+-    const zone = trace(@src());
+-    defer zone.end();
+-
+     _ = r catch |err| switch (err) {
+         // This is sent when our timer is canceled. That's fine.
+         error.Canceled => return .disarm,
+
+commit e1908f7cc7992216567f303d5b09228a3772ae37
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Feb 13 09:21:04 2024 -0800
+
+    renderer: handle renderer pause/redraw on occlusion
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 2ad4145c..113f6761 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -82,6 +82,10 @@ flags: packed struct {
+ 
+     /// This is true when the inspector is active.
+     has_inspector: bool = false,
++
++    /// This is true when the view is visible. This is used to determine
++    /// if we should be rendering or not.
++    visible: bool = true,
+ } = .{},
+ 
+ pub const DerivedConfig = struct {
+@@ -242,6 +246,23 @@ fn drainMailbox(self: *Thread) !void {
+     while (self.mailbox.pop()) |message| {
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
++            .visible => |v| {
++                // Set our visible state
++                self.flags.visible = v;
++
++                // If we became visible then we immediately trigger a draw.
++                // We don't need to update frame data because that should
++                // still be happening.
++                if (v) self.drawFrame();
++
++                // Note that we're explicitly today not stopping any
++                // cursor timers, draw timers, etc. These things have very
++                // little resource cost and properly maintaining their active
++                // state across different transitions is going to be bug-prone,
++                // so its easier to just let them keep firing and have them
++                // check the visible state themselves to control their behavior.
++            },
++
+             .focus => |v| {
+                 // Set it on the renderer
+                 try self.renderer.setFocus(v);
+@@ -341,6 +362,27 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
+     self.config = config.*;
+ }
+ 
++/// Trigger a draw. This will not update frame data or anything, it will
++/// just trigger a draw/paint.
++fn drawFrame(self: *Thread) void {
++    // If we're invisible, we do not draw.
++    if (!self.flags.visible) return;
++
++    // If we're doing single-threaded GPU calls then we just wake up the
++    // app thread to redraw at this point.
++    if (renderer.Renderer == renderer.OpenGL and
++        renderer.OpenGL.single_threaded_draw)
++    {
++        _ = self.app_mailbox.push(
++            .{ .redraw_surface = self.surface },
++            .{ .instant = {} },
++        );
++    } else {
++        self.renderer.drawFrame(self.surface) catch |err|
++            log.warn("error drawing err={}", .{err});
++    }
++}
++
+ fn wakeupCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+@@ -388,19 +430,8 @@ fn drawCallback(
+         return .disarm;
+     };
+ 
+-    // If we're doing single-threaded GPU calls then we just wake up the
+-    // app thread to redraw at this point.
+-    if (renderer.Renderer == renderer.OpenGL and
+-        renderer.OpenGL.single_threaded_draw)
+-    {
+-        _ = t.app_mailbox.push(
+-            .{ .redraw_surface = t.surface },
+-            .{ .instant = {} },
+-        );
+-    } else {
+-        t.renderer.drawFrame(t.surface) catch |err|
+-            log.warn("error drawing err={}", .{err});
+-    }
++    // Draw
++    t.drawFrame();
+ 
+     // Only continue if we're still active
+     if (t.draw_active) {
+@@ -436,18 +467,8 @@ fn renderCallback(
+     ) catch |err|
+         log.warn("error rendering err={}", .{err});
+ 
+-    // If we're doing single-threaded GPU calls then we also wake up the
+-    // app thread to redraw at this point.
+-    if (renderer.Renderer == renderer.OpenGL and
+-        renderer.OpenGL.single_threaded_draw)
+-    {
+-        _ = t.app_mailbox.push(.{ .redraw_surface = t.surface }, .{ .instant = {} });
+-        return .disarm;
+-    }
+-
+     // Draw
+-    t.renderer.drawFrame(t.surface) catch |err|
+-        log.warn("error drawing err={}", .{err});
++    t.drawFrame();
+ 
+     return .disarm;
+ }
+
+commit b5d543705de4ea42407db9e2d49ae03f3ae5cf14
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Feb 13 20:07:41 2024 -0800
+
+    renderer/metal: free resources when occluded
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 113f6761..84f1940f 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -250,6 +250,9 @@ fn drainMailbox(self: *Thread) !void {
+                 // Set our visible state
+                 self.flags.visible = v;
+ 
++                // Set it on the renderer
++                try self.renderer.setVisible(v);
++
+                 // If we became visible then we immediately trigger a draw.
+                 // We don't need to update frame data because that should
+                 // still be happening.
+
+commit e10e45a93579b28b090bf491ee56a237cdd68eb8
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Feb 13 21:57:46 2024 -0800
+
+    Revert "renderer/metal: free resources when occluded"
+    
+    This reverts commit b5d543705de4ea42407db9e2d49ae03f3ae5cf14.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 84f1940f..113f6761 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -250,9 +250,6 @@ fn drainMailbox(self: *Thread) !void {
+                 // Set our visible state
+                 self.flags.visible = v;
+ 
+-                // Set it on the renderer
+-                try self.renderer.setVisible(v);
+-
+                 // If we became visible then we immediately trigger a draw.
+                 // We don't need to update frame data because that should
+                 // still be happening.
+
+commit b8d11e57c9e4b20d4ef4fa9972693bb753be9e80
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 6 10:55:58 2024 -0700
+
+    renderer/Metal: change font size works again
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 113f6761..d7370565 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -321,8 +321,13 @@ fn drainMailbox(self: *Thread) !void {
+                 }
+             },
+ 
+-            .font_size => |size| {
+-                try self.renderer.setFontSize(size);
++            .font_grid => |grid| if (self.renderer.setFontGrid(grid.grid)) {
++                // Success, deref our old grid
++                grid.set.deref(grid.old_key);
++            } else |err| {
++                // Error, deref our new grid since we didn't use it.
++                grid.set.deref(grid.new_key);
++                return err;
+             },
+ 
+             .foreground_color => |color| {
+
+commit 506ba854fa160852e0622c89f41f7463abdff1e2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Apr 6 19:33:49 2024 -0700
+
+    core: font size changes work
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index d7370565..91a21313 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -321,13 +321,9 @@ fn drainMailbox(self: *Thread) !void {
+                 }
+             },
+ 
+-            .font_grid => |grid| if (self.renderer.setFontGrid(grid.grid)) {
+-                // Success, deref our old grid
++            .font_grid => |grid| {
++                self.renderer.setFontGrid(grid.grid);
+                 grid.set.deref(grid.old_key);
+-            } else |err| {
+-                // Error, deref our new grid since we didn't use it.
+-                grid.set.deref(grid.new_key);
+-                return err;
+             },
+ 
+             .foreground_color => |color| {
+
+commit caaf6a496fb795acd55796e5c4e50e2b44b205f9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri May 3 20:04:37 2024 -0700
+
+    renderer: add draw now async wakeup
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 91a21313..28344729 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -50,6 +50,11 @@ draw_h: xev.Timer,
+ draw_c: xev.Completion = .{},
+ draw_active: bool = false,
+ 
++/// This async is used to force a draw immediately. This does not
++/// coalesce like the wakeup does.
++draw_now: xev.Async,
++draw_now_c: xev.Completion = .{},
++
+ /// The timer used for cursor blinking
+ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+@@ -129,6 +134,10 @@ pub fn init(
+     var draw_h = try xev.Timer.init();
+     errdefer draw_h.deinit();
+ 
++    // Draw now async, see comments.
++    var draw_now = try xev.Async.init();
++    errdefer draw_now.deinit();
++
+     // Setup a timer for blinking the cursor
+     var cursor_timer = try xev.Timer.init();
+     errdefer cursor_timer.deinit();
+@@ -145,6 +154,7 @@ pub fn init(
+         .stop = stop_h,
+         .render_h = render_h,
+         .draw_h = draw_h,
++        .draw_now = draw_now,
+         .cursor_h = cursor_timer,
+         .surface = surface,
+         .renderer = renderer_impl,
+@@ -161,6 +171,7 @@ pub fn deinit(self: *Thread) void {
+     self.wakeup.deinit();
+     self.render_h.deinit();
+     self.draw_h.deinit();
++    self.draw_now.deinit();
+     self.cursor_h.deinit();
+     self.loop.deinit();
+ 
+@@ -189,6 +200,7 @@ fn threadMain_(self: *Thread) !void {
+     // Start the async handlers
+     self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
+     self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
++    self.draw_now.wait(&self.loop, &self.draw_now_c, Thread, self, drawNowCallback);
+ 
+     // Send an initial wakeup message so that we render right away.
+     try self.wakeup.notify();
+@@ -418,6 +430,24 @@ fn wakeupCallback(
+     return .rearm;
+ }
+ 
++fn drawNowCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Async.WaitError!void,
++) xev.CallbackAction {
++    _ = r catch |err| {
++        log.err("error in draw now err={}", .{err});
++        return .rearm;
++    };
++
++    // Draw immediately
++    const t = self_.?;
++    t.drawFrame();
++
++    return .rearm;
++}
++
+ fn drawCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+
+commit fe7ff998c9a0be8a9125463127e52468cb7d7a57
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri May 3 20:06:48 2024 -0700
+
+    renderer: move our constant draw timer up to 120fps
+    
+    Our renderers can now handle it
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 28344729..c4342ef4 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -14,7 +14,7 @@ const App = @import("../App.zig");
+ const Allocator = std.mem.Allocator;
+ const log = std.log.scoped(.renderer_thread);
+ 
+-const DRAW_INTERVAL = 33; // 30 FPS
++const DRAW_INTERVAL = 8; // 120 FPS
+ const CURSOR_BLINK_INTERVAL = 600;
+ 
+ /// The type used for sending messages to the IO thread. For now this is
+@@ -498,7 +498,7 @@ fn renderCallback(
+     ) catch |err|
+         log.warn("error rendering err={}", .{err});
+ 
+-    // Draw
++    // Draw immediately
+     t.drawFrame();
+ 
+     return .disarm;
+
+commit a40ffad2187a8c6040eb571be78544d08f1d8d84
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri May 3 20:45:56 2024 -0700
+
+    renderer/metal: setup display link
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index c4342ef4..ce7fc4d7 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -146,7 +146,7 @@ pub fn init(
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+ 
+-    return Thread{
++    return .{
+         .alloc = alloc,
+         .config = DerivedConfig.init(config),
+         .loop = loop,
+@@ -191,6 +191,11 @@ pub fn threadMain(self: *Thread) void {
+ fn threadMain_(self: *Thread) !void {
+     defer log.debug("renderer thread exited", .{});
+ 
++    // Run our loop start/end callbacks if the renderer cares.
++    const has_loop = @hasDecl(renderer.Renderer, "loopEnter");
++    if (has_loop) try self.renderer.loopEnter(self);
++    defer if (has_loop) self.renderer.loopExit();
++
+     // Run our thread start/end callbacks. This is important because some
+     // renderers have to do per-thread setup. For example, OpenGL has to set
+     // some thread-local state since that is how it works.
+
+commit ac813c924418461ae236ecbd71a2477e6ee23558
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri May 3 20:54:13 2024 -0700
+
+    renderer/metal: stop/start display link on occlusion
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index ce7fc4d7..3ed9385d 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -272,6 +272,9 @@ fn drainMailbox(self: *Thread) !void {
+                 // still be happening.
+                 if (v) self.drawFrame();
+ 
++                // Notify the renderer so it can update any state.
++                self.renderer.setVisible(v);
++
+                 // Note that we're explicitly today not stopping any
+                 // cursor timers, draw timers, etc. These things have very
+                 // little resource cost and properly maintaining their active
+
+commit c56e016ab31dc35f402f8026f4c690b78acfde17
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat May 4 14:05:42 2024 -0700
+
+    renderer: remove 10ms delay on repaint
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 3ed9385d..a629a656 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -422,18 +422,21 @@ fn wakeupCallback(
+     t.drainMailbox() catch |err|
+         log.err("error draining mailbox err={}", .{err});
+ 
+-    // If the timer is already active then we don't have to do anything.
+-    if (t.render_c.state() == .active) return .rearm;
+-
+-    // Timer is not active, let's start it
+-    t.render_h.run(
+-        &t.loop,
+-        &t.render_c,
+-        10,
+-        Thread,
+-        t,
+-        renderCallback,
+-    );
++    // Render immediately
++    _ = renderCallback(t, undefined, undefined, {});
++
++    // // If the timer is already active then we don't have to do anything.
++    // if (t.render_c.state() == .active) return .rearm;
++    //
++    // // Timer is not active, let's start it
++    // t.render_h.run(
++    //     &t.loop,
++    //     &t.render_c,
++    //     10,
++    //     Thread,
++    //     t,
++    //     renderCallback,
++    // );
+ 
+     return .rearm;
+ }
+
+commit 0836aa7318e059df8e11a11aa2a2ce33b6b3c394
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat May 4 14:10:12 2024 -0700
+
+    renderer: add comment why we have dead code
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index a629a656..2e4b0326 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -425,6 +425,10 @@ fn wakeupCallback(
+     // Render immediately
+     _ = renderCallback(t, undefined, undefined, {});
+ 
++    // The below is not used anymore but if we ever want to introduce
++    // a configuration to introduce a delay to coalesce renders, we can
++    // use this.
++    //
+     // // If the timer is already active then we don't have to do anything.
+     // if (t.render_c.state() == .active) return .rearm;
+     //
+
+commit ca9689be464571e804aba68be9393bbdfde65a0a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat May 4 19:40:58 2024 -0700
+
+    renderer/metal: API to handle macOS display ID changing
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 2e4b0326..9345d865 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -375,6 +375,12 @@ fn drainMailbox(self: *Thread) !void {
+             },
+ 
+             .inspector => |v| self.flags.has_inspector = v,
++
++            .macos_display_id => |v| {
++                if (@hasDecl(renderer.Renderer, "setMacOSDisplayID")) {
++                    try self.renderer.setMacOSDisplayID(v);
++                }
++            },
+         }
+     }
+ }
+
+commit 8fdf6b4b6454f684ead8d180055dd9009a5684cb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun May 5 10:06:21 2024 -0700
+
+    renderer: add window-vsync option (defaults to false)
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 9345d865..3ee8ab1b 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -270,7 +270,7 @@ fn drainMailbox(self: *Thread) !void {
+                 // If we became visible then we immediately trigger a draw.
+                 // We don't need to update frame data because that should
+                 // still be happening.
+-                if (v) self.drawFrame();
++                if (v) self.drawFrame(false);
+ 
+                 // Notify the renderer so it can update any state.
+                 self.renderer.setVisible(v);
+@@ -391,10 +391,14 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
+ 
+ /// Trigger a draw. This will not update frame data or anything, it will
+ /// just trigger a draw/paint.
+-fn drawFrame(self: *Thread) void {
++fn drawFrame(self: *Thread, now: bool) void {
+     // If we're invisible, we do not draw.
+     if (!self.flags.visible) return;
+ 
++    // If the renderer is managing a vsync on its own, we only draw
++    // when we're forced to via now.
++    if (!now and self.renderer.hasVsync()) return;
++
+     // If we're doing single-threaded GPU calls then we just wake up the
+     // app thread to redraw at this point.
+     if (renderer.Renderer == renderer.OpenGL and
+@@ -464,7 +468,7 @@ fn drawNowCallback(
+ 
+     // Draw immediately
+     const t = self_.?;
+-    t.drawFrame();
++    t.drawFrame(true);
+ 
+     return .rearm;
+ }
+@@ -483,7 +487,7 @@ fn drawCallback(
+     };
+ 
+     // Draw
+-    t.drawFrame();
++    t.drawFrame(false);
+ 
+     // Only continue if we're still active
+     if (t.draw_active) {
+@@ -518,9 +522,7 @@ fn renderCallback(
+         t.flags.cursor_blink_visible,
+     ) catch |err|
+         log.warn("error rendering err={}", .{err});
+-
+-    // Draw immediately
+-    t.drawFrame();
++    t.drawFrame(false);
+ 
+     return .disarm;
+ }
+
+commit f9be02a20f9f77649efad3f6fda3dd15639ef252
+Author: Łukasz Niemier <lukasz@niemier.pl>
+Date:   Mon Aug 5 13:56:57 2024 +0200
+
+    chore: clean up typos
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 3ee8ab1b..459fc105 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -230,7 +230,7 @@ fn threadMain_(self: *Thread) !void {
+ }
+ 
+ fn startDrawTimer(self: *Thread) void {
+-    // If our renderer doesn't suppoort animations then we never run this.
++    // If our renderer doesn't support animations then we never run this.
+     if (!@hasDecl(renderer.Renderer, "hasAnimations")) return;
+     if (!self.renderer.hasAnimations()) return;
+     if (self.config.custom_shader_animation == .false) return;
+
+commit 7929e0bc09d4524d982c6ac369013eba40762fd0
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Aug 14 19:35:52 2024 -0400
+
+    fix: prevent flicker while shrinking screen by eliminating thread race
+    
+    Before this fix, if vsync was on the GPU cells buffer could be cleared
+    for a frame while resizing the terminal down. This was due to the fact
+    that the surface sent messages for the resize to both the renderer and
+    the IO thread. If the renderer thread was processed first then the GPU
+    cells buffer(s) would be cleared and not rebuilt, because the terminal
+    state would be larger than the GPU cell buffers causing updateFrame to
+    bail out early, leaving empty cell buffers.
+    
+    This fixes the problem by changing the origin of the renderer's resize
+    message to be the IO thread, only after properly updating the terminal
+    state, to avoid clearing the GPU cells buffers at a time they can't be
+    successfully rebuilt.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 459fc105..2725a217 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -480,7 +480,7 @@ fn drawCallback(
+     r: xev.Timer.RunError!void,
+ ) xev.CallbackAction {
+     _ = r catch unreachable;
+-    const t = self_ orelse {
++    const t: *Thread = self_ orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+         return .disarm;
+@@ -504,7 +504,7 @@ fn renderCallback(
+     r: xev.Timer.RunError!void,
+ ) xev.CallbackAction {
+     _ = r catch unreachable;
+-    const t = self_ orelse {
++    const t: *Thread = self_ orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+         return .disarm;
+@@ -543,7 +543,7 @@ fn cursorTimerCallback(
+         },
+     };
+ 
+-    const t = self_ orelse {
++    const t: *Thread = self_ orelse {
+         // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+         return .disarm;
+
+commit 900aab10f2c744f943d65942654c7e90fae28a34
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Aug 14 22:43:58 2024 -0400
+
+    renderer: don't update frame if renderer grid size != terminal size
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 2725a217..2521d18a 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -522,6 +522,8 @@ fn renderCallback(
+         t.flags.cursor_blink_visible,
+     ) catch |err|
+         log.warn("error rendering err={}", .{err});
++
++    // Draw
+     t.drawFrame(false);
+ 
+     return .disarm;
+
+commit 8f477b00da8a503ef597099119e6957f663587d9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 1 10:59:19 2024 -0700
+
+    renderer/termio attach thread local state for crash capture
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 2521d18a..1b730693 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -5,6 +5,7 @@ pub const Thread = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const xev = @import("xev");
++const crash = @import("../crash/main.zig");
+ const renderer = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+@@ -191,6 +192,12 @@ pub fn threadMain(self: *Thread) void {
+ fn threadMain_(self: *Thread) !void {
+     defer log.debug("renderer thread exited", .{});
+ 
++    // Setup our crash metadata
++    crash.sentry.thread_state = .{
++        .surface = self.renderer.surface_mailbox.surface,
++    };
++    defer crash.sentry.thread_state = null;
++
+     // Run our loop start/end callbacks if the renderer cares.
+     const has_loop = @hasDecl(renderer.Renderer, "loopEnter");
+     if (has_loop) try self.renderer.loopEnter(self);
+
+commit d499f7795bf9608e6aa0ec700fbd0879f0daeb4f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 1 21:00:12 2024 -0700
+
+    input: crash binding can configure which thread to crash
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 1b730693..11a546d3 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -270,6 +270,8 @@ fn drainMailbox(self: *Thread) !void {
+     while (self.mailbox.pop()) |message| {
+         log.debug("mailbox message={}", .{message});
+         switch (message) {
++            .crash => @panic("crash request, crashing intentionally"),
++
+             .visible => |v| {
+                 // Set our visible state
+                 self.flags.visible = v;
+
+commit bae12993b3c1d71f104b88eae3380dcddd10f378
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Sep 2 09:59:19 2024 -0700
+
+    crash: tag the thread type
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 11a546d3..b3e54262 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -194,6 +194,7 @@ fn threadMain_(self: *Thread) !void {
+ 
+     // Setup our crash metadata
+     crash.sentry.thread_state = .{
++        .type = .renderer,
+         .surface = self.renderer.surface_mailbox.surface,
+     };
+     defer crash.sentry.thread_state = null;
+
+commit 89fadfc2021a437caf5c2b584de71a14a34e826b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Oct 4 06:57:42 2024 -1000
+
+    renderer: fg/bg/cursor change must mark the screen as dirty
+    
+    Fixes #2372
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index b3e54262..35679e99 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -358,14 +358,17 @@ fn drainMailbox(self: *Thread) !void {
+ 
+             .foreground_color => |color| {
+                 self.renderer.foreground_color = color;
++                self.renderer.markDirty();
+             },
+ 
+             .background_color => |color| {
+                 self.renderer.background_color = color;
++                self.renderer.markDirty();
+             },
+ 
+             .cursor_color => |color| {
+                 self.renderer.cursor_color = color;
++                self.renderer.markDirty();
+             },
+ 
+             .resize => |v| {
+
+commit a436bd0af62a4bdc5af14774b955f7b46ccd9deb
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 7 14:38:54 2024 -0800
+
+    move datastructures to dedicated "datastruct" package
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 35679e99..94a1280d 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -9,7 +9,7 @@ const crash = @import("../crash/main.zig");
+ const renderer = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+-const BlockingQueue = @import("../blocking_queue.zig").BlockingQueue;
++const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
+ const App = @import("../App.zig");
+ 
+ const Allocator = std.mem.Allocator;
+
+commit 6f62944b9cab9a32a74d1ccf940a32ae9f85d026
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 14 13:34:12 2024 -0800
+
+    renderer: message uses new size struct
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 94a1280d..8c4be3c6 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -371,9 +371,10 @@ fn drainMailbox(self: *Thread) !void {
+                 self.renderer.markDirty();
+             },
+ 
+-            .resize => |v| {
+-                try self.renderer.setScreenSize(v.screen_size, v.padding);
+-            },
++            .resize => |v| try self.renderer.setScreenSize(
++                v.screen,
++                v.padding,
++            ),
+ 
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.thread);
+
+commit b3b5e15e9648c8c3181669541e5ae09540185981
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 14 13:43:56 2024 -0800
+
+    renderer/metal: use new size struct
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 8c4be3c6..91e35548 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -371,10 +371,7 @@ fn drainMailbox(self: *Thread) !void {
+                 self.renderer.markDirty();
+             },
+ 
+-            .resize => |v| try self.renderer.setScreenSize(
+-                v.screen,
+-                v.padding,
+-            ),
++            .resize => |v| try self.renderer.setScreenSize(v),
+ 
+             .change_config => |config| {
+                 defer config.alloc.destroy(config.thread);
+
+commit a482224da8577246d4a31f72d298a25352e0df9d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Nov 25 19:57:29 2024 -0800
+
+    renderer: set QoS class of the renderer thread on macOS
+    
+    This sets the macOS QoS class of the renderer thread. Apple
+    recommends[1] that all threads should have a QoS class set, and there
+    are many benefits[2] to that, mainly around power management moreso than
+    performance I'd expect.
+    
+    In this commit, I start by setting the QoS class of the renderer thread.
+    By default, the renderer thread is set to user interactive, because it
+    is a UI thread after all. But under some conditions we downgrade:
+    
+      - If the surface is not visible at all (i.e. another window is fully
+        covering it or its minimized), we set the QoS class to utility. This
+        is lower than the default, previous QoS and should help macOS
+        unschedule the workload or move it to a different core.
+    
+      - If the surface is visible but not focused, we set the QoS class to
+        user initiated. This is lower than user interactive but higher than
+        default. The renderer should remain responsive but not consume as
+        much time as it would if it was user interactive.
+    
+    I'm unable to see any noticable difference in anything from these
+    changes. Unfortunately it doesn't seem like Apple provides good tools to
+    play around with this.
+    
+    We should continue to apply QoS classes to our other threads on macOS.
+    
+    [1]: https://developer.apple.com/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon?preferredLanguage=occl
+    [2]: https://blog.xoria.org/macos-tips-threading/
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 91e35548..cc63889f 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -4,8 +4,10 @@ pub const Thread = @This();
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const assert = std.debug.assert;
+ const xev = @import("xev");
+ const crash = @import("../crash/main.zig");
++const internal_os = @import("../os/main.zig");
+ const renderer = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+@@ -92,6 +94,10 @@ flags: packed struct {
+     /// This is true when the view is visible. This is used to determine
+     /// if we should be rendering or not.
+     visible: bool = true,
++
++    /// This is true when the view is focused. This defaults to true
++    /// and it is up to the apprt to set the correct value.
++    focused: bool = true,
+ } = .{},
+ 
+ pub const DerivedConfig = struct {
+@@ -199,6 +205,9 @@ fn threadMain_(self: *Thread) !void {
+     };
+     defer crash.sentry.thread_state = null;
+ 
++    // Setup our thread QoS
++    self.setQosClass();
++
+     // Run our loop start/end callbacks if the renderer cares.
+     const has_loop = @hasDecl(renderer.Renderer, "loopEnter");
+     if (has_loop) try self.renderer.loopEnter(self);
+@@ -237,6 +246,36 @@ fn threadMain_(self: *Thread) !void {
+     _ = try self.loop.run(.until_done);
+ }
+ 
++fn setQosClass(self: *const Thread) void {
++    // Thread QoS classes are only relevant on macOS.
++    if (comptime !builtin.target.isDarwin()) return;
++
++    const class: internal_os.macos.QosClass = class: {
++        // If we aren't visible (our view is fully occluded) then we
++        // always drop our rendering priority down because it's just
++        // mostly wasted work.
++        //
++        // The renderer itself should be doing this as well (for example
++        // Metal will stop our DisplayLink) but this also helps with
++        // general forced updates and CPU usage i.e. a rebuild cells call.
++        if (!self.flags.visible) break :class .utility;
++
++        // If we're not focused, but we're visible, then we set a higher
++        // than default priority because framerates still matter but it isn't
++        // as important as when we're focused.
++        if (!self.flags.focused) break :class .user_initiated;
++
++        // We are focused and visible, we are the definition of user interactive.
++        break :class .user_interactive;
++    };
++
++    if (internal_os.macos.setQosClass(class)) {
++        log.debug("thread QoS class set class={}", .{class});
++    } else |err| {
++        log.warn("error setting QoS class err={}", .{err});
++    }
++}
++
+ fn startDrawTimer(self: *Thread) void {
+     // If our renderer doesn't support animations then we never run this.
+     if (!@hasDecl(renderer.Renderer, "hasAnimations")) return;
+@@ -273,10 +312,16 @@ fn drainMailbox(self: *Thread) !void {
+         switch (message) {
+             .crash => @panic("crash request, crashing intentionally"),
+ 
+-            .visible => |v| {
++            .visible => |v| visible: {
++                // If our state didn't change we do nothing.
++                if (self.flags.visible == v) break :visible;
++
+                 // Set our visible state
+                 self.flags.visible = v;
+ 
++                // Visibility affects our QoS class
++                self.setQosClass();
++
+                 // If we became visible then we immediately trigger a draw.
+                 // We don't need to update frame data because that should
+                 // still be happening.
+@@ -293,7 +338,16 @@ fn drainMailbox(self: *Thread) !void {
+                 // check the visible state themselves to control their behavior.
+             },
+ 
+-            .focus => |v| {
++            .focus => |v| focus: {
++                // If our state didn't change we do nothing.
++                if (self.flags.focused == v) break :focus;
++
++                // Set our state
++                self.flags.focused = v;
++
++                // Focus affects our QoS class
++                self.setQosClass();
++
+                 // Set it on the renderer
+                 try self.renderer.setFocus(v);
+ 
+
+commit d532a6e260960fd427e438ff55ff74f14edc518c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Feb 20 21:38:49 2025 -0800
+
+    Update libxev to use dynamic backend, support Linux configurability
+    
+    Related to #3224
+    
+    Previously, Ghostty used a static API for async event handling: io_uring
+    on Linux, kqueue on macOS. This commit changes the backend to be dynamic
+    on Linux so that epoll will be used if io_uring isn't available, or if
+    the user explicitly chooses it.
+    
+    This introduces a new config `async-backend` (default "auto") which can
+    be set by the user to change the async backend in use. This is a
+    best-effort setting: if the user requests io_uring but it isn't
+    available, Ghostty will fall back to something that is and that choice
+    is up to us.
+    
+    Basic benchmarking both in libxev and Ghostty (vtebench) show no
+    noticeable performance differences introducing the dynamic API, nor
+    choosing epoll over io_uring.
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index cc63889f..03b41ab3 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -5,7 +5,7 @@ pub const Thread = @This();
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const assert = std.debug.assert;
+-const xev = @import("xev");
++const xev = @import("../global.zig").xev;
+ const crash = @import("../crash/main.zig");
+ const internal_os = @import("../os/main.zig");
+ const renderer = @import("../renderer.zig");
+
+commit 7e2286eb8c603ade782a3970911531595d57e280
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Mar 11 14:33:33 2025 -0700
+
+    Zig 0.14
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 03b41ab3..f4aa16df 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -8,7 +8,7 @@ const assert = std.debug.assert;
+ const xev = @import("../global.zig").xev;
+ const crash = @import("../crash/main.zig");
+ const internal_os = @import("../os/main.zig");
+-const renderer = @import("../renderer.zig");
++const rendererpkg = @import("../renderer.zig");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+ const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
+@@ -23,7 +23,7 @@ const CURSOR_BLINK_INTERVAL = 600;
+ /// The type used for sending messages to the IO thread. For now this is
+ /// hardcoded with a capacity. We can make this a comptime parameter in
+ /// the future if we want it configurable.
+-pub const Mailbox = BlockingQueue(renderer.Message, 64);
++pub const Mailbox = BlockingQueue(rendererpkg.Message, 64);
+ 
+ /// Allocator used for some state
+ alloc: std.mem.Allocator,
+@@ -67,10 +67,10 @@ cursor_c_cancel: xev.Completion = .{},
+ surface: *apprt.Surface,
+ 
+ /// The underlying renderer implementation.
+-renderer: *renderer.Renderer,
++renderer: *rendererpkg.Renderer,
+ 
+ /// Pointer to the shared state that is used to generate the final render.
+-state: *renderer.State,
++state: *rendererpkg.State,
+ 
+ /// The mailbox that can be used to send this thread messages. Note
+ /// this is a blocking queue so if it is full you will get errors (or block).
+@@ -117,8 +117,8 @@ pub fn init(
+     alloc: Allocator,
+     config: *const configpkg.Config,
+     surface: *apprt.Surface,
+-    renderer_impl: *renderer.Renderer,
+-    state: *renderer.State,
++    renderer_impl: *rendererpkg.Renderer,
++    state: *rendererpkg.State,
+     app_mailbox: App.Mailbox,
+ ) !Thread {
+     // Create our event loop.
+@@ -209,7 +209,7 @@ fn threadMain_(self: *Thread) !void {
+     self.setQosClass();
+ 
+     // Run our loop start/end callbacks if the renderer cares.
+-    const has_loop = @hasDecl(renderer.Renderer, "loopEnter");
++    const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
+     if (has_loop) try self.renderer.loopEnter(self);
+     defer if (has_loop) self.renderer.loopExit();
+ 
+@@ -278,7 +278,7 @@ fn setQosClass(self: *const Thread) void {
+ 
+ fn startDrawTimer(self: *Thread) void {
+     // If our renderer doesn't support animations then we never run this.
+-    if (!@hasDecl(renderer.Renderer, "hasAnimations")) return;
++    if (!@hasDecl(rendererpkg.Renderer, "hasAnimations")) return;
+     if (!self.renderer.hasAnimations()) return;
+     if (self.config.custom_shader_animation == .false) return;
+ 
+@@ -442,7 +442,7 @@ fn drainMailbox(self: *Thread) !void {
+             .inspector => |v| self.flags.has_inspector = v,
+ 
+             .macos_display_id => |v| {
+-                if (@hasDecl(renderer.Renderer, "setMacOSDisplayID")) {
++                if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
+                     try self.renderer.setMacOSDisplayID(v);
+                 }
+             },
+@@ -466,8 +466,8 @@ fn drawFrame(self: *Thread, now: bool) void {
+ 
+     // If we're doing single-threaded GPU calls then we just wake up the
+     // app thread to redraw at this point.
+-    if (renderer.Renderer == renderer.OpenGL and
+-        renderer.OpenGL.single_threaded_draw)
++    if (rendererpkg.Renderer == rendererpkg.OpenGL and
++        rendererpkg.OpenGL.single_threaded_draw)
+     {
+         _ = self.app_mailbox.push(
+             .{ .redraw_surface = self.surface },
+
+commit 0f4d2bb2375c707182dba8cf2dd7723a2e918e79
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 09:55:46 2025 -0700
+
+    Lots of 0.14 changes
+
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index f4aa16df..46ef8609 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -248,7 +248,7 @@ fn threadMain_(self: *Thread) !void {
+ 
+ fn setQosClass(self: *const Thread) void {
+     // Thread QoS classes are only relevant on macOS.
+-    if (comptime !builtin.target.isDarwin()) return;
++    if (comptime !builtin.target.os.tag.isDarwin()) return;
+ 
+     const class: internal_os.macos.QosClass = class: {
+         // If we aren't visible (our view is fully occluded) then we
+

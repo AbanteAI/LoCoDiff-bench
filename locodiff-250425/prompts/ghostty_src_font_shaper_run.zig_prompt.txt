@@ -1,0 +1,1821 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/font/shaper/run.zig
+
+commit f0b7fbecee2a12b5c72df3c010340e59a06d1305
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 6 13:23:53 2022 -0800
+
+    font: extract common shaper elements out
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+new file mode 100644
+index 00000000..c7f80298
+--- /dev/null
++++ b/src/font/shaper/run.zig
+@@ -0,0 +1,129 @@
++const std = @import("std");
++const assert = std.debug.assert;
++const Allocator = std.mem.Allocator;
++const font = @import("../main.zig");
++const shape = @import("../shape.zig");
++const terminal = @import("../../terminal/main.zig");
++const trace = @import("tracy").trace;
++
++/// A single text run. A text run is only valid for one Shaper instance and
++/// until the next run is created. A text run never goes across multiple
++/// rows in a terminal, so it is guaranteed to always be one line.
++pub const TextRun = struct {
++    /// The offset in the row where this run started
++    offset: u16,
++
++    /// The total number of cells produced by this run.
++    cells: u16,
++
++    /// The font group that built this run.
++    group: *font.GroupCache,
++
++    /// The font index to use for the glyphs of this run.
++    font_index: font.Group.FontIndex,
++};
++
++/// RunIterator is an iterator that yields text runs.
++pub const RunIterator = struct {
++    hooks: font.Shaper.RunIteratorHook,
++    group: *font.GroupCache,
++    row: terminal.Screen.Row,
++    i: usize = 0,
++
++    pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
++        const tracy = trace(@src());
++        defer tracy.end();
++
++        // Trim the right side of a row that might be empty
++        const max: usize = max: {
++            var j: usize = self.row.lenCells();
++            while (j > 0) : (j -= 1) if (!self.row.getCell(j - 1).empty()) break;
++            break :max j;
++        };
++
++        // We're over at the max
++        if (self.i >= max) return null;
++
++        // Track the font for our curent run
++        var current_font: font.Group.FontIndex = .{};
++
++        // Allow the hook to prepare
++        try self.hooks.prepare();
++
++        // Go through cell by cell and accumulate while we build our run.
++        var j: usize = self.i;
++        while (j < max) : (j += 1) {
++            const cluster = j;
++            const cell = self.row.getCell(j);
++
++            // If we're a spacer, then we ignore it
++            if (cell.attrs.wide_spacer_tail) continue;
++
++            const style: font.Style = if (cell.attrs.bold)
++                .bold
++            else
++                .regular;
++
++            // Determine the presentation format for this glyph.
++            const presentation: ?font.Presentation = if (cell.attrs.grapheme) p: {
++                // We only check the FIRST codepoint because I believe the
++                // presentation format must be directly adjacent to the codepoint.
++                var it = self.row.codepointIterator(j);
++                if (it.next()) |cp| {
++                    if (cp == 0xFE0E) break :p font.Presentation.text;
++                    if (cp == 0xFE0F) break :p font.Presentation.emoji;
++                }
++
++                break :p null;
++            } else null;
++
++            // Determine the font for this cell. We'll use fallbacks
++            // manually here to try replacement chars and then a space
++            // for unknown glyphs.
++            const font_idx_opt = (try self.group.indexForCodepoint(
++                alloc,
++                if (cell.empty() or cell.char == 0) ' ' else cell.char,
++                style,
++                presentation,
++            )) orelse (try self.group.indexForCodepoint(
++                alloc,
++                0xFFFD,
++                style,
++                .text,
++            )) orelse
++                try self.group.indexForCodepoint(alloc, ' ', style, .text);
++            const font_idx = font_idx_opt.?;
++            //log.warn("char={x} idx={}", .{ cell.char, font_idx });
++            if (j == self.i) current_font = font_idx;
++
++            // If our fonts are not equal, then we're done with our run.
++            if (font_idx.int() != current_font.int()) break;
++
++            // Continue with our run
++            try self.hooks.addCodepoint(cell.char, @intCast(u32, cluster));
++
++            // If this cell is part of a grapheme cluster, add all the grapheme
++            // data points.
++            if (cell.attrs.grapheme) {
++                var it = self.row.codepointIterator(j);
++                while (it.next()) |cp| {
++                    if (cp == 0xFE0E or cp == 0xFE0F) continue;
++                    try self.hooks.addCodepoint(cp, @intCast(u32, cluster));
++                }
++            }
++        }
++
++        // Finalize our buffer
++        try self.hooks.finalize();
++
++        // Move our cursor. Must defer since we use self.i below.
++        defer self.i = j;
++
++        return TextRun{
++            .offset = @intCast(u16, self.i),
++            .cells = @intCast(u16, j - self.i),
++            .group = self.group,
++            .font_index = current_font,
++        };
++    }
++};
+
+commit 2be4eb0da72f78658169fad944fac2ac482e4ea5
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 23 10:24:22 2023 -0700
+
+    font/shaper: split runs at selection boundaries
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index c7f80298..e9bc6177 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -28,6 +28,7 @@ pub const RunIterator = struct {
+     hooks: font.Shaper.RunIteratorHook,
+     group: *font.GroupCache,
+     row: terminal.Screen.Row,
++    selection: ?terminal.Selection = null,
+     i: usize = 0,
+ 
+     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
+@@ -56,6 +57,16 @@ pub const RunIterator = struct {
+             const cluster = j;
+             const cell = self.row.getCell(j);
+ 
++            // If we have a selection and we're at a boundary point, then
++            // we break the run here.
++            if (self.selection) |unordered_sel| {
++                if (j > self.i) {
++                    const sel = unordered_sel.ordered(.forward);
++                    if (sel.start.x > 0 and j == sel.start.x) break;
++                    if (sel.end.x > 0 and j == sel.end.x + 1) break;
++                }
++            }
++
+             // If we're a spacer, then we ignore it
+             if (cell.attrs.wide_spacer_tail) continue;
+ 
+
+commit 30fdbaebf45395e04fc39409cbba0674d43471dc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 23 13:56:07 2023 -0700
+
+    font: run splitting needs to detect italics
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index e9bc6177..c95c74a4 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -70,10 +70,17 @@ pub const RunIterator = struct {
+             // If we're a spacer, then we ignore it
+             if (cell.attrs.wide_spacer_tail) continue;
+ 
+-            const style: font.Style = if (cell.attrs.bold)
+-                .bold
+-            else
+-                .regular;
++            // Text runs break when font styles change so we need to get
++            // the proper style.
++            const style: font.Style = style: {
++                if (cell.attrs.bold) {
++                    if (cell.attrs.italic) break :style .bold_italic;
++                    break :style .bold;
++                }
++
++                if (cell.attrs.italic) break :style .italic;
++                break :style .regular;
++            };
+ 
+             // Determine the presentation format for this glyph.
+             const presentation: ?font.Presentation = if (cell.attrs.grapheme) p: {
+
+commit 314f9287b1854911e38d030ad6ec42bb6cd0a105
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 30 12:15:31 2023 -0700
+
+    Update Zig (#164)
+    
+    * update zig
+    
+    * pkg/fontconfig: clean up @as
+    
+    * pkg/freetype,harfbuzz: clean up @as
+    
+    * pkg/imgui: clean up @as
+    
+    * pkg/macos: clean up @as
+    
+    * pkg/pixman,utf8proc: clean up @as
+    
+    * clean up @as
+    
+    * lots more @as cleanup
+    
+    * undo flatpak changes
+    
+    * clean up @as
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index c95c74a4..7d9cbac6 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -118,7 +118,7 @@ pub const RunIterator = struct {
+             if (font_idx.int() != current_font.int()) break;
+ 
+             // Continue with our run
+-            try self.hooks.addCodepoint(cell.char, @intCast(u32, cluster));
++            try self.hooks.addCodepoint(cell.char, @intCast(cluster));
+ 
+             // If this cell is part of a grapheme cluster, add all the grapheme
+             // data points.
+@@ -126,7 +126,7 @@ pub const RunIterator = struct {
+                 var it = self.row.codepointIterator(j);
+                 while (it.next()) |cp| {
+                     if (cp == 0xFE0E or cp == 0xFE0F) continue;
+-                    try self.hooks.addCodepoint(cp, @intCast(u32, cluster));
++                    try self.hooks.addCodepoint(cp, @intCast(cluster));
+                 }
+             }
+         }
+@@ -138,8 +138,8 @@ pub const RunIterator = struct {
+         defer self.i = j;
+ 
+         return TextRun{
+-            .offset = @intCast(u16, self.i),
+-            .cells = @intCast(u16, j - self.i),
++            .offset = @intCast(self.i),
++            .cells = @intCast(j - self.i),
+             .group = self.group,
+             .font_index = current_font,
+         };
+
+commit 4b062dc45c57c75fd7082b64487308b333283df2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jul 18 16:17:46 2023 -0700
+
+    font/shaper: text runs should split around block cursors
+    
+    Fixes #206
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 7d9cbac6..bd6dc938 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -29,6 +29,7 @@ pub const RunIterator = struct {
+     group: *font.GroupCache,
+     row: terminal.Screen.Row,
+     selection: ?terminal.Selection = null,
++    cursor_x: ?usize = null,
+     i: usize = 0,
+ 
+     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
+@@ -67,6 +68,32 @@ pub const RunIterator = struct {
+                 }
+             }
+ 
++            // If our cursor is on this line then we break the run around the
++            // cursor. This means that any row with a cursor has at least
++            // three breaks: before, exactly the cursor, and after.
++            if (self.cursor_x) |cursor_x| {
++                // Exactly: self.i is the cursor and we iterated once. This
++                // means that we started exactly at the cursor and did at
++                // least one (probably exactly one) iteration. That is
++                // exactly one character.
++                if (self.i == cursor_x and j > self.i) {
++                    assert(j == self.i + 1);
++                    break;
++                }
++
++                // Before: up to and not including the cursor. This means
++                // that we started before the cursor (self.i < cursor_x)
++                // and j is now at the cursor meaning we haven't yet processed
++                // the cursor.
++                if (self.i < cursor_x and j == cursor_x) {
++                    assert(j > 0);
++                    break;
++                }
++
++                // After: after the cursor. We don't need to do anything
++                // special, we just let the run complete.
++            }
++
+             // If we're a spacer, then we ignore it
+             if (cell.attrs.wide_spacer_tail) continue;
+ 
+
+commit 4137c6cf69ef62ccddbd2467f36c9bc77c474e47
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jul 18 16:38:02 2023 -0700
+
+    font/shaper: do not break on merged emoji if cursor is directly on it
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index bd6dc938..e095ef64 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -68,32 +68,6 @@ pub const RunIterator = struct {
+                 }
+             }
+ 
+-            // If our cursor is on this line then we break the run around the
+-            // cursor. This means that any row with a cursor has at least
+-            // three breaks: before, exactly the cursor, and after.
+-            if (self.cursor_x) |cursor_x| {
+-                // Exactly: self.i is the cursor and we iterated once. This
+-                // means that we started exactly at the cursor and did at
+-                // least one (probably exactly one) iteration. That is
+-                // exactly one character.
+-                if (self.i == cursor_x and j > self.i) {
+-                    assert(j == self.i + 1);
+-                    break;
+-                }
+-
+-                // Before: up to and not including the cursor. This means
+-                // that we started before the cursor (self.i < cursor_x)
+-                // and j is now at the cursor meaning we haven't yet processed
+-                // the cursor.
+-                if (self.i < cursor_x and j == cursor_x) {
+-                    assert(j > 0);
+-                    break;
+-                }
+-
+-                // After: after the cursor. We don't need to do anything
+-                // special, we just let the run complete.
+-            }
+-
+             // If we're a spacer, then we ignore it
+             if (cell.attrs.wide_spacer_tail) continue;
+ 
+@@ -122,6 +96,39 @@ pub const RunIterator = struct {
+                 break :p null;
+             } else null;
+ 
++            // If our cursor is on this line then we break the run around the
++            // cursor. This means that any row with a cursor has at least
++            // three breaks: before, exactly the cursor, and after.
++            //
++            // We do not break a cell that is exactly the grapheme. If there
++            // are cells following that contain joiners, we allow those to
++            // break. This creates an effect where hovering over an emoji
++            // such as a skin-tone emoji is fine, but hovering over the
++            // joiners will show the joiners allowing you to modify the
++            // emoji.
++            if (!cell.attrs.grapheme) {
++                if (self.cursor_x) |cursor_x| {
++                    // Exactly: self.i is the cursor and we iterated once. This
++                    // means that we started exactly at the cursor and did at
++                    // exactly one iteration. Why exactly one? Because we may
++                    // start at our cursor but do many if our cursor is exactly
++                    // on an emoji.
++                    if (self.i == cursor_x and j == self.i + 1) break;
++
++                    // Before: up to and not including the cursor. This means
++                    // that we started before the cursor (self.i < cursor_x)
++                    // and j is now at the cursor meaning we haven't yet processed
++                    // the cursor.
++                    if (self.i < cursor_x and j == cursor_x) {
++                        assert(j > 0);
++                        break;
++                    }
++
++                    // After: after the cursor. We don't need to do anything
++                    // special, we just let the run complete.
++                }
++            }
++
+             // Determine the font for this cell. We'll use fallbacks
+             // manually here to try replacement chars and then a space
+             // for unknown glyphs.
+
+commit 22b81731649bd1aca3e6fd33f215747d29ba1f72
+Author: Kevin Hovsäter <kevin@hovsater.com>
+Date:   Tue Aug 8 14:27:34 2023 +0200
+
+    Fix typos
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index e095ef64..503a1c91 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -46,7 +46,7 @@ pub const RunIterator = struct {
+         // We're over at the max
+         if (self.i >= max) return null;
+ 
+-        // Track the font for our curent run
++        // Track the font for our current run
+         var current_font: font.Group.FontIndex = .{};
+ 
+         // Allow the hook to prepare
+
+commit 9e27dcdec977c04dfe1350a3d9fae83f51170595
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 15 15:14:35 2023 -0700
+
+    font: shaper doesn't split run on selection if selection splits grapheme
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 503a1c91..c180cf12 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -63,8 +63,14 @@ pub const RunIterator = struct {
+             if (self.selection) |unordered_sel| {
+                 if (j > self.i) {
+                     const sel = unordered_sel.ordered(.forward);
+-                    if (sel.start.x > 0 and j == sel.start.x) break;
+-                    if (sel.end.x > 0 and j == sel.end.x + 1) break;
++
++                    if (sel.start.x > 0 and
++                        j == sel.start.x and
++                        self.row.graphemeBreak(sel.start.x)) break;
++
++                    if (sel.end.x > 0 and
++                        j == sel.end.x + 1 and
++                        self.row.graphemeBreak(sel.end.x)) break;
+                 }
+             }
+ 
+
+commit e6edf3105e43ccf41f345eee263f49f7faca18f3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Aug 26 09:20:26 2023 -0700
+
+    font: grapheme clusters need to find a single font for all codepoints
+    
+    When font shaping grapheme clusters, we erroneously used the font index
+    of a font that only matches the first codepoint in the cell. This led to the
+    combining characters being [usually] unknown and rendering as boxes.
+    
+    For a grapheme, we must find a font face that has a glyph for _all codepoints_
+    in the grapheme.
+    
+    This also fixes an issue where we now properly render the unicode replacement
+    character if we can't find a font satisfying a codepoint.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index c180cf12..5cdc8fda 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -135,33 +135,61 @@ pub const RunIterator = struct {
+                 }
+             }
+ 
+-            // Determine the font for this cell. We'll use fallbacks
+-            // manually here to try replacement chars and then a space
+-            // for unknown glyphs.
+-            const font_idx_opt = (try self.group.indexForCodepoint(
+-                alloc,
+-                if (cell.empty() or cell.char == 0) ' ' else cell.char,
+-                style,
+-                presentation,
+-            )) orelse (try self.group.indexForCodepoint(
+-                alloc,
+-                0xFFFD,
+-                style,
+-                .text,
+-            )) orelse
+-                try self.group.indexForCodepoint(alloc, ' ', style, .text);
+-            const font_idx = font_idx_opt.?;
+-            //log.warn("char={x} idx={}", .{ cell.char, font_idx });
+-            if (j == self.i) current_font = font_idx;
++            // We need to find a font that supports this character. If
++            // there are additional zero-width codepoints (to form a single
++            // grapheme, i.e. combining characters), we need to find a font
++            // that supports all of them.
++            const font_info: struct {
++                idx: font.Group.FontIndex,
++                fallback: ?u32 = null,
++            } = font_info: {
++                // If we find a font that supports this entire grapheme
++                // then we use that.
++                if (try self.indexForCell(
++                    alloc,
++                    j,
++                    cell,
++                    style,
++                    presentation,
++                )) |idx| break :font_info .{ .idx = idx };
++
++                // Otherwise we need a fallback character. Prefer the
++                // official replacement character.
++                if (try self.group.indexForCodepoint(
++                    alloc,
++                    0xFFFD, // replacement char
++                    style,
++                    presentation,
++                )) |idx| break :font_info .{ .idx = idx, .fallback = 0xFFFD };
++
++                // Fallback to space
++                if (try self.group.indexForCodepoint(
++                    alloc,
++                    ' ',
++                    style,
++                    presentation,
++                )) |idx| break :font_info .{ .idx = idx, .fallback = ' ' };
++
++                // We can't render at all. This is a bug, we should always
++                // have a font that can render a space.
++                unreachable;
++            };
++
++            //log.warn("char={x} info={}", .{ cell.char, font_info });
++            if (j == self.i) current_font = font_info.idx;
+ 
+             // If our fonts are not equal, then we're done with our run.
+-            if (font_idx.int() != current_font.int()) break;
++            if (font_info.idx.int() != current_font.int()) break;
+ 
+-            // Continue with our run
+-            try self.hooks.addCodepoint(cell.char, @intCast(cluster));
++            // If we're a fallback character, add that and continue; we
++            // don't want to add the entire grapheme.
++            if (font_info.fallback) |cp| {
++                try self.hooks.addCodepoint(cp, @intCast(cluster));
++                continue;
++            }
+ 
+-            // If this cell is part of a grapheme cluster, add all the grapheme
+-            // data points.
++            // Add all the codepoints for our grapheme
++            try self.hooks.addCodepoint(cell.char, @intCast(cluster));
+             if (cell.attrs.grapheme) {
+                 var it = self.row.codepointIterator(j);
+                 while (it.next()) |cp| {
+@@ -184,4 +212,71 @@ pub const RunIterator = struct {
+             .font_index = current_font,
+         };
+     }
++
++    /// Find a font index that supports the grapheme for the given cell,
++    /// or null if no such font exists.
++    ///
++    /// This is used to find a font that supports the entire grapheme.
++    /// We look for fonts that support each individual codepoint and then
++    /// find the common font amongst all candidates.
++    fn indexForCell(
++        self: *RunIterator,
++        alloc: Allocator,
++        j: usize,
++        cell: terminal.Screen.Cell,
++        style: font.Style,
++        presentation: ?font.Presentation,
++    ) !?font.Group.FontIndex {
++        // Get the font index for the primary codepoint.
++        const primary_cp: u32 = if (cell.empty() or cell.char == 0) ' ' else cell.char;
++        const primary = try self.group.indexForCodepoint(
++            alloc,
++            primary_cp,
++            style,
++            presentation,
++        ) orelse return null;
++
++        // Easy, and common: we aren't a multi-codepoint grapheme, so
++        // we just return whatever index for the cell codepoint.
++        if (!cell.attrs.grapheme) return primary;
++
++        // If this is a grapheme, we need to find a font that supports
++        // all of the codepoints in the grapheme.
++        var it = self.row.codepointIterator(j);
++        var candidates = try std.ArrayList(font.Group.FontIndex).initCapacity(alloc, it.len() + 1);
++        defer candidates.deinit();
++        candidates.appendAssumeCapacity(primary);
++
++        while (it.next()) |cp| {
++            // Ignore Emoji ZWJs
++            if (cp == 0xFE0E or cp == 0xFE0F) continue;
++
++            // Find a font that supports this codepoint. If none support this
++            // then the whole grapheme can't be rendered so we return null.
++            const idx = try self.group.indexForCodepoint(
++                alloc,
++                cp,
++                style,
++                presentation,
++            ) orelse return null;
++            candidates.appendAssumeCapacity(idx);
++        }
++
++        // We need to find a candidate that has ALL of our codepoints
++        for (candidates.items) |idx| {
++            if (!self.group.group.hasCodepoint(idx, primary_cp, presentation)) continue;
++            it.reset();
++            while (it.next()) |cp| {
++                // Ignore Emoji ZWJs
++                if (cp == 0xFE0E or cp == 0xFE0F) continue;
++                if (!self.group.group.hasCodepoint(idx, cp, presentation)) break;
++            } else {
++                // If the while completed, then we have a candidate that
++                // supports all of our codepoints.
++                return idx;
++            }
++        }
++
++        return null;
++    }
+ };
+
+commit ed5c0016901d80706d0f41052f750dc3bbfb4638
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 29 14:09:21 2023 -0700
+
+    font/shaper: split ligature around cell style change
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 5cdc8fda..94a5da3f 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -77,6 +77,20 @@ pub const RunIterator = struct {
+             // If we're a spacer, then we ignore it
+             if (cell.attrs.wide_spacer_tail) continue;
+ 
++            // If our cell attributes are changing, then we split the run.
++            // This prevents a single glyph for ">=" to be rendered with
++            // one color when the two components have different styling.
++            if (j > self.i) {
++                const prev_cell = self.row.getCell(j - 1);
++                const Attrs = @TypeOf(cell.attrs);
++                const Int = @typeInfo(Attrs).Struct.backing_integer.?;
++                const prev_attrs: Int = @bitCast(prev_cell.attrs.styleAttrs());
++                const attrs: Int = @bitCast(cell.attrs.styleAttrs());
++                if (prev_attrs != attrs) break;
++                if (cell.attrs.has_bg and !cell.bg.eql(prev_cell.bg)) break;
++                if (cell.attrs.has_fg and !cell.fg.eql(prev_cell.fg)) break;
++            }
++
+             // Text runs break when font styles change so we need to get
+             // the proper style.
+             const style: font.Style = style: {
+
+commit 22757683834a35fb017d95f2282af72963786ff9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Nov 2 21:46:50 2023 -0700
+
+    font: if a codepoint is emoji presentation, prefer that for shaping
+    
+    Fixes #787
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 94a5da3f..9af4a9b4 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -1,6 +1,7 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
++const ziglyph = @import("ziglyph");
+ const font = @import("../main.zig");
+ const shape = @import("../shape.zig");
+ const terminal = @import("../../terminal/main.zig");
+@@ -109,12 +110,20 @@ pub const RunIterator = struct {
+                 // presentation format must be directly adjacent to the codepoint.
+                 var it = self.row.codepointIterator(j);
+                 if (it.next()) |cp| {
+-                    if (cp == 0xFE0E) break :p font.Presentation.text;
+-                    if (cp == 0xFE0F) break :p font.Presentation.emoji;
++                    if (cp == 0xFE0E) break :p .text;
++                    if (cp == 0xFE0F) break :p .emoji;
+                 }
+ 
+                 break :p null;
+-            } else null;
++            } else emoji: {
++                // If we're not a grapheme, our individual char could be
++                // an emoji so we want to check if we expect emoji presentation.
++                if (ziglyph.emoji.isEmojiPresentation(@intCast(cell.char))) {
++                    break :emoji .emoji;
++                }
++
++                break :emoji .text;
++            };
+ 
+             // If our cursor is on this line then we break the run around the
+             // cursor. This means that any row with a cursor has at least
+
+commit 3d8dd0783af8491c9b78651b2d8a72b734be3dc0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Nov 8 14:04:21 2023 -0800
+
+    font: if VS15/16 not specified, prefer any presentation in explicit font
+    
+    Fixes #845
+    
+    Quick background: Emoji codepoints are either default text or default
+    graphical ("Emoji") presentation. An example of a default text emoji
+    is ❤. You have to add VS16 to this emoji to get: ❤️. Some font are
+    default graphical and require VS15 to force text.
+    
+    A font face can only advertise text vs emoji presentation for the entire
+    font face. Some font faces (i.e. Cozette) include both text glyphs and
+    emoji glyphs, but since they can only advertise as one, advertise as
+    "text".
+    
+    As a result, if a user types an emoji such as 👽, it will fallback to
+    another font to try to find a font that satisfies the "graphical"
+    presentation requirement. But Cozette supports 👽, its just advertised
+    as "text"!
+    
+    Normally, this behavior is what you want. However, if a user explicitly
+    requests their font-family to be a font that contains a mix of test and
+    emoji, they _probably_ want those emoji to be used regardless of default
+    presentation. This is similar to a rich text editor (like TextEdit on
+    Mac): if you explicitly select "Cozette" as your font, the alien emoji
+    shows up using the text-based Cozette glyph.
+    
+    This commit changes our presentation handling behavior to do the
+    following:
+    
+      * If no explicit variation selector (VS15/VS16) is specified,
+        any matching codepoint in an explicitly loaded font (i.e. via
+        `font-family`) will be used.
+    
+      * If an explicit variation selector is specified or our explicitly
+        loaded fonts don't contain the codepoint, fallback fonts will be
+        searched but require an exact match on presentation.
+    
+      * If no fallback is found with an exact match, any font with any
+        presentation can match the codepoint.
+    
+    This commit should generally not change the behavior of Emoji or VS15/16
+    handling for almost all users. The only users impacted by this commit
+    are specifically users who are using fonts with a mix of emoji and text.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 9af4a9b4..d74e86c5 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -1,7 +1,6 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+-const ziglyph = @import("ziglyph");
+ const font = @import("../main.zig");
+ const shape = @import("../shape.zig");
+ const terminal = @import("../../terminal/main.zig");
+@@ -118,11 +117,9 @@ pub const RunIterator = struct {
+             } else emoji: {
+                 // If we're not a grapheme, our individual char could be
+                 // an emoji so we want to check if we expect emoji presentation.
+-                if (ziglyph.emoji.isEmojiPresentation(@intCast(cell.char))) {
+-                    break :emoji .emoji;
+-                }
+-
+-                break :emoji .text;
++                // The font group indexForCodepoint we use below will do this
++                // automatically.
++                break :emoji null;
+             };
+ 
+             // If our cursor is on this line then we break the run around the
+
+commit 42c4f52711ff5ef85d1246ca6f269b0bc728debe
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Nov 20 19:12:37 2023 -0800
+
+    font: shaper should not look up U+200D for consistent fonts
+    
+    Related to #914
+    
+    U+200D is the zero-width joiner character used for multi-codepoint
+    Emojis. When faced with a multi-codepoint grapheme, the font shaper must
+    find a font that provides _all codepoints_ consistently. However, U+200D
+    isn't meant to be provided by any font. As a result, the font shaper
+    search ends up iterating over every font looking for a match.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index d74e86c5..7bc56e2e 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -213,6 +213,7 @@ pub const RunIterator = struct {
+             if (cell.attrs.grapheme) {
+                 var it = self.row.codepointIterator(j);
+                 while (it.next()) |cp| {
++                    // Do not send presentation modifiers
+                     if (cp == 0xFE0E or cp == 0xFE0F) continue;
+                     try self.hooks.addCodepoint(cp, @intCast(cluster));
+                 }
+@@ -269,7 +270,7 @@ pub const RunIterator = struct {
+ 
+         while (it.next()) |cp| {
+             // Ignore Emoji ZWJs
+-            if (cp == 0xFE0E or cp == 0xFE0F) continue;
++            if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+ 
+             // Find a font that supports this codepoint. If none support this
+             // then the whole grapheme can't be rendered so we return null.
+@@ -288,7 +289,7 @@ pub const RunIterator = struct {
+             it.reset();
+             while (it.next()) |cp| {
+                 // Ignore Emoji ZWJs
+-                if (cp == 0xFE0E or cp == 0xFE0F) continue;
++                if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+                 if (!self.group.group.hasCodepoint(idx, cp, presentation)) break;
+             } else {
+                 // If the while completed, then we have a candidate that
+
+commit 22a0869525f20ba6bc54f4b8f5c36077e35ab660
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Dec 11 11:06:15 2023 -0800
+
+    font/shaper: if char is 0, should send space to shaper
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 7bc56e2e..093ffaeb 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -209,7 +209,10 @@ pub const RunIterator = struct {
+             }
+ 
+             // Add all the codepoints for our grapheme
+-            try self.hooks.addCodepoint(cell.char, @intCast(cluster));
++            try self.hooks.addCodepoint(
++                if (cell.char == 0) ' ' else cell.char,
++                @intCast(cluster),
++            );
+             if (cell.attrs.grapheme) {
+                 var it = self.row.codepointIterator(j);
+                 while (it.next()) |cp| {
+
+commit 060bdff117224ea467f2ade55f90dbc96a1b942f
+Author: Gregory Anders <greg@gpanders.com>
+Date:   Tue Jan 2 17:01:00 2024 -0600
+
+    terminal: track palette color in cell state
+    
+    Rather than immediately converting a color palette index into an RGB
+    value for a cell color, when a palette color is used track the palette
+    color directly in the cell state and convert to an RGB value in the
+    renderer.
+    
+    This causes palette color changes to take effect immediately instead of
+    only for newly drawn cells.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 093ffaeb..dd5b93be 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -87,8 +87,8 @@ pub const RunIterator = struct {
+                 const prev_attrs: Int = @bitCast(prev_cell.attrs.styleAttrs());
+                 const attrs: Int = @bitCast(cell.attrs.styleAttrs());
+                 if (prev_attrs != attrs) break;
+-                if (cell.attrs.has_bg and !cell.bg.eql(prev_cell.bg)) break;
+-                if (cell.attrs.has_fg and !cell.fg.eql(prev_cell.fg)) break;
++                if (!cell.bg.eql(prev_cell.bg)) break;
++                if (!cell.fg.eql(prev_cell.fg)) break;
+             }
+ 
+             // Text runs break when font styles change so we need to get
+
+commit adb7958f6177dfe5df69bc2202da98c566f389b9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Jan 13 15:06:08 2024 -0800
+
+    remove tracy usage from all files
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index dd5b93be..7b75b574 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -4,7 +4,6 @@ const Allocator = std.mem.Allocator;
+ const font = @import("../main.zig");
+ const shape = @import("../shape.zig");
+ const terminal = @import("../../terminal/main.zig");
+-const trace = @import("tracy").trace;
+ 
+ /// A single text run. A text run is only valid for one Shaper instance and
+ /// until the next run is created. A text run never goes across multiple
+@@ -33,9 +32,6 @@ pub const RunIterator = struct {
+     i: usize = 0,
+ 
+     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
+-        const tracy = trace(@src());
+-        defer tracy.end();
+-
+         // Trim the right side of a row that might be empty
+         const max: usize = max: {
+             var j: usize = self.row.lenCells();
+
+commit e3230cf1e6c6519c0d6a6588d3f2844fb02ca05f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 09:28:22 2024 -0800
+
+    font/shaper: start converting run to new terminal
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 7b75b574..3ef90013 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -3,7 +3,7 @@ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+ const font = @import("../main.zig");
+ const shape = @import("../shape.zig");
+-const terminal = @import("../../terminal/main.zig");
++const terminal = @import("../../terminal/main.zig").new;
+ 
+ /// A single text run. A text run is only valid for one Shaper instance and
+ /// until the next run is created. A text run never goes across multiple
+@@ -26,17 +26,22 @@ pub const TextRun = struct {
+ pub const RunIterator = struct {
+     hooks: font.Shaper.RunIteratorHook,
+     group: *font.GroupCache,
+-    row: terminal.Screen.Row,
++    row: terminal.Pin,
+     selection: ?terminal.Selection = null,
+     cursor_x: ?usize = null,
+     i: usize = 0,
+ 
+     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
++        const cells = self.row.cells(.all);
++
+         // Trim the right side of a row that might be empty
+         const max: usize = max: {
+-            var j: usize = self.row.lenCells();
+-            while (j > 0) : (j -= 1) if (!self.row.getCell(j - 1).empty()) break;
+-            break :max j;
++            for (0..cells.len) |i| {
++                const rev_i = cells.len - i - 1;
++                if (!cells[rev_i].isEmpty()) break :max rev_i + 1;
++            }
++
++            break :max 0;
+         };
+ 
+         // We're over at the max
+@@ -52,63 +57,60 @@ pub const RunIterator = struct {
+         var j: usize = self.i;
+         while (j < max) : (j += 1) {
+             const cluster = j;
+-            const cell = self.row.getCell(j);
++            const cell = &cells[j];
+ 
+             // If we have a selection and we're at a boundary point, then
+             // we break the run here.
+-            if (self.selection) |unordered_sel| {
+-                if (j > self.i) {
+-                    const sel = unordered_sel.ordered(.forward);
+-
+-                    if (sel.start.x > 0 and
+-                        j == sel.start.x and
+-                        self.row.graphemeBreak(sel.start.x)) break;
+-
+-                    if (sel.end.x > 0 and
+-                        j == sel.end.x + 1 and
+-                        self.row.graphemeBreak(sel.end.x)) break;
+-                }
+-            }
++            // TODO(paged-terminal)
++            // if (self.selection) |unordered_sel| {
++            //     if (j > self.i) {
++            //         const sel = unordered_sel.ordered(.forward);
++            //
++            //         if (sel.start.x > 0 and
++            //             j == sel.start.x and
++            //             self.row.graphemeBreak(sel.start.x)) break;
++            //
++            //         if (sel.end.x > 0 and
++            //             j == sel.end.x + 1 and
++            //             self.row.graphemeBreak(sel.end.x)) break;
++            //     }
++            // }
+ 
+             // If we're a spacer, then we ignore it
+-            if (cell.attrs.wide_spacer_tail) continue;
++            switch (cell.wide) {
++                .narrow, .wide => {},
++                .spacer_head, .spacer_tail => continue,
++            }
+ 
+             // If our cell attributes are changing, then we split the run.
+             // This prevents a single glyph for ">=" to be rendered with
+             // one color when the two components have different styling.
+             if (j > self.i) {
+-                const prev_cell = self.row.getCell(j - 1);
+-                const Attrs = @TypeOf(cell.attrs);
+-                const Int = @typeInfo(Attrs).Struct.backing_integer.?;
+-                const prev_attrs: Int = @bitCast(prev_cell.attrs.styleAttrs());
+-                const attrs: Int = @bitCast(cell.attrs.styleAttrs());
+-                if (prev_attrs != attrs) break;
+-                if (!cell.bg.eql(prev_cell.bg)) break;
+-                if (!cell.fg.eql(prev_cell.fg)) break;
++                const prev_cell = cells[j - 1];
++                if (prev_cell.style_id != cell.style_id) break;
+             }
+ 
+             // Text runs break when font styles change so we need to get
+             // the proper style.
+             const style: font.Style = style: {
+-                if (cell.attrs.bold) {
+-                    if (cell.attrs.italic) break :style .bold_italic;
+-                    break :style .bold;
+-                }
+-
+-                if (cell.attrs.italic) break :style .italic;
++                // TODO(paged-terminal)
++                // if (cell.attrs.bold) {
++                //     if (cell.attrs.italic) break :style .bold_italic;
++                //     break :style .bold;
++                // }
++                //
++                // if (cell.attrs.italic) break :style .italic;
+                 break :style .regular;
+             };
+ 
+             // Determine the presentation format for this glyph.
+-            const presentation: ?font.Presentation = if (cell.attrs.grapheme) p: {
++            const presentation: ?font.Presentation = if (cell.hasGrapheme()) p: {
+                 // We only check the FIRST codepoint because I believe the
+                 // presentation format must be directly adjacent to the codepoint.
+-                var it = self.row.codepointIterator(j);
+-                if (it.next()) |cp| {
+-                    if (cp == 0xFE0E) break :p .text;
+-                    if (cp == 0xFE0F) break :p .emoji;
+-                }
+-
++                const cps = self.row.grapheme(cell) orelse break :p null;
++                assert(cps.len > 0);
++                if (cps[0] == 0xFE0E) break :p .text;
++                if (cps[0] == 0xFE0F) break :p .emoji;
+                 break :p null;
+             } else emoji: {
+                 // If we're not a grapheme, our individual char could be
+@@ -128,7 +130,7 @@ pub const RunIterator = struct {
+             // such as a skin-tone emoji is fine, but hovering over the
+             // joiners will show the joiners allowing you to modify the
+             // emoji.
+-            if (!cell.attrs.grapheme) {
++            if (!cell.hasGrapheme()) {
+                 if (self.cursor_x) |cursor_x| {
+                     // Exactly: self.i is the cursor and we iterated once. This
+                     // means that we started exactly at the cursor and did at
+@@ -163,7 +165,6 @@ pub const RunIterator = struct {
+                 // then we use that.
+                 if (try self.indexForCell(
+                     alloc,
+-                    j,
+                     cell,
+                     style,
+                     presentation,
+@@ -206,12 +207,12 @@ pub const RunIterator = struct {
+ 
+             // Add all the codepoints for our grapheme
+             try self.hooks.addCodepoint(
+-                if (cell.char == 0) ' ' else cell.char,
++                if (cell.codepoint() == 0) ' ' else cell.codepoint(),
+                 @intCast(cluster),
+             );
+-            if (cell.attrs.grapheme) {
+-                var it = self.row.codepointIterator(j);
+-                while (it.next()) |cp| {
++            if (cell.hasGrapheme()) {
++                const cps = self.row.grapheme(cell).?;
++                for (cps) |cp| {
+                     // Do not send presentation modifiers
+                     if (cp == 0xFE0E or cp == 0xFE0F) continue;
+                     try self.hooks.addCodepoint(cp, @intCast(cluster));
+@@ -242,13 +243,12 @@ pub const RunIterator = struct {
+     fn indexForCell(
+         self: *RunIterator,
+         alloc: Allocator,
+-        j: usize,
+-        cell: terminal.Screen.Cell,
++        cell: *terminal.Cell,
+         style: font.Style,
+         presentation: ?font.Presentation,
+     ) !?font.Group.FontIndex {
+         // Get the font index for the primary codepoint.
+-        const primary_cp: u32 = if (cell.empty() or cell.char == 0) ' ' else cell.char;
++        const primary_cp: u32 = if (cell.isEmpty() or cell.codepoint() == 0) ' ' else cell.codepoint();
+         const primary = try self.group.indexForCodepoint(
+             alloc,
+             primary_cp,
+@@ -258,16 +258,16 @@ pub const RunIterator = struct {
+ 
+         // Easy, and common: we aren't a multi-codepoint grapheme, so
+         // we just return whatever index for the cell codepoint.
+-        if (!cell.attrs.grapheme) return primary;
++        if (!cell.hasGrapheme()) return primary;
+ 
+         // If this is a grapheme, we need to find a font that supports
+         // all of the codepoints in the grapheme.
+-        var it = self.row.codepointIterator(j);
+-        var candidates = try std.ArrayList(font.Group.FontIndex).initCapacity(alloc, it.len() + 1);
++        const cps = self.row.grapheme(cell) orelse return primary;
++        var candidates = try std.ArrayList(font.Group.FontIndex).initCapacity(alloc, cps.len + 1);
+         defer candidates.deinit();
+         candidates.appendAssumeCapacity(primary);
+ 
+-        while (it.next()) |cp| {
++        for (cps) |cp| {
+             // Ignore Emoji ZWJs
+             if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+ 
+@@ -285,8 +285,7 @@ pub const RunIterator = struct {
+         // We need to find a candidate that has ALL of our codepoints
+         for (candidates.items) |idx| {
+             if (!self.group.group.hasCodepoint(idx, primary_cp, presentation)) continue;
+-            it.reset();
+-            while (it.next()) |cp| {
++            for (cps) |cp| {
+                 // Ignore Emoji ZWJs
+                 if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+                 if (!self.group.group.hasCodepoint(idx, cp, presentation)) break;
+
+commit 34200a3e833cad188abf0378e5e028daa37a4ee3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 09:40:18 2024 -0800
+
+    font/shaper: more tests passing
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 3ef90013..b98f0fd4 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -26,6 +26,7 @@ pub const TextRun = struct {
+ pub const RunIterator = struct {
+     hooks: font.Shaper.RunIteratorHook,
+     group: *font.GroupCache,
++    screen: *const terminal.Screen,
+     row: terminal.Pin,
+     selection: ?terminal.Selection = null,
+     cursor_x: ?usize = null,
+@@ -61,20 +62,19 @@ pub const RunIterator = struct {
+ 
+             // If we have a selection and we're at a boundary point, then
+             // we break the run here.
+-            // TODO(paged-terminal)
+-            // if (self.selection) |unordered_sel| {
+-            //     if (j > self.i) {
+-            //         const sel = unordered_sel.ordered(.forward);
+-            //
+-            //         if (sel.start.x > 0 and
+-            //             j == sel.start.x and
+-            //             self.row.graphemeBreak(sel.start.x)) break;
+-            //
+-            //         if (sel.end.x > 0 and
+-            //             j == sel.end.x + 1 and
+-            //             self.row.graphemeBreak(sel.end.x)) break;
+-            //     }
+-            // }
++            if (self.selection) |unordered_sel| {
++                if (j > self.i) {
++                    const sel = unordered_sel.ordered(self.screen, .forward);
++                    const start_x = sel.start().x;
++                    const end_x = sel.end().x;
++
++                    if (start_x > 0 and
++                        j == start_x) break;
++
++                    if (end_x > 0 and
++                        j == end_x + 1) break;
++                }
++            }
+ 
+             // If we're a spacer, then we ignore it
+             switch (cell.wide) {
+
+commit 05470bb36a11f5cbaefb141fbaa5f67a37dcb1bd
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 09:58:19 2024 -0800
+
+    font/shaper: new API
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index b98f0fd4..7a6c4e55 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -54,6 +54,9 @@ pub const RunIterator = struct {
+         // Allow the hook to prepare
+         try self.hooks.prepare();
+ 
++        // Let's get our style that we'll expect for the run.
++        const style = self.row.style(&cells[0]);
++
+         // Go through cell by cell and accumulate while we build our run.
+         var j: usize = self.i;
+         while (j < max) : (j += 1) {
+@@ -92,14 +95,13 @@ pub const RunIterator = struct {
+ 
+             // Text runs break when font styles change so we need to get
+             // the proper style.
+-            const style: font.Style = style: {
+-                // TODO(paged-terminal)
+-                // if (cell.attrs.bold) {
+-                //     if (cell.attrs.italic) break :style .bold_italic;
+-                //     break :style .bold;
+-                // }
+-                //
+-                // if (cell.attrs.italic) break :style .italic;
++            const font_style: font.Style = style: {
++                if (style.flags.bold) {
++                    if (style.flags.italic) break :style .bold_italic;
++                    break :style .bold;
++                }
++
++                if (style.flags.italic) break :style .italic;
+                 break :style .regular;
+             };
+ 
+@@ -166,7 +168,7 @@ pub const RunIterator = struct {
+                 if (try self.indexForCell(
+                     alloc,
+                     cell,
+-                    style,
++                    font_style,
+                     presentation,
+                 )) |idx| break :font_info .{ .idx = idx };
+ 
+@@ -175,7 +177,7 @@ pub const RunIterator = struct {
+                 if (try self.group.indexForCodepoint(
+                     alloc,
+                     0xFFFD, // replacement char
+-                    style,
++                    font_style,
+                     presentation,
+                 )) |idx| break :font_info .{ .idx = idx, .fallback = 0xFFFD };
+ 
+@@ -183,7 +185,7 @@ pub const RunIterator = struct {
+                 if (try self.group.indexForCodepoint(
+                     alloc,
+                     ' ',
+-                    style,
++                    font_style,
+                     presentation,
+                 )) |idx| break :font_info .{ .idx = idx, .fallback = ' ' };
+ 
+
+commit 9b4ab0e209b84890cf53182078a6c42d85553263
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 10:17:41 2024 -0800
+
+    zig build test with renamed terminal package
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 7a6c4e55..c1f48377 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -3,7 +3,7 @@ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+ const font = @import("../main.zig");
+ const shape = @import("../shape.zig");
+-const terminal = @import("../../terminal/main.zig").new;
++const terminal = @import("../../terminal/main.zig");
+ 
+ /// A single text run. A text run is only valid for one Shaper instance and
+ /// until the next run is created. A text run never goes across multiple
+
+commit cf885b89983100aa94a2e2117d91ac016056016d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Mar 9 20:37:33 2024 -0800
+
+    font/shaper: fix style for runs
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index c1f48377..b5c29ec3 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -55,7 +55,7 @@ pub const RunIterator = struct {
+         try self.hooks.prepare();
+ 
+         // Let's get our style that we'll expect for the run.
+-        const style = self.row.style(&cells[0]);
++        const style = self.row.style(&cells[self.i]);
+ 
+         // Go through cell by cell and accumulate while we build our run.
+         var j: usize = self.i;
+
+commit 329697779a662792d9e88c387044ef2b9c12a82f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Apr 5 18:51:26 2024 -0700
+
+    renderer/metal: convert more
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index b5c29ec3..2d982411 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -15,17 +15,17 @@ pub const TextRun = struct {
+     /// The total number of cells produced by this run.
+     cells: u16,
+ 
+-    /// The font group that built this run.
+-    group: *font.GroupCache,
++    /// The font grid that built this run.
++    grid: *font.SharedGrid,
+ 
+     /// The font index to use for the glyphs of this run.
+-    font_index: font.Group.FontIndex,
++    font_index: font.Collection.Index,
+ };
+ 
+ /// RunIterator is an iterator that yields text runs.
+ pub const RunIterator = struct {
+     hooks: font.Shaper.RunIteratorHook,
+-    group: *font.GroupCache,
++    grid: *font.SharedGrid,
+     screen: *const terminal.Screen,
+     row: terminal.Pin,
+     selection: ?terminal.Selection = null,
+@@ -49,7 +49,7 @@ pub const RunIterator = struct {
+         if (self.i >= max) return null;
+ 
+         // Track the font for our current run
+-        var current_font: font.Group.FontIndex = .{};
++        var current_font: font.Collection.Index = .{};
+ 
+         // Allow the hook to prepare
+         try self.hooks.prepare();
+@@ -117,7 +117,7 @@ pub const RunIterator = struct {
+             } else emoji: {
+                 // If we're not a grapheme, our individual char could be
+                 // an emoji so we want to check if we expect emoji presentation.
+-                // The font group indexForCodepoint we use below will do this
++                // The font grid indexForCodepoint we use below will do this
+                 // automatically.
+                 break :emoji null;
+             };
+@@ -160,7 +160,7 @@ pub const RunIterator = struct {
+             // grapheme, i.e. combining characters), we need to find a font
+             // that supports all of them.
+             const font_info: struct {
+-                idx: font.Group.FontIndex,
++                idx: font.Collection.Index,
+                 fallback: ?u32 = null,
+             } = font_info: {
+                 // If we find a font that supports this entire grapheme
+@@ -231,7 +231,7 @@ pub const RunIterator = struct {
+         return TextRun{
+             .offset = @intCast(self.i),
+             .cells = @intCast(j - self.i),
+-            .group = self.group,
++            .grid = self.grid,
+             .font_index = current_font,
+         };
+     }
+@@ -248,7 +248,7 @@ pub const RunIterator = struct {
+         cell: *terminal.Cell,
+         style: font.Style,
+         presentation: ?font.Presentation,
+-    ) !?font.Group.FontIndex {
++    ) !?font.Collection.Index {
+         // Get the font index for the primary codepoint.
+         const primary_cp: u32 = if (cell.isEmpty() or cell.codepoint() == 0) ' ' else cell.codepoint();
+         const primary = try self.group.indexForCodepoint(
+@@ -265,7 +265,7 @@ pub const RunIterator = struct {
+         // If this is a grapheme, we need to find a font that supports
+         // all of the codepoints in the grapheme.
+         const cps = self.row.grapheme(cell) orelse return primary;
+-        var candidates = try std.ArrayList(font.Group.FontIndex).initCapacity(alloc, cps.len + 1);
++        var candidates = try std.ArrayList(font.Collection.Index).initCapacity(alloc, cps.len + 1);
+         defer candidates.deinit();
+         candidates.appendAssumeCapacity(primary);
+ 
+
+commit c88137d2545b1dd5fd55bf576b218a0e6e33d1a7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Apr 5 20:21:13 2024 -0700
+
+    font/shaper: work on new grid APIs
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 2d982411..36e7ef2a 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -174,7 +174,7 @@ pub const RunIterator = struct {
+ 
+                 // Otherwise we need a fallback character. Prefer the
+                 // official replacement character.
+-                if (try self.group.indexForCodepoint(
++                if (try self.grid.getIndex(
+                     alloc,
+                     0xFFFD, // replacement char
+                     font_style,
+@@ -182,7 +182,7 @@ pub const RunIterator = struct {
+                 )) |idx| break :font_info .{ .idx = idx, .fallback = 0xFFFD };
+ 
+                 // Fallback to space
+-                if (try self.group.indexForCodepoint(
++                if (try self.grid.getIndex(
+                     alloc,
+                     ' ',
+                     font_style,
+@@ -251,7 +251,7 @@ pub const RunIterator = struct {
+     ) !?font.Collection.Index {
+         // Get the font index for the primary codepoint.
+         const primary_cp: u32 = if (cell.isEmpty() or cell.codepoint() == 0) ' ' else cell.codepoint();
+-        const primary = try self.group.indexForCodepoint(
++        const primary = try self.grid.getIndex(
+             alloc,
+             primary_cp,
+             style,
+@@ -275,7 +275,7 @@ pub const RunIterator = struct {
+ 
+             // Find a font that supports this codepoint. If none support this
+             // then the whole grapheme can't be rendered so we return null.
+-            const idx = try self.group.indexForCodepoint(
++            const idx = try self.grid.getIndex(
+                 alloc,
+                 cp,
+                 style,
+@@ -286,11 +286,11 @@ pub const RunIterator = struct {
+ 
+         // We need to find a candidate that has ALL of our codepoints
+         for (candidates.items) |idx| {
+-            if (!self.group.group.hasCodepoint(idx, primary_cp, presentation)) continue;
++            if (!self.grid.hasCodepoint(idx, primary_cp, presentation)) continue;
+             for (cps) |cp| {
+                 // Ignore Emoji ZWJs
+                 if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+-                if (!self.group.group.hasCodepoint(idx, cp, presentation)) break;
++                if (!self.grid.hasCodepoint(idx, cp, presentation)) break;
+             } else {
+                 // If the while completed, then we have a candidate that
+                 // supports all of our codepoints.
+
+commit 313c7f4cf1e7ef55807abbee7e9a85d3bafa4ff5
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Apr 30 11:08:13 2024 -0700
+
+    font: runs do not split on bg color change
+    
+    We previously split text runs for shaping on bg color changes. As
+    pointed out in Discord, this is not necessary, since we can always color
+    cells according to their desired background even if the text in the cell
+    shapes to something else.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 36e7ef2a..9441fae2 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -88,9 +88,17 @@ pub const RunIterator = struct {
+             // If our cell attributes are changing, then we split the run.
+             // This prevents a single glyph for ">=" to be rendered with
+             // one color when the two components have different styling.
+-            if (j > self.i) {
++            if (j > self.i) style: {
+                 const prev_cell = cells[j - 1];
+-                if (prev_cell.style_id != cell.style_id) break;
++
++                // If the style is exactly the change then fast path out.
++                if (prev_cell.style_id == cell.style_id) break :style;
++
++                // The style is different. We allow differing background
++                // styles but any other change results in a new run.
++                const c1 = comparableStyle(style);
++                const c2 = comparableStyle(self.row.style(&cells[j]));
++                if (!c1.eql(c2)) break;
+             }
+ 
+             // Text runs break when font styles change so we need to get
+@@ -301,3 +309,16 @@ pub const RunIterator = struct {
+         return null;
+     }
+ };
++
++/// Returns a style that when compared must be identical for a run to
++/// continue.
++fn comparableStyle(style: terminal.Style) terminal.Style {
++    var s = style;
++
++    // We allow background colors to differ because we'll just paint the
++    // cell background whatever the style is, and wherever the glyph
++    // lands on top of it will be the color of the glyph.
++    s.bg_color = .none;
++
++    return s;
++}
+
+commit 81a12b0d8647868b0109f3a1dcc7adf98122d4d9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed May 1 18:28:53 2024 -0700
+
+    font/shaper: add hash to text runs
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 9441fae2..ee5b8f9e 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -4,11 +4,21 @@ const Allocator = std.mem.Allocator;
+ const font = @import("../main.zig");
+ const shape = @import("../shape.zig");
+ const terminal = @import("../../terminal/main.zig");
++const autoHash = std.hash.autoHash;
++const Hasher = std.hash.Wyhash;
+ 
+ /// A single text run. A text run is only valid for one Shaper instance and
+ /// until the next run is created. A text run never goes across multiple
+ /// rows in a terminal, so it is guaranteed to always be one line.
+ pub const TextRun = struct {
++    /// A unique hash for this run. This can be used to cache the shaping
++    /// results. We don't provide a means to compare actual values if the
++    /// hash is the same, so we should continue to improve this hash to
++    /// lower the chance of hash collisions if they become a problem. If
++    /// there are hash collisions, it would result in rendering issues but
++    /// the core data would be correct.
++    hash: u64,
++
+     /// The offset in the row where this run started
+     offset: u16,
+ 
+@@ -54,6 +64,9 @@ pub const RunIterator = struct {
+         // Allow the hook to prepare
+         try self.hooks.prepare();
+ 
++        // Initialize our hash for this run.
++        var hasher = Hasher.init(0);
++
+         // Let's get our style that we'll expect for the run.
+         const style = self.row.style(&cells[self.i]);
+ 
+@@ -211,12 +224,13 @@ pub const RunIterator = struct {
+             // If we're a fallback character, add that and continue; we
+             // don't want to add the entire grapheme.
+             if (font_info.fallback) |cp| {
+-                try self.hooks.addCodepoint(cp, @intCast(cluster));
++                try self.addCodepoint(&hasher, cp, @intCast(cluster));
+                 continue;
+             }
+ 
+             // Add all the codepoints for our grapheme
+-            try self.hooks.addCodepoint(
++            try self.addCodepoint(
++                &hasher,
+                 if (cell.codepoint() == 0) ' ' else cell.codepoint(),
+                 @intCast(cluster),
+             );
+@@ -225,7 +239,7 @@ pub const RunIterator = struct {
+                 for (cps) |cp| {
+                     // Do not send presentation modifiers
+                     if (cp == 0xFE0E or cp == 0xFE0F) continue;
+-                    try self.hooks.addCodepoint(cp, @intCast(cluster));
++                    try self.addCodepoint(&hasher, cp, @intCast(cluster));
+                 }
+             }
+         }
+@@ -233,10 +247,14 @@ pub const RunIterator = struct {
+         // Finalize our buffer
+         try self.hooks.finalize();
+ 
++        // Add our length to the hash as an additional mechanism to avoid collisions
++        autoHash(&hasher, j - self.i);
++
+         // Move our cursor. Must defer since we use self.i below.
+         defer self.i = j;
+ 
+         return TextRun{
++            .hash = hasher.final(),
+             .offset = @intCast(self.i),
+             .cells = @intCast(j - self.i),
+             .grid = self.grid,
+@@ -244,6 +262,12 @@ pub const RunIterator = struct {
+         };
+     }
+ 
++    fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
++        autoHash(hasher, cp);
++        autoHash(hasher, cluster);
++        try self.hooks.addCodepoint(cp, cluster);
++    }
++
+     /// Find a font index that supports the grapheme for the given cell,
+     /// or null if no such font exists.
+     ///
+
+commit 6683b159ce3492e7f8ccccce5e88ad895c4740c5
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed May 1 19:53:27 2024 -0700
+
+    font/shaper: run hash should include font index
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index ee5b8f9e..ef55ba98 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -250,6 +250,9 @@ pub const RunIterator = struct {
+         // Add our length to the hash as an additional mechanism to avoid collisions
+         autoHash(&hasher, j - self.i);
+ 
++        // Add our font index
++        autoHash(&hasher, current_font);
++
+         // Move our cursor. Must defer since we use self.i below.
+         defer self.i = j;
+ 
+
+commit 77ee2f413cc290409c9e5cbb19fb0e29cd25041a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Jul 29 14:36:49 2024 -0700
+
+    terminal: hasText no longer special cases kitty placeholders
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index ef55ba98..8d53c601 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -228,6 +228,12 @@ pub const RunIterator = struct {
+                 continue;
+             }
+ 
++            // If we're a Kitty unicode placeholder then we add a blank.
++            if (cell.codepoint() == terminal.kitty.graphics.unicode.placeholder) {
++                try self.addCodepoint(&hasher, ' ', @intCast(cluster));
++                continue;
++            }
++
+             // Add all the codepoints for our grapheme
+             try self.addCodepoint(
+                 &hasher,
+@@ -284,8 +290,20 @@ pub const RunIterator = struct {
+         style: font.Style,
+         presentation: ?font.Presentation,
+     ) !?font.Collection.Index {
++        if (cell.isEmpty() or
++            cell.codepoint() == 0 or
++            cell.codepoint() == terminal.kitty.graphics.unicode.placeholder)
++        {
++            return try self.grid.getIndex(
++                alloc,
++                ' ',
++                style,
++                presentation,
++            );
++        }
++
+         // Get the font index for the primary codepoint.
+-        const primary_cp: u32 = if (cell.isEmpty() or cell.codepoint() == 0) ' ' else cell.codepoint();
++        const primary_cp: u32 = cell.codepoint();
+         const primary = try self.grid.getIndex(
+             alloc,
+             primary_cp,
+
+commit e385e0f9d0759a036a51fc2a169fbb2ede64f127
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 11 15:23:05 2024 -0700
+
+    font/shaper: split text runs on common bad ligature pairs
+    
+    Fixes #2081
+    
+    Many fonts have a bad ligature for "fl", "fi", or "st". We previously
+    maintained a list of such fonts in quirks.zig. However, these are so
+    common that it was suggested we do something more systematic and this
+    commit is that.
+    
+    This commit changes our text run splitting algorithm to always split on
+    `fl`, `fi`, and `st`. This will cause some more runs for well behaved
+    fonts but the combination of those characters is rare enough and our
+    caching algorithm is good enough that it should be minimal overhead.
+    
+    This commit renders our existing quirks fonts obsolete but I kept that
+    logic around so we can add to it if/when we find other quirky font
+    behaviors.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 8d53c601..8ef0f790 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -104,6 +104,30 @@ pub const RunIterator = struct {
+             if (j > self.i) style: {
+                 const prev_cell = cells[j - 1];
+ 
++                // If the prev cell and this cell are both plain
++                // codepoints then we check if they are commonly "bad"
++                // ligatures and spit the run if they are.
++                if (prev_cell.content_tag == .codepoint and
++                    cell.content_tag == .codepoint)
++                {
++                    const prev_cp = prev_cell.codepoint();
++                    switch (prev_cp) {
++                        // fl, fi
++                        'f' => {
++                            const cp = cell.codepoint();
++                            if (cp == 'l' or cp == 'i') break;
++                        },
++
++                        // st
++                        's' => {
++                            const cp = cell.codepoint();
++                            if (cp == 't') break;
++                        },
++
++                        else => {},
++                    }
++                }
++
+                 // If the style is exactly the change then fast path out.
+                 if (prev_cell.style_id == cell.style_id) break :style;
+ 
+
+commit e4f4b708c989e68a96ed340f5ce99b0678c6f556
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Fri Oct 11 13:44:49 2024 -0400
+
+    font/shaper: explicitly skip invisible cells while shaping
+    
+    Fixes a bug caused by the renderer logic assuming this behavior and not
+    advancing the run iterator when skipping foreground elements in cells
+    with the invisible flag set.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 8ef0f790..22d19979 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -55,6 +55,14 @@ pub const RunIterator = struct {
+             break :max 0;
+         };
+ 
++        // Invisible cells don't have any glyphs rendered,
++        // so we explicitly skip them in the shaping process.
++        while (self.i < max and
++            self.row.style(&cells[self.i]).flags.invisible)
++        {
++            self.i += 1;
++        }
++
+         // We're over at the max
+         if (self.i >= max) return null;
+ 
+
+commit f0080529c42ccccbeb0340a7e36534695c621807
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Mar 19 14:50:42 2025 -0600
+
+    fix(font/shape): don't require emoji presentation for grapheme parts
+    
+    Also update shaper test that fails because the run iterator can't apply
+    that logic since `testWriteString` doesn't do proper grpaheme clustering
+    so the parts are actually split across multiple cells.
+    
+    Several other tests are technically incorrect for the same reason but
+    still pass, so I've decided not to fix them here.
+
+diff --git a/src/font/shaper/run.zig b/src/font/shaper/run.zig
+index 22d19979..18ddd4b5 100644
+--- a/src/font/shaper/run.zig
++++ b/src/font/shaper/run.zig
+@@ -360,11 +360,16 @@ pub const RunIterator = struct {
+ 
+             // Find a font that supports this codepoint. If none support this
+             // then the whole grapheme can't be rendered so we return null.
++            //
++            // We explicitly do not require the additional grapheme components
++            // to support the base presentation, since it is common for emoji
++            // fonts to support the base emoji with emoji presentation but not
++            // certain ZWJ-combined characters like the male and female signs.
+             const idx = try self.grid.getIndex(
+                 alloc,
+                 cp,
+                 style,
+-                presentation,
++                null,
+             ) orelse return null;
+             candidates.appendAssumeCapacity(idx);
+         }
+@@ -375,7 +380,7 @@ pub const RunIterator = struct {
+             for (cps) |cp| {
+                 // Ignore Emoji ZWJs
+                 if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+-                if (!self.grid.hasCodepoint(idx, cp, presentation)) break;
++                if (!self.grid.hasCodepoint(idx, cp, null)) break;
+             } else {
+                 // If the while completed, then we have a candidate that
+                 // supports all of our codepoints.
+
