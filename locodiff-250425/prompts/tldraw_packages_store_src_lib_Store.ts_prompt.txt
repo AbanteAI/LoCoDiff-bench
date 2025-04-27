@@ -1,0 +1,5503 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- packages/store/src/lib/Store.ts
+
+commit c1b84bf2468caeb0c6e502f621b19dffe3aa8aba
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Sat Jun 3 09:59:04 2023 +0100
+
+    Rename tlstore to store (#1507)
+    
+    This PR renames the `@tldraw/tlstore` package to `@tldraw/store`, mainly
+    to avoid confusion between `TLStore`. Will be doing the same with other
+    packages.
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking Change
+    
+    ### Release Notes
+    
+    - Replace @tldraw/tlstore with @tldraw/store
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+new file mode 100644
+index 000000000..86f847f96
+--- /dev/null
++++ b/packages/store/src/lib/Store.ts
+@@ -0,0 +1,834 @@
++import {
++	objectMapEntries,
++	objectMapFromEntries,
++	objectMapKeys,
++	objectMapValues,
++	throttledRaf,
++} from '@tldraw/utils'
++import { Atom, Computed, Reactor, atom, computed, reactor, transact } from 'signia'
++import { ID, IdOf, UnknownRecord } from './BaseRecord'
++import { Cache } from './Cache'
++import { RecordType } from './RecordType'
++import { StoreQueries } from './StoreQueries'
++import { SerializedSchema, StoreSchema } from './StoreSchema'
++import { devFreeze } from './devFreeze'
++
++type RecFromId<K extends ID<UnknownRecord>> = K extends ID<infer R> ? R : never
++
++/**
++ * A diff describing the changes to a record.
++ *
++ * @public
++ */
++export type RecordsDiff<R extends UnknownRecord> = {
++	added: Record<IdOf<R>, R>
++	updated: Record<IdOf<R>, [from: R, to: R]>
++	removed: Record<IdOf<R>, R>
++}
++
++/**
++ * A diff describing the changes to a collection.
++ *
++ * @public
++ */
++export type CollectionDiff<T> = { added?: Set<T>; removed?: Set<T> }
++
++/**
++ * An entry containing changes that originated either by user actions or remote changes.
++ *
++ * @public
++ */
++export type HistoryEntry<R extends UnknownRecord = UnknownRecord> = {
++	changes: RecordsDiff<R>
++	source: 'user' | 'remote'
++}
++
++/**
++ * A function that will be called when the history changes.
++ *
++ * @public
++ */
++export type StoreListener<R extends UnknownRecord> = (entry: HistoryEntry<R>) => void
++
++/**
++ * A record store is a collection of records of different types.
++ *
++ * @public
++ */
++export type ComputedCache<Data, R extends UnknownRecord> = {
++	get(id: IdOf<R>): Data | undefined
++}
++
++/**
++ * A serialized snapshot of the record store's values.
++ *
++ * @public
++ */
++export type StoreSnapshot<R extends UnknownRecord> = Record<IdOf<R>, R>
++
++/** @public */
++export type StoreValidator<R extends UnknownRecord> = {
++	validate: (record: unknown) => R
++}
++
++/** @public */
++export type StoreValidators<R extends UnknownRecord> = {
++	[K in R['typeName']]: StoreValidator<Extract<R, { typeName: K }>>
++}
++
++/** @public */
++export type StoreError = {
++	error: Error
++	phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests'
++	recordBefore?: unknown
++	recordAfter: unknown
++	isExistingValidationIssue: boolean
++}
++
++/** @internal */
++export type StoreRecord<S extends Store<any>> = S extends Store<infer R> ? R : never
++
++/**
++ * A store of records.
++ *
++ * @public
++ */
++export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
++	/**
++	 * An atom containing the store's atoms.
++	 *
++	 * @internal
++	 * @readonly
++	 */
++	private readonly atoms = atom('store_atoms', {} as Record<IdOf<R>, Atom<R>>)
++
++	/**
++	 * An atom containing the store's history.
++	 *
++	 * @public
++	 * @readonly
++	 */
++	readonly history: Atom<number, RecordsDiff<R>> = atom('history', 0, {
++		historyLength: 1000,
++	})
++
++	/**
++	 * A StoreQueries instance for this store.
++	 *
++	 * @public
++	 * @readonly
++	 */
++	readonly query = new StoreQueries<R>(this.atoms, this.history)
++
++	/**
++	 * A set containing listeners that have been added to this store.
++	 *
++	 * @internal
++	 */
++	private listeners = new Set<StoreListener<R>>()
++
++	/**
++	 * An array of history entries that have not yet been flushed.
++	 *
++	 * @internal
++	 */
++	private historyAccumulator = new HistoryAccumulator<R>()
++
++	/**
++	 * A reactor that responds to changes to the history by squashing the accumulated history and
++	 * notifying listeners of the changes.
++	 *
++	 * @internal
++	 */
++	private historyReactor: Reactor
++
++	readonly schema: StoreSchema<R, Props>
++
++	readonly props: Props
++
++	constructor(config: {
++		/** The store's initial data. */
++		initialData?: StoreSnapshot<R>
++		/**
++		 * A map of validators for each record type. A record's validator will be called when the record
++		 * is created or updated. It should throw an error if the record is invalid.
++		 */
++		schema: StoreSchema<R, Props>
++		props: Props
++	}) {
++		const { initialData, schema } = config
++
++		this.schema = schema
++		this.props = config.props
++
++		if (initialData) {
++			this.atoms.set(
++				objectMapFromEntries(
++					objectMapEntries(initialData).map(([id, record]) => [
++						id,
++						atom('atom:' + id, this.schema.validateRecord(this, record, 'initialize', null)),
++					])
++				)
++			)
++		}
++
++		this.historyReactor = reactor(
++			'Store.historyReactor',
++			() => {
++				// deref to make sure we're subscribed regardless of whether we need to propagate
++				this.history.value
++				// If we have accumulated history, flush it and update listeners
++				this._flushHistory()
++			},
++			{ scheduleEffect: (cb) => throttledRaf(cb) }
++		)
++	}
++
++	public _flushHistory() {
++		// If we have accumulated history, flush it and update listeners
++		if (this.historyAccumulator.hasChanges()) {
++			const entries = this.historyAccumulator.flush()
++			for (const { changes, source } of entries) {
++				this.listeners.forEach((l) => l({ changes, source }))
++			}
++		}
++	}
++
++	/**
++	 * Update the history with a diff of changes.
++	 *
++	 * @param changes - The changes to add to the history.
++	 */
++	private updateHistory(changes: RecordsDiff<R>): void {
++		this.historyAccumulator.add({
++			changes,
++			source: this.isMergingRemoteChanges ? 'remote' : 'user',
++		})
++		if (this.listeners.size === 0) {
++			this.historyAccumulator.clear()
++		}
++		this.history.set(this.history.value + 1, changes)
++	}
++
++	validate(phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests') {
++		this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
++	}
++
++	/**
++	 * A callback fired after a record is created. Use this to perform related updates to other
++	 * records in the store.
++	 *
++	 * @param record - The record to be created
++	 */
++	onAfterCreate?: (record: R) => void
++
++	/**
++	 * A callback fired after each record's change.
++	 *
++	 * @param prev - The previous value, if any.
++	 * @param next - The next value.
++	 */
++	onAfterChange?: (prev: R, next: R) => void
++
++	/**
++	 * A callback fired before a record is deleted.
++	 *
++	 * @param prev - The record that will be deleted.
++	 */
++	onBeforeDelete?: (prev: R) => void
++
++	/**
++	 * A callback fired after a record is deleted.
++	 *
++	 * @param prev - The record that will be deleted.
++	 */
++	onAfterDelete?: (prev: R) => void
++
++	// used to avoid running callbacks when rolling back changes in sync client
++	private _runCallbacks = true
++
++	/**
++	 * Add some records to the store. It's an error if they already exist.
++	 *
++	 * @param records - The records to add.
++	 * @public
++	 */
++	put = (records: R[], phaseOverride?: 'initialize'): void => {
++		transact(() => {
++			const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {}
++			const additions: Record<IdOf<UnknownRecord>, R> = {}
++
++			const currentMap = this.atoms.__unsafe__getWithoutCapture()
++			let map = null as null | Record<IdOf<UnknownRecord>, Atom<R>>
++
++			// Iterate through all records, creating, updating or removing as needed
++			let record: R
++
++			// There's a chance that, despite having records, all of the values are
++			// identical to what they were before; and so we'd end up with an "empty"
++			// history entry. Let's keep track of whether we've actually made any
++			// changes (e.g. additions, deletions, or updates that produce a new value).
++			let didChange = false
++
++			for (let i = 0, n = records.length; i < n; i++) {
++				record = records[i]
++
++				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
++
++				if (recordAtom) {
++					// If we already have an atom for this record, update its value.
++
++					const initialValue = recordAtom.__unsafe__getWithoutCapture()
++
++					// Validate the record
++					record = this.schema.validateRecord(
++						this,
++						record,
++						phaseOverride ?? 'updateRecord',
++						initialValue
++					)
++
++					recordAtom.set(devFreeze(record))
++
++					// need to deref atom in case nextValue is not identical but is .equals?
++					const finalValue = recordAtom.__unsafe__getWithoutCapture()
++
++					// If the value has changed, assign it to updates.
++					if (initialValue !== finalValue) {
++						didChange = true
++						updates[record.id] = [initialValue, finalValue]
++					}
++				} else {
++					didChange = true
++
++					// If we don't have an atom, create one.
++
++					// Validate the record
++					record = this.schema.validateRecord(
++						this,
++						record as R,
++						phaseOverride ?? 'createRecord',
++						null
++					)
++
++					// Mark the change as a new addition.
++					additions[record.id] = record
++
++					// Assign the atom to the map under the record's id.
++					if (!map) {
++						map = { ...currentMap }
++					}
++					map[record.id] = atom('atom:' + record.id, record)
++				}
++			}
++
++			// Set the map of atoms to the store.
++			if (map) {
++				this.atoms.set(map)
++			}
++
++			// If we did change, update the history
++			if (!didChange) return
++			this.updateHistory({
++				added: additions,
++				updated: updates,
++				removed: {} as Record<IdOf<R>, R>,
++			})
++
++			const { onAfterCreate, onAfterChange } = this
++
++			if (onAfterCreate && this._runCallbacks) {
++				// Run the onAfterChange callback for addition.
++				Object.values(additions).forEach((record) => {
++					onAfterCreate(record)
++				})
++			}
++
++			if (onAfterChange && this._runCallbacks) {
++				// Run the onAfterChange callback for update.
++				Object.values(updates).forEach(([from, to]) => {
++					onAfterChange(from, to)
++				})
++			}
++		})
++	}
++
++	/**
++	 * Remove some records from the store via their ids.
++	 *
++	 * @param ids - The ids of the records to remove.
++	 * @public
++	 */
++	remove = (ids: IdOf<R>[]): void => {
++		transact(() => {
++			if (this.onBeforeDelete && this._runCallbacks) {
++				for (const id of ids) {
++					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
++					if (!atom) continue
++
++					this.onBeforeDelete(atom.value)
++				}
++			}
++
++			let removed = undefined as undefined | RecordsDiff<R>['removed']
++
++			// For each map in our atoms, remove the ids that we are removing.
++			this.atoms.update((atoms) => {
++				let result: typeof atoms | undefined = undefined
++
++				for (const id of ids) {
++					if (!(id in atoms)) continue
++					if (!result) result = { ...atoms }
++					if (!removed) removed = {} as Record<IdOf<R>, R>
++					delete result[id]
++					removed[id] = atoms[id].value
++				}
++
++				return result ?? atoms
++			})
++
++			if (!removed) return
++			// Update the history with the removed records.
++			this.updateHistory({ added: {}, updated: {}, removed } as RecordsDiff<R>)
++
++			// If we have an onAfterChange, run it for each removed record.
++			if (this.onAfterDelete && this._runCallbacks) {
++				for (let i = 0, n = ids.length; i < n; i++) {
++					this.onAfterDelete(removed[ids[i]])
++				}
++			}
++		})
++	}
++
++	/**
++	 * Get the value of a store record by its id.
++	 *
++	 * @param id - The id of the record to get.
++	 * @public
++	 */
++	get = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
++		return this.atoms.value[id]?.value as any
++	}
++
++	/**
++	 * Get the value of a store record by its id without updating its epoch.
++	 *
++	 * @param id - The id of the record to get.
++	 * @public
++	 */
++	unsafeGetWithoutCapture = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
++		return this.atoms.value[id]?.__unsafe__getWithoutCapture() as any
++	}
++
++	/**
++	 * Opposite of `deserialize`. Creates a JSON payload from the record store.
++	 *
++	 * @param filter - A function to filter structs that do not satisfy the predicate.
++	 * @returns The record store snapshot as a JSON payload.
++	 */
++	serialize = (filter?: (record: R) => boolean): StoreSnapshot<R> => {
++		const result = {} as StoreSnapshot<R>
++		for (const [id, atom] of objectMapEntries(this.atoms.value)) {
++			const record = atom.value
++			if (typeof filter === 'function' && !filter(record)) continue
++			result[id as IdOf<R>] = record
++		}
++		return result
++	}
++
++	/**
++	 * The same as `serialize`, but only serializes records with a scope of `document`.
++	 * @returns The record store snapshot as a JSON payload.
++	 */
++	serializeDocumentState = (): StoreSnapshot<R> => {
++		return this.serialize((r) => {
++			const type = this.schema.types[r.typeName as R['typeName']] as RecordType<any, any>
++			return type.scope === 'document'
++		})
++	}
++
++	/**
++	 * Opposite of `serialize`. Replace the store's current records with records as defined by a
++	 * simple JSON structure into the stores.
++	 *
++	 * @param snapshot - The JSON snapshot to deserialize.
++	 * @public
++	 */
++	deserialize = (snapshot: StoreSnapshot<R>): void => {
++		transact(() => {
++			this.clear()
++			this.put(Object.values(snapshot))
++		})
++	}
++
++	/**
++	 * Get a serialized snapshot of the store and its schema.
++	 *
++	 * ```ts
++	 * const snapshot = store.getSnapshot()
++	 * store.loadSnapshot(snapshot)
++	 * ```
++	 *
++	 * @public
++	 */
++	getSnapshot() {
++		return {
++			store: this.serializeDocumentState(),
++			schema: this.schema.serialize(),
++		}
++	}
++
++	/**
++	 * Load a serialized snapshot.
++	 *
++	 * ```ts
++	 * const snapshot = store.getSnapshot()
++	 * store.loadSnapshot(snapshot)
++	 * ```
++	 *
++	 * @param snapshot - The snapshot to load.
++	 *
++	 * @public
++	 */
++	loadSnapshot(snapshot: { store: StoreSnapshot<R>; schema: SerializedSchema }): void {
++		const migrationResult = this.schema.migrateStoreSnapshot(snapshot.store, snapshot.schema)
++
++		if (migrationResult.type === 'error') {
++			throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
++		}
++
++		this.deserialize(migrationResult.value)
++	}
++
++	/**
++	 * Get an array of all values in the store.
++	 *
++	 * @returns An array of all values in the store.
++	 * @public
++	 */
++	allRecords = (): R[] => {
++		return objectMapValues(this.atoms.value).map((atom) => atom.value)
++	}
++
++	/**
++	 * Removes all records from the store.
++	 *
++	 * @public
++	 */
++	clear = (): void => {
++		this.remove(objectMapKeys(this.atoms.value))
++	}
++
++	/**
++	 * Update a record. To update multiple records at once, use the `update` method of the
++	 * `TypedStore` class.
++	 *
++	 * @param id - The id of the record to update.
++	 * @param updater - A function that updates the record.
++	 */
++	update = <K extends IdOf<R>>(id: K, updater: (record: RecFromId<K>) => RecFromId<K>) => {
++		const atom = this.atoms.value[id]
++		if (!atom) {
++			console.error(`Record ${id} not found. This is probably an error`)
++			return
++		}
++		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecFromId<K>) as any])
++	}
++
++	/**
++	 * Get whether the record store has a id.
++	 *
++	 * @param id - The id of the record to check.
++	 * @public
++	 */
++	has = <K extends IdOf<R>>(id: K): boolean => {
++		return !!this.atoms.value[id]
++	}
++
++	/**
++	 * Add a new listener to the store.
++	 *
++	 * @param listener - The listener to call when the store updates.
++	 * @returns A function to remove the listener.
++	 */
++	listen = (listener: StoreListener<R>) => {
++		// flush history so that this listener's history starts from exactly now
++		this._flushHistory()
++
++		this.listeners.add(listener)
++
++		if (!this.historyReactor.scheduler.isActivelyListening) {
++			this.historyReactor.start()
++		}
++
++		return () => {
++			this.listeners.delete(listener)
++
++			if (this.listeners.size === 0) {
++				this.historyReactor.stop()
++			}
++		}
++	}
++
++	private isMergingRemoteChanges = false
++
++	/**
++	 * Merge changes from a remote source without triggering listeners.
++	 *
++	 * @param fn - A function that merges the external changes.
++	 * @public
++	 */
++	mergeRemoteChanges = (fn: () => void) => {
++		if (this.isMergingRemoteChanges) {
++			return fn()
++		}
++
++		try {
++			this.isMergingRemoteChanges = true
++			transact(fn)
++		} finally {
++			this.isMergingRemoteChanges = false
++		}
++	}
++
++	extractingChanges(fn: () => void): RecordsDiff<R> {
++		const changes: Array<RecordsDiff<R>> = []
++		const dispose = this.historyAccumulator.intercepting((entry) => changes.push(entry.changes))
++		try {
++			transact(fn)
++			return squashRecordDiffs(changes)
++		} finally {
++			dispose()
++		}
++	}
++
++	applyDiff(diff: RecordsDiff<R>, runCallbacks = true) {
++		const prevRunCallbacks = this._runCallbacks
++		try {
++			this._runCallbacks = runCallbacks
++			transact(() => {
++				const toPut = objectMapValues(diff.added).concat(
++					objectMapValues(diff.updated).map(([_from, to]) => to)
++				)
++				const toRemove = objectMapKeys(diff.removed)
++				if (toPut.length) {
++					this.put(toPut)
++				}
++				if (toRemove.length) {
++					this.remove(toRemove)
++				}
++			})
++		} finally {
++			this._runCallbacks = prevRunCallbacks
++		}
++	}
++
++	/**
++	 * Create a computed cache.
++	 *
++	 * @param name - The name of the derivation cache.
++	 * @param derive - A function used to derive the value of the cache.
++	 * @public
++	 */
++	createComputedCache = <T, V extends R = R>(
++		name: string,
++		derive: (record: V) => T | undefined
++	): ComputedCache<T, V> => {
++		const cache = new Cache<Atom<any>, Computed<T | undefined>>()
++		return {
++			get: (id: IdOf<V>) => {
++				const atom = this.atoms.value[id]
++				if (!atom) {
++					return undefined
++				}
++				return cache.get(atom, () =>
++					computed<T | undefined>(name + ':' + id, () => derive(atom.value as V))
++				).value
++			},
++		}
++	}
++
++	/**
++	 * Create a computed cache from a selector
++	 *
++	 * @param name - The name of the derivation cache.
++	 * @param selector - A function that returns a subset of the original shape
++	 * @param derive - A function used to derive the value of the cache.
++	 * @public
++	 */
++	createSelectedComputedCache = <T, J, V extends R = R>(
++		name: string,
++		selector: (record: V) => T | undefined,
++		derive: (input: T) => J | undefined
++	): ComputedCache<J, V> => {
++		const cache = new Cache<Atom<any>, Computed<J | undefined>>()
++		return {
++			get: (id: IdOf<V>) => {
++				const atom = this.atoms.value[id]
++				if (!atom) {
++					return undefined
++				}
++
++				const d = computed<T | undefined>(name + ':' + id + ':selector', () =>
++					selector(atom.value as V)
++				)
++				return cache.get(atom, () =>
++					computed<J | undefined>(name + ':' + id, () => derive(d.value as T))
++				).value
++			},
++		}
++	}
++
++	private _integrityChecker?: () => void | undefined
++
++	/** @internal */
++	ensureStoreIsUsable() {
++		this._integrityChecker ??= this.schema.createIntegrityChecker(this)
++		this._integrityChecker?.()
++	}
++
++	private _isPossiblyCorrupted = false
++	/** @internal */
++	markAsPossiblyCorrupted() {
++		this._isPossiblyCorrupted = true
++	}
++	/** @internal */
++	isPossiblyCorrupted() {
++		return this._isPossiblyCorrupted
++	}
++}
++
++/**
++ * Squash a collection of diffs into a single diff.
++ *
++ * @param diffs - An array of diffs to squash.
++ * @returns A single diff that represents the squashed diffs.
++ * @public
++ */
++export function squashRecordDiffs<T extends UnknownRecord>(
++	diffs: RecordsDiff<T>[]
++): RecordsDiff<T> {
++	const result = { added: {}, removed: {}, updated: {} } as RecordsDiff<T>
++
++	for (const diff of diffs) {
++		for (const [id, value] of objectMapEntries(diff.added)) {
++			if (result.removed[id]) {
++				const original = result.removed[id]
++				delete result.removed[id]
++				if (original !== value) {
++					result.updated[id] = [original, value]
++				}
++			} else {
++				result.added[id] = value
++			}
++		}
++
++		for (const [id, [_from, to]] of objectMapEntries(diff.updated)) {
++			if (result.added[id]) {
++				result.added[id] = to
++				delete result.updated[id]
++				delete result.removed[id]
++				continue
++			}
++			if (result.updated[id]) {
++				result.updated[id][1] = to
++				delete result.removed[id]
++				continue
++			}
++
++			result.updated[id] = diff.updated[id]
++			delete result.removed[id]
++		}
++
++		for (const [id, value] of objectMapEntries(diff.removed)) {
++			// the same record was added in this diff sequence, just drop it
++			if (result.added[id]) {
++				delete result.added[id]
++			} else if (result.updated[id]) {
++				result.removed[id] = result.updated[id][0]
++				delete result.updated[id]
++			} else {
++				result.removed[id] = value
++			}
++		}
++	}
++
++	return result
++}
++
++/**
++ * Collect all history entries by their sources.
++ *
++ * @param entries - The array of history entries.
++ * @returns A map of history entries by their sources.
++ * @public
++ */
++function squashHistoryEntries<T extends UnknownRecord>(
++	entries: HistoryEntry<T>[]
++): HistoryEntry<T>[] {
++	const result: HistoryEntry<T>[] = []
++
++	let current = entries[0]
++	let entry: HistoryEntry<T>
++
++	for (let i = 1, n = entries.length; i < n; i++) {
++		entry = entries[i]
++
++		if (current.source !== entry.source) {
++			result.push(current)
++			current = entry
++		} else {
++			current = {
++				source: current.source,
++				changes: squashRecordDiffs([current.changes, entry.changes]),
++			}
++		}
++	}
++
++	result.push(current)
++
++	return result
++}
++
++/** @public */
++export function reverseRecordsDiff(diff: RecordsDiff<any>) {
++	const result: RecordsDiff<any> = { added: diff.removed, removed: diff.added, updated: {} }
++	for (const [from, to] of Object.values(diff.updated)) {
++		result.updated[from.id] = [to, from]
++	}
++	return result
++}
++
++class HistoryAccumulator<T extends UnknownRecord> {
++	private _history: HistoryEntry<T>[] = []
++
++	private _inteceptors: Set<(entry: HistoryEntry<T>) => void> = new Set()
++
++	intercepting(fn: (entry: HistoryEntry<T>) => void) {
++		this._inteceptors.add(fn)
++		return () => {
++			this._inteceptors.delete(fn)
++		}
++	}
++
++	add(entry: HistoryEntry<T>) {
++		this._history.push(entry)
++		for (const interceptor of this._inteceptors) {
++			interceptor(entry)
++		}
++	}
++
++	flush() {
++		const history = squashHistoryEntries(this._history)
++		this._history = []
++		return history
++	}
++
++	clear() {
++		this._history = []
++	}
++
++	hasChanges() {
++		return this._history.length > 0
++	}
++}
+
+commit 4b6383ed90ee20f93571c5e2247f6cae4a62b407
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Sat Jun 3 21:46:53 2023 +0100
+
+    tlschema cleanup (#1509)
+    
+    This PR cleans up the file names and imports for @tldraw/tlschema.
+    
+    It also:
+    - renames some erroneously named validators / migrators (e.g.
+    `pageTypeValidator` -> `pageValidator`)
+    - removes the duplicated `languages.ts` and makes `tlschema` the source
+    of truth for languages
+    - renames ID to RecordId
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking Change
+    
+    ### Release Notes
+    
+    - [editor] Remove `app.createShapeId`
+    - [tlschema] Cleans up exports
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 86f847f96..eb6e334fe 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -6,14 +6,14 @@ import {
+ 	throttledRaf,
+ } from '@tldraw/utils'
+ import { Atom, Computed, Reactor, atom, computed, reactor, transact } from 'signia'
+-import { ID, IdOf, UnknownRecord } from './BaseRecord'
++import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { Cache } from './Cache'
+ import { RecordType } from './RecordType'
+ import { StoreQueries } from './StoreQueries'
+ import { SerializedSchema, StoreSchema } from './StoreSchema'
+ import { devFreeze } from './devFreeze'
+ 
+-type RecFromId<K extends ID<UnknownRecord>> = K extends ID<infer R> ? R : never
++type RecFromId<K extends RecordId<UnknownRecord>> = K extends RecordId<infer R> ? R : never
+ 
+ /**
+  * A diff describing the changes to a record.
+
+commit f15a8797f04132dc21949f731894b0e2d97a3e14
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Jun 5 15:11:07 2023 +0100
+
+    Independent instance state persistence (#1493)
+    
+    This PR
+    
+    - Removes UserDocumentRecordType
+      - moving isSnapMode to user preferences
+      - moving isGridMode and isPenMode to InstanceRecordType
+      - deleting the other properties which are no longer needed.
+    
+    - Creates a separate pipeline for persisting instance state.
+    
+    Previously the instance state records were stored alongside the document
+    state records, and in order to load the state for a particular instance
+    (in our case, a particular tab) you needed to pass the 'instanceId'
+    prop. This prop ended up totally pervading the public API and people ran
+    into all kinds of issues with it, e.g. using the same instance id in
+    multiple editor instances.
+    
+    There was also an issue whereby it was hard for us to clean up old
+    instance state so the idb table ended up bloating over time.
+    
+    This PR makes it so that rather than passing an instanceId, you load the
+    instance state yourself while creating the store. It provides tools to
+    make that easy.
+    
+    - Undoes the assumption that we might have more than one instance's
+    state in the store.
+    
+    - Like `document`, `instance` now has a singleton id
+    `instance:instance`.
+    - Page state ids and camera ids are no longer random, but rather derive
+    from the page they belong to. This is like having a foreign primary key
+    in SQL databases. It's something i'd love to support fully as part of
+    the RecordType/Store api.
+    
+    Tests to do
+    
+    - [x] Test Migrations
+    - [x] Test Store.listen filtering
+    - [x] Make type sets in Store public and readonly
+    - [x] Test RecordType.createId
+    - [x] Test Instance state snapshot loading/exporting
+    - [x] Manual test File I/O
+    - [x] Manual test Vscode extension with multiple tabs
+    - [x] Audit usages of store.query
+    - [x] Audit usages of changed types: InstanceRecordType, 'instance',
+    InstancePageStateRecordType, 'instance_page_state', 'user_document',
+    'camera', CameraRecordType, InstancePresenceRecordType,
+    'instance_presence'
+    - [x] Test user preferences
+    - [x] Manual test isSnapMode and isGridMode and isPenMode
+    - [ ] Test indexedDb functions
+    - [x] Add instanceId stuff back
+    
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking Change
+    
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] Webdriver tests
+    
+    ### Release Notes
+    
+    - Add a brief release note for your PR here.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index eb6e334fe..7f1c15ceb 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -1,14 +1,16 @@
+ import {
++	filterEntries,
+ 	objectMapEntries,
+ 	objectMapFromEntries,
+ 	objectMapKeys,
+ 	objectMapValues,
+ 	throttledRaf,
+ } from '@tldraw/utils'
++import { nanoid } from 'nanoid'
+ import { Atom, Computed, Reactor, atom, computed, reactor, transact } from 'signia'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { Cache } from './Cache'
+-import { RecordType } from './RecordType'
++import { RecordScope } from './RecordType'
+ import { StoreQueries } from './StoreQueries'
+ import { SerializedSchema, StoreSchema } from './StoreSchema'
+ import { devFreeze } from './devFreeze'
+@@ -33,6 +35,13 @@ export type RecordsDiff<R extends UnknownRecord> = {
+  */
+ export type CollectionDiff<T> = { added?: Set<T>; removed?: Set<T> }
+ 
++export type ChangeSource = 'user' | 'remote'
++
++export type StoreListenerFilters = {
++	source: ChangeSource | 'all'
++	scope: RecordScope | 'all'
++}
++
+ /**
+  * An entry containing changes that originated either by user actions or remote changes.
+  *
+@@ -40,7 +49,7 @@ export type CollectionDiff<T> = { added?: Set<T>; removed?: Set<T> }
+  */
+ export type HistoryEntry<R extends UnknownRecord = UnknownRecord> = {
+ 	changes: RecordsDiff<R>
+-	source: 'user' | 'remote'
++	source: ChangeSource
+ }
+ 
+ /**
+@@ -94,6 +103,10 @@ export type StoreRecord<S extends Store<any>> = S extends Store<infer R> ? R : n
+  * @public
+  */
+ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
++	/**
++	 * The random id of the store.
++	 */
++	public readonly id = nanoid()
+ 	/**
+ 	 * An atom containing the store's atoms.
+ 	 *
+@@ -125,7 +138,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 *
+ 	 * @internal
+ 	 */
+-	private listeners = new Set<StoreListener<R>>()
++	private listeners = new Set<{ onHistory: StoreListener<R>; filters: StoreListenerFilters }>()
+ 
+ 	/**
+ 	 * An array of history entries that have not yet been flushed.
+@@ -146,6 +159,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 	readonly props: Props
+ 
++	public readonly scopedTypes: { readonly [K in RecordScope]: ReadonlySet<R['typeName']> }
++
+ 	constructor(config: {
+ 		/** The store's initial data. */
+ 		initialData?: StoreSnapshot<R>
+@@ -182,6 +197,23 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			},
+ 			{ scheduleEffect: (cb) => throttledRaf(cb) }
+ 		)
++		this.scopedTypes = {
++			document: new Set(
++				objectMapValues(this.schema.types)
++					.filter((t) => t.scope === 'document')
++					.map((t) => t.typeName)
++			),
++			session: new Set(
++				objectMapValues(this.schema.types)
++					.filter((t) => t.scope === 'session')
++					.map((t) => t.typeName)
++			),
++			presence: new Set(
++				objectMapValues(this.schema.types)
++					.filter((t) => t.scope === 'presence')
++					.map((t) => t.typeName)
++			),
++		}
+ 	}
+ 
+ 	public _flushHistory() {
+@@ -189,11 +221,56 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		if (this.historyAccumulator.hasChanges()) {
+ 			const entries = this.historyAccumulator.flush()
+ 			for (const { changes, source } of entries) {
+-				this.listeners.forEach((l) => l({ changes, source }))
++				let instanceChanges = null as null | RecordsDiff<R>
++				let documentChanges = null as null | RecordsDiff<R>
++				let presenceChanges = null as null | RecordsDiff<R>
++				for (const { onHistory, filters } of this.listeners) {
++					if (filters.source !== 'all' && filters.source !== source) {
++						continue
++					}
++					if (filters.scope !== 'all') {
++						if (filters.scope === 'document') {
++							documentChanges ??= this.filterChangesByScope(changes, 'document')
++							if (!documentChanges) continue
++							onHistory({ changes: documentChanges, source })
++						} else if (filters.scope === 'session') {
++							instanceChanges ??= this.filterChangesByScope(changes, 'session')
++							if (!instanceChanges) continue
++							onHistory({ changes: instanceChanges, source })
++						} else {
++							presenceChanges ??= this.filterChangesByScope(changes, 'presence')
++							if (!presenceChanges) continue
++							onHistory({ changes: presenceChanges, source })
++						}
++					} else {
++						onHistory({ changes, source })
++					}
++				}
+ 			}
+ 		}
+ 	}
+ 
++	/**
++	 * Filters out non-document changes from a diff. Returns null if there are no changes left.
++	 * @param change - the records diff
++	 * @returns
++	 */
++	filterChangesByScope(change: RecordsDiff<R>, scope: RecordScope) {
++		const result = {
++			added: filterEntries(change.added, (_, r) => this.scopedTypes[scope].has(r.typeName)),
++			updated: filterEntries(change.updated, (_, r) => this.scopedTypes[scope].has(r[1].typeName)),
++			removed: filterEntries(change.removed, (_, r) => this.scopedTypes[scope].has(r.typeName)),
++		}
++		if (
++			Object.keys(result.added).length === 0 &&
++			Object.keys(result.updated).length === 0 &&
++			Object.keys(result.removed).length === 0
++		) {
++			return null
++		}
++		return result
++	}
++
+ 	/**
+ 	 * Update the history with a diff of changes.
+ 	 *
+@@ -421,46 +498,22 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	}
+ 
+ 	/**
+-	 * Opposite of `deserialize`. Creates a JSON payload from the record store.
++	 * Creates a JSON payload from the record store.
+ 	 *
+-	 * @param filter - A function to filter structs that do not satisfy the predicate.
++	 * @param scope - The scope of records to serialize. Defaults to 'document'.
+ 	 * @returns The record store snapshot as a JSON payload.
+ 	 */
+-	serialize = (filter?: (record: R) => boolean): StoreSnapshot<R> => {
++	serialize = (scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> => {
+ 		const result = {} as StoreSnapshot<R>
+ 		for (const [id, atom] of objectMapEntries(this.atoms.value)) {
+ 			const record = atom.value
+-			if (typeof filter === 'function' && !filter(record)) continue
+-			result[id as IdOf<R>] = record
++			if (scope === 'all' || this.scopedTypes[scope].has(record.typeName)) {
++				result[id as IdOf<R>] = record
++			}
+ 		}
+ 		return result
+ 	}
+ 
+-	/**
+-	 * The same as `serialize`, but only serializes records with a scope of `document`.
+-	 * @returns The record store snapshot as a JSON payload.
+-	 */
+-	serializeDocumentState = (): StoreSnapshot<R> => {
+-		return this.serialize((r) => {
+-			const type = this.schema.types[r.typeName as R['typeName']] as RecordType<any, any>
+-			return type.scope === 'document'
+-		})
+-	}
+-
+-	/**
+-	 * Opposite of `serialize`. Replace the store's current records with records as defined by a
+-	 * simple JSON structure into the stores.
+-	 *
+-	 * @param snapshot - The JSON snapshot to deserialize.
+-	 * @public
+-	 */
+-	deserialize = (snapshot: StoreSnapshot<R>): void => {
+-		transact(() => {
+-			this.clear()
+-			this.put(Object.values(snapshot))
+-		})
+-	}
+-
+ 	/**
+ 	 * Get a serialized snapshot of the store and its schema.
+ 	 *
+@@ -469,11 +522,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * store.loadSnapshot(snapshot)
+ 	 * ```
+ 	 *
++	 * @param scope - The scope of records to serialize. Defaults to 'document'.
+ 	 * @public
+ 	 */
+-	getSnapshot() {
++	getSnapshot(scope: RecordScope | 'all' = 'document') {
+ 		return {
+-			store: this.serializeDocumentState(),
++			store: this.serialize(scope),
+ 			schema: this.schema.serialize(),
+ 		}
+ 	}
+@@ -497,7 +551,11 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
+ 		}
+ 
+-		this.deserialize(migrationResult.value)
++		transact(() => {
++			this.clear()
++			this.put(Object.values(migrationResult.value))
++			this.ensureStoreIsUsable()
++		})
+ 	}
+ 
+ 	/**
+@@ -548,13 +606,22 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	/**
+ 	 * Add a new listener to the store.
+ 	 *
+-	 * @param listener - The listener to call when the store updates.
++	 * @param onHistory - The listener to call when the store updates.
++	 * @param filters - Filters to apply to the listener.
+ 	 * @returns A function to remove the listener.
+ 	 */
+-	listen = (listener: StoreListener<R>) => {
++	listen = (onHistory: StoreListener<R>, filters?: Partial<StoreListenerFilters>) => {
+ 		// flush history so that this listener's history starts from exactly now
+ 		this._flushHistory()
+ 
++		const listener = {
++			onHistory,
++			filters: {
++				source: filters?.source ?? 'all',
++				scope: filters?.scope ?? 'all',
++			},
++		}
++
+ 		this.listeners.add(listener)
+ 
+ 		if (!this.historyReactor.scheduler.isActivelyListening) {
+@@ -802,18 +869,18 @@ export function reverseRecordsDiff(diff: RecordsDiff<any>) {
+ class HistoryAccumulator<T extends UnknownRecord> {
+ 	private _history: HistoryEntry<T>[] = []
+ 
+-	private _inteceptors: Set<(entry: HistoryEntry<T>) => void> = new Set()
++	private _interceptors: Set<(entry: HistoryEntry<T>) => void> = new Set()
+ 
+ 	intercepting(fn: (entry: HistoryEntry<T>) => void) {
+-		this._inteceptors.add(fn)
++		this._interceptors.add(fn)
+ 		return () => {
+-			this._inteceptors.delete(fn)
++			this._interceptors.delete(fn)
+ 		}
+ 	}
+ 
+ 	add(entry: HistoryEntry<T>) {
+ 		this._history.push(entry)
+-		for (const interceptor of this._inteceptors) {
++		for (const interceptor of this._interceptors) {
+ 			interceptor(entry)
+ 		}
+ 	}
+
+commit 5cb08711c19c086a013b3a52b06b7cdcfd443fe5
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Jun 20 14:31:26 2023 +0100
+
+    Incorporate signia as @tldraw/state (#1620)
+    
+    It tried to get out but we're dragging it back in.
+    
+    This PR brings [signia](https://github.com/tldraw/signia) back into
+    tldraw as @tldraw/state.
+    
+    ### Change Type
+    
+    - [x] major
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 7f1c15ceb..21a61d024 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -1,3 +1,4 @@
++import { Atom, Computed, Reactor, atom, computed, reactor, transact } from '@tldraw/state'
+ import {
+ 	filterEntries,
+ 	objectMapEntries,
+@@ -7,7 +8,6 @@ import {
+ 	throttledRaf,
+ } from '@tldraw/utils'
+ import { nanoid } from 'nanoid'
+-import { Atom, Computed, Reactor, atom, computed, reactor, transact } from 'signia'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { Cache } from './Cache'
+ import { RecordScope } from './RecordType'
+
+commit ed8d4d9e05fd30a1f36b8ca398c4d784470d7990
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Jun 27 13:25:55 2023 +0100
+
+    [improvement] store snapshot types (#1657)
+    
+    This PR improves the types for the Store.
+    
+    - renames `StoreSnapshot` to `SerializedStore`, which is the return type
+    of `Store.serialize`
+    - creates `StoreSnapshot` as a type for the return type of
+    `Store.getSnapshot` / the argument type for `Store.loadSnapshot`
+    - creates `TLStoreSnapshot` as the type used for the `TLStore`.
+    
+    This came out of a session I had with a user. This should prevent
+    needing to import types from `@tldraw/store` directly.
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Test Plan
+    
+    - [x] Unit Tests
+    
+    ### Release Notes
+    
+    - [dev] Rename `StoreSnapshot` to `SerializedStore`
+    - [dev] Create new `StoreSnapshot` as type related to
+    `getSnapshot`/`loadSnapshot`
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 21a61d024..4ed3f427a 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -73,7 +73,13 @@ export type ComputedCache<Data, R extends UnknownRecord> = {
+  *
+  * @public
+  */
+-export type StoreSnapshot<R extends UnknownRecord> = Record<IdOf<R>, R>
++export type SerializedStore<R extends UnknownRecord> = Record<IdOf<R>, R>
++
++/** @public */
++export type StoreSnapshot<R extends UnknownRecord> = {
++	store: SerializedStore<R>
++	schema: SerializedSchema
++}
+ 
+ /** @public */
+ export type StoreValidator<R extends UnknownRecord> = {
+@@ -163,7 +169,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 	constructor(config: {
+ 		/** The store's initial data. */
+-		initialData?: StoreSnapshot<R>
++		initialData?: SerializedStore<R>
+ 		/**
+ 		 * A map of validators for each record type. A record's validator will be called when the record
+ 		 * is created or updated. It should throw an error if the record is invalid.
+@@ -503,8 +509,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param scope - The scope of records to serialize. Defaults to 'document'.
+ 	 * @returns The record store snapshot as a JSON payload.
+ 	 */
+-	serialize = (scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> => {
+-		const result = {} as StoreSnapshot<R>
++	serialize = (scope: RecordScope | 'all' = 'document'): SerializedStore<R> => {
++		const result = {} as SerializedStore<R>
+ 		for (const [id, atom] of objectMapEntries(this.atoms.value)) {
+ 			const record = atom.value
+ 			if (scope === 'all' || this.scopedTypes[scope].has(record.typeName)) {
+@@ -525,7 +531,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param scope - The scope of records to serialize. Defaults to 'document'.
+ 	 * @public
+ 	 */
+-	getSnapshot(scope: RecordScope | 'all' = 'document') {
++	getSnapshot(scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> {
+ 		return {
+ 			store: this.serialize(scope),
+ 			schema: this.schema.serialize(),
+@@ -544,7 +550,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 *
+ 	 * @public
+ 	 */
+-	loadSnapshot(snapshot: { store: StoreSnapshot<R>; schema: SerializedSchema }): void {
++	loadSnapshot(snapshot: StoreSnapshot<R>): void {
+ 		const migrationResult = this.schema.migrateStoreSnapshot(snapshot.store, snapshot.schema)
+ 
+ 		if (migrationResult.type === 'error') {
+
+commit 2d5b2bdc94723fccfa7124f88c1797221e990e0f
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Jun 27 14:59:07 2023 +0100
+
+    [tweak] migrate store snapshot arguments (#1659)
+    
+    This PR updates the `migrateStoreSnapshot` method in @tldraw/store
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Test Plan
+    
+    - [x] Unit Tests
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 4ed3f427a..ec3467b86 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -551,7 +551,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	loadSnapshot(snapshot: StoreSnapshot<R>): void {
+-		const migrationResult = this.schema.migrateStoreSnapshot(snapshot.store, snapshot.schema)
++		const migrationResult = this.schema.migrateStoreSnapshot(snapshot)
+ 
+ 		if (migrationResult.type === 'error') {
+ 			throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
+
+commit e17074a8b3a60d26a2e54ca5b5d47622db7676be
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Aug 1 14:21:14 2023 +0100
+
+    Editor commands API / effects (#1778)
+    
+    This PR shrinks the commands API surface and adds a manager
+    (`CleanupManager`) for side effects.
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ### Test Plan
+    
+    Use the app! Especially undo and redo. Our tests are passing but I've
+    found more cases where our coverage fails to catch issues.
+    
+    ### Release Notes
+    
+    - tbd
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index ec3467b86..56c958447 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -297,13 +297,29 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
+ 	}
+ 
++	/**
++	 * A callback fired after each record's change.
++	 *
++	 * @param prev - The previous value, if any.
++	 * @param next - The next value.
++	 */
++	onBeforeCreate?: (next: R, source: 'remote' | 'user') => R
++
+ 	/**
+ 	 * A callback fired after a record is created. Use this to perform related updates to other
+ 	 * records in the store.
+ 	 *
+ 	 * @param record - The record to be created
+ 	 */
+-	onAfterCreate?: (record: R) => void
++	onAfterCreate?: (record: R, source: 'remote' | 'user') => void
++
++	/**
++	 * A callback before after each record's change.
++	 *
++	 * @param prev - The previous value, if any.
++	 * @param next - The next value.
++	 */
++	onBeforeChange?: (prev: R, next: R, source: 'remote' | 'user') => R
+ 
+ 	/**
+ 	 * A callback fired after each record's change.
+@@ -311,21 +327,21 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param prev - The previous value, if any.
+ 	 * @param next - The next value.
+ 	 */
+-	onAfterChange?: (prev: R, next: R) => void
++	onAfterChange?: (prev: R, next: R, source: 'remote' | 'user') => void
+ 
+ 	/**
+ 	 * A callback fired before a record is deleted.
+ 	 *
+ 	 * @param prev - The record that will be deleted.
+ 	 */
+-	onBeforeDelete?: (prev: R) => void
++	onBeforeDelete?: (prev: R, source: 'remote' | 'user') => false | void
+ 
+ 	/**
+ 	 * A callback fired after a record is deleted.
+ 	 *
+ 	 * @param prev - The record that will be deleted.
+ 	 */
+-	onAfterDelete?: (prev: R) => void
++	onAfterDelete?: (prev: R, source: 'remote' | 'user') => void
+ 
+ 	// used to avoid running callbacks when rolling back changes in sync client
+ 	private _runCallbacks = true
+@@ -353,12 +369,18 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			// changes (e.g. additions, deletions, or updates that produce a new value).
+ 			let didChange = false
+ 
++			const beforeCreate = this.onBeforeCreate && this._runCallbacks ? this.onBeforeCreate : null
++			const beforeUpdate = this.onBeforeChange && this._runCallbacks ? this.onBeforeChange : null
++			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
++
+ 			for (let i = 0, n = records.length; i < n; i++) {
+ 				record = records[i]
+ 
+ 				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
+ 
+ 				if (recordAtom) {
++					if (beforeUpdate) record = beforeUpdate(recordAtom.value, record, source)
++
+ 					// If we already have an atom for this record, update its value.
+ 
+ 					const initialValue = recordAtom.__unsafe__getWithoutCapture()
+@@ -382,6 +404,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 						updates[record.id] = [initialValue, finalValue]
+ 					}
+ 				} else {
++					if (beforeCreate) record = beforeCreate(record, source)
++
+ 					didChange = true
+ 
+ 					// If we don't have an atom, create one.
+@@ -418,20 +442,22 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				removed: {} as Record<IdOf<R>, R>,
+ 			})
+ 
+-			const { onAfterCreate, onAfterChange } = this
++			if (this._runCallbacks) {
++				const { onAfterCreate, onAfterChange } = this
+ 
+-			if (onAfterCreate && this._runCallbacks) {
+-				// Run the onAfterChange callback for addition.
+-				Object.values(additions).forEach((record) => {
+-					onAfterCreate(record)
+-				})
+-			}
++				if (onAfterCreate) {
++					// Run the onAfterChange callback for addition.
++					Object.values(additions).forEach((record) => {
++						onAfterCreate(record, source)
++					})
++				}
+ 
+-			if (onAfterChange && this._runCallbacks) {
+-				// Run the onAfterChange callback for update.
+-				Object.values(updates).forEach(([from, to]) => {
+-					onAfterChange(from, to)
+-				})
++				if (onAfterChange) {
++					// Run the onAfterChange callback for update.
++					Object.values(updates).forEach(([from, to]) => {
++						onAfterChange(from, to, source)
++					})
++				}
+ 			}
+ 		})
+ 	}
+@@ -444,12 +470,17 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	remove = (ids: IdOf<R>[]): void => {
+ 		transact(() => {
++			const cancelled = [] as IdOf<R>[]
++			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
++
+ 			if (this.onBeforeDelete && this._runCallbacks) {
+ 				for (const id of ids) {
+ 					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
+ 					if (!atom) continue
+ 
+-					this.onBeforeDelete(atom.value)
++					if (this.onBeforeDelete(atom.value, source) === false) {
++						cancelled.push(id)
++					}
+ 				}
+ 			}
+ 
+@@ -460,6 +491,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				let result: typeof atoms | undefined = undefined
+ 
+ 				for (const id of ids) {
++					if (cancelled.includes(id)) continue
+ 					if (!(id in atoms)) continue
+ 					if (!result) result = { ...atoms }
+ 					if (!removed) removed = {} as Record<IdOf<R>, R>
+@@ -476,8 +508,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 			// If we have an onAfterChange, run it for each removed record.
+ 			if (this.onAfterDelete && this._runCallbacks) {
++				let record: R
+ 				for (let i = 0, n = ids.length; i < n; i++) {
+-					this.onAfterDelete(removed[ids[i]])
++					record = removed[ids[i]]
++					if (record) {
++						this.onAfterDelete(record, source)
++					}
+ 				}
+ 			}
+ 		})
+@@ -596,6 +632,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+ 			return
+ 		}
++
+ 		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecFromId<K>) as any])
+ 	}
+ 
+@@ -752,6 +789,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
++	getRecordType = <T extends R>(record: R): T => {
++		const type = this.schema.types[record.typeName as R['typeName']]
++		if (!type) {
++			throw new Error(`Record type ${record.typeName} not found`)
++		}
++		return type as unknown as T
++	}
++
+ 	private _integrityChecker?: () => void | undefined
+ 
+ 	/** @internal */
+
+commit 79fae186e4816f4b60f336fa80c2d85ef1debc21
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Tue Aug 1 18:03:31 2023 +0100
+
+    Revert "Editor commands API / effects" (#1783)
+    
+    Reverts tldraw/tldraw#1778.
+    
+    Fuzz testing picked up errors related to deleting pages and undo/redo
+    which may doom this PR.
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 56c958447..ec3467b86 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -297,29 +297,13 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
+ 	}
+ 
+-	/**
+-	 * A callback fired after each record's change.
+-	 *
+-	 * @param prev - The previous value, if any.
+-	 * @param next - The next value.
+-	 */
+-	onBeforeCreate?: (next: R, source: 'remote' | 'user') => R
+-
+ 	/**
+ 	 * A callback fired after a record is created. Use this to perform related updates to other
+ 	 * records in the store.
+ 	 *
+ 	 * @param record - The record to be created
+ 	 */
+-	onAfterCreate?: (record: R, source: 'remote' | 'user') => void
+-
+-	/**
+-	 * A callback before after each record's change.
+-	 *
+-	 * @param prev - The previous value, if any.
+-	 * @param next - The next value.
+-	 */
+-	onBeforeChange?: (prev: R, next: R, source: 'remote' | 'user') => R
++	onAfterCreate?: (record: R) => void
+ 
+ 	/**
+ 	 * A callback fired after each record's change.
+@@ -327,21 +311,21 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param prev - The previous value, if any.
+ 	 * @param next - The next value.
+ 	 */
+-	onAfterChange?: (prev: R, next: R, source: 'remote' | 'user') => void
++	onAfterChange?: (prev: R, next: R) => void
+ 
+ 	/**
+ 	 * A callback fired before a record is deleted.
+ 	 *
+ 	 * @param prev - The record that will be deleted.
+ 	 */
+-	onBeforeDelete?: (prev: R, source: 'remote' | 'user') => false | void
++	onBeforeDelete?: (prev: R) => void
+ 
+ 	/**
+ 	 * A callback fired after a record is deleted.
+ 	 *
+ 	 * @param prev - The record that will be deleted.
+ 	 */
+-	onAfterDelete?: (prev: R, source: 'remote' | 'user') => void
++	onAfterDelete?: (prev: R) => void
+ 
+ 	// used to avoid running callbacks when rolling back changes in sync client
+ 	private _runCallbacks = true
+@@ -369,18 +353,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			// changes (e.g. additions, deletions, or updates that produce a new value).
+ 			let didChange = false
+ 
+-			const beforeCreate = this.onBeforeCreate && this._runCallbacks ? this.onBeforeCreate : null
+-			const beforeUpdate = this.onBeforeChange && this._runCallbacks ? this.onBeforeChange : null
+-			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+-
+ 			for (let i = 0, n = records.length; i < n; i++) {
+ 				record = records[i]
+ 
+ 				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
+ 
+ 				if (recordAtom) {
+-					if (beforeUpdate) record = beforeUpdate(recordAtom.value, record, source)
+-
+ 					// If we already have an atom for this record, update its value.
+ 
+ 					const initialValue = recordAtom.__unsafe__getWithoutCapture()
+@@ -404,8 +382,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 						updates[record.id] = [initialValue, finalValue]
+ 					}
+ 				} else {
+-					if (beforeCreate) record = beforeCreate(record, source)
+-
+ 					didChange = true
+ 
+ 					// If we don't have an atom, create one.
+@@ -442,22 +418,20 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				removed: {} as Record<IdOf<R>, R>,
+ 			})
+ 
+-			if (this._runCallbacks) {
+-				const { onAfterCreate, onAfterChange } = this
++			const { onAfterCreate, onAfterChange } = this
+ 
+-				if (onAfterCreate) {
+-					// Run the onAfterChange callback for addition.
+-					Object.values(additions).forEach((record) => {
+-						onAfterCreate(record, source)
+-					})
+-				}
++			if (onAfterCreate && this._runCallbacks) {
++				// Run the onAfterChange callback for addition.
++				Object.values(additions).forEach((record) => {
++					onAfterCreate(record)
++				})
++			}
+ 
+-				if (onAfterChange) {
+-					// Run the onAfterChange callback for update.
+-					Object.values(updates).forEach(([from, to]) => {
+-						onAfterChange(from, to, source)
+-					})
+-				}
++			if (onAfterChange && this._runCallbacks) {
++				// Run the onAfterChange callback for update.
++				Object.values(updates).forEach(([from, to]) => {
++					onAfterChange(from, to)
++				})
+ 			}
+ 		})
+ 	}
+@@ -470,17 +444,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	remove = (ids: IdOf<R>[]): void => {
+ 		transact(() => {
+-			const cancelled = [] as IdOf<R>[]
+-			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+-
+ 			if (this.onBeforeDelete && this._runCallbacks) {
+ 				for (const id of ids) {
+ 					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
+ 					if (!atom) continue
+ 
+-					if (this.onBeforeDelete(atom.value, source) === false) {
+-						cancelled.push(id)
+-					}
++					this.onBeforeDelete(atom.value)
+ 				}
+ 			}
+ 
+@@ -491,7 +460,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				let result: typeof atoms | undefined = undefined
+ 
+ 				for (const id of ids) {
+-					if (cancelled.includes(id)) continue
+ 					if (!(id in atoms)) continue
+ 					if (!result) result = { ...atoms }
+ 					if (!removed) removed = {} as Record<IdOf<R>, R>
+@@ -508,12 +476,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 			// If we have an onAfterChange, run it for each removed record.
+ 			if (this.onAfterDelete && this._runCallbacks) {
+-				let record: R
+ 				for (let i = 0, n = ids.length; i < n; i++) {
+-					record = removed[ids[i]]
+-					if (record) {
+-						this.onAfterDelete(record, source)
+-					}
++					this.onAfterDelete(removed[ids[i]])
+ 				}
+ 			}
+ 		})
+@@ -632,7 +596,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+ 			return
+ 		}
+-
+ 		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecFromId<K>) as any])
+ 	}
+ 
+@@ -789,14 +752,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
+-	getRecordType = <T extends R>(record: R): T => {
+-		const type = this.schema.types[record.typeName as R['typeName']]
+-		if (!type) {
+-			throw new Error(`Record type ${record.typeName} not found`)
+-		}
+-		return type as unknown as T
+-	}
+-
+ 	private _integrityChecker?: () => void | undefined
+ 
+ 	/** @internal */
+
+commit 507bba82fd8830ad1f6e7f7ae2a2d9a5b5625033
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Wed Aug 2 12:05:14 2023 +0100
+
+    SideEffectManager (#1785)
+    
+    This PR extracts the side effect manager from #1778.
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index ec3467b86..56c958447 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -297,13 +297,29 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
+ 	}
+ 
++	/**
++	 * A callback fired after each record's change.
++	 *
++	 * @param prev - The previous value, if any.
++	 * @param next - The next value.
++	 */
++	onBeforeCreate?: (next: R, source: 'remote' | 'user') => R
++
+ 	/**
+ 	 * A callback fired after a record is created. Use this to perform related updates to other
+ 	 * records in the store.
+ 	 *
+ 	 * @param record - The record to be created
+ 	 */
+-	onAfterCreate?: (record: R) => void
++	onAfterCreate?: (record: R, source: 'remote' | 'user') => void
++
++	/**
++	 * A callback before after each record's change.
++	 *
++	 * @param prev - The previous value, if any.
++	 * @param next - The next value.
++	 */
++	onBeforeChange?: (prev: R, next: R, source: 'remote' | 'user') => R
+ 
+ 	/**
+ 	 * A callback fired after each record's change.
+@@ -311,21 +327,21 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param prev - The previous value, if any.
+ 	 * @param next - The next value.
+ 	 */
+-	onAfterChange?: (prev: R, next: R) => void
++	onAfterChange?: (prev: R, next: R, source: 'remote' | 'user') => void
+ 
+ 	/**
+ 	 * A callback fired before a record is deleted.
+ 	 *
+ 	 * @param prev - The record that will be deleted.
+ 	 */
+-	onBeforeDelete?: (prev: R) => void
++	onBeforeDelete?: (prev: R, source: 'remote' | 'user') => false | void
+ 
+ 	/**
+ 	 * A callback fired after a record is deleted.
+ 	 *
+ 	 * @param prev - The record that will be deleted.
+ 	 */
+-	onAfterDelete?: (prev: R) => void
++	onAfterDelete?: (prev: R, source: 'remote' | 'user') => void
+ 
+ 	// used to avoid running callbacks when rolling back changes in sync client
+ 	private _runCallbacks = true
+@@ -353,12 +369,18 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			// changes (e.g. additions, deletions, or updates that produce a new value).
+ 			let didChange = false
+ 
++			const beforeCreate = this.onBeforeCreate && this._runCallbacks ? this.onBeforeCreate : null
++			const beforeUpdate = this.onBeforeChange && this._runCallbacks ? this.onBeforeChange : null
++			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
++
+ 			for (let i = 0, n = records.length; i < n; i++) {
+ 				record = records[i]
+ 
+ 				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
+ 
+ 				if (recordAtom) {
++					if (beforeUpdate) record = beforeUpdate(recordAtom.value, record, source)
++
+ 					// If we already have an atom for this record, update its value.
+ 
+ 					const initialValue = recordAtom.__unsafe__getWithoutCapture()
+@@ -382,6 +404,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 						updates[record.id] = [initialValue, finalValue]
+ 					}
+ 				} else {
++					if (beforeCreate) record = beforeCreate(record, source)
++
+ 					didChange = true
+ 
+ 					// If we don't have an atom, create one.
+@@ -418,20 +442,22 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				removed: {} as Record<IdOf<R>, R>,
+ 			})
+ 
+-			const { onAfterCreate, onAfterChange } = this
++			if (this._runCallbacks) {
++				const { onAfterCreate, onAfterChange } = this
+ 
+-			if (onAfterCreate && this._runCallbacks) {
+-				// Run the onAfterChange callback for addition.
+-				Object.values(additions).forEach((record) => {
+-					onAfterCreate(record)
+-				})
+-			}
++				if (onAfterCreate) {
++					// Run the onAfterChange callback for addition.
++					Object.values(additions).forEach((record) => {
++						onAfterCreate(record, source)
++					})
++				}
+ 
+-			if (onAfterChange && this._runCallbacks) {
+-				// Run the onAfterChange callback for update.
+-				Object.values(updates).forEach(([from, to]) => {
+-					onAfterChange(from, to)
+-				})
++				if (onAfterChange) {
++					// Run the onAfterChange callback for update.
++					Object.values(updates).forEach(([from, to]) => {
++						onAfterChange(from, to, source)
++					})
++				}
+ 			}
+ 		})
+ 	}
+@@ -444,12 +470,17 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	remove = (ids: IdOf<R>[]): void => {
+ 		transact(() => {
++			const cancelled = [] as IdOf<R>[]
++			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
++
+ 			if (this.onBeforeDelete && this._runCallbacks) {
+ 				for (const id of ids) {
+ 					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
+ 					if (!atom) continue
+ 
+-					this.onBeforeDelete(atom.value)
++					if (this.onBeforeDelete(atom.value, source) === false) {
++						cancelled.push(id)
++					}
+ 				}
+ 			}
+ 
+@@ -460,6 +491,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				let result: typeof atoms | undefined = undefined
+ 
+ 				for (const id of ids) {
++					if (cancelled.includes(id)) continue
+ 					if (!(id in atoms)) continue
+ 					if (!result) result = { ...atoms }
+ 					if (!removed) removed = {} as Record<IdOf<R>, R>
+@@ -476,8 +508,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 			// If we have an onAfterChange, run it for each removed record.
+ 			if (this.onAfterDelete && this._runCallbacks) {
++				let record: R
+ 				for (let i = 0, n = ids.length; i < n; i++) {
+-					this.onAfterDelete(removed[ids[i]])
++					record = removed[ids[i]]
++					if (record) {
++						this.onAfterDelete(record, source)
++					}
+ 				}
+ 			}
+ 		})
+@@ -596,6 +632,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+ 			return
+ 		}
++
+ 		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecFromId<K>) as any])
+ 	}
+ 
+@@ -752,6 +789,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
++	getRecordType = <T extends R>(record: R): T => {
++		const type = this.schema.types[record.typeName as R['typeName']]
++		if (!type) {
++			throw new Error(`Record type ${record.typeName} not found`)
++		}
++		return type as unknown as T
++	}
++
+ 	private _integrityChecker?: () => void | undefined
+ 
+ 	/** @internal */
+
+commit 48a1bb4d88b16f3b1cf42246e7690a1754e3befc
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Fri Sep 8 18:04:53 2023 +0100
+
+    Migrate snapshot (#1843)
+    
+    Add `Store.migrateSnapshot`, another surface API alongside getSnapshot
+    and loadSnapshot.
+    
+    ### Change Type
+    
+    - [x] `minor` — New feature
+    
+    ### Release Notes
+    
+    - [editor] add `Store.migrateSnapshot`
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 56c958447..5418836ad 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -565,6 +565,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * ```
+ 	 *
+ 	 * @param scope - The scope of records to serialize. Defaults to 'document'.
++	 *
+ 	 * @public
+ 	 */
+ 	getSnapshot(scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> {
+@@ -574,6 +575,30 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
++	/**
++	 * Migrate a serialized snapshot of the store and its schema.
++	 *
++	 * ```ts
++	 * const snapshot = store.getSnapshot()
++	 * store.migrateSnapshot(snapshot)
++	 * ```
++	 *
++	 * @param snapshot - The snapshot to load.
++	 * @public
++	 */
++	migrateSnapshot(snapshot: StoreSnapshot<R>): StoreSnapshot<R> {
++		const migrationResult = this.schema.migrateStoreSnapshot(snapshot)
++
++		if (migrationResult.type === 'error') {
++			throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
++		}
++
++		return {
++			store: migrationResult.value,
++			schema: this.schema.serialize(),
++		}
++	}
++
+ 	/**
+ 	 * Load a serialized snapshot.
+ 	 *
+@@ -583,7 +608,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * ```
+ 	 *
+ 	 * @param snapshot - The snapshot to load.
+-	 *
+ 	 * @public
+ 	 */
+ 	loadSnapshot(snapshot: StoreSnapshot<R>): void {
+
+commit 386a2396d13edae2a95f45e5f1cca99b8dad2fa0
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Sep 19 16:29:13 2023 +0100
+
+    Fix shape drag perf (#1932)
+    
+    This prevents geometry from being recalculated when dragging shapes
+    around. It uses an equality check on the shape props to opt out of
+    recalculations. This still allows bounds to be calculated based on other
+    reactive values, so if folks really want to use x,y values or opacity or
+    whatever, they can call editor.getShape(id) when making their
+    calculation.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+    - [ ] `minor` — New feature
+    - [ ] `major` — Breaking change
+    - [ ] `dependencies` — Changes to package dependencies[^1]
+    - [ ] `documentation` — Changes to the documentation only[^2]
+    - [ ] `tests` — Changes to any test code only[^2]
+    - [ ] `internal` — Any other changes that don't affect the published
+    package[^2]
+    - [ ] I don't know
+    
+    [^1]: publishes a `patch` release, for devDependencies use `internal`
+    [^2]: will not publish a new version
+    
+    
+    ### Release Notes
+    
+    - Fixes a perf regression for dragging shapes around
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 5418836ad..7aca636e1 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -766,7 +766,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	createComputedCache = <T, V extends R = R>(
+ 		name: string,
+-		derive: (record: V) => T | undefined
++		derive: (record: V) => T | undefined,
++		isEqual?: (a: V, b: V) => boolean
+ 	): ComputedCache<T, V> => {
+ 		const cache = new Cache<Atom<any>, Computed<T | undefined>>()
+ 		return {
+@@ -775,9 +776,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				if (!atom) {
+ 					return undefined
+ 				}
+-				return cache.get(atom, () =>
+-					computed<T | undefined>(name + ':' + id, () => derive(atom.value as V))
+-				).value
++				return cache.get(atom, () => {
++					const recordSignal = isEqual
++						? computed(atom.name + ':equals', () => atom.value, { isEqual })
++						: atom
++					return computed<T | undefined>(name + ':' + id, () => {
++						return derive(recordSignal.value as V)
++					})
++				}).value
+ 			},
+ 		}
+ 	}
+
+commit 5db3c1553e14edd14aa5f7c0fc85fc5efc352335
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Mon Nov 13 11:51:22 2023 +0000
+
+    Replace Atom.value with Atom.get() (#2189)
+    
+    This PR replaces the `.value` getter for the atom with `.get()`
+    
+    ### Change Type
+    
+    - [x] `major` — Breaking change
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 7aca636e1..e715420f7 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -197,7 +197,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			'Store.historyReactor',
+ 			() => {
+ 				// deref to make sure we're subscribed regardless of whether we need to propagate
+-				this.history.value
++				this.history.get()
+ 				// If we have accumulated history, flush it and update listeners
+ 				this._flushHistory()
+ 			},
+@@ -290,7 +290,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		if (this.listeners.size === 0) {
+ 			this.historyAccumulator.clear()
+ 		}
+-		this.history.set(this.history.value + 1, changes)
++		this.history.set(this.history.get() + 1, changes)
+ 	}
+ 
+ 	validate(phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests') {
+@@ -379,7 +379,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
+ 
+ 				if (recordAtom) {
+-					if (beforeUpdate) record = beforeUpdate(recordAtom.value, record, source)
++					if (beforeUpdate) record = beforeUpdate(recordAtom.get(), record, source)
+ 
+ 					// If we already have an atom for this record, update its value.
+ 
+@@ -478,7 +478,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
+ 					if (!atom) continue
+ 
+-					if (this.onBeforeDelete(atom.value, source) === false) {
++					if (this.onBeforeDelete(atom.get(), source) === false) {
+ 						cancelled.push(id)
+ 					}
+ 				}
+@@ -496,7 +496,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					if (!result) result = { ...atoms }
+ 					if (!removed) removed = {} as Record<IdOf<R>, R>
+ 					delete result[id]
+-					removed[id] = atoms[id].value
++					removed[id] = atoms[id].get()
+ 				}
+ 
+ 				return result ?? atoms
+@@ -526,7 +526,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	get = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
+-		return this.atoms.value[id]?.value as any
++		return this.atoms.get()[id]?.get() as any
+ 	}
+ 
+ 	/**
+@@ -536,7 +536,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	unsafeGetWithoutCapture = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
+-		return this.atoms.value[id]?.__unsafe__getWithoutCapture() as any
++		return this.atoms.get()[id]?.__unsafe__getWithoutCapture() as any
+ 	}
+ 
+ 	/**
+@@ -547,8 +547,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	serialize = (scope: RecordScope | 'all' = 'document'): SerializedStore<R> => {
+ 		const result = {} as SerializedStore<R>
+-		for (const [id, atom] of objectMapEntries(this.atoms.value)) {
+-			const record = atom.value
++		for (const [id, atom] of objectMapEntries(this.atoms.get())) {
++			const record = atom.get()
+ 			if (scope === 'all' || this.scopedTypes[scope].has(record.typeName)) {
+ 				result[id as IdOf<R>] = record
+ 			}
+@@ -631,7 +631,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	allRecords = (): R[] => {
+-		return objectMapValues(this.atoms.value).map((atom) => atom.value)
++		return objectMapValues(this.atoms.get()).map((atom) => atom.get())
+ 	}
+ 
+ 	/**
+@@ -640,7 +640,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	clear = (): void => {
+-		this.remove(objectMapKeys(this.atoms.value))
++		this.remove(objectMapKeys(this.atoms.get()))
+ 	}
+ 
+ 	/**
+@@ -651,7 +651,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param updater - A function that updates the record.
+ 	 */
+ 	update = <K extends IdOf<R>>(id: K, updater: (record: RecFromId<K>) => RecFromId<K>) => {
+-		const atom = this.atoms.value[id]
++		const atom = this.atoms.get()[id]
+ 		if (!atom) {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+ 			return
+@@ -667,7 +667,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	has = <K extends IdOf<R>>(id: K): boolean => {
+-		return !!this.atoms.value[id]
++		return !!this.atoms.get()[id]
+ 	}
+ 
+ 	/**
+@@ -772,18 +772,20 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		const cache = new Cache<Atom<any>, Computed<T | undefined>>()
+ 		return {
+ 			get: (id: IdOf<V>) => {
+-				const atom = this.atoms.value[id]
++				const atom = this.atoms.get()[id]
+ 				if (!atom) {
+ 					return undefined
+ 				}
+-				return cache.get(atom, () => {
+-					const recordSignal = isEqual
+-						? computed(atom.name + ':equals', () => atom.value, { isEqual })
+-						: atom
+-					return computed<T | undefined>(name + ':' + id, () => {
+-						return derive(recordSignal.value as V)
++				return cache
++					.get(atom, () => {
++						const recordSignal = isEqual
++							? computed(atom.name + ':equals', () => atom.get(), { isEqual })
++							: atom
++						return computed<T | undefined>(name + ':' + id, () => {
++							return derive(recordSignal.get() as V)
++						})
+ 					})
+-				}).value
++					.get()
+ 			},
+ 		}
+ 	}
+@@ -804,17 +806,17 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		const cache = new Cache<Atom<any>, Computed<J | undefined>>()
+ 		return {
+ 			get: (id: IdOf<V>) => {
+-				const atom = this.atoms.value[id]
++				const atom = this.atoms.get()[id]
+ 				if (!atom) {
+ 					return undefined
+ 				}
+ 
+ 				const d = computed<T | undefined>(name + ':' + id + ':selector', () =>
+-					selector(atom.value as V)
++					selector(atom.get() as V)
+ 				)
+-				return cache.get(atom, () =>
+-					computed<J | undefined>(name + ':' + id, () => derive(d.value as T))
+-				).value
++				return cache
++					.get(atom, () => computed<J | undefined>(name + ':' + id, () => derive(d.get() as T)))
++					.get()
+ 			},
+ 		}
+ 	}
+
+commit 509ee3a6e4fcf8eadcd265a0343773b2dd3c5908
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Dec 18 15:45:52 2023 +0000
+
+    Call devFreeze on initialData (#2332)
+    
+    I noticed we weren't freezing the initialData passed into the store.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index e715420f7..49492fe53 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -187,7 +187,10 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				objectMapFromEntries(
+ 					objectMapEntries(initialData).map(([id, record]) => [
+ 						id,
+-						atom('atom:' + id, this.schema.validateRecord(this, record, 'initialize', null)),
++						atom(
++							'atom:' + id,
++							devFreeze(this.schema.validateRecord(this, record, 'initialize', null))
++						),
+ 					])
+ 				)
+ 			)
+
+commit 1d29ac3c4288492b8856dfd14248d844a9033ae1
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Dec 18 20:18:31 2023 +0000
+
+    Prevent diff mutation (#2336)
+    
+    We had a bug in `squashRecordDiffs` where it could potentially mutate
+    'updated' entries.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+    
+    
+    ### Release Notes
+    
+    - Fix `squashRecordDiffs` to prevent a bug where it mutates the
+    'updated' entires
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 49492fe53..59ab7dc95 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -884,7 +884,7 @@ export function squashRecordDiffs<T extends UnknownRecord>(
+ 				continue
+ 			}
+ 			if (result.updated[id]) {
+-				result.updated[id][1] = to
++				result.updated[id] = [result.updated[id][0], to]
+ 				delete result.removed[id]
+ 				continue
+ 			}
+@@ -940,7 +940,7 @@ function squashHistoryEntries<T extends UnknownRecord>(
+ 
+ 	result.push(current)
+ 
+-	return result
++	return devFreeze(result)
+ }
+ 
+ /** @public */
+
+commit 16316ac2a01aa4877f31153d1b529c4d5d5fc444
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Wed Jan 3 08:26:22 2024 +0000
+
+    Fix meta examples (#2379)
+    
+    This PR fixes a bug in our meta examples.
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 59ab7dc95..803fe132d 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -382,12 +382,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
+ 
+ 				if (recordAtom) {
+-					if (beforeUpdate) record = beforeUpdate(recordAtom.get(), record, source)
+-
+ 					// If we already have an atom for this record, update its value.
+-
+ 					const initialValue = recordAtom.__unsafe__getWithoutCapture()
+ 
++					// If we have a beforeUpdate callback, run it against the initial and next records
++					if (beforeUpdate) record = beforeUpdate(initialValue, record, source)
++
+ 					// Validate the record
+ 					record = this.schema.validateRecord(
+ 						this,
+@@ -402,6 +402,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					const finalValue = recordAtom.__unsafe__getWithoutCapture()
+ 
+ 					// If the value has changed, assign it to updates.
++					// todo: is this always going to be true?
+ 					if (initialValue !== finalValue) {
+ 						didChange = true
+ 						updates[record.id] = [initialValue, finalValue]
+
+commit 4a2040f92ce6a13a03977195ebf8985dcc19b5d7
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Feb 20 12:35:25 2024 +0000
+
+    Faster validations + record reference stability at the same time (#2848)
+    
+    This PR adds a validation mode whereby previous known-to-be-valid values
+    can be used to speed up the validation process itself. At the same time
+    it enables us to do fine-grained equality checking on records much more
+    quickly than by using something like lodash isEqual, and using that we
+    can prevent triggering effects for record updates that don't actually
+    alter any values in the store.
+    
+    Here's some preliminary perf testing of average time spent in
+    `store.put()` during some common interactions
+    
+    | task | before (ms) | after (ms) |
+    | ---- | ---- | ---- |
+    | drawing lines | 0.0403 | 0.0214 |
+    | drawing boxes | 0.0408 | 0.0348 |
+    | translating lines | 0.0352 | 0.0042 |
+    | translating boxes | 0.0051 | 0.0032 |
+    | rotating lines | 0.0312 | 0.0065 |
+    | rotating boxes | 0.0053 | 0.0035 |
+    | brush selecting boxes | 0.0200 | 0.0232 |
+    | traversal with shapes | 0.0130 | 0.0108 |
+    | traversal without shapes | 0.0201 | 0.0173 |
+    
+    **traversal** means moving the camera and pointer around the canvas
+    
+    #### Discussion
+    
+    At the scale of hundredths of a millisecond these .put operations are so
+    fast that even if they became literally instantaneous the change would
+    not be human perceptible. That said, there is an overall marked
+    improvement here. Especially for dealing with draw shapes.
+    
+    These figures are also mostly in line with expectations, aside from a
+    couple of things:
+    
+    - I don't understand why the `brush selecting boxes` task got slower
+    after the change.
+    - I don't understand why the `traversal` tasks are slower than the
+    `translating boxes` task, both before and after. I would expect that
+    .putting shape records would be much slower than .putting pointer/camera
+    records (since the latter have fewer and simpler properties)
+    
+    ### Change Type
+    
+    - [x] `patch` — Bug fix
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    - Add a brief release note for your PR here.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 803fe132d..b665b6751 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -84,6 +84,7 @@ export type StoreSnapshot<R extends UnknownRecord> = {
+ /** @public */
+ export type StoreValidator<R extends UnknownRecord> = {
+ 	validate: (record: unknown) => R
++	validateUsingKnownGoodVersion?: (knownGoodVersion: R, record: unknown) => R
+ }
+ 
+ /** @public */
+@@ -389,24 +390,19 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					if (beforeUpdate) record = beforeUpdate(initialValue, record, source)
+ 
+ 					// Validate the record
+-					record = this.schema.validateRecord(
++					const validated = this.schema.validateRecord(
+ 						this,
+ 						record,
+ 						phaseOverride ?? 'updateRecord',
+ 						initialValue
+ 					)
+ 
+-					recordAtom.set(devFreeze(record))
++					if (validated === initialValue) continue
+ 
+-					// need to deref atom in case nextValue is not identical but is .equals?
+-					const finalValue = recordAtom.__unsafe__getWithoutCapture()
++					recordAtom.set(devFreeze(record))
+ 
+-					// If the value has changed, assign it to updates.
+-					// todo: is this always going to be true?
+-					if (initialValue !== finalValue) {
+-						didChange = true
+-						updates[record.id] = [initialValue, finalValue]
+-					}
++					didChange = true
++					updates[record.id] = [initialValue, recordAtom.__unsafe__getWithoutCapture()]
+ 				} else {
+ 					if (beforeCreate) record = beforeCreate(record, source)
+ 
+
+commit b5aff00c8964a3513954fad7ca296c0b8c3bd4cf
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Mar 11 14:17:31 2024 +0100
+
+    Performance improvements (#2977)
+    
+    This PR does a few things to help with performance:
+    1. Instead of doing changes on raf we now do them 60 times per second.
+    This limits the number of updates on high refresh rate screens like the
+    iPad. With the current code this only applied to the history updates (so
+    when you subscribed to the updates), but the next point takes this a bit
+    futher.
+    2. We now trigger react updates 60 times per second. This is a change in
+    `useValue` and `useStateTracking` hooks.
+    3. We now throttle the inputs (like the `pointerMove`) in state nodes.
+    This means we batch multiple inputs and only apply them at most 60 times
+    per second.
+    
+    We had to adjust our own tests to pass after this change so I marked
+    this as major as it might require the users of the library to do the
+    same.
+    
+    Few observations:
+    - The browser calls the raf callbacks when it can. If it gets
+    overwhelmed it will call them further and further apart. As things call
+    down it will start calling them more frequently again. You can clearly
+    see this in the drawing example. When fps gets to a certain level we
+    start to get fewer updates, then fps can recover a bit. This makes the
+    experience quite janky. The updates can be kinda ok one second (dropping
+    frames, but consistently) and then they can completely stop and you have
+    to let go of the mouse to make them happen again. With the new logic it
+    seems everything is a lot more consistent.
+    - We might look into variable refresh rates to prevent this overtaxing
+    of the browser. Like when we see that the times between our updates are
+    getting higher we could make the updates less frequent. If we then see
+    that they are happening more often we could ramp them back up. I had an
+    [experiment for this
+    here](https://github.com/tldraw/tldraw/pull/2977/commits/48348639669e556798296eee82fc53ca8ef444f2#diff-318e71563d7c47173f89ec084ca44417cf70fc72faac85b96f48b856a8aec466L30-L35).
+    
+    Few tests below. Used 6x slowdown for these.
+    
+    # Resizing
+    
+    ### Before
+    
+    
+    https://github.com/tldraw/tldraw/assets/2523721/798a033f-5dfa-419e-9a2d-fd8908272ba0
+    
+    ### After
+    
+    
+    https://github.com/tldraw/tldraw/assets/2523721/45870a0c-c310-4be0-b63c-6c92c20ca037
+    
+    # Drawing
+    Comparison is not 100% fair, we don't store the intermediate inputs
+    right now. That said, tick should still only produce once update so I do
+    think we can get a sense of the differences.
+    
+    ### Before
+    
+    
+    https://github.com/tldraw/tldraw/assets/2523721/2e8ac8c5-bbdf-484b-bb0c-70c967f4541c
+    
+    ### After
+    
+    
+    https://github.com/tldraw/tldraw/assets/2523721/8f54b7a8-9a0e-4a39-b168-482caceb0149
+    
+    
+    ### Change Type
+    
+    - [ ] `patch` — Bug fix
+    - [ ] `minor` — New feature
+    - [x] `major` — Breaking change
+    - [ ] `dependencies` — Changes to package dependencies[^1]
+    - [ ] `documentation` — Changes to the documentation only[^2]
+    - [ ] `tests` — Changes to any test code only[^2]
+    - [ ] `internal` — Any other changes that don't affect the published
+    package[^2]
+    - [ ] I don't know
+    
+    [^1]: publishes a `patch` release, for devDependencies use `internal`
+    [^2]: will not publish a new version
+    
+    
+    ### Release Notes
+    
+    - Improves the performance of rendering.
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index b665b6751..2d24ceec6 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -5,7 +5,7 @@ import {
+ 	objectMapFromEntries,
+ 	objectMapKeys,
+ 	objectMapValues,
+-	throttledRaf,
++	throttleToNextFrame,
+ } from '@tldraw/utils'
+ import { nanoid } from 'nanoid'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+@@ -205,7 +205,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				// If we have accumulated history, flush it and update listeners
+ 				this._flushHistory()
+ 			},
+-			{ scheduleEffect: (cb) => throttledRaf(cb) }
++			{ scheduleEffect: (cb) => throttleToNextFrame(cb) }
+ 		)
+ 		this.scopedTypes = {
+ 			document: new Set(
+
+commit 72ae8ddefd4b9372674255b8989deb83876a52f4
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Wed Mar 20 12:44:09 2024 +0000
+
+    Don't double squash (#3182)
+    
+    This PR changes the way `Store.squashHistoryEntries` works. Previously,
+    the function would iterate through every entry and squash it against the
+    current entry (using `squashRecordDiffs`) to get the new current entry.
+    However, `squashRecordDiffs` does basically the same pattern, iterating
+    through the properties of every diff. As a result, each diff would be
+    iterated through twice: once as itself, and once again in the next
+    current.
+    
+    This PR tweaks the function to operate on as many diffs as possible at
+    once.
+    
+    ### Change Type
+    
+    <!-- ❗ Please select a 'Scope' label ❗️ -->
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [ ] `dotcom` — Changes the tldraw.com web app
+    - [ ] `docs` — Changes to the documentation, examples, or templates.
+    - [ ] `vs code` — Changes to the vscode plugin
+    - [ ] `internal` — Does not affect user-facing stuff
+    
+    <!-- ❗ Please select a 'Type' label ❗️ -->
+    
+    - [ ] `bugfix` — Bug fix
+    - [ ] `feature` — New feature
+    - [x] `improvement` — Improving existing features
+    - [ ] `chore` — Updating dependencies, other boring stuff
+    - [ ] `galaxy brain` — Architectural changes
+    - [ ] `tests` — Changes to any test code
+    - [ ] `tools` — Changes to infrastructure, CI, internal scripts,
+    debugging tools, etc.
+    - [ ] `dunno` — I don't know
+    
+    
+    ### Test Plan
+    
+    - [x] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    - Minor improvement when modifying multiple shapes at once.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 2d24ceec6..c0feabd64 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -907,7 +907,9 @@ export function squashRecordDiffs<T extends UnknownRecord>(
+ }
+ 
+ /**
+- * Collect all history entries by their sources.
++ * Collect all history entries by their adjacent sources.
++ * For example, [user, user, remote, remote, user] would result in [user, remote, user],
++ * with adjacent entries of the same source squashed into a single entry.
+  *
+  * @param entries - The array of history entries.
+  * @returns A map of history entries by their sources.
+@@ -916,28 +918,29 @@ export function squashRecordDiffs<T extends UnknownRecord>(
+ function squashHistoryEntries<T extends UnknownRecord>(
+ 	entries: HistoryEntry<T>[]
+ ): HistoryEntry<T>[] {
+-	const result: HistoryEntry<T>[] = []
++	if (entries.length === 0) return []
+ 
+-	let current = entries[0]
++	const chunked: HistoryEntry<T>[][] = []
++	let chunk: HistoryEntry<T>[] = [entries[0]]
+ 	let entry: HistoryEntry<T>
+ 
+ 	for (let i = 1, n = entries.length; i < n; i++) {
+ 		entry = entries[i]
+-
+-		if (current.source !== entry.source) {
+-			result.push(current)
+-			current = entry
+-		} else {
+-			current = {
+-				source: current.source,
+-				changes: squashRecordDiffs([current.changes, entry.changes]),
+-			}
++		if (chunk[0].source !== entry.source) {
++			chunked.push(chunk)
++			chunk = []
+ 		}
++		chunk.push(entry)
+ 	}
++	// Push the last chunk
++	chunked.push(chunk)
+ 
+-	result.push(current)
+-
+-	return devFreeze(result)
++	return devFreeze(
++		chunked.map((chunk) => ({
++			source: chunk[0].source,
++			changes: squashRecordDiffs(chunk.map((e) => e.changes)),
++		}))
++	)
+ }
+ 
+ /** @public */
+
+commit 86403c1b0d6ffb853e4d320be506b3be39491342
+Author: Orion Reed <orionreedt@gmail.com>
+Date:   Mon Apr 8 01:06:24 2024 -0700
+
+    Fix typo in Store.ts (#3385)
+    
+    An immense contribution, I know.
+    
+    ### Change Type
+    
+    <!-- ❗ Please select a 'Scope' label ❗️ -->
+    
+    - [ x ] `docs` — Changes to the documentation, examples, or templates.
+    
+    <!-- ❗ Please select a 'Type' label ❗️ -->
+    
+    - [ x ] `chore` — Updating dependencies, other boring stuff
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index c0feabd64..87856ef1a 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -318,7 +318,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	onAfterCreate?: (record: R, source: 'remote' | 'user') => void
+ 
+ 	/**
+-	 * A callback before after each record's change.
++	 * A callback fired before each record's change.
+ 	 *
+ 	 * @param prev - The previous value, if any.
+ 	 * @param next - The next value.
+
+commit 4f70a4f4e85b278e79a4afadec2eeb08f26879a8
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Apr 15 13:53:42 2024 +0100
+
+    New migrations again (#3220)
+    
+    Describe what your pull request does. If appropriate, add GIFs or images
+    showing the before and after.
+    
+    ### Change Type
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `galaxy brain` — Architectural changes
+    
+    
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    #### BREAKING CHANGES
+    
+    - The `Migrations` type is now called `LegacyMigrations`.
+    - The serialized schema format (e.g. returned by
+    `StoreSchema.serialize()` and `Store.getSnapshot()`) has changed. You
+    don't need to do anything about it unless you were reading data directly
+    from the schema for some reason. In which case it'd be best to avoid
+    that in the future! We have no plans to change the schema format again
+    (this time was traumatic enough) but you never know.
+    - `compareRecordVersions` and the `RecordVersion` type have both
+    disappeared. There is no replacement. These were public by mistake
+    anyway, so hopefully nobody had been using it.
+    - `compareSchemas` is a bit less useful now. Our migrations system has
+    become a little fuzzy to allow for simpler UX when adding/removing
+    custom extensions and 3rd party dependencies, and as a result we can no
+    longer compare serialized schemas in any rigorous manner. You can rely
+    on this function to return `0` if the schemas are the same. Otherwise it
+    will return `-1` if the schema on the right _seems_ to be newer than the
+    schema on the left, but it cannot guarantee that in situations where
+    migration sequences have been removed over time (e.g. if you remove one
+    of the builtin tldraw shapes).
+    
+    Generally speaking, the best way to check schema compatibility now is to
+    call `store.schema.getMigrationsSince(persistedSchema)`. This will throw
+    an error if there is no upgrade path from the `persistedSchema` to the
+    current version.
+    
+    - `defineMigrations` has been deprecated and will be removed in a future
+    release. For upgrade instructions see
+    https://tldraw.dev/docs/persistence#Updating-legacy-shape-migrations-defineMigrations
+    
+    - `migrate` has been removed. Nobody should have been using this but if
+    you were you'll need to find an alternative. For migrating tldraw data,
+    you should stick to using `schema.migrateStoreSnapshot` and, if you are
+    building a nuanced sync engine that supports some amount of backwards
+    compatibility, also feel free to use `schema.migratePersistedRecord`.
+    - the `Migration` type has changed. If you need the old one for some
+    reason it has been renamed to `LegacyMigration`. It will be removed in a
+    future release.
+    - the `Migrations` type has been renamed to `LegacyMigrations` and will
+    be removed in a future release.
+    - the `SerializedSchema` type has been augmented. If you need the old
+    version specifically you can use `SerializedSchemaV1`
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 87856ef1a..5ce958f3f 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -617,11 +617,17 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
+ 		}
+ 
+-		transact(() => {
+-			this.clear()
+-			this.put(Object.values(migrationResult.value))
+-			this.ensureStoreIsUsable()
+-		})
++		const prevRunCallbacks = this._runCallbacks
++		try {
++			this._runCallbacks = false
++			transact(() => {
++				this.clear()
++				this.put(Object.values(migrationResult.value))
++				this.ensureStoreIsUsable()
++			})
++		} finally {
++			this._runCallbacks = prevRunCallbacks
++		}
+ 	}
+ 
+ 	/**
+
+commit 8151e6f586149e4447149d25bd70868a5a4e8838
+Author: alex <alex@dytry.ch>
+Date:   Wed Apr 24 19:26:10 2024 +0100
+
+    Automatic undo/redo (#3364)
+    
+    Our undo-redo system before this diff is based on commands. A command
+    is:
+    - A function that produces some data required to perform and undo a
+    change
+    - A function that actually performs the change, based on the data
+    - Another function that undoes the change, based on the data
+    - Optionally, a function to _redo_ the change, although in practice we
+    never use this
+    
+    Each command that gets run is added to the undo/redo stack unless it
+    says it shouldn't be.
+    
+    This diff replaces this system of commands with a new one where all
+    changes to the store are automatically recorded in the undo/redo stack.
+    You can imagine the new history manager like a tape recorder - it
+    automatically records everything that happens to the store in a special
+    diff, unless you "pause" the recording and ask it not to. Undo and redo
+    rewind/fast-forward the tape to certain marks.
+    
+    As the command concept is gone, the things that were commands are now
+    just functions that manipulate the store.
+    
+    One other change here is that the store's after-phase callbacks (and the
+    after-phase side-effects as a result) are now batched up and called at
+    the end of certain key operations. For example, `applyDiff` would
+    previously call all the `afterCreate` callbacks before making any
+    removals from the diff. Now, it (and anything else that uses
+    `store.atomic(fn)` will defer firing any after callbacks until the end
+    of an operation. before callbacks are still called part-way through
+    operations.
+    
+    ## Design options
+    Automatic recording is a fairly large big semantic change, particularly
+    to the standalone `store.put`/`store.remove` etc. commands. We could
+    instead make not-recording the default, and make recording opt-in
+    instead. However, I think auto-record-by-default is the right choice for
+    a few reasons:
+    
+    1. Switching to a recording-based vs command-based undo-redo model is
+    fundamentally a big semantic change. In the past, `store.put` etc. were
+    always ignored. Now, regardless of whether we choose record-by-default
+    or ignore-by-default, the behaviour of `store.put` is _context_
+    dependant.
+    2. Switching to ignore-by-default means that either our commands don't
+    record undo/redo history any more (unless wrapped in
+    `editor.history.record`, a far larger semantic change) or they have to
+    always-record/all accept a history options bag. If we choose
+    always-record, we can't use commands within `history.ignore` as they'll
+    start recording again. If we choose the history options bag, we have to
+    accept those options in 10s of methods - basically the entire `Editor`
+    api surface.
+    
+    Overall, given that some breaking semantic change here is unavoidable, I
+    think that record-by-default hits the right balance of tradeoffs. I
+    think it's a better API going forward, whilst also not being too
+    disruptive as the APIs it affects are very "deep" ones that we don't
+    typically encourage people to use.
+    
+    
+    
+    ### Change Type
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `improvement` — Improving existing features
+    - [x] `galaxy brain` — Architectural changes
+    
+    ### Release Note
+    #### Breaking changes
+    ##### 1. History Options
+    Previously, some (not all!) commands accepted a history options object
+    with `squashing`, `ephemeral`, and `preserveRedoStack` flags. Squashing
+    enabled/disabled a memory optimisation (storing individual commands vs
+    squashing them together). Ephemeral stopped a command from affecting the
+    undo/redo stack at all. Preserve redo stack stopped commands from wiping
+    the redo stack. These flags were never available consistently - some
+    commands had them and others didn't.
+    
+    In this version, most of these flags have been removed. `squashing` is
+    gone entirely (everything squashes & does so much faster than before).
+    There were a couple of commands that had a special default - for
+    example, `updateInstanceState` used to default to being `ephemeral`.
+    Those maintain the defaults, but the options look a little different now
+    - `{ephemeral: true}` is now `{history: 'ignore'}` and
+    `{preserveRedoStack: true}` is now `{history:
+    'record-preserveRedoStack'}`.
+    
+    If you were previously using these options in places where they've now
+    been removed, you can use wrap them with `editor.history.ignore(fn)` or
+    `editor.history.batch(fn, {history: 'record-preserveRedoStack'})`. For
+    example,
+    ```ts
+    editor.nudgeShapes(..., { ephemeral: true })
+    ```
+    can now be written as
+    ```ts
+    editor.history.ignore(() => {
+        editor.nudgeShapes(...)
+    })
+    ```
+    
+    ##### 2. Automatic recording
+    Previously, only commands (e.g. `editor.updateShapes` and things that
+    use it) were added to the undo/redo stack. Everything else (e.g.
+    `editor.store.put`) wasn't. Now, _everything_ that touches the store is
+    recorded in the undo/redo stack (unless it's part of
+    `mergeRemoteChanges`). You can use `editor.history.ignore(fn)` as above
+    if you want to make other changes to the store that aren't recorded -
+    this is short for `editor.history.batch(fn, {history: 'ignore'})`
+    
+    When upgrading to this version of tldraw, you shouldn't need to change
+    anything unless you're using `store.put`, `store.remove`, or
+    `store.applyDiff` outside of `store.mergeRemoteChanges`. If you are, you
+    can preserve the functionality of those not being recorded by wrapping
+    them either in `mergeRemoteChanges` (if they're multiplayer-related) or
+    `history.ignore` as appropriate.
+    
+    ##### 3. Side effects
+    Before this diff, any changes in side-effects weren't captured by the
+    undo-redo stack. This was actually the motivation for this change in the
+    first place! But it's a pretty big change, and if you're using side
+    effects we recommend you double-check how they interact with undo/redo
+    before/after this change. To get the old behaviour back, wrap your side
+    effects in `editor.history.ignore`.
+    
+    ##### 4. Mark options
+    Previously, `editor.mark(id)` accepted two additional boolean
+    parameters: `onUndo` and `onRedo`. If these were set to false, then when
+    undoing or redoing we'd skip over that mark and keep going until we
+    found one with those values set to true. We've removed those options -
+    if you're using them, let us know and we'll figure out an alternative!
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 5ce958f3f..e718ab002 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -1,6 +1,8 @@
+ import { Atom, Computed, Reactor, atom, computed, reactor, transact } from '@tldraw/state'
+ import {
++	assert,
+ 	filterEntries,
++	getOwnProperty,
+ 	objectMapEntries,
+ 	objectMapFromEntries,
+ 	objectMapKeys,
+@@ -11,23 +13,13 @@ import { nanoid } from 'nanoid'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { Cache } from './Cache'
+ import { RecordScope } from './RecordType'
++import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+ import { StoreQueries } from './StoreQueries'
+ import { SerializedSchema, StoreSchema } from './StoreSchema'
+ import { devFreeze } from './devFreeze'
+ 
+ type RecFromId<K extends RecordId<UnknownRecord>> = K extends RecordId<infer R> ? R : never
+ 
+-/**
+- * A diff describing the changes to a record.
+- *
+- * @public
+- */
+-export type RecordsDiff<R extends UnknownRecord> = {
+-	added: Record<IdOf<R>, R>
+-	updated: Record<IdOf<R>, [from: R, to: R]>
+-	removed: Record<IdOf<R>, R>
+-}
+-
+ /**
+  * A diff describing the changes to a collection.
+  *
+@@ -113,7 +105,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	/**
+ 	 * The random id of the store.
+ 	 */
+-	public readonly id = nanoid()
++	public readonly id: string
+ 	/**
+ 	 * An atom containing the store's atoms.
+ 	 *
+@@ -169,6 +161,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	public readonly scopedTypes: { readonly [K in RecordScope]: ReadonlySet<R['typeName']> }
+ 
+ 	constructor(config: {
++		id?: string
+ 		/** The store's initial data. */
+ 		initialData?: SerializedStore<R>
+ 		/**
+@@ -178,8 +171,9 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		schema: StoreSchema<R, Props>
+ 		props: Props
+ 	}) {
+-		const { initialData, schema } = config
++		const { initialData, schema, id } = config
+ 
++		this.id = id ?? nanoid()
+ 		this.schema = schema
+ 		this.props = config.props
+ 
+@@ -357,7 +351,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	put = (records: R[], phaseOverride?: 'initialize'): void => {
+-		transact(() => {
++		this.atomic(() => {
+ 			const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {}
+ 			const additions: Record<IdOf<UnknownRecord>, R> = {}
+ 
+@@ -402,7 +396,9 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					recordAtom.set(devFreeze(record))
+ 
+ 					didChange = true
+-					updates[record.id] = [initialValue, recordAtom.__unsafe__getWithoutCapture()]
++					const updated = recordAtom.__unsafe__getWithoutCapture()
++					updates[record.id] = [initialValue, updated]
++					this.addDiffForAfterEvent(initialValue, updated, source)
+ 				} else {
+ 					if (beforeCreate) record = beforeCreate(record, source)
+ 
+@@ -420,6 +416,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 					// Mark the change as a new addition.
+ 					additions[record.id] = record
++					this.addDiffForAfterEvent(null, record, source)
+ 
+ 					// Assign the atom to the map under the record's id.
+ 					if (!map) {
+@@ -441,24 +438,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				updated: updates,
+ 				removed: {} as Record<IdOf<R>, R>,
+ 			})
+-
+-			if (this._runCallbacks) {
+-				const { onAfterCreate, onAfterChange } = this
+-
+-				if (onAfterCreate) {
+-					// Run the onAfterChange callback for addition.
+-					Object.values(additions).forEach((record) => {
+-						onAfterCreate(record, source)
+-					})
+-				}
+-
+-				if (onAfterChange) {
+-					// Run the onAfterChange callback for update.
+-					Object.values(updates).forEach(([from, to]) => {
+-						onAfterChange(from, to, source)
+-					})
+-				}
+-			}
+ 		})
+ 	}
+ 
+@@ -469,7 +448,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	remove = (ids: IdOf<R>[]): void => {
+-		transact(() => {
++		this.atomic(() => {
+ 			const cancelled = [] as IdOf<R>[]
+ 			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+ 
+@@ -496,7 +475,9 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					if (!result) result = { ...atoms }
+ 					if (!removed) removed = {} as Record<IdOf<R>, R>
+ 					delete result[id]
+-					removed[id] = atoms[id].get()
++					const record = atoms[id].get()
++					removed[id] = record
++					this.addDiffForAfterEvent(record, null, source)
+ 				}
+ 
+ 				return result ?? atoms
+@@ -505,17 +486,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			if (!removed) return
+ 			// Update the history with the removed records.
+ 			this.updateHistory({ added: {}, updated: {}, removed } as RecordsDiff<R>)
+-
+-			// If we have an onAfterChange, run it for each removed record.
+-			if (this.onAfterDelete && this._runCallbacks) {
+-				let record: R
+-				for (let i = 0, n = ids.length; i < n; i++) {
+-					record = removed[ids[i]]
+-					if (record) {
+-						this.onAfterDelete(record, source)
+-					}
+-				}
+-			}
+ 		})
+ 	}
+ 
+@@ -620,7 +590,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		const prevRunCallbacks = this._runCallbacks
+ 		try {
+ 			this._runCallbacks = false
+-			transact(() => {
++			this.atomic(() => {
+ 				this.clear()
+ 				this.put(Object.values(migrationResult.value))
+ 				this.ensureStoreIsUsable()
+@@ -731,9 +701,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
++	/**
++	 * Run `fn` and return a {@link RecordsDiff} of the changes that occurred as a result.
++	 */
+ 	extractingChanges(fn: () => void): RecordsDiff<R> {
+ 		const changes: Array<RecordsDiff<R>> = []
+-		const dispose = this.historyAccumulator.intercepting((entry) => changes.push(entry.changes))
++		const dispose = this.historyAccumulator.addInterceptor((entry) => changes.push(entry.changes))
+ 		try {
+ 			transact(fn)
+ 			return squashRecordDiffs(changes)
+@@ -742,25 +715,47 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
+-	applyDiff(diff: RecordsDiff<R>, runCallbacks = true) {
+-		const prevRunCallbacks = this._runCallbacks
+-		try {
+-			this._runCallbacks = runCallbacks
+-			transact(() => {
+-				const toPut = objectMapValues(diff.added).concat(
+-					objectMapValues(diff.updated).map(([_from, to]) => to)
+-				)
+-				const toRemove = objectMapKeys(diff.removed)
+-				if (toPut.length) {
+-					this.put(toPut)
+-				}
+-				if (toRemove.length) {
+-					this.remove(toRemove)
++	applyDiff(
++		diff: RecordsDiff<R>,
++		{
++			runCallbacks = true,
++			ignoreEphemeralKeys = false,
++		}: { runCallbacks?: boolean; ignoreEphemeralKeys?: boolean } = {}
++	) {
++		this.atomic(() => {
++			const toPut = objectMapValues(diff.added)
++
++			for (const [_from, to] of objectMapValues(diff.updated)) {
++				const type = this.schema.getType(to.typeName)
++				if (ignoreEphemeralKeys && type.ephemeralKeySet.size) {
++					const existing = this.get(to.id)
++					if (!existing) {
++						toPut.push(to)
++						continue
++					}
++					let changed: R | null = null
++					for (const [key, value] of Object.entries(to)) {
++						if (type.ephemeralKeySet.has(key) || Object.is(value, getOwnProperty(existing, key))) {
++							continue
++						}
++
++						if (!changed) changed = { ...existing } as R
++						;(changed as any)[key] = value
++					}
++					if (changed) toPut.push(changed)
++				} else {
++					toPut.push(to)
+ 				}
+-			})
+-		} finally {
+-			this._runCallbacks = prevRunCallbacks
+-		}
++			}
++
++			const toRemove = objectMapKeys(diff.removed)
++			if (toPut.length) {
++				this.put(toPut)
++			}
++			if (toRemove.length) {
++				this.remove(toRemove)
++			}
++		}, runCallbacks)
+ 	}
+ 
+ 	/**
+@@ -827,20 +822,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
+-	getRecordType = <T extends R>(record: R): T => {
+-		const type = this.schema.types[record.typeName as R['typeName']]
+-		if (!type) {
+-			throw new Error(`Record type ${record.typeName} not found`)
+-		}
+-		return type as unknown as T
+-	}
+-
+ 	private _integrityChecker?: () => void | undefined
+ 
+ 	/** @internal */
+ 	ensureStoreIsUsable() {
+-		this._integrityChecker ??= this.schema.createIntegrityChecker(this)
+-		this._integrityChecker?.()
++		this.atomic(() => {
++			this._integrityChecker ??= this.schema.createIntegrityChecker(this)
++			this._integrityChecker?.()
++		})
+ 	}
+ 
+ 	private _isPossiblyCorrupted = false
+@@ -852,64 +841,82 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	isPossiblyCorrupted() {
+ 		return this._isPossiblyCorrupted
+ 	}
+-}
+ 
+-/**
+- * Squash a collection of diffs into a single diff.
+- *
+- * @param diffs - An array of diffs to squash.
+- * @returns A single diff that represents the squashed diffs.
+- * @public
+- */
+-export function squashRecordDiffs<T extends UnknownRecord>(
+-	diffs: RecordsDiff<T>[]
+-): RecordsDiff<T> {
+-	const result = { added: {}, removed: {}, updated: {} } as RecordsDiff<T>
+-
+-	for (const diff of diffs) {
+-		for (const [id, value] of objectMapEntries(diff.added)) {
+-			if (result.removed[id]) {
+-				const original = result.removed[id]
+-				delete result.removed[id]
+-				if (original !== value) {
+-					result.updated[id] = [original, value]
+-				}
+-			} else {
+-				result.added[id] = value
+-			}
++	private pendingAfterEvents: Map<
++		IdOf<R>,
++		{ before: R | null; after: R | null; source: 'remote' | 'user' }
++	> | null = null
++	private addDiffForAfterEvent(before: R | null, after: R | null, source: 'remote' | 'user') {
++		assert(this.pendingAfterEvents, 'must be in event operation')
++		if (before === after) return
++		if (before && after) assert(before.id === after.id)
++		if (!before && !after) return
++		const id = (before || after)!.id
++		const existing = this.pendingAfterEvents.get(id)
++		if (existing) {
++			assert(existing.source === source, 'source cannot change within a single event operation')
++			existing.after = after
++		} else {
++			this.pendingAfterEvents.set(id, { before, after, source })
+ 		}
++	}
++	private flushAtomicCallbacks() {
++		let updateDepth = 0
++		while (this.pendingAfterEvents) {
++			const events = this.pendingAfterEvents
++			this.pendingAfterEvents = null
+ 
+-		for (const [id, [_from, to]] of objectMapEntries(diff.updated)) {
+-			if (result.added[id]) {
+-				result.added[id] = to
+-				delete result.updated[id]
+-				delete result.removed[id]
+-				continue
+-			}
+-			if (result.updated[id]) {
+-				result.updated[id] = [result.updated[id][0], to]
+-				delete result.removed[id]
+-				continue
++			if (!this._runCallbacks) continue
++
++			updateDepth++
++			if (updateDepth > 100) {
++				throw new Error('Maximum store update depth exceeded, bailing out')
+ 			}
+ 
+-			result.updated[id] = diff.updated[id]
+-			delete result.removed[id]
++			for (const { before, after, source } of events.values()) {
++				if (before && after) {
++					this.onAfterChange?.(before, after, source)
++				} else if (before && !after) {
++					this.onAfterDelete?.(before, source)
++				} else if (!before && after) {
++					this.onAfterCreate?.(after, source)
++				}
++			}
+ 		}
++	}
++	private _isInAtomicOp = false
++	/** @internal */
++	atomic<T>(fn: () => T, runCallbacks = true): T {
++		return transact(() => {
++			if (this._isInAtomicOp) {
++				if (!this.pendingAfterEvents) this.pendingAfterEvents = new Map()
++				return fn()
++			}
++
++			this.pendingAfterEvents = new Map()
++			const prevRunCallbacks = this._runCallbacks
++			this._runCallbacks = runCallbacks ?? prevRunCallbacks
++			this._isInAtomicOp = true
++			try {
++				const result = fn()
+ 
+-		for (const [id, value] of objectMapEntries(diff.removed)) {
+-			// the same record was added in this diff sequence, just drop it
+-			if (result.added[id]) {
+-				delete result.added[id]
+-			} else if (result.updated[id]) {
+-				result.removed[id] = result.updated[id][0]
+-				delete result.updated[id]
+-			} else {
+-				result.removed[id] = value
++				this.flushAtomicCallbacks()
++
++				return result
++			} finally {
++				this.pendingAfterEvents = null
++				this._runCallbacks = prevRunCallbacks
++				this._isInAtomicOp = false
+ 			}
+-		}
++		})
+ 	}
+ 
+-	return result
++	/** @internal */
++	addHistoryInterceptor(fn: (entry: HistoryEntry<R>, source: ChangeSource) => void) {
++		return this.historyAccumulator.addInterceptor((entry) =>
++			fn(entry, this.isMergingRemoteChanges ? 'remote' : 'user')
++		)
++	}
+ }
+ 
+ /**
+@@ -949,21 +956,12 @@ function squashHistoryEntries<T extends UnknownRecord>(
+ 	)
+ }
+ 
+-/** @public */
+-export function reverseRecordsDiff(diff: RecordsDiff<any>) {
+-	const result: RecordsDiff<any> = { added: diff.removed, removed: diff.added, updated: {} }
+-	for (const [from, to] of Object.values(diff.updated)) {
+-		result.updated[from.id] = [to, from]
+-	}
+-	return result
+-}
+-
+ class HistoryAccumulator<T extends UnknownRecord> {
+ 	private _history: HistoryEntry<T>[] = []
+ 
+ 	private _interceptors: Set<(entry: HistoryEntry<T>) => void> = new Set()
+ 
+-	intercepting(fn: (entry: HistoryEntry<T>) => void) {
++	addInterceptor(fn: (entry: HistoryEntry<T>) => void) {
+ 		this._interceptors.add(fn)
+ 		return () => {
+ 			this._interceptors.delete(fn)
+
+commit 91903c97614f3645dcbdcf6986fd5e4ca3dd95dc
+Author: alex <alex@dytry.ch>
+Date:   Thu May 9 10:48:01 2024 +0100
+
+    Move arrow helpers from editor to tldraw (#3721)
+    
+    With the new work on bindings, we no longer need to keep any arrows
+    stuff hard-coded in `editor`, so let's move it to `tldraw` with the rest
+    of the shapes.
+    
+    Couple other changes as part of this:
+    - We had two different types of `WeakMap` backed cache, but we now only
+    have one
+    - There's a new free-standing version of `createComputedCache` that
+    doesn't need access to the editor/store in order to create the cache.
+    instead, it returns a `{get(editor, id)}` object and instantiates the
+    cache on a per-editor basis for each call.
+    - Fixed a bug in `createSelectedComputedCache` where the selector
+    derivation would get re-created on every call to `get`
+    
+    ### Change Type
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `improvement` — Improving existing features
+    
+    ### Release Notes
+    
+    #### Breaking changes
+    - `editor.getArrowInfo(shape)` has been replaced with
+    `getArrowInfo(editor, shape)`
+    - `editor.getArrowsBoundTo(shape)` has been removed. Instead, use
+    `editor.getBindingsToShape(shape, 'arrow')` and follow the `fromId` of
+    each binding to the corresponding arrow shape
+    - These types have moved from `@tldraw/editor` to `tldraw`:
+        - `TLArcInfo`
+        - `TLArrowInfo`
+        - `TLArrowPoint`
+    - `WeakMapCache` has been removed
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index e718ab002..6bffe9489 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -1,5 +1,6 @@
+ import { Atom, Computed, Reactor, atom, computed, reactor, transact } from '@tldraw/state'
+ import {
++	WeakCache,
+ 	assert,
+ 	filterEntries,
+ 	getOwnProperty,
+@@ -11,7 +12,6 @@ import {
+ } from '@tldraw/utils'
+ import { nanoid } from 'nanoid'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+-import { Cache } from './Cache'
+ import { RecordScope } from './RecordType'
+ import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+ import { StoreQueries } from './StoreQueries'
+@@ -765,14 +765,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param derive - A function used to derive the value of the cache.
+ 	 * @public
+ 	 */
+-	createComputedCache = <T, V extends R = R>(
++	createComputedCache = <Result, Record extends R = R>(
+ 		name: string,
+-		derive: (record: V) => T | undefined,
+-		isEqual?: (a: V, b: V) => boolean
+-	): ComputedCache<T, V> => {
+-		const cache = new Cache<Atom<any>, Computed<T | undefined>>()
++		derive: (record: Record) => Result | undefined,
++		isEqual?: (a: Record, b: Record) => boolean
++	): ComputedCache<Result, Record> => {
++		const cache = new WeakCache<Atom<any>, Computed<Result | undefined>>()
+ 		return {
+-			get: (id: IdOf<V>) => {
++			get: (id: IdOf<Record>) => {
+ 				const atom = this.atoms.get()[id]
+ 				if (!atom) {
+ 					return undefined
+@@ -782,8 +782,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 						const recordSignal = isEqual
+ 							? computed(atom.name + ':equals', () => atom.get(), { isEqual })
+ 							: atom
+-						return computed<T | undefined>(name + ':' + id, () => {
+-							return derive(recordSignal.get() as V)
++						return computed<Result | undefined>(name + ':' + id, () => {
++							return derive(recordSignal.get() as Record)
+ 						})
+ 					})
+ 					.get()
+@@ -799,24 +799,26 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param derive - A function used to derive the value of the cache.
+ 	 * @public
+ 	 */
+-	createSelectedComputedCache = <T, J, V extends R = R>(
++	createSelectedComputedCache = <Selection, Result, Record extends R = R>(
+ 		name: string,
+-		selector: (record: V) => T | undefined,
+-		derive: (input: T) => J | undefined
+-	): ComputedCache<J, V> => {
+-		const cache = new Cache<Atom<any>, Computed<J | undefined>>()
++		selector: (record: Record) => Selection | undefined,
++		derive: (input: Selection) => Result | undefined
++	): ComputedCache<Result, Record> => {
++		const cache = new WeakCache<Atom<any>, Computed<Result | undefined>>()
+ 		return {
+-			get: (id: IdOf<V>) => {
++			get: (id: IdOf<Record>) => {
+ 				const atom = this.atoms.get()[id]
+ 				if (!atom) {
+ 					return undefined
+ 				}
+ 
+-				const d = computed<T | undefined>(name + ':' + id + ':selector', () =>
+-					selector(atom.get() as V)
+-				)
+ 				return cache
+-					.get(atom, () => computed<J | undefined>(name + ':' + id, () => derive(d.get() as T)))
++					.get(atom, () => {
++						const d = computed<Selection | undefined>(name + ':' + id + ':selector', () =>
++							selector(atom.get() as Record)
++						)
++						return computed<Result | undefined>(name + ':' + id, () => derive(d.get() as Selection))
++					})
+ 					.get()
+ 			},
+ 		}
+@@ -989,3 +991,42 @@ class HistoryAccumulator<T extends UnknownRecord> {
+ 		return this._history.length > 0
+ 	}
+ }
++
++type StoreContext<R extends UnknownRecord> = Store<R> | { store: Store<R> }
++type ContextRecordType<Context extends StoreContext<any>> =
++	Context extends Store<infer R> ? R : Context extends { store: Store<infer R> } ? R : never
++
++/**
++ * Free version of {@link Store.createComputedCache}.
++ *
++ * @example
++ * ```ts
++ * const myCache = createComputedCache('myCache', (editor: Editor, shape: TLShape) => {
++ *     return editor.getSomethingExpensive(shape)
++ * })
++ *
++ * myCache.get(editor, shape.id)
++ * ```
++ *
++ * @public
++ */
++export function createComputedCache<
++	Context extends StoreContext<any>,
++	Result,
++	Record extends ContextRecordType<Context> = ContextRecordType<Context>,
++>(
++	name: string,
++	derive: (context: Context, record: Record) => Result | undefined,
++	isEqual?: (a: Record, b: Record) => boolean
++) {
++	const cache = new WeakCache<Context, ComputedCache<Result, Record>>()
++	return {
++		get(context: Context, id: IdOf<Record>) {
++			const computedCache = cache.get(context, () => {
++				const store = (context instanceof Store ? context : context.store) as Store<Record>
++				return store.createComputedCache(name, (record) => derive(context, record), isEqual)
++			})
++			return computedCache.get(id)
++		},
++	}
++}
+
+commit ab807afda313226953c72bd74a95bb312162b643
+Author: alex <alex@dytry.ch>
+Date:   Tue May 14 10:42:41 2024 +0100
+
+    Store-level "operation end" event (#3748)
+    
+    This adds a store-level "operation end" event which fires at the end of
+    atomic operations. It includes some other changes too:
+    
+    - The `SideEffectManager` now lives in & is a property of the store as
+    `StoreSideEffects`. One benefit to this is that instead of overriding
+    methods on the store to register side effects (meaning the store can
+    only ever be used in one place) the store now calls directly into the
+    side effect manager, which is responsible for dealing with any other
+    callbacks
+    - The history manager's "batch complete" event is gone, in favour of
+    this new event. We were using the batch complete event for only one
+    thing, calling `onChildrenChange` - which meant it wasn't getting called
+    for undo/redo events, which aren't part of a batch. `onChildrenChange`
+    is now called after each atomic store operation affecting children.
+    
+    I've also added a rough pin example which shows (kinda messily) how you
+    might use the operation complete handler to traverse a graph of bindings
+    and resolve constraints between them.
+    
+    ### Change Type
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `feature` — New feature
+    
+    ### Release Notes
+    
+    #### Breaking changes
+    `editor.registerBatchCompleteHandler` has been replaced with
+    `editor.registerOperationCompleteHandler`
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 6bffe9489..ace5e9217 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -16,6 +16,7 @@ import { RecordScope } from './RecordType'
+ import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+ import { StoreQueries } from './StoreQueries'
+ import { SerializedSchema, StoreSchema } from './StoreSchema'
++import { StoreSideEffects } from './StoreSideEffects'
+ import { devFreeze } from './devFreeze'
+ 
+ type RecFromId<K extends RecordId<UnknownRecord>> = K extends RecordId<infer R> ? R : never
+@@ -160,6 +161,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 	public readonly scopedTypes: { readonly [K in RecordScope]: ReadonlySet<R['typeName']> }
+ 
++	public readonly sideEffects = new StoreSideEffects<R>(this)
++
+ 	constructor(config: {
+ 		id?: string
+ 		/** The store's initial data. */
+@@ -295,55 +298,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
+ 	}
+ 
+-	/**
+-	 * A callback fired after each record's change.
+-	 *
+-	 * @param prev - The previous value, if any.
+-	 * @param next - The next value.
+-	 */
+-	onBeforeCreate?: (next: R, source: 'remote' | 'user') => R
+-
+-	/**
+-	 * A callback fired after a record is created. Use this to perform related updates to other
+-	 * records in the store.
+-	 *
+-	 * @param record - The record to be created
+-	 */
+-	onAfterCreate?: (record: R, source: 'remote' | 'user') => void
+-
+-	/**
+-	 * A callback fired before each record's change.
+-	 *
+-	 * @param prev - The previous value, if any.
+-	 * @param next - The next value.
+-	 */
+-	onBeforeChange?: (prev: R, next: R, source: 'remote' | 'user') => R
+-
+-	/**
+-	 * A callback fired after each record's change.
+-	 *
+-	 * @param prev - The previous value, if any.
+-	 * @param next - The next value.
+-	 */
+-	onAfterChange?: (prev: R, next: R, source: 'remote' | 'user') => void
+-
+-	/**
+-	 * A callback fired before a record is deleted.
+-	 *
+-	 * @param prev - The record that will be deleted.
+-	 */
+-	onBeforeDelete?: (prev: R, source: 'remote' | 'user') => false | void
+-
+-	/**
+-	 * A callback fired after a record is deleted.
+-	 *
+-	 * @param prev - The record that will be deleted.
+-	 */
+-	onAfterDelete?: (prev: R, source: 'remote' | 'user') => void
+-
+-	// used to avoid running callbacks when rolling back changes in sync client
+-	private _runCallbacks = true
+-
+ 	/**
+ 	 * Add some records to the store. It's an error if they already exist.
+ 	 *
+@@ -367,8 +321,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			// changes (e.g. additions, deletions, or updates that produce a new value).
+ 			let didChange = false
+ 
+-			const beforeCreate = this.onBeforeCreate && this._runCallbacks ? this.onBeforeCreate : null
+-			const beforeUpdate = this.onBeforeChange && this._runCallbacks ? this.onBeforeChange : null
+ 			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+ 
+ 			for (let i = 0, n = records.length; i < n; i++) {
+@@ -381,7 +333,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					const initialValue = recordAtom.__unsafe__getWithoutCapture()
+ 
+ 					// If we have a beforeUpdate callback, run it against the initial and next records
+-					if (beforeUpdate) record = beforeUpdate(initialValue, record, source)
++					record = this.sideEffects.handleBeforeChange(initialValue, record, source)
+ 
+ 					// Validate the record
+ 					const validated = this.schema.validateRecord(
+@@ -398,9 +350,9 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 					didChange = true
+ 					const updated = recordAtom.__unsafe__getWithoutCapture()
+ 					updates[record.id] = [initialValue, updated]
+-					this.addDiffForAfterEvent(initialValue, updated, source)
++					this.addDiffForAfterEvent(initialValue, updated)
+ 				} else {
+-					if (beforeCreate) record = beforeCreate(record, source)
++					record = this.sideEffects.handleBeforeCreate(record, source)
+ 
+ 					didChange = true
+ 
+@@ -416,7 +368,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 					// Mark the change as a new addition.
+ 					additions[record.id] = record
+-					this.addDiffForAfterEvent(null, record, source)
++					this.addDiffForAfterEvent(null, record)
+ 
+ 					// Assign the atom to the map under the record's id.
+ 					if (!map) {
+@@ -449,16 +401,16 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	remove = (ids: IdOf<R>[]): void => {
+ 		this.atomic(() => {
+-			const cancelled = [] as IdOf<R>[]
++			const cancelled = new Set<IdOf<R>>()
+ 			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+ 
+-			if (this.onBeforeDelete && this._runCallbacks) {
++			if (this.sideEffects.isEnabled()) {
+ 				for (const id of ids) {
+ 					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
+ 					if (!atom) continue
+ 
+-					if (this.onBeforeDelete(atom.get(), source) === false) {
+-						cancelled.push(id)
++					if (this.sideEffects.handleBeforeDelete(atom.get(), source) === false) {
++						cancelled.add(id)
+ 					}
+ 				}
+ 			}
+@@ -470,14 +422,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				let result: typeof atoms | undefined = undefined
+ 
+ 				for (const id of ids) {
+-					if (cancelled.includes(id)) continue
++					if (cancelled.has(id)) continue
+ 					if (!(id in atoms)) continue
+ 					if (!result) result = { ...atoms }
+ 					if (!removed) removed = {} as Record<IdOf<R>, R>
+ 					delete result[id]
+ 					const record = atoms[id].get()
+ 					removed[id] = record
+-					this.addDiffForAfterEvent(record, null, source)
++					this.addDiffForAfterEvent(record, null)
+ 				}
+ 
+ 				return result ?? atoms
+@@ -587,16 +539,16 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
+ 		}
+ 
+-		const prevRunCallbacks = this._runCallbacks
++		const prevSideEffectsEnabled = this.sideEffects.isEnabled()
+ 		try {
+-			this._runCallbacks = false
++			this.sideEffects.setIsEnabled(false)
+ 			this.atomic(() => {
+ 				this.clear()
+ 				this.put(Object.values(migrationResult.value))
+ 				this.ensureStoreIsUsable()
+ 			})
+ 		} finally {
+-			this._runCallbacks = prevRunCallbacks
++			this.sideEffects.setIsEnabled(prevSideEffectsEnabled)
+ 		}
+ 	}
+ 
+@@ -693,6 +645,10 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			return fn()
+ 		}
+ 
++		if (this._isInAtomicOp) {
++			throw new Error('Cannot merge remote changes while in atomic operation')
++		}
++
+ 		try {
+ 			this.isMergingRemoteChanges = true
+ 			transact(fn)
+@@ -844,11 +800,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		return this._isPossiblyCorrupted
+ 	}
+ 
+-	private pendingAfterEvents: Map<
+-		IdOf<R>,
+-		{ before: R | null; after: R | null; source: 'remote' | 'user' }
+-	> | null = null
+-	private addDiffForAfterEvent(before: R | null, after: R | null, source: 'remote' | 'user') {
++	private pendingAfterEvents: Map<IdOf<R>, { before: R | null; after: R | null }> | null = null
++	private addDiffForAfterEvent(before: R | null, after: R | null) {
+ 		assert(this.pendingAfterEvents, 'must be in event operation')
+ 		if (before === after) return
+ 		if (before && after) assert(before.id === after.id)
+@@ -856,34 +809,38 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		const id = (before || after)!.id
+ 		const existing = this.pendingAfterEvents.get(id)
+ 		if (existing) {
+-			assert(existing.source === source, 'source cannot change within a single event operation')
+ 			existing.after = after
+ 		} else {
+-			this.pendingAfterEvents.set(id, { before, after, source })
++			this.pendingAfterEvents.set(id, { before, after })
+ 		}
+ 	}
+ 	private flushAtomicCallbacks() {
+ 		let updateDepth = 0
++		const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+ 		while (this.pendingAfterEvents) {
+ 			const events = this.pendingAfterEvents
+ 			this.pendingAfterEvents = null
+ 
+-			if (!this._runCallbacks) continue
++			if (!this.sideEffects.isEnabled()) continue
+ 
+ 			updateDepth++
+ 			if (updateDepth > 100) {
+ 				throw new Error('Maximum store update depth exceeded, bailing out')
+ 			}
+ 
+-			for (const { before, after, source } of events.values()) {
++			for (const { before, after } of events.values()) {
+ 				if (before && after) {
+-					this.onAfterChange?.(before, after, source)
++					this.sideEffects.handleAfterChange(before, after, source)
+ 				} else if (before && !after) {
+-					this.onAfterDelete?.(before, source)
++					this.sideEffects.handleAfterDelete(before, source)
+ 				} else if (!before && after) {
+-					this.onAfterCreate?.(after, source)
++					this.sideEffects.handleAfterCreate(after, source)
+ 				}
+ 			}
++
++			if (!this.pendingAfterEvents) {
++				this.sideEffects.handleOperationComplete(source)
++			}
+ 		}
+ 	}
+ 	private _isInAtomicOp = false
+@@ -896,8 +853,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			}
+ 
+ 			this.pendingAfterEvents = new Map()
+-			const prevRunCallbacks = this._runCallbacks
+-			this._runCallbacks = runCallbacks ?? prevRunCallbacks
++			const prevSideEffectsEnabled = this.sideEffects.isEnabled()
++			this.sideEffects.setIsEnabled(runCallbacks ?? prevSideEffectsEnabled)
+ 			this._isInAtomicOp = true
+ 			try {
+ 				const result = fn()
+@@ -907,7 +864,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				return result
+ 			} finally {
+ 				this.pendingAfterEvents = null
+-				this._runCallbacks = prevRunCallbacks
++				this.sideEffects.setIsEnabled(prevSideEffectsEnabled)
+ 				this._isInAtomicOp = false
+ 			}
+ 		})
+
+commit f9ed1bf2c9480b1c49f591a8609adfb4fcf91eae
+Author: alex <alex@dytry.ch>
+Date:   Wed May 22 16:55:49 2024 +0100
+
+    Force `interface` instead of `type` for better docs (#3815)
+    
+    Typescript's type aliases (`type X = thing`) can refer to basically
+    anything, which makes it hard to write an automatic document formatter
+    for them. Interfaces on the other hand are only object, so they play
+    much nicer with docs. Currently, object-flavoured type aliases don't
+    really get expanded at all on our docs site, which means we have a bunch
+    of docs content that's not shown on the site.
+    
+    This diff introduces a lint rule that forces `interface X {foo: bar}`s
+    instead of `type X = {foo: bar}` where possible, as it results in a much
+    better documentation experience:
+    
+    Before:
+    <img width="437" alt="Screenshot 2024-05-22 at 15 24 13"
+    src="https://github.com/tldraw/tldraw/assets/1489520/32606fd1-6832-4a1e-aa5f-f0534d160c92">
+    
+    After:
+    <img width="431" alt="Screenshot 2024-05-22 at 15 33 01"
+    src="https://github.com/tldraw/tldraw/assets/1489520/4e0d59ee-c38e-4056-b9fd-6a7f15d28f0f">
+    
+    
+    ### Change Type
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `docs` — Changes to the documentation, examples, or templates.
+    - [x] `improvement` — Improving existing features
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index ace5e9217..6654705ae 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -26,11 +26,14 @@ type RecFromId<K extends RecordId<UnknownRecord>> = K extends RecordId<infer R>
+  *
+  * @public
+  */
+-export type CollectionDiff<T> = { added?: Set<T>; removed?: Set<T> }
++export interface CollectionDiff<T> {
++	added?: Set<T>
++	removed?: Set<T>
++}
+ 
+ export type ChangeSource = 'user' | 'remote'
+ 
+-export type StoreListenerFilters = {
++export interface StoreListenerFilters {
+ 	source: ChangeSource | 'all'
+ 	scope: RecordScope | 'all'
+ }
+@@ -40,7 +43,7 @@ export type StoreListenerFilters = {
+  *
+  * @public
+  */
+-export type HistoryEntry<R extends UnknownRecord = UnknownRecord> = {
++export interface HistoryEntry<R extends UnknownRecord = UnknownRecord> {
+ 	changes: RecordsDiff<R>
+ 	source: ChangeSource
+ }
+@@ -57,7 +60,7 @@ export type StoreListener<R extends UnknownRecord> = (entry: HistoryEntry<R>) =>
+  *
+  * @public
+  */
+-export type ComputedCache<Data, R extends UnknownRecord> = {
++export interface ComputedCache<Data, R extends UnknownRecord> {
+ 	get(id: IdOf<R>): Data | undefined
+ }
+ 
+@@ -69,13 +72,13 @@ export type ComputedCache<Data, R extends UnknownRecord> = {
+ export type SerializedStore<R extends UnknownRecord> = Record<IdOf<R>, R>
+ 
+ /** @public */
+-export type StoreSnapshot<R extends UnknownRecord> = {
++export interface StoreSnapshot<R extends UnknownRecord> {
+ 	store: SerializedStore<R>
+ 	schema: SerializedSchema
+ }
+ 
+ /** @public */
+-export type StoreValidator<R extends UnknownRecord> = {
++export interface StoreValidator<R extends UnknownRecord> {
+ 	validate: (record: unknown) => R
+ 	validateUsingKnownGoodVersion?: (knownGoodVersion: R, record: unknown) => R
+ }
+@@ -86,7 +89,7 @@ export type StoreValidators<R extends UnknownRecord> = {
+ }
+ 
+ /** @public */
+-export type StoreError = {
++export interface StoreError {
+ 	error: Error
+ 	phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests'
+ 	recordBefore?: unknown
+
+commit 19d051c188381e54d7f8a1fd90a2ccd247419909
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Jun 3 16:58:00 2024 +0100
+
+    Snapshots pit of success (#3811)
+    
+    Lots of people are having a bad time with loading/restoring snapshots
+    and there's a few reasons for that:
+    
+    - It's not clear how to preserve UI state independently of document
+    state.
+    - Loading a snapshot wipes the instance state, which means we almost
+    always need to
+      - update the viewport page bounds
+      - refocus the editor
+      - preserver some other sneaky properties of the `instance` record
+    
+    ### Change Type
+    
+    <!-- ❗ Please select a 'Scope' label ❗️ -->
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [ ] `dotcom` — Changes the tldraw.com web app
+    - [ ] `docs` — Changes to the documentation, examples, or templates.
+    - [ ] `vs code` — Changes to the vscode plugin
+    - [ ] `internal` — Does not affect user-facing stuff
+    
+    <!-- ❗ Please select a 'Type' label ❗️ -->
+    
+    - [ ] `bugfix` — Bug fix
+    - [ ] `feature` — New feature
+    - [ ] `improvement` — Improving existing features
+    - [ ] `chore` — Updating dependencies, other boring stuff
+    - [ ] `galaxy brain` — Architectural changes
+    - [ ] `tests` — Changes to any test code
+    - [ ] `tools` — Changes to infrastructure, CI, internal scripts,
+    debugging tools, etc.
+    - [ ] `dunno` — I don't know
+    
+    
+    ### Test Plan
+    
+    1. Add a step-by-step description of how to test your PR here.
+    2.
+    
+    - [ ] Unit Tests
+    - [ ] End to end tests
+    
+    ### Release Notes
+    
+    - Add a brief release note for your PR here.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 6654705ae..d272e3b18 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -485,21 +485,31 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * Get a serialized snapshot of the store and its schema.
+ 	 *
+ 	 * ```ts
+-	 * const snapshot = store.getSnapshot()
+-	 * store.loadSnapshot(snapshot)
++	 * const snapshot = store.getStoreSnapshot()
++	 * store.loadStoreSnapshot(snapshot)
+ 	 * ```
+ 	 *
+ 	 * @param scope - The scope of records to serialize. Defaults to 'document'.
+ 	 *
+ 	 * @public
+ 	 */
+-	getSnapshot(scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> {
++	getStoreSnapshot(scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> {
+ 		return {
+ 			store: this.serialize(scope),
+ 			schema: this.schema.serialize(),
+ 		}
+ 	}
+ 
++	/**
++	 * @deprecated use `getSnapshot` from the 'tldraw' package instead.
++	 */
++	getSnapshot(scope: RecordScope | 'all' = 'document') {
++		console.warn(
++			'[tldraw] `Store.getSnapshot` is deprecated and will be removed in a future release. Use `getSnapshot` from the `tldraw` package instead.'
++		)
++		return this.getStoreSnapshot(scope)
++	}
++
+ 	/**
+ 	 * Migrate a serialized snapshot of the store and its schema.
+ 	 *
+@@ -528,14 +538,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * Load a serialized snapshot.
+ 	 *
+ 	 * ```ts
+-	 * const snapshot = store.getSnapshot()
+-	 * store.loadSnapshot(snapshot)
++	 * const snapshot = store.getStoreSnapshot()
++	 * store.loadStoreSnapshot(snapshot)
+ 	 * ```
+ 	 *
+ 	 * @param snapshot - The snapshot to load.
+ 	 * @public
+ 	 */
+-	loadSnapshot(snapshot: StoreSnapshot<R>): void {
++	loadStoreSnapshot(snapshot: StoreSnapshot<R>): void {
+ 		const migrationResult = this.schema.migrateStoreSnapshot(snapshot)
+ 
+ 		if (migrationResult.type === 'error') {
+@@ -555,6 +565,17 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
++	/**
++	 * @public
++	 * @deprecated use `loadSnapshot` from the 'tldraw' package instead.
++	 */
++	loadSnapshot(snapshot: StoreSnapshot<R>) {
++		console.warn(
++			"[tldraw] `Store.loadSnapshot` is deprecated and will be removed in a future release. Use `loadSnapshot` from the 'tldraw' package instead."
++		)
++		this.loadStoreSnapshot(snapshot)
++	}
++
+ 	/**
+ 	 * Get an array of all values in the store.
+ 	 *
+
+commit fb0dd1d2fe7d974dfa194264b4c3f196469cba97
+Author: alex <alex@dytry.ch>
+Date:   Mon Jun 10 14:50:03 2024 +0100
+
+    make sure everything marked @public gets documented (#3892)
+    
+    Previously, we had the `ae-forgotten-export` rule from api-extractor
+    disabled. This rule makes sure that everything that's referred to in the
+    public API is actually exported. There are more details on the rule
+    [here](https://api-extractor.com/pages/messages/ae-forgotten-export/),
+    but not exporting public API entires is bad because they're hard to
+    document and can't be typed/called from consumer code. For us, the big
+    effect is that they don't appear in our docs at all.
+    
+    This diff re-enables that rule. Now, if you introduce something new to
+    the public API but don't export it, your build will fail.
+    
+    ### Change Type
+    
+    - [x] `docs` — Changes to the documentation, examples, or templates.
+    - [x] `improvement` — Improving existing features
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index d272e3b18..814215139 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -19,7 +19,9 @@ import { SerializedSchema, StoreSchema } from './StoreSchema'
+ import { StoreSideEffects } from './StoreSideEffects'
+ import { devFreeze } from './devFreeze'
+ 
+-type RecFromId<K extends RecordId<UnknownRecord>> = K extends RecordId<infer R> ? R : never
++/** @public */
++export type RecordFromId<K extends RecordId<UnknownRecord>> =
++	K extends RecordId<infer R> ? R : never
+ 
+ /**
+  * A diff describing the changes to a collection.
+@@ -31,8 +33,10 @@ export interface CollectionDiff<T> {
+ 	removed?: Set<T>
+ }
+ 
++/** @public */
+ export type ChangeSource = 'user' | 'remote'
+ 
++/** @public */
+ export interface StoreListenerFilters {
+ 	source: ChangeSource | 'all'
+ 	scope: RecordScope | 'all'
+@@ -450,7 +454,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to get.
+ 	 * @public
+ 	 */
+-	get = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
++	get = <K extends IdOf<R>>(id: K): RecordFromId<K> | undefined => {
+ 		return this.atoms.get()[id]?.get() as any
+ 	}
+ 
+@@ -460,7 +464,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to get.
+ 	 * @public
+ 	 */
+-	unsafeGetWithoutCapture = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
++	unsafeGetWithoutCapture = <K extends IdOf<R>>(id: K): RecordFromId<K> | undefined => {
+ 		return this.atoms.get()[id]?.__unsafe__getWithoutCapture() as any
+ 	}
+ 
+@@ -602,14 +606,14 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to update.
+ 	 * @param updater - A function that updates the record.
+ 	 */
+-	update = <K extends IdOf<R>>(id: K, updater: (record: RecFromId<K>) => RecFromId<K>) => {
++	update = <K extends IdOf<R>>(id: K, updater: (record: RecordFromId<K>) => RecordFromId<K>) => {
+ 		const atom = this.atoms.get()[id]
+ 		if (!atom) {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+ 			return
+ 		}
+ 
+-		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecFromId<K>) as any])
++		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecordFromId<K>) as any])
+ 	}
+ 
+ 	/**
+@@ -973,8 +977,10 @@ class HistoryAccumulator<T extends UnknownRecord> {
+ 	}
+ }
+ 
+-type StoreContext<R extends UnknownRecord> = Store<R> | { store: Store<R> }
+-type ContextRecordType<Context extends StoreContext<any>> =
++/** @public */
++export type StoreObject<R extends UnknownRecord> = Store<R> | { store: Store<R> }
++/** @public */
++export type StoreObjectRecordType<Context extends StoreObject<any>> =
+ 	Context extends Store<infer R> ? R : Context extends { store: Store<infer R> } ? R : never
+ 
+ /**
+@@ -992,9 +998,9 @@ type ContextRecordType<Context extends StoreContext<any>> =
+  * @public
+  */
+ export function createComputedCache<
+-	Context extends StoreContext<any>,
++	Context extends StoreObject<any>,
+ 	Result,
+-	Record extends ContextRecordType<Context> = ContextRecordType<Context>,
++	Record extends StoreObjectRecordType<Context> = StoreObjectRecordType<Context>,
+ >(
+ 	name: string,
+ 	derive: (context: Context, record: Record) => Result | undefined,
+
+commit 3adae06d9c1db0b047bf44d2dc216841bcbc6ce8
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Tue Jun 11 14:59:25 2024 +0100
+
+    security: enforce use of our fetch function and its default referrerpolicy (#3884)
+    
+    followup to https://github.com/tldraw/tldraw/pull/3881 to enforce this
+    in the codebase
+    
+    Describe what your pull request does. If appropriate, add GIFs or images
+    showing the before and after.
+    
+    ### Change Type
+    
+    <!-- ❗ Please select a 'Scope' label ❗️ -->
+    
+    - [x] `sdk` — Changes the tldraw SDK
+    - [x] `dotcom` — Changes the tldraw.com web app
+    - [ ] `docs` — Changes to the documentation, examples, or templates.
+    - [ ] `vs code` — Changes to the vscode plugin
+    - [ ] `internal` — Does not affect user-facing stuff
+    
+    <!-- ❗ Please select a 'Type' label ❗️ -->
+    
+    - [ ] `bugfix` — Bug fix
+    - [ ] `feature` — New feature
+    - [x] `improvement` — Improving existing features
+    - [ ] `chore` — Updating dependencies, other boring stuff
+    - [ ] `galaxy brain` — Architectural changes
+    - [ ] `tests` — Changes to any test code
+    - [ ] `tools` — Changes to infrastructure, CI, internal scripts,
+    debugging tools, etc.
+    - [ ] `dunno` — I don't know
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 814215139..ae61ce142 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -162,6 +162,15 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	private historyReactor: Reactor
+ 
++	/**
++	 * Function to dispose of any in-flight timeouts.
++	 *
++	 * @internal
++	 */
++	private cancelHistoryReactor: () => void = () => {
++		/* noop */
++	}
++
+ 	readonly schema: StoreSchema<R, Props>
+ 
+ 	readonly props: Props
+@@ -209,7 +218,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 				// If we have accumulated history, flush it and update listeners
+ 				this._flushHistory()
+ 			},
+-			{ scheduleEffect: (cb) => throttleToNextFrame(cb) }
++			{ scheduleEffect: (cb) => (this.cancelHistoryReactor = throttleToNextFrame(cb)) }
+ 		)
+ 		this.scopedTypes = {
+ 			document: new Set(
+@@ -264,6 +273,10 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 	}
+ 
++	dispose() {
++		this.cancelHistoryReactor()
++	}
++
+ 	/**
+ 	 * Filters out non-document changes from a diff. Returns null if there are no changes left.
+ 	 * @param change - the records diff
+
+commit f05d102cd44ec3ab3ac84b51bf8669ef3b825481
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Jul 29 15:40:18 2024 +0200
+
+    Move from function properties to methods (#4288)
+    
+    Things left to do
+    - [x] Update docs (things like the [tools
+    page](https://tldraw-docs-fqnvru1os-tldraw.vercel.app/docs/tools),
+    possibly more)
+    - [x] Write a list of breaking changes and how to upgrade.
+    - [x] Do another pass and check if we can update any lines that have
+    `@typescript-eslint/method-signature-style` and
+    `local/prefer-class-methods` disabled
+    - [x] Thinks about what to do with `TLEventHandlers`. Edit: Feels like
+    keeping them is the best way to go.
+    - [x] Remove `override` keyword where it's not needed. Not sure if it's
+    worth the effort. Edit: decided not to spend time here.
+    - [ ] What about possible detached / destructured uses?
+    
+    Fixes https://github.com/tldraw/tldraw/issues/2799
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [x] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Adds eslint rules for enforcing the use of methods instead of function
+    properties and fixes / disables all the resulting errors.
+    
+    # Breaking changes
+    
+    This change affects the syntax of how the event handlers for shape tools
+    and utils are defined.
+    
+    ## Shape utils
+    **Before**
+    ```ts
+    export class CustomShapeUtil extends ShapeUtil<CustomShape> {
+       // Defining flags
+       override canEdit = () => true
+    
+       // Defining event handlers
+       override onResize: TLOnResizeHandler<CustomShape> = (shape, info) => {
+          ...
+       }
+    }
+    ```
+    
+    
+    **After**
+    ```ts
+    export class CustomShapeUtil extends ShapeUtil<CustomShape> {
+       // Defining flags
+       override canEdit() {
+          return true
+       }
+    
+       // Defining event handlers
+       override onResize(shape: CustomShape, info: TLResizeInfo<CustomShape>) {
+          ...
+       }
+    }
+    ```
+    
+    ## Tools
+    
+    **Before**
+    ```ts
+    export class CustomShapeTool extends StateNode {
+       // Defining child states
+       static override children = (): TLStateNodeConstructor[] => [Idle, Pointing]
+    
+       // Defining event handlers
+       override onKeyDown: TLEventHandlers['onKeyDown'] = (info) => {
+          ...
+       }
+    }
+    ```
+    
+    
+    **After**
+    ```ts
+    export class CustomShapeTool extends StateNode {
+       // Defining child states
+       static override children(): TLStateNodeConstructor[] {
+          return [Idle, Pointing]
+       }
+    
+       // Defining event handlers
+       override onKeyDown(info: TLKeyboardEventInfo) {
+          ...
+       }
+    }
+    ```
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index ae61ce142..0a06d8589 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -83,8 +83,8 @@ export interface StoreSnapshot<R extends UnknownRecord> {
+ 
+ /** @public */
+ export interface StoreValidator<R extends UnknownRecord> {
+-	validate: (record: unknown) => R
+-	validateUsingKnownGoodVersion?: (knownGoodVersion: R, record: unknown) => R
++	validate(record: unknown): R
++	validateUsingKnownGoodVersion?(knownGoodVersion: R, record: unknown): R
+ }
+ 
+ /** @public */
+@@ -167,7 +167,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 *
+ 	 * @internal
+ 	 */
+-	private cancelHistoryReactor: () => void = () => {
++	private cancelHistoryReactor(): void {
+ 		/* noop */
+ 	}
+ 
+@@ -324,7 +324,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param records - The records to add.
+ 	 * @public
+ 	 */
+-	put = (records: R[], phaseOverride?: 'initialize'): void => {
++	put(records: R[], phaseOverride?: 'initialize'): void {
+ 		this.atomic(() => {
+ 			const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {}
+ 			const additions: Record<IdOf<UnknownRecord>, R> = {}
+@@ -419,7 +419,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param ids - The ids of the records to remove.
+ 	 * @public
+ 	 */
+-	remove = (ids: IdOf<R>[]): void => {
++	remove(ids: IdOf<R>[]): void {
+ 		this.atomic(() => {
+ 			const cancelled = new Set<IdOf<R>>()
+ 			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+@@ -467,7 +467,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to get.
+ 	 * @public
+ 	 */
+-	get = <K extends IdOf<R>>(id: K): RecordFromId<K> | undefined => {
++	get<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+ 		return this.atoms.get()[id]?.get() as any
+ 	}
+ 
+@@ -477,7 +477,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to get.
+ 	 * @public
+ 	 */
+-	unsafeGetWithoutCapture = <K extends IdOf<R>>(id: K): RecordFromId<K> | undefined => {
++	unsafeGetWithoutCapture<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+ 		return this.atoms.get()[id]?.__unsafe__getWithoutCapture() as any
+ 	}
+ 
+@@ -487,7 +487,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param scope - The scope of records to serialize. Defaults to 'document'.
+ 	 * @returns The record store snapshot as a JSON payload.
+ 	 */
+-	serialize = (scope: RecordScope | 'all' = 'document'): SerializedStore<R> => {
++	serialize(scope: RecordScope | 'all' = 'document'): SerializedStore<R> {
+ 		const result = {} as SerializedStore<R>
+ 		for (const [id, atom] of objectMapEntries(this.atoms.get())) {
+ 			const record = atom.get()
+@@ -599,7 +599,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @returns An array of all values in the store.
+ 	 * @public
+ 	 */
+-	allRecords = (): R[] => {
++	allRecords(): R[] {
+ 		return objectMapValues(this.atoms.get()).map((atom) => atom.get())
+ 	}
+ 
+@@ -608,7 +608,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 *
+ 	 * @public
+ 	 */
+-	clear = (): void => {
++	clear(): void {
+ 		this.remove(objectMapKeys(this.atoms.get()))
+ 	}
+ 
+@@ -619,7 +619,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to update.
+ 	 * @param updater - A function that updates the record.
+ 	 */
+-	update = <K extends IdOf<R>>(id: K, updater: (record: RecordFromId<K>) => RecordFromId<K>) => {
++	update<K extends IdOf<R>>(id: K, updater: (record: RecordFromId<K>) => RecordFromId<K>) {
+ 		const atom = this.atoms.get()[id]
+ 		if (!atom) {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+@@ -635,7 +635,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param id - The id of the record to check.
+ 	 * @public
+ 	 */
+-	has = <K extends IdOf<R>>(id: K): boolean => {
++	has<K extends IdOf<R>>(id: K): boolean {
+ 		return !!this.atoms.get()[id]
+ 	}
+ 
+@@ -646,7 +646,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param filters - Filters to apply to the listener.
+ 	 * @returns A function to remove the listener.
+ 	 */
+-	listen = (onHistory: StoreListener<R>, filters?: Partial<StoreListenerFilters>) => {
++	listen(onHistory: StoreListener<R>, filters?: Partial<StoreListenerFilters>) {
+ 		// flush history so that this listener's history starts from exactly now
+ 		this._flushHistory()
+ 
+@@ -681,7 +681,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param fn - A function that merges the external changes.
+ 	 * @public
+ 	 */
+-	mergeRemoteChanges = (fn: () => void) => {
++	mergeRemoteChanges(fn: () => void) {
+ 		if (this.isMergingRemoteChanges) {
+ 			return fn()
+ 		}
+@@ -762,11 +762,11 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param derive - A function used to derive the value of the cache.
+ 	 * @public
+ 	 */
+-	createComputedCache = <Result, Record extends R = R>(
++	createComputedCache<Result, Record extends R = R>(
+ 		name: string,
+ 		derive: (record: Record) => Result | undefined,
+ 		isEqual?: (a: Record, b: Record) => boolean
+-	): ComputedCache<Result, Record> => {
++	): ComputedCache<Result, Record> {
+ 		const cache = new WeakCache<Atom<any>, Computed<Result | undefined>>()
+ 		return {
+ 			get: (id: IdOf<Record>) => {
+@@ -796,11 +796,11 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param derive - A function used to derive the value of the cache.
+ 	 * @public
+ 	 */
+-	createSelectedComputedCache = <Selection, Result, Record extends R = R>(
++	createSelectedComputedCache<Selection, Result, Record extends R = R>(
+ 		name: string,
+ 		selector: (record: Record) => Selection | undefined,
+ 		derive: (input: Selection) => Result | undefined
+-	): ComputedCache<Result, Record> => {
++	): ComputedCache<Result, Record> {
+ 		const cache = new WeakCache<Atom<any>, Computed<Result | undefined>>()
+ 		return {
+ 			get: (id: IdOf<Record>) => {
+
+commit fa9dbe131e949cd23d4c646eaa94a10b4efdf85d
+Author: alex <alex@dytry.ch>
+Date:   Thu Aug 22 15:37:21 2024 +0100
+
+    inline nanoid (#4410)
+    
+    We have a bunch of code working around the fact that nanoId is only
+    distributed as an ES module, but we run both as es and commonjs modules.
+    luckily, nanoid is nano! and even more so if you strip out the bits we
+    don't use. This replaces the nanoid library with a vendored version of
+    just the part we use.
+    
+    ### Change type
+    
+    - [x] `improvement`
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 0a06d8589..517b3cd3a 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -9,8 +9,8 @@ import {
+ 	objectMapKeys,
+ 	objectMapValues,
+ 	throttleToNextFrame,
++	uniqueId,
+ } from '@tldraw/utils'
+-import { nanoid } from 'nanoid'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { RecordScope } from './RecordType'
+ import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+@@ -192,7 +192,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	}) {
+ 		const { initialData, schema, id } = config
+ 
+-		this.id = id ?? nanoid()
++		this.id = id ?? uniqueId()
+ 		this.schema = schema
+ 		this.props = config.props
+ 
+
+commit 870fc6728f6db63eca03ab1fcb82dceaff3bbcf5
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Aug 29 10:43:13 2024 +0100
+
+    Fix rendering perf regression (#4433)
+    
+    Fixes
+    https://discord.com/channels/859816885297741824/1277974515565203517/1277974515565203517
+    
+    ### Change type
+    
+    - [x] `bugfix`
+    
+    ### Release notes
+    
+    - Fixed a perf issue that caused shapes to rerender too often.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 517b3cd3a..e8215d041 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -478,7 +478,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	unsafeGetWithoutCapture<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+-		return this.atoms.get()[id]?.__unsafe__getWithoutCapture() as any
++		return this.atoms.__unsafe__getWithoutCapture()[id]?.__unsafe__getWithoutCapture() as any
+ 	}
+ 
+ 	/**
+
+commit adda30254754d9985bdc1b4c2eca94a176c0dea2
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Sep 30 13:08:56 2024 +0200
+
+    Add eslint rule to check that tsdoc params match with function params (#4615)
+    
+    After this
+    [conversation](https://discord.com/channels/859816885297741824/859816885801713728/1289133853822423050)
+    I noticed that our tsdocs `@params` and our function / method
+    definitions don't always match. We often miss tsdoc params or have
+    outdated names for them.
+    
+    This PR:
+    - Adds an eslint rule to check whether the tsdoc params and the function
+    params / method arguments match. It allows for using `_` in function
+    params (you can specifiy `@param shapes` in the tsdocs but use `_shapes:
+    SomeType` in function. This helps with some functions that get
+    overriden, like [this
+    one](https://github.com/tldraw/tldraw/blob/a19c8f73898d59500accd87d416b4ae9a7a82ece/packages/editor/src/lib/editor/shapes/ShapeUtil.ts#L299-L308).
+    - It fixes the issues that the new rule found.
+    - Also adds the `select` argument back to the `createShape` and
+    `createShapes` methods. We could also go the other way and remove the
+    docs instead of adding the argument.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Add lint rules to check for discrepancies between tsdoc params and
+    function params and fix all the discovered issues.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index e8215d041..29b10590d 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -280,6 +280,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	/**
+ 	 * Filters out non-document changes from a diff. Returns null if there are no changes left.
+ 	 * @param change - the records diff
++	 * @param scope - the records scope
+ 	 * @returns
+ 	 */
+ 	filterChangesByScope(change: RecordsDiff<R>, scope: RecordScope) {
+@@ -322,6 +323,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * Add some records to the store. It's an error if they already exist.
+ 	 *
+ 	 * @param records - The records to add.
++	 * @param phaseOverride - The phase override.
+ 	 * @public
+ 	 */
+ 	put(records: R[], phaseOverride?: 'initialize'): void {
+@@ -760,6 +762,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 *
+ 	 * @param name - The name of the derivation cache.
+ 	 * @param derive - A function used to derive the value of the cache.
++	 * @param isEqual - A function that determins equality between two records.
+ 	 * @public
+ 	 */
+ 	createComputedCache<Result, Record extends R = R>(
+
+commit eafac1acc5f701fd75ae53d5078eb20146c52573
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Nov 1 14:24:16 2024 +0000
+
+    Call ensureStoreIsUsable after mergeRemoteChanges (#4833)
+    
+    `ensureStoreIsUsable` is marked internal and should probably stay that
+    way? But it makes sense to always call it after `mergeRemoteChanges`
+    (which we already do)
+    
+    ### Change type
+    
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Add store consistency checks during `mergeRemoteChanges`
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 29b10590d..382544de3 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -697,6 +697,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			transact(fn)
+ 		} finally {
+ 			this.isMergingRemoteChanges = false
++			this.ensureStoreIsUsable()
+ 		}
+ 	}
+ 
+
+commit 0d88f3e0a5efee2e23b10c56cdadc3fcd976b984
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Dec 18 09:06:32 2024 +0000
+
+    Execute reactor immediately on listen (#5133)
+    
+    Fixes #5130
+    
+    ### Change type
+    
+    - [x] `bugfix`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug during development with React Strict Mode enabled where
+    store.listen might end up not calling the listener.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 382544de3..a74e323ed 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -660,12 +660,13 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			},
+ 		}
+ 
+-		this.listeners.add(listener)
+-
+ 		if (!this.historyReactor.scheduler.isActivelyListening) {
+ 			this.historyReactor.start()
++			this.historyReactor.scheduler.execute()
+ 		}
+ 
++		this.listeners.add(listener)
++
+ 		return () => {
+ 			this.listeners.delete(listener)
+ 
+@@ -763,7 +764,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 *
+ 	 * @param name - The name of the derivation cache.
+ 	 * @param derive - A function used to derive the value of the cache.
+-	 * @param isEqual - A function that determins equality between two records.
++	 * @param isEqual - A function that determines equality between two records.
+ 	 * @public
+ 	 */
+ 	createComputedCache<Result, Record extends R = R>(
+
+commit b670314051ba706a5181c4d2d9f4a5604964ce67
+Author: alex <alex@dytry.ch>
+Date:   Wed Feb 26 17:57:59 2025 +0000
+
+    Add `AtomMap` & refactor store (#5496)
+    
+    This diff adds `AtomMap`, a drop-in replacement for `Map` that stores
+    values in reactive atoms. `AtomMap` replaces the old storage mechanism
+    for the `Store` - an `Atom<ReadonlyMap<Id, Atom<Record>>>`.
+    
+    The main benefit (and motivation behind this change) is that
+    adding/removing a record from an `AtomMap` no longer causes everything
+    accessing a record from the store to recompute. This cuts down on the
+    number cache invalidations on unrelated changes pretty dramatically. The
+    fact that `AtomMap` is a motivation too - it does't have a second use in
+    this diff, but in #4895, this replaces another adhoc atom-map like
+    structure in the font manager.
+    
+    There are a couple of additional changes in this diff that I pulled out
+    of the rich text/fonts PR:
+    - `createSelectedComputedCache`, which had no uses throughout the
+    codebase, has been deleted. There's a new `createCache` method that
+    accepts a function returning a `computed` which can be used to create
+    selector caches, or anything more complex you might need.
+    - `createComputedCache` now accepts an options object instead of a plain
+    `isEqual` callback so we can have callbacks for record-equality and
+    result-equality.
+    
+    ### Change type
+    
+    - [x] `api`
+    
+    ### Release notes
+    
+    - **BREAKING**. `store.createSelectedComputedCache` has been removed.
+    Use `store.createCache` and create your own selector `computed` instead.
+    - **BREAKING**. `createComputerCache` no longer accepts a single
+    `isEqual` fn as its 3rd argument. Instead, pass in an options object,
+    with the `isEqual` fn named `areRecordsEqual`. You can now pass
+    `areResultsEqual`, too.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index a74e323ed..1a288670d 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -1,16 +1,16 @@
+-import { Atom, Computed, Reactor, atom, computed, reactor, transact } from '@tldraw/state'
++import { Atom, Reactor, Signal, atom, computed, reactor, transact } from '@tldraw/state'
+ import {
+ 	WeakCache,
+ 	assert,
+ 	filterEntries,
+ 	getOwnProperty,
+ 	objectMapEntries,
+-	objectMapFromEntries,
+ 	objectMapKeys,
+ 	objectMapValues,
+ 	throttleToNextFrame,
+ 	uniqueId,
+ } from '@tldraw/utils'
++import { AtomMap } from './AtomMap'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { RecordScope } from './RecordType'
+ import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+@@ -68,6 +68,12 @@ export interface ComputedCache<Data, R extends UnknownRecord> {
+ 	get(id: IdOf<R>): Data | undefined
+ }
+ 
++/** @public */
++export interface CreateComputedCacheOpts<Data, R extends UnknownRecord> {
++	areRecordsEqual?(a: R, b: R): boolean
++	areResultsEqual?(a: Data, b: Data): boolean
++}
++
+ /**
+  * A serialized snapshot of the record store's values.
+  *
+@@ -115,12 +121,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	public readonly id: string
+ 	/**
+-	 * An atom containing the store's atoms.
++	 * An AtomMap containing the stores records.
+ 	 *
+ 	 * @internal
+ 	 * @readonly
+ 	 */
+-	private readonly atoms = atom('store_atoms', {} as Record<IdOf<R>, Atom<R>>)
++	private readonly records: AtomMap<IdOf<R>, R>
+ 
+ 	/**
+ 	 * An atom containing the store's history.
+@@ -138,7 +144,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 * @readonly
+ 	 */
+-	readonly query = new StoreQueries<R>(this.atoms, this.history)
++	readonly query: StoreQueries<R>
+ 
+ 	/**
+ 	 * A set containing listeners that have been added to this store.
+@@ -197,19 +203,19 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		this.props = config.props
+ 
+ 		if (initialData) {
+-			this.atoms.set(
+-				objectMapFromEntries(
+-					objectMapEntries(initialData).map(([id, record]) => [
+-						id,
+-						atom(
+-							'atom:' + id,
+-							devFreeze(this.schema.validateRecord(this, record, 'initialize', null))
+-						),
+-					])
+-				)
++			this.records = new AtomMap(
++				'store',
++				objectMapEntries(initialData).map(([id, record]) => [
++					id,
++					devFreeze(this.schema.validateRecord(this, record, 'initialize', null)),
++				])
+ 			)
++		} else {
++			this.records = new AtomMap('store')
+ 		}
+ 
++		this.query = new StoreQueries<R>(this.records, this.history)
++
+ 		this.historyReactor = reactor(
+ 			'Store.historyReactor',
+ 			() => {
+@@ -331,9 +337,6 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {}
+ 			const additions: Record<IdOf<UnknownRecord>, R> = {}
+ 
+-			const currentMap = this.atoms.__unsafe__getWithoutCapture()
+-			let map = null as null | Record<IdOf<UnknownRecord>, Atom<R>>
+-
+ 			// Iterate through all records, creating, updating or removing as needed
+ 			let record: R
+ 
+@@ -348,12 +351,9 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			for (let i = 0, n = records.length; i < n; i++) {
+ 				record = records[i]
+ 
+-				const recordAtom = (map ?? currentMap)[record.id as IdOf<R>]
+-
+-				if (recordAtom) {
+-					// If we already have an atom for this record, update its value.
+-					const initialValue = recordAtom.__unsafe__getWithoutCapture()
+-
++				const initialValue = this.records.__unsafe__getWithoutCapture(record.id)
++				// If we already have an atom for this record, update its value.
++				if (initialValue) {
+ 					// If we have a beforeUpdate callback, run it against the initial and next records
+ 					record = this.sideEffects.handleBeforeChange(initialValue, record, source)
+ 
+@@ -367,12 +367,12 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 					if (validated === initialValue) continue
+ 
+-					recordAtom.set(devFreeze(record))
++					record = devFreeze(record)
++					this.records.set(record.id, record)
+ 
+ 					didChange = true
+-					const updated = recordAtom.__unsafe__getWithoutCapture()
+-					updates[record.id] = [initialValue, updated]
+-					this.addDiffForAfterEvent(initialValue, updated)
++					updates[record.id] = [initialValue, record]
++					this.addDiffForAfterEvent(initialValue, record)
+ 				} else {
+ 					record = this.sideEffects.handleBeforeCreate(record, source)
+ 
+@@ -388,23 +388,17 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 						null
+ 					)
+ 
++					// freeze it
++					record = devFreeze(record)
++
+ 					// Mark the change as a new addition.
+ 					additions[record.id] = record
+ 					this.addDiffForAfterEvent(null, record)
+ 
+-					// Assign the atom to the map under the record's id.
+-					if (!map) {
+-						map = { ...currentMap }
+-					}
+-					map[record.id] = atom('atom:' + record.id, record)
++					this.records.set(record.id, record)
+ 				}
+ 			}
+ 
+-			// Set the map of atoms to the store.
+-			if (map) {
+-				this.atoms.set(map)
+-			}
+-
+ 			// If we did change, update the history
+ 			if (!didChange) return
+ 			this.updateHistory({
+@@ -423,41 +417,29 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	remove(ids: IdOf<R>[]): void {
+ 		this.atomic(() => {
+-			const cancelled = new Set<IdOf<R>>()
++			const toDelete = new Set<IdOf<R>>(ids)
+ 			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+ 
+ 			if (this.sideEffects.isEnabled()) {
+ 				for (const id of ids) {
+-					const atom = this.atoms.__unsafe__getWithoutCapture()[id]
+-					if (!atom) continue
++					const record = this.records.__unsafe__getWithoutCapture(id)
++					if (!record) continue
+ 
+-					if (this.sideEffects.handleBeforeDelete(atom.get(), source) === false) {
+-						cancelled.add(id)
++					if (this.sideEffects.handleBeforeDelete(record, source) === false) {
++						toDelete.delete(id)
+ 					}
+ 				}
+ 			}
+ 
+-			let removed = undefined as undefined | RecordsDiff<R>['removed']
+-
+-			// For each map in our atoms, remove the ids that we are removing.
+-			this.atoms.update((atoms) => {
+-				let result: typeof atoms | undefined = undefined
+-
+-				for (const id of ids) {
+-					if (cancelled.has(id)) continue
+-					if (!(id in atoms)) continue
+-					if (!result) result = { ...atoms }
+-					if (!removed) removed = {} as Record<IdOf<R>, R>
+-					delete result[id]
+-					const record = atoms[id].get()
+-					removed[id] = record
+-					this.addDiffForAfterEvent(record, null)
+-				}
++			const actuallyDeleted = this.records.deleteMany(toDelete)
++			if (actuallyDeleted.length === 0) return
+ 
+-				return result ?? atoms
+-			})
++			const removed = {} as RecordsDiff<R>['removed']
++			for (const [id, record] of actuallyDeleted) {
++				removed[id] = record
++				this.addDiffForAfterEvent(record, null)
++			}
+ 
+-			if (!removed) return
+ 			// Update the history with the removed records.
+ 			this.updateHistory({ added: {}, updated: {}, removed } as RecordsDiff<R>)
+ 		})
+@@ -470,7 +452,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	get<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+-		return this.atoms.get()[id]?.get() as any
++		return this.records.get(id) as RecordFromId<K> | undefined
+ 	}
+ 
+ 	/**
+@@ -480,7 +462,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	unsafeGetWithoutCapture<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+-		return this.atoms.__unsafe__getWithoutCapture()[id]?.__unsafe__getWithoutCapture() as any
++		return this.records.__unsafe__getWithoutCapture(id) as RecordFromId<K> | undefined
+ 	}
+ 
+ 	/**
+@@ -491,8 +473,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 */
+ 	serialize(scope: RecordScope | 'all' = 'document'): SerializedStore<R> {
+ 		const result = {} as SerializedStore<R>
+-		for (const [id, atom] of objectMapEntries(this.atoms.get())) {
+-			const record = atom.get()
++		for (const [id, record] of this.records) {
+ 			if (scope === 'all' || this.scopedTypes[scope].has(record.typeName)) {
+ 				result[id as IdOf<R>] = record
+ 			}
+@@ -602,7 +583,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	allRecords(): R[] {
+-		return objectMapValues(this.atoms.get()).map((atom) => atom.get())
++		return Array.from(this.records.values())
+ 	}
+ 
+ 	/**
+@@ -611,7 +592,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	clear(): void {
+-		this.remove(objectMapKeys(this.atoms.get()))
++		this.remove(Array.from(this.records.keys()))
+ 	}
+ 
+ 	/**
+@@ -622,13 +603,13 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @param updater - A function that updates the record.
+ 	 */
+ 	update<K extends IdOf<R>>(id: K, updater: (record: RecordFromId<K>) => RecordFromId<K>) {
+-		const atom = this.atoms.get()[id]
+-		if (!atom) {
++		const existing = this.unsafeGetWithoutCapture(id)
++		if (!existing) {
+ 			console.error(`Record ${id} not found. This is probably an error`)
+ 			return
+ 		}
+ 
+-		this.put([updater(atom.__unsafe__getWithoutCapture() as any as RecordFromId<K>) as any])
++		this.put([updater(existing) as any])
+ 	}
+ 
+ 	/**
+@@ -638,7 +619,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	 * @public
+ 	 */
+ 	has<K extends IdOf<R>>(id: K): boolean {
+-		return !!this.atoms.get()[id]
++		return this.records.has(id)
+ 	}
+ 
+ 	/**
+@@ -760,70 +741,52 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	}
+ 
+ 	/**
+-	 * Create a computed cache.
+-	 *
+-	 * @param name - The name of the derivation cache.
+-	 * @param derive - A function used to derive the value of the cache.
+-	 * @param isEqual - A function that determines equality between two records.
+-	 * @public
++	 * Create a cache based on values in the store. Pass in a function that takes and ID and a
++	 * signal for the underlying record. Return a signal (usually a computed) for the cached value.
++	 * For simple derivations, use {@link Store.createComputedCache}. This function is useful if you
++	 * need more precise control over intermediate values.
+ 	 */
+-	createComputedCache<Result, Record extends R = R>(
+-		name: string,
+-		derive: (record: Record) => Result | undefined,
+-		isEqual?: (a: Record, b: Record) => boolean
+-	): ComputedCache<Result, Record> {
+-		const cache = new WeakCache<Atom<any>, Computed<Result | undefined>>()
++	createCache<Result, Record extends R = R>(
++		create: (id: IdOf<Record>, recordSignal: Signal<R>) => Signal<Result>
++	) {
++		const cache = new WeakCache<Atom<any>, Signal<Result>>()
+ 		return {
+ 			get: (id: IdOf<Record>) => {
+-				const atom = this.atoms.get()[id]
+-				if (!atom) {
+-					return undefined
+-				}
+-				return cache
+-					.get(atom, () => {
+-						const recordSignal = isEqual
+-							? computed(atom.name + ':equals', () => atom.get(), { isEqual })
+-							: atom
+-						return computed<Result | undefined>(name + ':' + id, () => {
+-							return derive(recordSignal.get() as Record)
+-						})
+-					})
+-					.get()
++				const atom = this.records.getAtom(id)
++				if (!atom) return undefined
++				return cache.get(atom, () => create(id, atom as Signal<R>)).get()
+ 			},
+ 		}
+ 	}
+ 
+ 	/**
+-	 * Create a computed cache from a selector
++	 * Create a computed cache.
+ 	 *
+ 	 * @param name - The name of the derivation cache.
+-	 * @param selector - A function that returns a subset of the original shape
+ 	 * @param derive - A function used to derive the value of the cache.
++	 * @param opts - Options for the computed cache.
+ 	 * @public
+ 	 */
+-	createSelectedComputedCache<Selection, Result, Record extends R = R>(
++	createComputedCache<Result, Record extends R = R>(
+ 		name: string,
+-		selector: (record: Record) => Selection | undefined,
+-		derive: (input: Selection) => Result | undefined
++		derive: (record: Record) => Result | undefined,
++		opts?: CreateComputedCacheOpts<Result, Record>
+ 	): ComputedCache<Result, Record> {
+-		const cache = new WeakCache<Atom<any>, Computed<Result | undefined>>()
+-		return {
+-			get: (id: IdOf<Record>) => {
+-				const atom = this.atoms.get()[id]
+-				if (!atom) {
+-					return undefined
++		return this.createCache((id, record) => {
++			const recordSignal = opts?.areRecordsEqual
++				? computed(atom.name + ':equals', () => record.get(), { isEqual: opts.areRecordsEqual })
++				: record
++
++			return computed<Result | undefined>(
++				name + ':' + id,
++				() => {
++					return derive(recordSignal.get() as Record)
++				},
++				{
++					isEqual: opts?.areResultsEqual,
+ 				}
+-
+-				return cache
+-					.get(atom, () => {
+-						const d = computed<Selection | undefined>(name + ':' + id + ':selector', () =>
+-							selector(atom.get() as Record)
+-						)
+-						return computed<Result | undefined>(name + ':' + id, () => derive(d.get() as Selection))
+-					})
+-					.get()
+-			},
+-		}
++			)
++		})
+ 	}
+ 
+ 	private _integrityChecker?: () => void | undefined
+@@ -1022,14 +985,14 @@ export function createComputedCache<
+ >(
+ 	name: string,
+ 	derive: (context: Context, record: Record) => Result | undefined,
+-	isEqual?: (a: Record, b: Record) => boolean
++	opts?: CreateComputedCacheOpts<Result, Record>
+ ) {
+ 	const cache = new WeakCache<Context, ComputedCache<Result, Record>>()
+ 	return {
+ 		get(context: Context, id: IdOf<Record>) {
+ 			const computedCache = cache.get(context, () => {
+ 				const store = (context instanceof Store ? context : context.store) as Store<Record>
+-				return store.createComputedCache(name, (record) => derive(context, record), isEqual)
++				return store.createComputedCache(name, (record) => derive(context, record), opts)
+ 			})
+ 			return computedCache.get(id)
+ 		},
+
+commit 5fcdc0f29d81f74d55b7e5d08d4bdb6cc968c58d
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Mar 28 16:10:04 2025 +0000
+
+    Better whyAmIRunning (#5746)
+    
+    @SomeHats I think this should fix the flakiness you were seeing. can you
+    confirm?
+    
+    Leaving as draft because I still need to check the perf and probably add
+    tests now that it touches normal code paths.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index 1a288670d..d09229962 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -774,7 +774,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	): ComputedCache<Result, Record> {
+ 		return this.createCache((id, record) => {
+ 			const recordSignal = opts?.areRecordsEqual
+-				? computed(atom.name + ':equals', () => record.get(), { isEqual: opts.areRecordsEqual })
++				? computed(`${name}:${id}:isEqual`, () => record.get(), { isEqual: opts.areRecordsEqual })
+ 				: record
+ 
+ 			return computed<Result | undefined>(
+
+commit 3d1a69111704e326eb0fc7487f869ebb64917c8e
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Apr 4 09:10:11 2025 +0100
+
+    Store.atomic and Store.mergeRemoteChanges fixes (#5801)
+    
+    This PR fixes a few things
+    
+    - `mergeRemoteChanges` becomes atomic
+    - doing an `atomic(no callbacks)` inside of an `atomic(with callbacks)`
+    will switch off `before*` callbacks during the inner `atomic`, but
+    `after*` callbacks will still be handled by the outer `atomic`. This was
+    needed to allow the tlsync `rebase` operation to run as it did before
+    making `mergeRemoteChanges` atomic, but it feels like it should have
+    always been this way?
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Make `store.mergeRemoteChanges` atomic. This allows after* side
+    effects to react to incoming changes and to propagate any effects to
+    other clients via `'user'`-scoped store change events.
+
+diff --git a/packages/store/src/lib/Store.ts b/packages/store/src/lib/Store.ts
+index d09229962..f2b9f9b4a 100644
+--- a/packages/store/src/lib/Store.ts
++++ b/packages/store/src/lib/Store.ts
+@@ -10,6 +10,7 @@ import {
+ 	throttleToNextFrame,
+ 	uniqueId,
+ } from '@tldraw/utils'
++import isEqual from 'lodash.isequal'
+ import { AtomMap } from './AtomMap'
+ import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+ import { RecordScope } from './RecordType'
+@@ -660,7 +661,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 	private isMergingRemoteChanges = false
+ 
+ 	/**
+-	 * Merge changes from a remote source without triggering listeners.
++	 * Merge changes from a remote source
+ 	 *
+ 	 * @param fn - A function that merges the external changes.
+ 	 * @public
+@@ -675,10 +676,8 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 		}
+ 
+ 		try {
+-			this.isMergingRemoteChanges = true
+-			transact(fn)
++			this.atomic(fn, true, true)
+ 		} finally {
+-			this.isMergingRemoteChanges = false
+ 			this.ensureStoreIsUsable()
+ 		}
+ 	}
+@@ -823,9 +822,9 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			this.pendingAfterEvents.set(id, { before, after })
+ 		}
+ 	}
+-	private flushAtomicCallbacks() {
++	private flushAtomicCallbacks(isMergingRemoteChanges: boolean) {
+ 		let updateDepth = 0
+-		const source = this.isMergingRemoteChanges ? 'remote' : 'user'
++		let source: ChangeSource = isMergingRemoteChanges ? 'remote' : 'user'
+ 		while (this.pendingAfterEvents) {
+ 			const events = this.pendingAfterEvents
+ 			this.pendingAfterEvents = null
+@@ -838,7 +837,7 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 			}
+ 
+ 			for (const { before, after } of events.values()) {
+-				if (before && after) {
++				if (before && after && before !== after && !isEqual(before, after)) {
+ 					this.sideEffects.handleAfterChange(before, after, source)
+ 				} else if (before && !after) {
+ 					this.sideEffects.handleAfterDelete(before, source)
+@@ -849,32 +848,54 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+ 
+ 			if (!this.pendingAfterEvents) {
+ 				this.sideEffects.handleOperationComplete(source)
++			} else {
++				// if the side effects triggered by a remote operation resulted in more effects,
++				// those extra effects should not be marked as originating remotely.
++				source = 'user'
+ 			}
+ 		}
+ 	}
+ 	private _isInAtomicOp = false
+ 	/** @internal */
+-	atomic<T>(fn: () => T, runCallbacks = true): T {
++	atomic<T>(fn: () => T, runCallbacks = true, isMergingRemoteChanges = false): T {
+ 		return transact(() => {
+ 			if (this._isInAtomicOp) {
+ 				if (!this.pendingAfterEvents) this.pendingAfterEvents = new Map()
+-				return fn()
++				const prevSideEffectsEnabled = this.sideEffects.isEnabled()
++				assert(!isMergingRemoteChanges, 'cannot call mergeRemoteChanges while in atomic operation')
++				try {
++					// if we are in an atomic context with side effects ON allow switching before* callbacks OFF.
++					// but don't allow switching them ON if they had been marked OFF before.
++					if (prevSideEffectsEnabled && !runCallbacks) {
++						this.sideEffects.setIsEnabled(false)
++					}
++					return fn()
++				} finally {
++					this.sideEffects.setIsEnabled(prevSideEffectsEnabled)
++				}
+ 			}
+ 
+ 			this.pendingAfterEvents = new Map()
+ 			const prevSideEffectsEnabled = this.sideEffects.isEnabled()
+ 			this.sideEffects.setIsEnabled(runCallbacks ?? prevSideEffectsEnabled)
+ 			this._isInAtomicOp = true
++
++			if (isMergingRemoteChanges) {
++				this.isMergingRemoteChanges = true
++			}
++
+ 			try {
+ 				const result = fn()
++				this.isMergingRemoteChanges = false
+ 
+-				this.flushAtomicCallbacks()
++				this.flushAtomicCallbacks(isMergingRemoteChanges)
+ 
+ 				return result
+ 			} finally {
+ 				this.pendingAfterEvents = null
+ 				this.sideEffects.setIsEnabled(prevSideEffectsEnabled)
+ 				this._isInAtomicOp = false
++				this.isMergingRemoteChanges = false
+ 			}
+ 		})
+ 	}
+

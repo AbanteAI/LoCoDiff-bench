@@ -1,0 +1,3287 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- packages/sync-core/src/lib/TLSyncRoom.ts
+
+commit ce493dcfaf3371ce088f14912bd6493cc61c8c69
+Author: alex <alex@dytry.ch>
+Date:   Wed Jul 10 17:09:10 2024 +0100
+
+    [4/5] sync -> sync-core, sync-react -> sync (#4123)
+    
+    Renames `@tldraw/sync` to `@tldraw/sync-core`, and `@tldraw/sync-react`
+    to `@tldraw/sync`. This also adds an export * from sync-core to sync.
+    
+    - [x] `other`
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+new file mode 100644
+index 000000000..38af31b50
+--- /dev/null
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -0,0 +1,1082 @@
++import { Atom, atom, transaction } from '@tldraw/state'
++import {
++	IdOf,
++	MigrationFailureReason,
++	RecordType,
++	SerializedSchema,
++	StoreSchema,
++	UnknownRecord,
++} from '@tldraw/store'
++import { DocumentRecordType, PageRecordType, TLDOCUMENT_ID } from '@tldraw/tlschema'
++import {
++	IndexKey,
++	Result,
++	assert,
++	assertExists,
++	exhaustiveSwitchError,
++	getOwnProperty,
++	hasOwnProperty,
++	isNativeStructuredClone,
++	objectMapEntries,
++	objectMapKeys,
++} from '@tldraw/utils'
++import isEqual from 'lodash.isequal'
++import { createNanoEvents } from 'nanoevents'
++import {
++	RoomSession,
++	RoomSessionState,
++	SESSION_IDLE_TIMEOUT,
++	SESSION_REMOVAL_WAIT_TIME,
++	SESSION_START_WAIT_TIME,
++} from './RoomSession'
++import {
++	NetworkDiff,
++	ObjectDiff,
++	RecordOp,
++	RecordOpType,
++	ValueOpType,
++	applyObjectDiff,
++	diffRecord,
++} from './diff'
++import { interval } from './interval'
++import {
++	TLIncompatibilityReason,
++	TLSocketClientSentEvent,
++	TLSocketServerSentDataEvent,
++	TLSocketServerSentEvent,
++	getTlsyncProtocolVersion,
++} from './protocol'
++
++/** @public */
++export interface TLRoomSocket<R extends UnknownRecord> {
++	isOpen: boolean
++	sendMessage: (msg: TLSocketServerSentEvent<R>) => void
++	close: () => void
++}
++
++// the max number of tombstones to keep in the store
++export const MAX_TOMBSTONES = 3000
++// the number of tombstones to delete when the max is reached
++export const TOMBSTONE_PRUNE_BUFFER_SIZE = 300
++// the minimum time between data-related messages to the clients
++export const DATA_MESSAGE_DEBOUNCE_INTERVAL = 1000 / 60
++
++const timeSince = (time: number) => Date.now() - time
++
++class DocumentState<R extends UnknownRecord> {
++	_atom: Atom<{ state: R; lastChangedClock: number }>
++
++	static createWithoutValidating<R extends UnknownRecord>(
++		state: R,
++		lastChangedClock: number,
++		recordType: RecordType<R, any>
++	): DocumentState<R> {
++		return new DocumentState(state, lastChangedClock, recordType)
++	}
++
++	static createAndValidate<R extends UnknownRecord>(
++		state: R,
++		lastChangedClock: number,
++		recordType: RecordType<R, any>
++	): Result<DocumentState<R>, Error> {
++		try {
++			recordType.validate(state)
++		} catch (error: any) {
++			return Result.err(error)
++		}
++		return Result.ok(new DocumentState(state, lastChangedClock, recordType))
++	}
++
++	private constructor(
++		state: R,
++		lastChangedClock: number,
++		private readonly recordType: RecordType<R, any>
++	) {
++		this._atom = atom('document:' + state.id, { state, lastChangedClock })
++	}
++	// eslint-disable-next-line no-restricted-syntax
++	get state() {
++		return this._atom.get().state
++	}
++	// eslint-disable-next-line no-restricted-syntax
++	get lastChangedClock() {
++		return this._atom.get().lastChangedClock
++	}
++	replaceState(state: R, clock: number): Result<ObjectDiff | null, Error> {
++		const diff = diffRecord(this.state, state)
++		if (!diff) return Result.ok(null)
++		try {
++			this.recordType.validate(state)
++		} catch (error: any) {
++			return Result.err(error)
++		}
++		this._atom.set({ state, lastChangedClock: clock })
++		return Result.ok(diff)
++	}
++	mergeDiff(diff: ObjectDiff, clock: number): Result<ObjectDiff | null, Error> {
++		const newState = applyObjectDiff(this.state, diff)
++		return this.replaceState(newState, clock)
++	}
++}
++
++/** @public */
++export interface RoomSnapshot {
++	clock: number
++	documents: Array<{ state: UnknownRecord; lastChangedClock: number }>
++	tombstones?: Record<string, number>
++	schema?: SerializedSchema
++}
++
++/**
++ * A room is a workspace for a group of clients. It allows clients to collaborate on documents
++ * within that workspace.
++ *
++ * @public
++ */
++export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
++	// A table of connected clients
++	readonly sessions = new Map<string, RoomSession<R, SessionMeta>>()
++
++	pruneSessions = () => {
++		for (const client of this.sessions.values()) {
++			switch (client.state) {
++				case RoomSessionState.Connected: {
++					const hasTimedOut = timeSince(client.lastInteractionTime) > SESSION_IDLE_TIMEOUT
++					if (hasTimedOut || !client.socket.isOpen) {
++						this.cancelSession(client.sessionKey)
++					}
++					break
++				}
++				case RoomSessionState.AwaitingConnectMessage: {
++					const hasTimedOut = timeSince(client.sessionStartTime) > SESSION_START_WAIT_TIME
++					if (hasTimedOut || !client.socket.isOpen) {
++						// remove immediately
++						this.removeSession(client.sessionKey)
++					}
++					break
++				}
++				case RoomSessionState.AwaitingRemoval: {
++					const hasTimedOut = timeSince(client.cancellationTime) > SESSION_REMOVAL_WAIT_TIME
++					if (hasTimedOut) {
++						this.removeSession(client.sessionKey)
++					}
++					break
++				}
++				default: {
++					exhaustiveSwitchError(client)
++				}
++			}
++		}
++	}
++
++	private disposables: Array<() => void> = [interval(this.pruneSessions, 2000)]
++
++	close() {
++		this.disposables.forEach((d) => d())
++		this.sessions.forEach((session) => {
++			session.socket.close()
++		})
++	}
++
++	readonly events = createNanoEvents<{
++		room_became_empty: () => void
++		session_removed: (args: { sessionKey: string; meta: SessionMeta }) => void
++	}>()
++
++	// Values associated with each uid (must be serializable).
++	state = atom<{
++		documents: Record<string, DocumentState<R>>
++		tombstones: Record<string, number>
++	}>('room state', {
++		documents: {},
++		tombstones: {},
++	})
++
++	// this clock should start higher than the client, to make sure that clients who sync with their
++	// initial lastServerClock value get the full state
++	// in this case clients will start with 0, and the server will start with 1
++	clock = 1
++	documentClock = 1
++	tombstoneHistoryStartsAtClock = this.clock
++	// map from record id to clock upon deletion
++
++	readonly serializedSchema: SerializedSchema
++
++	readonly documentTypes: Set<string>
++	readonly presenceType: RecordType<R, any>
++
++	constructor(
++		public readonly schema: StoreSchema<R, any>,
++		snapshot?: RoomSnapshot
++	) {
++		assert(
++			isNativeStructuredClone,
++			'TLSyncRoom is supposed to run either on Cloudflare Workers' +
++				'or on a 18+ version of Node.js, which both support the native structuredClone API'
++		)
++
++		// do a json serialization cycle to make sure the schema has no 'undefined' values
++		this.serializedSchema = JSON.parse(JSON.stringify(schema.serialize()))
++
++		this.documentTypes = new Set(
++			Object.values<RecordType<R, any>>(schema.types)
++				.filter((t) => t.scope === 'document')
++				.map((t) => t.typeName)
++		)
++
++		const presenceTypes = new Set(
++			Object.values<RecordType<R, any>>(schema.types).filter((t) => t.scope === 'presence')
++		)
++
++		if (presenceTypes.size != 1) {
++			throw new Error(
++				`TLSyncRoom: exactly one presence type is expected, but found ${presenceTypes.size}`
++			)
++		}
++
++		this.presenceType = presenceTypes.values().next().value
++
++		if (!snapshot) {
++			snapshot = {
++				clock: 0,
++				documents: [
++					{
++						state: DocumentRecordType.create({ id: TLDOCUMENT_ID }),
++						lastChangedClock: 0,
++					},
++					{
++						state: PageRecordType.create({ name: 'Page 1', index: 'a1' as IndexKey }),
++						lastChangedClock: 0,
++					},
++				],
++			}
++		}
++
++		this.clock = snapshot.clock
++		let didIncrementClock = false
++		const ensureClockDidIncrement = (_reason: string) => {
++			if (!didIncrementClock) {
++				didIncrementClock = true
++				this.clock++
++			}
++		}
++
++		const tombstones = { ...snapshot.tombstones }
++		const filteredDocuments = []
++		for (const doc of snapshot.documents) {
++			if (this.documentTypes.has(doc.state.typeName)) {
++				filteredDocuments.push(doc)
++			} else {
++				ensureClockDidIncrement('doc type was not doc type')
++				tombstones[doc.state.id] = this.clock
++			}
++		}
++
++		const documents: Record<string, DocumentState<R>> = Object.fromEntries(
++			filteredDocuments.map((r) => [
++				r.state.id,
++				DocumentState.createWithoutValidating<R>(
++					r.state as R,
++					r.lastChangedClock,
++					assertExists(getOwnProperty(schema.types, r.state.typeName))
++				),
++			])
++		)
++
++		const migrationResult = schema.migrateStoreSnapshot({
++			store: Object.fromEntries(
++				objectMapEntries(documents).map(([id, { state }]) => [id, state as R])
++			) as Record<IdOf<R>, R>,
++			// eslint-disable-next-line deprecation/deprecation
++			schema: snapshot.schema ?? schema.serializeEarliestVersion(),
++		})
++
++		if (migrationResult.type === 'error') {
++			// TODO: Fault tolerance
++			throw new Error('Failed to migrate: ' + migrationResult.reason)
++		}
++
++		for (const [id, r] of objectMapEntries(migrationResult.value)) {
++			const existing = documents[id]
++			if (!existing) {
++				// record was added during migration
++				ensureClockDidIncrement('record was added during migration')
++				documents[id] = DocumentState.createWithoutValidating(
++					r,
++					this.clock,
++					assertExists(getOwnProperty(schema.types, r.typeName)) as any
++				)
++			} else if (!isEqual(existing.state, r)) {
++				// record was maybe updated during migration
++				ensureClockDidIncrement('record was maybe updated during migration')
++				existing.replaceState(r, this.clock)
++			}
++		}
++
++		for (const id of objectMapKeys(documents)) {
++			if (!migrationResult.value[id as keyof typeof migrationResult.value]) {
++				// record was removed during migration
++				ensureClockDidIncrement('record was removed during migration')
++				tombstones[id] = this.clock
++				delete documents[id]
++			}
++		}
++
++		this.state.set({ documents, tombstones })
++
++		this.pruneTombstones()
++		this.documentClock = this.clock
++	}
++
++	private pruneTombstones = () => {
++		// avoid blocking any pending responses
++		this.state.update(({ tombstones, documents }) => {
++			const entries = Object.entries(this.state.get().tombstones)
++			if (entries.length > MAX_TOMBSTONES) {
++				// sort entries in ascending order by clock
++				entries.sort((a, b) => a[1] - b[1])
++				// trim off the first bunch
++				const excessQuantity = entries.length - MAX_TOMBSTONES
++				tombstones = Object.fromEntries(entries.slice(excessQuantity + TOMBSTONE_PRUNE_BUFFER_SIZE))
++			}
++			return {
++				documents,
++				tombstones,
++			}
++		})
++	}
++
++	private getDocument(id: string) {
++		return this.state.get().documents[id]
++	}
++
++	private addDocument(id: string, state: R, clock: number): Result<void, Error> {
++		let { documents, tombstones } = this.state.get()
++		if (hasOwnProperty(tombstones, id)) {
++			tombstones = { ...tombstones }
++			delete tombstones[id]
++		}
++		const createResult = DocumentState.createAndValidate(
++			state,
++			clock,
++			assertExists(getOwnProperty(this.schema.types, state.typeName))
++		)
++		if (!createResult.ok) return createResult
++		documents = { ...documents, [id]: createResult.value }
++		this.state.set({ documents, tombstones })
++		return Result.ok(undefined)
++	}
++
++	private removeDocument(id: string, clock: number) {
++		this.state.update(({ documents, tombstones }) => {
++			documents = { ...documents }
++			delete documents[id]
++			tombstones = { ...tombstones, [id]: clock }
++			return { documents, tombstones }
++		})
++	}
++
++	getSnapshot(): RoomSnapshot {
++		const { documents, tombstones } = this.state.get()
++		return {
++			clock: this.clock,
++			tombstones,
++			schema: this.serializedSchema,
++			documents: Object.values(documents)
++				.map((doc) => ({
++					state: doc.state,
++					lastChangedClock: doc.lastChangedClock,
++				}))
++				.filter((d) => this.documentTypes.has(d.state.typeName)),
++		}
++	}
++
++	/**
++	 * Send a message to a particular client. Debounces data events
++	 *
++	 * @param sessionKey - The session to send the message to.
++	 * @param message - The message to send.
++	 */
++	private sendMessage(
++		sessionKey: string,
++		message: TLSocketServerSentEvent<R> | TLSocketServerSentDataEvent<R>
++	) {
++		const session = this.sessions.get(sessionKey)
++		if (!session) {
++			console.warn('Tried to send message to unknown session', message.type)
++			return
++		}
++		if (session.state !== RoomSessionState.Connected) {
++			console.warn('Tried to send message to disconnected client', message.type)
++			return
++		}
++		if (session.socket.isOpen) {
++			if (message.type !== 'patch' && message.type !== 'push_result') {
++				// this is not a data message
++				if (message.type !== 'pong') {
++					// non-data messages like "connect" might still need to be ordered correctly with
++					// respect to data messages, so it's better to flush just in case
++					this._flushDataMessages(sessionKey)
++				}
++				session.socket.sendMessage(message)
++			} else {
++				if (session.debounceTimer === null) {
++					// this is the first message since the last flush, don't delay it
++					session.socket.sendMessage({ type: 'data', data: [message] })
++
++					session.debounceTimer = setTimeout(
++						() => this._flushDataMessages(sessionKey),
++						DATA_MESSAGE_DEBOUNCE_INTERVAL
++					)
++				} else {
++					session.outstandingDataMessages.push(message)
++				}
++			}
++		} else {
++			this.cancelSession(session.sessionKey)
++		}
++	}
++
++	// needs to accept sessionKey and not a session because the session might be dead by the time
++	// the timer fires
++	_flushDataMessages(sessionKey: string) {
++		const session = this.sessions.get(sessionKey)
++
++		if (!session || session.state !== RoomSessionState.Connected) {
++			return
++		}
++
++		session.debounceTimer = null
++
++		if (session.outstandingDataMessages.length > 0) {
++			session.socket.sendMessage({ type: 'data', data: session.outstandingDataMessages })
++			session.outstandingDataMessages.length = 0
++		}
++	}
++
++	private removeSession(sessionKey: string) {
++		const session = this.sessions.get(sessionKey)
++		if (!session) {
++			console.warn('Tried to remove unknown session')
++			return
++		}
++
++		this.sessions.delete(sessionKey)
++
++		const presence = this.getDocument(session.presenceId)
++
++		try {
++			if (session.socket.isOpen) {
++				session.socket.close()
++			}
++		} catch (_e) {
++			// noop
++		}
++
++		if (presence) {
++			this.state.update(({ tombstones, documents }) => {
++				documents = { ...documents }
++				delete documents[session.presenceId]
++				return { documents, tombstones }
++			})
++
++			this.broadcastPatch({
++				diff: { [session.presenceId]: [RecordOpType.Remove] },
++				sourceSessionKey: sessionKey,
++			})
++		}
++
++		this.events.emit('session_removed', { sessionKey, meta: session.meta })
++		if (this.sessions.size === 0) {
++			this.events.emit('room_became_empty')
++		}
++	}
++
++	private cancelSession(sessionKey: string) {
++		const session = this.sessions.get(sessionKey)
++		if (!session) {
++			return
++		}
++
++		if (session.state === RoomSessionState.AwaitingRemoval) {
++			console.warn('Tried to cancel session that is already awaiting removal')
++			return
++		}
++
++		this.sessions.set(sessionKey, {
++			state: RoomSessionState.AwaitingRemoval,
++			sessionKey,
++			presenceId: session.presenceId,
++			socket: session.socket,
++			cancellationTime: Date.now(),
++			meta: session.meta,
++		})
++	}
++
++	/**
++	 * Broadcast a message to all connected clients except the one with the sessionKey provided.
++	 *
++	 * @param message - The message to broadcast.
++	 * @param sourceSessionKey - The session to exclude.
++	 */
++	broadcastPatch({
++		diff,
++		sourceSessionKey: sourceSessionKey,
++	}: {
++		diff: NetworkDiff<R>
++		sourceSessionKey: string
++	}) {
++		this.sessions.forEach((session) => {
++			if (session.state !== RoomSessionState.Connected) return
++			if (sourceSessionKey === session.sessionKey) return
++			if (!session.socket.isOpen) {
++				this.cancelSession(session.sessionKey)
++				return
++			}
++
++			const res = this.migrateDiffForSession(session.serializedSchema, diff)
++
++			if (!res.ok) {
++				// disconnect client and send incompatibility error
++				this.rejectSession(
++					session,
++					res.error === MigrationFailureReason.TargetVersionTooNew
++						? TLIncompatibilityReason.ServerTooOld
++						: TLIncompatibilityReason.ClientTooOld
++				)
++				return
++			}
++
++			this.sendMessage(session.sessionKey, {
++				type: 'patch',
++				diff: res.value,
++				serverClock: this.clock,
++			})
++		})
++		return this
++	}
++
++	/**
++	 * When a client connects to the room, add them to the list of clients and then merge the history
++	 * down into the snapshots.
++	 *
++	 * @param sessionKey - The session of the client that connected to the room.
++	 * @param socket - Their socket.
++	 */
++	handleNewSession = (sessionKey: string, socket: TLRoomSocket<R>, meta: SessionMeta) => {
++		const existing = this.sessions.get(sessionKey)
++		this.sessions.set(sessionKey, {
++			state: RoomSessionState.AwaitingConnectMessage,
++			sessionKey,
++			socket,
++			presenceId: existing?.presenceId ?? this.presenceType.createId(),
++			sessionStartTime: Date.now(),
++			meta,
++		})
++		return this
++	}
++
++	/**
++	 * When we send a diff to a client, if that client is on a lower version than us, we need to make
++	 * the diff compatible with their version. At the moment this means migrating each affected record
++	 * to the client's version and sending the whole record again. We can optimize this later by
++	 * keeping the previous versions of records around long enough to recalculate these diffs for
++	 * older client versions.
++	 */
++	private migrateDiffForSession(
++		serializedSchema: SerializedSchema,
++		diff: NetworkDiff<R>
++	): Result<NetworkDiff<R>, MigrationFailureReason> {
++		// TODO: optimize this by recalculating patches using the previous versions of records
++
++		// when the client connects we check whether the schema is identical and make sure
++		// to use the same object reference so that === works on this line
++		if (serializedSchema === this.serializedSchema) {
++			return Result.ok(diff)
++		}
++
++		const result: NetworkDiff<R> = {}
++		for (const [id, op] of Object.entries(diff)) {
++			if (op[0] === RecordOpType.Remove) {
++				result[id] = op
++				continue
++			}
++
++			const migrationResult = this.schema.migratePersistedRecord(
++				this.getDocument(id).state,
++				serializedSchema,
++				'down'
++			)
++
++			if (migrationResult.type === 'error') {
++				return Result.err(migrationResult.reason)
++			}
++
++			result[id] = [RecordOpType.Put, migrationResult.value]
++		}
++
++		return Result.ok(result)
++	}
++
++	/**
++	 * When the server receives a message from the clients Currently, supports connect and patches.
++	 * Invalid messages types throws an error. Currently, doesn't validate data.
++	 *
++	 * @param sessionKey - The session that sent the message
++	 * @param message - The message that was sent
++	 */
++	handleMessage = async (sessionKey: string, message: TLSocketClientSentEvent<R>) => {
++		const session = this.sessions.get(sessionKey)
++		if (!session) {
++			console.warn('Received message from unknown session')
++			return
++		}
++		switch (message.type) {
++			case 'connect': {
++				return this.handleConnectRequest(session, message)
++			}
++			case 'push': {
++				return this.handlePushRequest(session, message)
++			}
++			case 'ping': {
++				if (session.state === RoomSessionState.Connected) {
++					session.lastInteractionTime = Date.now()
++				}
++				return this.sendMessage(session.sessionKey, { type: 'pong' })
++			}
++			default: {
++				exhaustiveSwitchError(message)
++			}
++		}
++	}
++
++	/** If the client is out of date, or we are out of date, we need to let them know */
++	private rejectSession(session: RoomSession<R, SessionMeta>, reason: TLIncompatibilityReason) {
++		try {
++			if (session.socket.isOpen) {
++				session.socket.sendMessage({
++					type: 'incompatibility_error',
++					reason,
++				})
++			}
++		} catch (e) {
++			// noop
++		} finally {
++			this.removeSession(session.sessionKey)
++		}
++	}
++
++	private handleConnectRequest(
++		session: RoomSession<R, SessionMeta>,
++		message: Extract<TLSocketClientSentEvent<R>, { type: 'connect' }>
++	) {
++		// if the protocol versions don't match, disconnect the client
++		// we will eventually want to try to make our protocol backwards compatible to some degree
++		// and have a MIN_PROTOCOL_VERSION constant that the TLSyncRoom implements support for
++		let theirProtocolVersion = message.protocolVersion
++		// 5 is the same as 6
++		if (theirProtocolVersion === 5) {
++			theirProtocolVersion = 6
++		}
++		if (theirProtocolVersion == null || theirProtocolVersion < getTlsyncProtocolVersion()) {
++			this.rejectSession(session, TLIncompatibilityReason.ClientTooOld)
++			return
++		} else if (theirProtocolVersion > getTlsyncProtocolVersion()) {
++			this.rejectSession(session, TLIncompatibilityReason.ServerTooOld)
++			return
++		}
++		// If the client's store is at a different version to ours, it could cause corruption.
++		// We should disconnect the client and ask them to refresh.
++		if (message.schema == null) {
++			this.rejectSession(session, TLIncompatibilityReason.ClientTooOld)
++			return
++		}
++		const migrations = this.schema.getMigrationsSince(message.schema)
++		// if the client's store is at a different version to ours, we can't support them
++		if (!migrations.ok || migrations.value.some((m) => m.scope === 'store' || !m.down)) {
++			this.rejectSession(session, TLIncompatibilityReason.ClientTooOld)
++			return
++		}
++
++		const sessionSchema = isEqual(message.schema, this.serializedSchema)
++			? this.serializedSchema
++			: message.schema
++
++		const connect = (msg: TLSocketServerSentEvent<R>) => {
++			this.sessions.set(session.sessionKey, {
++				state: RoomSessionState.Connected,
++				sessionKey: session.sessionKey,
++				presenceId: session.presenceId,
++				socket: session.socket,
++				serializedSchema: sessionSchema,
++				lastInteractionTime: Date.now(),
++				debounceTimer: null,
++				outstandingDataMessages: [],
++				meta: session.meta,
++			})
++			this.sendMessage(session.sessionKey, msg)
++		}
++
++		transaction((rollback) => {
++			if (
++				// if the client requests changes since a time before we have tombstone history, send them the full state
++				message.lastServerClock < this.tombstoneHistoryStartsAtClock ||
++				// similarly, if they ask for a time we haven't reached yet, send them the full state
++				// this will only happen if the DB is reset (or there is no db) and the server restarts
++				// or if the server exits/crashes with unpersisted changes
++				message.lastServerClock > this.clock
++			) {
++				const diff: NetworkDiff<R> = {}
++				for (const [id, doc] of Object.entries(this.state.get().documents)) {
++					if (id !== session.presenceId) {
++						diff[id] = [RecordOpType.Put, doc.state]
++					}
++				}
++				const migrated = this.migrateDiffForSession(sessionSchema, diff)
++				if (!migrated.ok) {
++					rollback()
++					this.rejectSession(
++						session,
++						migrated.error === MigrationFailureReason.TargetVersionTooNew
++							? TLIncompatibilityReason.ServerTooOld
++							: TLIncompatibilityReason.ClientTooOld
++					)
++					return
++				}
++				connect({
++					type: 'connect',
++					connectRequestId: message.connectRequestId,
++					hydrationType: 'wipe_all',
++					protocolVersion: getTlsyncProtocolVersion(),
++					schema: this.schema.serialize(),
++					serverClock: this.clock,
++					diff: migrated.value,
++				})
++			} else {
++				// calculate the changes since the time the client last saw
++				const diff: NetworkDiff<R> = {}
++				const updatedDocs = Object.values(this.state.get().documents).filter(
++					(doc) => doc.lastChangedClock > message.lastServerClock
++				)
++				const presenceDocs = Object.values(this.state.get().documents).filter(
++					(doc) =>
++						this.presenceType.typeName === doc.state.typeName && doc.state.id !== session.presenceId
++				)
++				const deletedDocsIds = Object.entries(this.state.get().tombstones)
++					.filter(([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock)
++					.map(([id]) => id)
++
++				for (const doc of updatedDocs) {
++					diff[doc.state.id] = [RecordOpType.Put, doc.state]
++				}
++				for (const doc of presenceDocs) {
++					diff[doc.state.id] = [RecordOpType.Put, doc.state]
++				}
++
++				for (const docId of deletedDocsIds) {
++					diff[docId] = [RecordOpType.Remove]
++				}
++				const migrated = this.migrateDiffForSession(sessionSchema, diff)
++				if (!migrated.ok) {
++					rollback()
++					this.rejectSession(
++						session,
++						migrated.error === MigrationFailureReason.TargetVersionTooNew
++							? TLIncompatibilityReason.ServerTooOld
++							: TLIncompatibilityReason.ClientTooOld
++					)
++					return
++				}
++
++				connect({
++					type: 'connect',
++					connectRequestId: message.connectRequestId,
++					hydrationType: 'wipe_presence',
++					schema: this.schema.serialize(),
++					protocolVersion: getTlsyncProtocolVersion(),
++					serverClock: this.clock,
++					diff: migrated.value,
++				})
++			}
++		})
++	}
++
++	private handlePushRequest(
++		session: RoomSession<R, SessionMeta>,
++		message: Extract<TLSocketClientSentEvent<R>, { type: 'push' }>
++	) {
++		// We must be connected to handle push requests
++		if (session.state !== RoomSessionState.Connected) {
++			return
++		}
++
++		// update the last interaction time
++		session.lastInteractionTime = Date.now()
++
++		// increment the clock for this push
++		this.clock++
++
++		transaction((rollback) => {
++			// collect actual ops that resulted from the push
++			// these will be broadcast to other users
++			interface ActualChanges {
++				diff: NetworkDiff<R> | null
++			}
++			const docChanges: ActualChanges = { diff: null }
++			const presenceChanges: ActualChanges = { diff: null }
++
++			const propagateOp = (changes: ActualChanges, id: string, op: RecordOp<R>) => {
++				if (!changes.diff) changes.diff = {}
++				changes.diff[id] = op
++			}
++
++			const fail = (reason: TLIncompatibilityReason): Result<void, void> => {
++				rollback()
++				this.rejectSession(session, reason)
++				if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
++					console.error('failed to apply push', reason, message)
++				}
++				return Result.err(undefined)
++			}
++
++			const addDocument = (changes: ActualChanges, id: string, _state: R): Result<void, void> => {
++				const res = this.schema.migratePersistedRecord(_state, session.serializedSchema, 'up')
++				if (res.type === 'error') {
++					return fail(
++						res.reason === MigrationFailureReason.TargetVersionTooOld // target version is our version
++							? TLIncompatibilityReason.ServerTooOld
++							: TLIncompatibilityReason.ClientTooOld
++					)
++				}
++				const { value: state } = res
++
++				// Get the existing document, if any
++				const doc = this.getDocument(id)
++
++				if (doc) {
++					// If there's an existing document, replace it with the new state
++					// but propagate a diff rather than the entire value
++					const diff = doc.replaceState(state, this.clock)
++					if (!diff.ok) {
++						return fail(TLIncompatibilityReason.InvalidRecord)
++					}
++					if (diff.value) {
++						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
++					}
++				} else {
++					// Otherwise, if we don't already have a document with this id
++					// create the document and propagate the put op
++					const result = this.addDocument(id, state, this.clock)
++					if (!result.ok) {
++						return fail(TLIncompatibilityReason.InvalidRecord)
++					}
++					propagateOp(changes, id, [RecordOpType.Put, state])
++				}
++
++				return Result.ok(undefined)
++			}
++
++			const patchDocument = (
++				changes: ActualChanges,
++				id: string,
++				patch: ObjectDiff
++			): Result<void, void> => {
++				// if it was already deleted, there's no need to apply the patch
++				const doc = this.getDocument(id)
++				if (!doc) return Result.ok(undefined)
++				// If the client's version of the record is older than ours,
++				// we apply the patch to the downgraded version of the record
++				const downgraded = this.schema.migratePersistedRecord(
++					doc.state,
++					session.serializedSchema,
++					'down'
++				)
++				if (downgraded.type === 'error') {
++					return fail(TLIncompatibilityReason.ClientTooOld)
++				}
++
++				if (downgraded.value === doc.state) {
++					// If the versions are compatible, apply the patch and propagate the patch op
++					const diff = doc.mergeDiff(patch, this.clock)
++					if (!diff.ok) {
++						return fail(TLIncompatibilityReason.InvalidRecord)
++					}
++					if (diff.value) {
++						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
++					}
++				} else {
++					// need to apply the patch to the downgraded version and then upgrade it
++
++					// apply the patch to the downgraded version
++					const patched = applyObjectDiff(downgraded.value, patch)
++					// then upgrade the patched version and use that as the new state
++					const upgraded = this.schema.migratePersistedRecord(
++						patched,
++						session.serializedSchema,
++						'up'
++					)
++					// If the client's version is too old, we'll hit an error
++					if (upgraded.type === 'error') {
++						return fail(TLIncompatibilityReason.ClientTooOld)
++					}
++					// replace the state with the upgraded version and propagate the patch op
++					const diff = doc.replaceState(upgraded.value, this.clock)
++					if (!diff.ok) {
++						return fail(TLIncompatibilityReason.InvalidRecord)
++					}
++					if (diff.value) {
++						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
++					}
++				}
++
++				return Result.ok(undefined)
++			}
++
++			const { clientClock } = message
++
++			if ('presence' in message && message.presence) {
++				// The push request was for the presence scope.
++				const id = session.presenceId
++				const [type, val] = message.presence
++				const { typeName } = this.presenceType
++				switch (type) {
++					case RecordOpType.Put: {
++						// Try to put the document. If it fails, stop here.
++						const res = addDocument(presenceChanges, id, { ...val, id, typeName })
++						// if res.ok is false here then we already called `fail` and we should stop immediately
++						if (!res.ok) return
++						break
++					}
++					case RecordOpType.Patch: {
++						// Try to patch the document. If it fails, stop here.
++						const res = patchDocument(presenceChanges, id, {
++							...val,
++							id: [ValueOpType.Put, id],
++							typeName: [ValueOpType.Put, typeName],
++						})
++						// if res.ok is false here then we already called `fail` and we should stop immediately
++						if (!res.ok) return
++						break
++					}
++				}
++			}
++			if (message.diff) {
++				// The push request was for the document scope.
++				for (const [id, op] of Object.entries(message.diff!)) {
++					switch (op[0]) {
++						case RecordOpType.Put: {
++							// Try to add the document.
++							// If we're putting a record with a type that we don't recognize, fail
++							if (!this.documentTypes.has(op[1].typeName)) {
++								return fail(TLIncompatibilityReason.InvalidRecord)
++							}
++							const res = addDocument(docChanges, id, op[1])
++							// if res.ok is false here then we already called `fail` and we should stop immediately
++							if (!res.ok) return
++							break
++						}
++						case RecordOpType.Patch: {
++							// Try to patch the document. If it fails, stop here.
++							const res = patchDocument(docChanges, id, op[1])
++							// if res.ok is false here then we already called `fail` and we should stop immediately
++							if (!res.ok) return
++							break
++						}
++						case RecordOpType.Remove: {
++							const doc = this.getDocument(id)
++							if (!doc) {
++								// If the doc was already deleted, don't do anything, no need to propagate a delete op
++								continue
++							}
++
++							// If the doc is not a type that we recognize, fail
++							if (!this.documentTypes.has(doc.state.typeName)) {
++								return fail(TLIncompatibilityReason.InvalidOperation)
++							}
++
++							// Delete the document and propagate the delete op
++							this.removeDocument(id, this.clock)
++							// Schedule a pruneTombstones call to happen on the next call stack
++							setTimeout(this.pruneTombstones, 0)
++							propagateOp(docChanges, id, op)
++							break
++						}
++					}
++				}
++			}
++
++			// Let the client know what action to take based on the results of the push
++			if (
++				// if there was only a presence push, the client doesn't need to do anything aside from
++				// shift the push request.
++				!message.diff ||
++				isEqual(docChanges.diff, message.diff)
++			) {
++				// COMMIT
++				// Applying the client's changes had the exact same effect on the server as
++				// they had on the client, so the client should keep the diff
++				this.sendMessage(session.sessionKey, {
++					type: 'push_result',
++					serverClock: this.clock,
++					clientClock,
++					action: 'commit',
++				})
++			} else if (!docChanges.diff) {
++				// DISCARD
++				// Applying the client's changes had no effect, so the client should drop the diff
++				this.sendMessage(session.sessionKey, {
++					type: 'push_result',
++					serverClock: this.clock,
++					clientClock,
++					action: 'discard',
++				})
++			} else {
++				// REBASE
++				// Applying the client's changes had a different non-empty effect on the server,
++				// so the client should rebase with our gold-standard / authoritative diff.
++				// First we need to migrate the diff to the client's version
++				const migrateResult = this.migrateDiffForSession(session.serializedSchema, docChanges.diff)
++				if (!migrateResult.ok) {
++					return fail(
++						migrateResult.error === MigrationFailureReason.TargetVersionTooNew
++							? TLIncompatibilityReason.ServerTooOld
++							: TLIncompatibilityReason.ClientTooOld
++					)
++				}
++				// If the migration worked, send the rebased diff to the client
++				this.sendMessage(session.sessionKey, {
++					type: 'push_result',
++					serverClock: this.clock,
++					clientClock,
++					action: { rebaseWithDiff: migrateResult.value },
++				})
++			}
++
++			// If there are merged changes, broadcast them to all other clients
++			if (docChanges.diff || presenceChanges.diff) {
++				this.broadcastPatch({
++					sourceSessionKey: session.sessionKey,
++					diff: {
++						...docChanges.diff,
++						...presenceChanges.diff,
++					},
++				})
++			}
++
++			if (docChanges.diff) {
++				this.documentClock = this.clock
++			}
++
++			return
++		})
++	}
++
++	/**
++	 * Handle the event when a client disconnects.
++	 *
++	 * @param sessionKey - The session that disconnected.
++	 */
++	handleClose = (sessionKey: string) => {
++		this.cancelSession(sessionKey)
++	}
++}
+
+commit 348ff9f66a24cc41738a2eff10a87ef6b535bf3f
+Author: alex <alex@dytry.ch>
+Date:   Mon Jul 15 17:08:42 2024 +0100
+
+    publish bemo canaries (#4175)
+    
+    Switch on package publishing for sync libraries so we can start building
+    templates on the canaries.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 38af31b50..c9299c20c 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -63,7 +63,8 @@ export const DATA_MESSAGE_DEBOUNCE_INTERVAL = 1000 / 60
+ 
+ const timeSince = (time: number) => Date.now() - time
+ 
+-class DocumentState<R extends UnknownRecord> {
++/** @internal */
++export class DocumentState<R extends UnknownRecord> {
+ 	_atom: Atom<{ state: R; lastChangedClock: number }>
+ 
+ 	static createWithoutValidating<R extends UnknownRecord>(
+@@ -184,6 +185,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	}>()
+ 
+ 	// Values associated with each uid (must be serializable).
++	/** @internal */
+ 	state = atom<{
+ 		documents: Record<string, DocumentState<R>>
+ 		tombstones: Record<string, number>
+
+commit 4c478d226709a34a804565979e22fd2a56f51b37
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Jul 18 08:48:10 2024 +0100
+
+    Example node + bun server (#4173)
+    
+    This PR adds an app with examples for building a tlsync backend in both
+    node and bun.
+    
+    Highlights
+    - simple vite frontend
+    - node backend using `fastify` (popular modern alternative to express,
+    and much better api for websockets)
+    - bun backend using `itty-router` and `Bun.serve`. Interestingly Bun has
+    a similar websockets api to the cloudflare hibernatable sockets api,
+    which required some simplification of the socket argument on
+    `TLSocketRoom`.
+    - updated itty-router and got rid of itty-cors. There were some minor
+    breaking API changes to account for, and a new cors api that allows us
+    to remove an ugly hack.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index c9299c20c..0c2513440 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -172,11 +172,18 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 	private disposables: Array<() => void> = [interval(this.pruneSessions, 2000)]
+ 
++	private _isClosed = false
++
+ 	close() {
+ 		this.disposables.forEach((d) => d())
+ 		this.sessions.forEach((session) => {
+ 			session.socket.close()
+ 		})
++		this._isClosed = true
++	}
++
++	isClosed() {
++		return this._isClosed
+ 	}
+ 
+ 	readonly events = createNanoEvents<{
+
+commit 8347697097ab8cb9cb4fc3f4bd1dfcc0511ffe34
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Jul 19 07:55:40 2024 +0100
+
+    Finesse sync api (#4212)
+    
+    - Make it so that for client-side stuff, only the api surface area of
+    the two hooks are public.
+    - Make it so that for server-side stuff, only the TLSocketRoom api
+    surface area is public.
+    - Rename `sessionKey` => `sessionId` for consistency
+    - Add tsdoc comments for public stuff
+    
+    NEW!
+    
+    - refactor `userPreferences` option quite heavily to make it simpler
+    - rename the multiplayer option `userPreferences` -> `userInfo` and
+    simplify the type since it's only a subset and don't want to pollute the
+    api with confusing stuff.
+    - `useTldrawUser()` api for easy-peasy user data integration + new
+    example showing how it's used.
+    - make assets required, and make `resolve` optional.
+    
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [x] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+    
+    ---------
+    
+    Co-authored-by: alex <alex@dytry.ch>
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 0c2513440..e1ef79de8 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -29,6 +29,7 @@ import {
+ 	SESSION_REMOVAL_WAIT_TIME,
+ 	SESSION_START_WAIT_TIME,
+ } from './RoomSession'
++import { TLSyncLog } from './TLSocketRoom'
+ import {
+ 	NetworkDiff,
+ 	ObjectDiff,
+@@ -47,7 +48,7 @@ import {
+ 	getTlsyncProtocolVersion,
+ } from './protocol'
+ 
+-/** @public */
++/** @internal */
+ export interface TLRoomSocket<R extends UnknownRecord> {
+ 	isOpen: boolean
+ 	sendMessage: (msg: TLSocketServerSentEvent<R>) => void
+@@ -132,7 +133,7 @@ export interface RoomSnapshot {
+  * A room is a workspace for a group of clients. It allows clients to collaborate on documents
+  * within that workspace.
+  *
+- * @public
++ * @internal
+  */
+ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	// A table of connected clients
+@@ -144,7 +145,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				case RoomSessionState.Connected: {
+ 					const hasTimedOut = timeSince(client.lastInteractionTime) > SESSION_IDLE_TIMEOUT
+ 					if (hasTimedOut || !client.socket.isOpen) {
+-						this.cancelSession(client.sessionKey)
++						this.cancelSession(client.sessionId)
+ 					}
+ 					break
+ 				}
+@@ -152,14 +153,14 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					const hasTimedOut = timeSince(client.sessionStartTime) > SESSION_START_WAIT_TIME
+ 					if (hasTimedOut || !client.socket.isOpen) {
+ 						// remove immediately
+-						this.removeSession(client.sessionKey)
++						this.removeSession(client.sessionId)
+ 					}
+ 					break
+ 				}
+ 				case RoomSessionState.AwaitingRemoval: {
+ 					const hasTimedOut = timeSince(client.cancellationTime) > SESSION_REMOVAL_WAIT_TIME
+ 					if (hasTimedOut) {
+-						this.removeSession(client.sessionKey)
++						this.removeSession(client.sessionId)
+ 					}
+ 					break
+ 				}
+@@ -188,7 +189,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 	readonly events = createNanoEvents<{
+ 		room_became_empty: () => void
+-		session_removed: (args: { sessionKey: string; meta: SessionMeta }) => void
++		session_removed: (args: { sessionId: string; meta: SessionMeta }) => void
+ 	}>()
+ 
+ 	// Values associated with each uid (must be serializable).
+@@ -213,11 +214,14 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 	readonly documentTypes: Set<string>
+ 	readonly presenceType: RecordType<R, any>
++	private log?: TLSyncLog
++	public readonly schema: StoreSchema<R, any>
++
++	constructor(opts: { log?: TLSyncLog; schema: StoreSchema<R, any>; snapshot?: RoomSnapshot }) {
++		this.schema = opts.schema
++		let snapshot = opts.snapshot
++		this.log = opts.log
+ 
+-	constructor(
+-		public readonly schema: StoreSchema<R, any>,
+-		snapshot?: RoomSnapshot
+-	) {
+ 		assert(
+ 			isNativeStructuredClone,
+ 			'TLSyncRoom is supposed to run either on Cloudflare Workers' +
+@@ -225,16 +229,16 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		)
+ 
+ 		// do a json serialization cycle to make sure the schema has no 'undefined' values
+-		this.serializedSchema = JSON.parse(JSON.stringify(schema.serialize()))
++		this.serializedSchema = JSON.parse(JSON.stringify(this.schema.serialize()))
+ 
+ 		this.documentTypes = new Set(
+-			Object.values<RecordType<R, any>>(schema.types)
++			Object.values<RecordType<R, any>>(this.schema.types)
+ 				.filter((t) => t.scope === 'document')
+ 				.map((t) => t.typeName)
+ 		)
+ 
+ 		const presenceTypes = new Set(
+-			Object.values<RecordType<R, any>>(schema.types).filter((t) => t.scope === 'presence')
++			Object.values<RecordType<R, any>>(this.schema.types).filter((t) => t.scope === 'presence')
+ 		)
+ 
+ 		if (presenceTypes.size != 1) {
+@@ -287,17 +291,17 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				DocumentState.createWithoutValidating<R>(
+ 					r.state as R,
+ 					r.lastChangedClock,
+-					assertExists(getOwnProperty(schema.types, r.state.typeName))
++					assertExists(getOwnProperty(this.schema.types, r.state.typeName))
+ 				),
+ 			])
+ 		)
+ 
+-		const migrationResult = schema.migrateStoreSnapshot({
++		const migrationResult = this.schema.migrateStoreSnapshot({
+ 			store: Object.fromEntries(
+ 				objectMapEntries(documents).map(([id, { state }]) => [id, state as R])
+ 			) as Record<IdOf<R>, R>,
+ 			// eslint-disable-next-line deprecation/deprecation
+-			schema: snapshot.schema ?? schema.serializeEarliestVersion(),
++			schema: snapshot.schema ?? this.schema.serializeEarliestVersion(),
+ 		})
+ 
+ 		if (migrationResult.type === 'error') {
+@@ -313,7 +317,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				documents[id] = DocumentState.createWithoutValidating(
+ 					r,
+ 					this.clock,
+-					assertExists(getOwnProperty(schema.types, r.typeName)) as any
++					assertExists(getOwnProperty(this.schema.types, r.typeName)) as any
+ 				)
+ 			} else if (!isEqual(existing.state, r)) {
+ 				// record was maybe updated during migration
+@@ -403,20 +407,20 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	/**
+ 	 * Send a message to a particular client. Debounces data events
+ 	 *
+-	 * @param sessionKey - The session to send the message to.
++	 * @param sessionId - The id of the session to send the message to.
+ 	 * @param message - The message to send.
+ 	 */
+ 	private sendMessage(
+-		sessionKey: string,
++		sessionId: string,
+ 		message: TLSocketServerSentEvent<R> | TLSocketServerSentDataEvent<R>
+ 	) {
+-		const session = this.sessions.get(sessionKey)
++		const session = this.sessions.get(sessionId)
+ 		if (!session) {
+-			console.warn('Tried to send message to unknown session', message.type)
++			this.log?.warn?.('Tried to send message to unknown session', message.type)
+ 			return
+ 		}
+ 		if (session.state !== RoomSessionState.Connected) {
+-			console.warn('Tried to send message to disconnected client', message.type)
++			this.log?.warn?.('Tried to send message to disconnected client', message.type)
+ 			return
+ 		}
+ 		if (session.socket.isOpen) {
+@@ -425,7 +429,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				if (message.type !== 'pong') {
+ 					// non-data messages like "connect" might still need to be ordered correctly with
+ 					// respect to data messages, so it's better to flush just in case
+-					this._flushDataMessages(sessionKey)
++					this._flushDataMessages(sessionId)
+ 				}
+ 				session.socket.sendMessage(message)
+ 			} else {
+@@ -434,7 +438,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					session.socket.sendMessage({ type: 'data', data: [message] })
+ 
+ 					session.debounceTimer = setTimeout(
+-						() => this._flushDataMessages(sessionKey),
++						() => this._flushDataMessages(sessionId),
+ 						DATA_MESSAGE_DEBOUNCE_INTERVAL
+ 					)
+ 				} else {
+@@ -442,14 +446,14 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				}
+ 			}
+ 		} else {
+-			this.cancelSession(session.sessionKey)
++			this.cancelSession(session.sessionId)
+ 		}
+ 	}
+ 
+-	// needs to accept sessionKey and not a session because the session might be dead by the time
++	// needs to accept sessionId and not a session because the session might be dead by the time
+ 	// the timer fires
+-	_flushDataMessages(sessionKey: string) {
+-		const session = this.sessions.get(sessionKey)
++	_flushDataMessages(sessionId: string) {
++		const session = this.sessions.get(sessionId)
+ 
+ 		if (!session || session.state !== RoomSessionState.Connected) {
+ 			return
+@@ -463,14 +467,14 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		}
+ 	}
+ 
+-	private removeSession(sessionKey: string) {
+-		const session = this.sessions.get(sessionKey)
++	private removeSession(sessionId: string) {
++		const session = this.sessions.get(sessionId)
+ 		if (!session) {
+-			console.warn('Tried to remove unknown session')
++			this.log?.warn?.('Tried to remove unknown session')
+ 			return
+ 		}
+ 
+-		this.sessions.delete(sessionKey)
++		this.sessions.delete(sessionId)
+ 
+ 		const presence = this.getDocument(session.presenceId)
+ 
+@@ -491,30 +495,30 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 			this.broadcastPatch({
+ 				diff: { [session.presenceId]: [RecordOpType.Remove] },
+-				sourceSessionKey: sessionKey,
++				sourceSessionId: sessionId,
+ 			})
+ 		}
+ 
+-		this.events.emit('session_removed', { sessionKey, meta: session.meta })
++		this.events.emit('session_removed', { sessionId, meta: session.meta })
+ 		if (this.sessions.size === 0) {
+ 			this.events.emit('room_became_empty')
+ 		}
+ 	}
+ 
+-	private cancelSession(sessionKey: string) {
+-		const session = this.sessions.get(sessionKey)
++	private cancelSession(sessionId: string) {
++		const session = this.sessions.get(sessionId)
+ 		if (!session) {
+ 			return
+ 		}
+ 
+ 		if (session.state === RoomSessionState.AwaitingRemoval) {
+-			console.warn('Tried to cancel session that is already awaiting removal')
++			this.log?.warn?.('Tried to cancel session that is already awaiting removal')
+ 			return
+ 		}
+ 
+-		this.sessions.set(sessionKey, {
++		this.sessions.set(sessionId, {
+ 			state: RoomSessionState.AwaitingRemoval,
+-			sessionKey,
++			sessionId,
+ 			presenceId: session.presenceId,
+ 			socket: session.socket,
+ 			cancellationTime: Date.now(),
+@@ -523,23 +527,17 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	}
+ 
+ 	/**
+-	 * Broadcast a message to all connected clients except the one with the sessionKey provided.
++	 * Broadcast a message to all connected clients except the one with the sessionId provided.
+ 	 *
+ 	 * @param message - The message to broadcast.
+-	 * @param sourceSessionKey - The session to exclude.
++	 * @param sourceSessionId - The session to exclude.
+ 	 */
+-	broadcastPatch({
+-		diff,
+-		sourceSessionKey: sourceSessionKey,
+-	}: {
+-		diff: NetworkDiff<R>
+-		sourceSessionKey: string
+-	}) {
++	broadcastPatch({ diff, sourceSessionId }: { diff: NetworkDiff<R>; sourceSessionId: string }) {
+ 		this.sessions.forEach((session) => {
+ 			if (session.state !== RoomSessionState.Connected) return
+-			if (sourceSessionKey === session.sessionKey) return
++			if (sourceSessionId === session.sessionId) return
+ 			if (!session.socket.isOpen) {
+-				this.cancelSession(session.sessionKey)
++				this.cancelSession(session.sessionId)
+ 				return
+ 			}
+ 
+@@ -556,7 +554,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				return
+ 			}
+ 
+-			this.sendMessage(session.sessionKey, {
++			this.sendMessage(session.sessionId, {
+ 				type: 'patch',
+ 				diff: res.value,
+ 				serverClock: this.clock,
+@@ -569,14 +567,14 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * When a client connects to the room, add them to the list of clients and then merge the history
+ 	 * down into the snapshots.
+ 	 *
+-	 * @param sessionKey - The session of the client that connected to the room.
++	 * @param sessionId - The session of the client that connected to the room.
+ 	 * @param socket - Their socket.
+ 	 */
+-	handleNewSession = (sessionKey: string, socket: TLRoomSocket<R>, meta: SessionMeta) => {
+-		const existing = this.sessions.get(sessionKey)
+-		this.sessions.set(sessionKey, {
++	handleNewSession = (sessionId: string, socket: TLRoomSocket<R>, meta: SessionMeta) => {
++		const existing = this.sessions.get(sessionId)
++		this.sessions.set(sessionId, {
+ 			state: RoomSessionState.AwaitingConnectMessage,
+-			sessionKey,
++			sessionId,
+ 			socket,
+ 			presenceId: existing?.presenceId ?? this.presenceType.createId(),
+ 			sessionStartTime: Date.now(),
+@@ -631,13 +629,13 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * When the server receives a message from the clients Currently, supports connect and patches.
+ 	 * Invalid messages types throws an error. Currently, doesn't validate data.
+ 	 *
+-	 * @param sessionKey - The session that sent the message
++	 * @param sessionId - The session that sent the message
+ 	 * @param message - The message that was sent
+ 	 */
+-	handleMessage = async (sessionKey: string, message: TLSocketClientSentEvent<R>) => {
+-		const session = this.sessions.get(sessionKey)
++	handleMessage = async (sessionId: string, message: TLSocketClientSentEvent<R>) => {
++		const session = this.sessions.get(sessionId)
+ 		if (!session) {
+-			console.warn('Received message from unknown session')
++			this.log?.warn?.('Received message from unknown session')
+ 			return
+ 		}
+ 		switch (message.type) {
+@@ -651,7 +649,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				if (session.state === RoomSessionState.Connected) {
+ 					session.lastInteractionTime = Date.now()
+ 				}
+-				return this.sendMessage(session.sessionKey, { type: 'pong' })
++				return this.sendMessage(session.sessionId, { type: 'pong' })
+ 			}
+ 			default: {
+ 				exhaustiveSwitchError(message)
+@@ -671,7 +669,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		} catch (e) {
+ 			// noop
+ 		} finally {
+-			this.removeSession(session.sessionKey)
++			this.removeSession(session.sessionId)
+ 		}
+ 	}
+ 
+@@ -712,9 +710,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			: message.schema
+ 
+ 		const connect = (msg: TLSocketServerSentEvent<R>) => {
+-			this.sessions.set(session.sessionKey, {
++			this.sessions.set(session.sessionId, {
+ 				state: RoomSessionState.Connected,
+-				sessionKey: session.sessionKey,
++				sessionId: session.sessionId,
+ 				presenceId: session.presenceId,
+ 				socket: session.socket,
+ 				serializedSchema: sessionSchema,
+@@ -723,7 +721,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				outstandingDataMessages: [],
+ 				meta: session.meta,
+ 			})
+-			this.sendMessage(session.sessionKey, msg)
++			this.sendMessage(session.sessionId, msg)
+ 		}
+ 
+ 		transaction((rollback) => {
+@@ -843,7 +841,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				rollback()
+ 				this.rejectSession(session, reason)
+ 				if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
+-					console.error('failed to apply push', reason, message)
++					this.log?.error?.('failed to apply push', reason, message)
+ 				}
+ 				return Result.err(undefined)
+ 			}
+@@ -1024,7 +1022,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				// COMMIT
+ 				// Applying the client's changes had the exact same effect on the server as
+ 				// they had on the client, so the client should keep the diff
+-				this.sendMessage(session.sessionKey, {
++				this.sendMessage(session.sessionId, {
+ 					type: 'push_result',
+ 					serverClock: this.clock,
+ 					clientClock,
+@@ -1033,7 +1031,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			} else if (!docChanges.diff) {
+ 				// DISCARD
+ 				// Applying the client's changes had no effect, so the client should drop the diff
+-				this.sendMessage(session.sessionKey, {
++				this.sendMessage(session.sessionId, {
+ 					type: 'push_result',
+ 					serverClock: this.clock,
+ 					clientClock,
+@@ -1053,7 +1051,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					)
+ 				}
+ 				// If the migration worked, send the rebased diff to the client
+-				this.sendMessage(session.sessionKey, {
++				this.sendMessage(session.sessionId, {
+ 					type: 'push_result',
+ 					serverClock: this.clock,
+ 					clientClock,
+@@ -1064,7 +1062,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			// If there are merged changes, broadcast them to all other clients
+ 			if (docChanges.diff || presenceChanges.diff) {
+ 				this.broadcastPatch({
+-					sourceSessionKey: session.sessionKey,
++					sourceSessionId: session.sessionId,
+ 					diff: {
+ 						...docChanges.diff,
+ 						...presenceChanges.diff,
+@@ -1083,9 +1081,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	/**
+ 	 * Handle the event when a client disconnects.
+ 	 *
+-	 * @param sessionKey - The session that disconnected.
++	 * @param sessionId - The session that disconnected.
+ 	 */
+-	handleClose = (sessionKey: string) => {
+-		this.cancelSession(sessionKey)
++	handleClose = (sessionId: string) => {
++		this.cancelSession(sessionId)
+ 	}
+ }
+
+commit f05d102cd44ec3ab3ac84b51bf8669ef3b825481
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Jul 29 15:40:18 2024 +0200
+
+    Move from function properties to methods (#4288)
+    
+    Things left to do
+    - [x] Update docs (things like the [tools
+    page](https://tldraw-docs-fqnvru1os-tldraw.vercel.app/docs/tools),
+    possibly more)
+    - [x] Write a list of breaking changes and how to upgrade.
+    - [x] Do another pass and check if we can update any lines that have
+    `@typescript-eslint/method-signature-style` and
+    `local/prefer-class-methods` disabled
+    - [x] Thinks about what to do with `TLEventHandlers`. Edit: Feels like
+    keeping them is the best way to go.
+    - [x] Remove `override` keyword where it's not needed. Not sure if it's
+    worth the effort. Edit: decided not to spend time here.
+    - [ ] What about possible detached / destructured uses?
+    
+    Fixes https://github.com/tldraw/tldraw/issues/2799
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [x] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Adds eslint rules for enforcing the use of methods instead of function
+    properties and fixes / disables all the resulting errors.
+    
+    # Breaking changes
+    
+    This change affects the syntax of how the event handlers for shape tools
+    and utils are defined.
+    
+    ## Shape utils
+    **Before**
+    ```ts
+    export class CustomShapeUtil extends ShapeUtil<CustomShape> {
+       // Defining flags
+       override canEdit = () => true
+    
+       // Defining event handlers
+       override onResize: TLOnResizeHandler<CustomShape> = (shape, info) => {
+          ...
+       }
+    }
+    ```
+    
+    
+    **After**
+    ```ts
+    export class CustomShapeUtil extends ShapeUtil<CustomShape> {
+       // Defining flags
+       override canEdit() {
+          return true
+       }
+    
+       // Defining event handlers
+       override onResize(shape: CustomShape, info: TLResizeInfo<CustomShape>) {
+          ...
+       }
+    }
+    ```
+    
+    ## Tools
+    
+    **Before**
+    ```ts
+    export class CustomShapeTool extends StateNode {
+       // Defining child states
+       static override children = (): TLStateNodeConstructor[] => [Idle, Pointing]
+    
+       // Defining event handlers
+       override onKeyDown: TLEventHandlers['onKeyDown'] = (info) => {
+          ...
+       }
+    }
+    ```
+    
+    
+    **After**
+    ```ts
+    export class CustomShapeTool extends StateNode {
+       // Defining child states
+       static override children(): TLStateNodeConstructor[] {
+          return [Idle, Pointing]
+       }
+    
+       // Defining event handlers
+       override onKeyDown(info: TLKeyboardEventInfo) {
+          ...
+       }
+    }
+    ```
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index e1ef79de8..c1548d679 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -51,8 +51,8 @@ import {
+ /** @internal */
+ export interface TLRoomSocket<R extends UnknownRecord> {
+ 	isOpen: boolean
+-	sendMessage: (msg: TLSocketServerSentEvent<R>) => void
+-	close: () => void
++	sendMessage(msg: TLSocketServerSentEvent<R>): void
++	close(): void
+ }
+ 
+ // the max number of tombstones to keep in the store
+@@ -139,6 +139,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	// A table of connected clients
+ 	readonly sessions = new Map<string, RoomSession<R, SessionMeta>>()
+ 
++	// eslint-disable-next-line local/prefer-class-methods
+ 	pruneSessions = () => {
+ 		for (const client of this.sessions.values()) {
+ 			switch (client.state) {
+@@ -188,8 +189,8 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	}
+ 
+ 	readonly events = createNanoEvents<{
+-		room_became_empty: () => void
+-		session_removed: (args: { sessionId: string; meta: SessionMeta }) => void
++		room_became_empty(): void
++		session_removed(args: { sessionId: string; meta: SessionMeta }): void
+ 	}>()
+ 
+ 	// Values associated with each uid (must be serializable).
+@@ -341,6 +342,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		this.documentClock = this.clock
+ 	}
+ 
++	// eslint-disable-next-line local/prefer-class-methods
+ 	private pruneTombstones = () => {
+ 		// avoid blocking any pending responses
+ 		this.state.update(({ tombstones, documents }) => {
+@@ -570,7 +572,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * @param sessionId - The session of the client that connected to the room.
+ 	 * @param socket - Their socket.
+ 	 */
+-	handleNewSession = (sessionId: string, socket: TLRoomSocket<R>, meta: SessionMeta) => {
++	handleNewSession(sessionId: string, socket: TLRoomSocket<R>, meta: SessionMeta) {
+ 		const existing = this.sessions.get(sessionId)
+ 		this.sessions.set(sessionId, {
+ 			state: RoomSessionState.AwaitingConnectMessage,
+@@ -632,7 +634,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * @param sessionId - The session that sent the message
+ 	 * @param message - The message that was sent
+ 	 */
+-	handleMessage = async (sessionId: string, message: TLSocketClientSentEvent<R>) => {
++	async handleMessage(sessionId: string, message: TLSocketClientSentEvent<R>) {
+ 		const session = this.sessions.get(sessionId)
+ 		if (!session) {
+ 			this.log?.warn?.('Received message from unknown session')
+@@ -1083,7 +1085,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 *
+ 	 * @param sessionId - The session that disconnected.
+ 	 */
+-	handleClose = (sessionId: string) => {
++	handleClose(sessionId: string) {
+ 		this.cancelSession(sessionId)
+ 	}
+ }
+
+commit 75f64f20413828b363448390ecee6b546ed9a78c
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Sep 23 11:53:54 2024 +0100
+
+    [sync] Allow doing CRUD directly on the server (#4559)
+    
+    We've had a couple of requests for the ability to update the room data
+    directly on the server, which totally make sense when implementing any
+    kind of workflow that involves talking to an external service.
+    
+    This PR adds a simple helper that gives you an async transactional
+    context in which to perform updates that will be committed at the end,
+    and which are isolated from any other concurrent updates happening in
+    the server due to client activity or even other transactions. At the end
+    of a transaction, the generated diff is calculated as if it were on a
+    client and 'sent' to the room via a push request.
+    
+    ### Change type
+    
+    - [x] `feature`
+    - [x] `api`
+    
+    ### Test plan
+    
+    - [x] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Adds the `updateStore` method to the `TLSocketRoom` class, to allow
+    updating room data directly on the server.
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index c1548d679..291c06bb2 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -19,6 +19,7 @@ import {
+ 	isNativeStructuredClone,
+ 	objectMapEntries,
+ 	objectMapKeys,
++	structuredClone,
+ } from '@tldraw/utils'
+ import isEqual from 'lodash.isequal'
+ import { createNanoEvents } from 'nanoevents'
+@@ -217,11 +218,18 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	readonly presenceType: RecordType<R, any>
+ 	private log?: TLSyncLog
+ 	public readonly schema: StoreSchema<R, any>
+-
+-	constructor(opts: { log?: TLSyncLog; schema: StoreSchema<R, any>; snapshot?: RoomSnapshot }) {
++	private onDataChange?(): void
++
++	constructor(opts: {
++		log?: TLSyncLog
++		schema: StoreSchema<R, any>
++		snapshot?: RoomSnapshot
++		onDataChange?(): void
++	}) {
+ 		this.schema = opts.schema
+ 		let snapshot = opts.snapshot
+ 		this.log = opts.log
++		this.onDataChange = opts.onDataChange
+ 
+ 		assert(
+ 			isNativeStructuredClone,
+@@ -340,6 +348,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 		this.pruneTombstones()
+ 		this.documentClock = this.clock
++		if (didIncrementClock) {
++			opts.onDataChange?.()
++		}
+ 	}
+ 
+ 	// eslint-disable-next-line local/prefer-class-methods
+@@ -534,7 +545,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * @param message - The message to broadcast.
+ 	 * @param sourceSessionId - The session to exclude.
+ 	 */
+-	broadcastPatch({ diff, sourceSessionId }: { diff: NetworkDiff<R>; sourceSessionId: string }) {
++	broadcastPatch({ diff, sourceSessionId }: { diff: NetworkDiff<R>; sourceSessionId?: string }) {
+ 		this.sessions.forEach((session) => {
+ 			if (session.state !== RoomSessionState.Connected) return
+ 			if (sourceSessionId === session.sessionId) return
+@@ -811,20 +822,23 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	}
+ 
+ 	private handlePushRequest(
+-		session: RoomSession<R, SessionMeta>,
++		session: RoomSession<R, SessionMeta> | null,
+ 		message: Extract<TLSocketClientSentEvent<R>, { type: 'push' }>
+ 	) {
+ 		// We must be connected to handle push requests
+-		if (session.state !== RoomSessionState.Connected) {
++		if (session && session.state !== RoomSessionState.Connected) {
+ 			return
+ 		}
+ 
+ 		// update the last interaction time
+-		session.lastInteractionTime = Date.now()
++		if (session) {
++			session.lastInteractionTime = Date.now()
++		}
+ 
+ 		// increment the clock for this push
+ 		this.clock++
+ 
++		const initialDocumentClock = this.documentClock
+ 		transaction((rollback) => {
+ 			// collect actual ops that resulted from the push
+ 			// these will be broadcast to other users
+@@ -841,7 +855,11 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 			const fail = (reason: TLIncompatibilityReason): Result<void, void> => {
+ 				rollback()
+-				this.rejectSession(session, reason)
++				if (session) {
++					this.rejectSession(session, reason)
++				} else {
++					throw new Error('failed to apply changes: ' + reason)
++				}
+ 				if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
+ 					this.log?.error?.('failed to apply push', reason, message)
+ 				}
+@@ -849,7 +867,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			}
+ 
+ 			const addDocument = (changes: ActualChanges, id: string, _state: R): Result<void, void> => {
+-				const res = this.schema.migratePersistedRecord(_state, session.serializedSchema, 'up')
++				const res = session
++					? this.schema.migratePersistedRecord(_state, session.serializedSchema, 'up')
++					: { type: 'success' as const, value: _state }
+ 				if (res.type === 'error') {
+ 					return fail(
+ 						res.reason === MigrationFailureReason.TargetVersionTooOld // target version is our version
+@@ -895,11 +915,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				if (!doc) return Result.ok(undefined)
+ 				// If the client's version of the record is older than ours,
+ 				// we apply the patch to the downgraded version of the record
+-				const downgraded = this.schema.migratePersistedRecord(
+-					doc.state,
+-					session.serializedSchema,
+-					'down'
+-				)
++				const downgraded = session
++					? this.schema.migratePersistedRecord(doc.state, session.serializedSchema, 'down')
++					: { type: 'success' as const, value: doc.state }
+ 				if (downgraded.type === 'error') {
+ 					return fail(TLIncompatibilityReason.ClientTooOld)
+ 				}
+@@ -919,11 +937,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					// apply the patch to the downgraded version
+ 					const patched = applyObjectDiff(downgraded.value, patch)
+ 					// then upgrade the patched version and use that as the new state
+-					const upgraded = this.schema.migratePersistedRecord(
+-						patched,
+-						session.serializedSchema,
+-						'up'
+-					)
++					const upgraded = session
++						? this.schema.migratePersistedRecord(patched, session.serializedSchema, 'up')
++						: { type: 'success' as const, value: patched }
+ 					// If the client's version is too old, we'll hit an error
+ 					if (upgraded.type === 'error') {
+ 						return fail(TLIncompatibilityReason.ClientTooOld)
+@@ -944,6 +960,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			const { clientClock } = message
+ 
+ 			if ('presence' in message && message.presence) {
++				if (!session) throw new Error('session is required for presence pushes')
+ 				// The push request was for the presence scope.
+ 				const id = session.presenceId
+ 				const [type, val] = message.presence
+@@ -1024,47 +1041,56 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				// COMMIT
+ 				// Applying the client's changes had the exact same effect on the server as
+ 				// they had on the client, so the client should keep the diff
+-				this.sendMessage(session.sessionId, {
+-					type: 'push_result',
+-					serverClock: this.clock,
+-					clientClock,
+-					action: 'commit',
+-				})
++				if (session) {
++					this.sendMessage(session.sessionId, {
++						type: 'push_result',
++						serverClock: this.clock,
++						clientClock,
++						action: 'commit',
++					})
++				}
+ 			} else if (!docChanges.diff) {
+ 				// DISCARD
+ 				// Applying the client's changes had no effect, so the client should drop the diff
+-				this.sendMessage(session.sessionId, {
+-					type: 'push_result',
+-					serverClock: this.clock,
+-					clientClock,
+-					action: 'discard',
+-				})
++				if (session) {
++					this.sendMessage(session.sessionId, {
++						type: 'push_result',
++						serverClock: this.clock,
++						clientClock,
++						action: 'discard',
++					})
++				}
+ 			} else {
+ 				// REBASE
+ 				// Applying the client's changes had a different non-empty effect on the server,
+ 				// so the client should rebase with our gold-standard / authoritative diff.
+ 				// First we need to migrate the diff to the client's version
+-				const migrateResult = this.migrateDiffForSession(session.serializedSchema, docChanges.diff)
+-				if (!migrateResult.ok) {
+-					return fail(
+-						migrateResult.error === MigrationFailureReason.TargetVersionTooNew
+-							? TLIncompatibilityReason.ServerTooOld
+-							: TLIncompatibilityReason.ClientTooOld
++				if (session) {
++					const migrateResult = this.migrateDiffForSession(
++						session.serializedSchema,
++						docChanges.diff
+ 					)
++					if (!migrateResult.ok) {
++						return fail(
++							migrateResult.error === MigrationFailureReason.TargetVersionTooNew
++								? TLIncompatibilityReason.ServerTooOld
++								: TLIncompatibilityReason.ClientTooOld
++						)
++					}
++					// If the migration worked, send the rebased diff to the client
++					this.sendMessage(session.sessionId, {
++						type: 'push_result',
++						serverClock: this.clock,
++						clientClock,
++						action: { rebaseWithDiff: migrateResult.value },
++					})
+ 				}
+-				// If the migration worked, send the rebased diff to the client
+-				this.sendMessage(session.sessionId, {
+-					type: 'push_result',
+-					serverClock: this.clock,
+-					clientClock,
+-					action: { rebaseWithDiff: migrateResult.value },
+-				})
+ 			}
+ 
+ 			// If there are merged changes, broadcast them to all other clients
+ 			if (docChanges.diff || presenceChanges.diff) {
+ 				this.broadcastPatch({
+-					sourceSessionId: session.sessionId,
++					sourceSessionId: session?.sessionId,
+ 					diff: {
+ 						...docChanges.diff,
+ 						...presenceChanges.diff,
+@@ -1078,6 +1104,11 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 			return
+ 		})
++
++		// if it threw the changes will have been rolled back and the document clock will not have been incremented
++		if (this.documentClock !== initialDocumentClock) {
++			this.onDataChange?.()
++		}
+ 	}
+ 
+ 	/**
+@@ -1088,4 +1119,102 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	handleClose(sessionId: string) {
+ 		this.cancelSession(sessionId)
+ 	}
++
++	/**
++	 * Allow applying changes to the store in a transactional way.
++	 * @param updater - A function that will be called with a store object that can be used to make changes.
++	 * @returns A promise that resolves when the transaction is complete.
++	 */
++	async updateStore(updater: (store: RoomStoreMethods<R>) => void | Promise<void>) {
++		if (this._isClosed) {
++			throw new Error('Cannot update store on a closed room')
++		}
++		const context = new StoreUpdateContext<R>(
++			Object.fromEntries(this.getSnapshot().documents.map((d) => [d.state.id, d.state]))
++		)
++		try {
++			await updater(context)
++		} finally {
++			context.close()
++		}
++
++		const diff = context.toDiff()
++		if (Object.keys(diff).length === 0) {
++			return
++		}
++
++		this.handlePushRequest(null, { type: 'push', diff, clientClock: 0 })
++	}
++}
++
++/**
++ * @public
++ */
++export interface RoomStoreMethods<R extends UnknownRecord = UnknownRecord> {
++	put(record: R): void
++	delete(recordOrId: R | string): void
++	get(id: string): R | null
++	getAll(): R[]
++}
++
++class StoreUpdateContext<R extends UnknownRecord> implements RoomStoreMethods<R> {
++	constructor(private readonly snapshot: Record<string, UnknownRecord>) {}
++	private readonly updates = {
++		puts: {} as Record<string, UnknownRecord>,
++		deletes: new Set<string>(),
++	}
++	put(record: R): void {
++		if (this._isClosed) throw new Error('StoreUpdateContext is closed')
++		if (record.id in this.snapshot && isEqual(this.snapshot[record.id], record)) {
++			delete this.updates.puts[record.id]
++		} else {
++			this.updates.puts[record.id] = structuredClone(record)
++		}
++		this.updates.deletes.delete(record.id)
++	}
++	delete(recordOrId: R | string): void {
++		if (this._isClosed) throw new Error('StoreUpdateContext is closed')
++		const id = typeof recordOrId === 'string' ? recordOrId : recordOrId.id
++		delete this.updates.puts[id]
++		if (this.snapshot[id]) {
++			this.updates.deletes.add(id)
++		}
++	}
++	get(id: string): R | null {
++		if (this._isClosed) throw new Error('StoreUpdateContext is closed')
++		if (hasOwnProperty(this.updates.puts, id)) {
++			return structuredClone(this.updates.puts[id]) as R
++		}
++		if (this.updates.deletes.has(id)) {
++			return null
++		}
++		return structuredClone(this.snapshot[id] ?? null) as R
++	}
++
++	getAll(): R[] {
++		if (this._isClosed) throw new Error('StoreUpdateContext is closed')
++		const result = Object.values(this.updates.puts)
++		for (const [id, record] of Object.entries(this.snapshot)) {
++			if (!this.updates.deletes.has(id) && !hasOwnProperty(this.updates.puts, id)) {
++				result.push(record)
++			}
++		}
++		return structuredClone(result) as R[]
++	}
++
++	toDiff(): NetworkDiff<any> {
++		const diff: NetworkDiff<R> = {}
++		for (const [id, record] of Object.entries(this.updates.puts)) {
++			diff[id] = [RecordOpType.Put, record as R]
++		}
++		for (const id of this.updates.deletes) {
++			diff[id] = [RecordOpType.Remove]
++		}
++		return diff
++	}
++
++	private _isClosed = false
++	close() {
++		this._isClosed = true
++	}
+ }
+
+commit 9396faa50d2722a70ec37aa6e9d991849560bb2c
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Sep 24 13:48:25 2024 +0100
+
+    [sync] tiny perf thing (#4591)
+    
+    Just make generating a snapshot a tiny tiny tiny bit faster. This PR is
+    totally unnecessary tbh.
+    
+    - [x] `improvement`
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 291c06bb2..7158f3073 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -409,11 +409,11 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			tombstones,
+ 			schema: this.serializedSchema,
+ 			documents: Object.values(documents)
++				.filter((d) => this.documentTypes.has(d.state.typeName))
+ 				.map((doc) => ({
+ 					state: doc.state,
+ 					lastChangedClock: doc.lastChangedClock,
+-				}))
+-				.filter((d) => this.documentTypes.has(d.state.typeName)),
++				})),
+ 		}
+ 	}
+ 
+
+commit adda30254754d9985bdc1b4c2eca94a176c0dea2
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Sep 30 13:08:56 2024 +0200
+
+    Add eslint rule to check that tsdoc params match with function params (#4615)
+    
+    After this
+    [conversation](https://discord.com/channels/859816885297741824/859816885801713728/1289133853822423050)
+    I noticed that our tsdocs `@params` and our function / method
+    definitions don't always match. We often miss tsdoc params or have
+    outdated names for them.
+    
+    This PR:
+    - Adds an eslint rule to check whether the tsdoc params and the function
+    params / method arguments match. It allows for using `_` in function
+    params (you can specifiy `@param shapes` in the tsdocs but use `_shapes:
+    SomeType` in function. This helps with some functions that get
+    overriden, like [this
+    one](https://github.com/tldraw/tldraw/blob/a19c8f73898d59500accd87d416b4ae9a7a82ece/packages/editor/src/lib/editor/shapes/ShapeUtil.ts#L299-L308).
+    - It fixes the issues that the new rule found.
+    - Also adds the `select` argument back to the `createShape` and
+    `createShapes` methods. We could also go the other way and remove the
+    docs instead of adding the argument.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Add lint rules to check for discrepancies between tsdoc params and
+    function params and fix all the discovered issues.
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 7158f3073..01b0543d9 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -543,9 +543,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * Broadcast a message to all connected clients except the one with the sessionId provided.
+ 	 *
+ 	 * @param message - The message to broadcast.
+-	 * @param sourceSessionId - The session to exclude.
+ 	 */
+-	broadcastPatch({ diff, sourceSessionId }: { diff: NetworkDiff<R>; sourceSessionId?: string }) {
++	broadcastPatch(message: { diff: NetworkDiff<R>; sourceSessionId?: string }) {
++		const { diff, sourceSessionId } = message
+ 		this.sessions.forEach((session) => {
+ 			if (session.state !== RoomSessionState.Connected) return
+ 			if (sourceSessionId === session.sessionId) return
+@@ -582,6 +582,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 *
+ 	 * @param sessionId - The session of the client that connected to the room.
+ 	 * @param socket - Their socket.
++	 * @param meta - Any metadata associated with the session.
+ 	 */
+ 	handleNewSession(sessionId: string, socket: TLRoomSocket<R>, meta: SessionMeta) {
+ 		const existing = this.sessions.get(sessionId)
+
+commit e3ca52603451ccbe4ae99c2ce9e066d6af5e043c
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Sep 30 12:36:52 2024 +0100
+
+    [botcom] use tlsync as prototype backend (#4617)
+    
+    phew that was a beefy one.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 01b0543d9..527f2b37a 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -215,7 +215,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	readonly serializedSchema: SerializedSchema
+ 
+ 	readonly documentTypes: Set<string>
+-	readonly presenceType: RecordType<R, any>
++	readonly presenceType: RecordType<R, any> | null
+ 	private log?: TLSyncLog
+ 	public readonly schema: StoreSchema<R, any>
+ 	private onDataChange?(): void
+@@ -250,13 +250,13 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			Object.values<RecordType<R, any>>(this.schema.types).filter((t) => t.scope === 'presence')
+ 		)
+ 
+-		if (presenceTypes.size != 1) {
++		if (presenceTypes.size > 1) {
+ 			throw new Error(
+-				`TLSyncRoom: exactly one presence type is expected, but found ${presenceTypes.size}`
++				`TLSyncRoom: exactly zero or one presence type is expected, but found ${presenceTypes.size}`
+ 			)
+ 		}
+ 
+-		this.presenceType = presenceTypes.values().next().value
++		this.presenceType = presenceTypes.values().next()?.value
+ 
+ 		if (!snapshot) {
+ 			snapshot = {
+@@ -489,7 +489,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 		this.sessions.delete(sessionId)
+ 
+-		const presence = this.getDocument(session.presenceId)
++		const presence = this.getDocument(session.presenceId ?? '')
+ 
+ 		try {
+ 			if (session.socket.isOpen) {
+@@ -502,12 +502,12 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		if (presence) {
+ 			this.state.update(({ tombstones, documents }) => {
+ 				documents = { ...documents }
+-				delete documents[session.presenceId]
++				delete documents[session.presenceId!]
+ 				return { documents, tombstones }
+ 			})
+ 
+ 			this.broadcastPatch({
+-				diff: { [session.presenceId]: [RecordOpType.Remove] },
++				diff: { [session.presenceId!]: [RecordOpType.Remove] },
+ 				sourceSessionId: sessionId,
+ 			})
+ 		}
+@@ -590,7 +590,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			state: RoomSessionState.AwaitingConnectMessage,
+ 			sessionId,
+ 			socket,
+-			presenceId: existing?.presenceId ?? this.presenceType.createId(),
++			presenceId: existing?.presenceId ?? this.presenceType?.createId() ?? null,
+ 			sessionStartTime: Date.now(),
+ 			meta,
+ 		})
+@@ -779,10 +779,13 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				const updatedDocs = Object.values(this.state.get().documents).filter(
+ 					(doc) => doc.lastChangedClock > message.lastServerClock
+ 				)
+-				const presenceDocs = Object.values(this.state.get().documents).filter(
+-					(doc) =>
+-						this.presenceType.typeName === doc.state.typeName && doc.state.id !== session.presenceId
+-				)
++				const presenceDocs = this.presenceType
++					? Object.values(this.state.get().documents).filter(
++							(doc) =>
++								this.presenceType!.typeName === doc.state.typeName &&
++								doc.state.id !== session.presenceId
++						)
++					: []
+ 				const deletedDocsIds = Object.entries(this.state.get().tombstones)
+ 					.filter(([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock)
+ 					.map(([id]) => id)
+@@ -960,7 +963,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 			const { clientClock } = message
+ 
+-			if ('presence' in message && message.presence) {
++			if (this.presenceType && session?.presenceId && 'presence' in message && message.presence) {
+ 				if (!session) throw new Error('session is required for presence pushes')
+ 				// The push request was for the presence scope.
+ 				const id = session.presenceId
+
+commit 2e89a0621e311843b14995b57471857fccdbd8ed
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Oct 2 16:03:36 2024 +0100
+
+    [sync] readonly mode (#4648)
+    
+    This PR adds readonly mode for tldraw sync.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [x] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - [tldraw sync] Adds `isReadonly` mode for socket connections.
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 527f2b37a..0279db686 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -536,6 +536,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			socket: session.socket,
+ 			cancellationTime: Date.now(),
+ 			meta: session.meta,
++			isReadonly: session.isReadonly,
+ 		})
+ 	}
+ 
+@@ -580,11 +581,15 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	 * When a client connects to the room, add them to the list of clients and then merge the history
+ 	 * down into the snapshots.
+ 	 *
+-	 * @param sessionId - The session of the client that connected to the room.
+-	 * @param socket - Their socket.
+-	 * @param meta - Any metadata associated with the session.
++	 * @internal
+ 	 */
+-	handleNewSession(sessionId: string, socket: TLRoomSocket<R>, meta: SessionMeta) {
++	handleNewSession(opts: {
++		sessionId: string
++		socket: TLRoomSocket<R>
++		meta: SessionMeta
++		isReadonly: boolean
++	}) {
++		const { sessionId, socket, meta, isReadonly } = opts
+ 		const existing = this.sessions.get(sessionId)
+ 		this.sessions.set(sessionId, {
+ 			state: RoomSessionState.AwaitingConnectMessage,
+@@ -593,6 +598,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			presenceId: existing?.presenceId ?? this.presenceType?.createId() ?? null,
+ 			sessionStartTime: Date.now(),
+ 			meta,
++			isReadonly: isReadonly ?? false,
+ 		})
+ 		return this
+ 	}
+@@ -734,6 +740,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				debounceTimer: null,
+ 				outstandingDataMessages: [],
+ 				meta: session.meta,
++				isReadonly: session.isReadonly,
+ 			})
+ 			this.sendMessage(session.sessionId, msg)
+ 		}
+@@ -990,7 +997,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					}
+ 				}
+ 			}
+-			if (message.diff) {
++			if (message.diff && !session?.isReadonly) {
+ 				// The push request was for the document scope.
+ 				for (const [id, op] of Object.entries(message.diff!)) {
+ 					switch (op[0]) {
+
+commit 9c14e0f1f9db3c37ac58d6df33b5404658132a9f
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Oct 7 09:35:01 2024 +0100
+
+    [sync] Set instance.isReadonly automatically  (#4673)
+    
+    Follow up to #4648 , extracted from #4660
+    
+    This PR adds a TLStore prop that contains a signal for setting the
+    readonly mode. This allows the readonlyness to change on the fly, which
+    is necessary for botcom. it's also just nice for tlsync users to be able
+    to decide on the server whether something is readonly.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Puts the editor into readonly mode automatically when the tlsync
+    server responds in readonly mode.
+    - Adds the `editor.getIsReadonly()` method.
+    - Fixes a bug where arrow labels could be edited in readonly mode.
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 0279db686..4629b677c 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -779,6 +779,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					schema: this.schema.serialize(),
+ 					serverClock: this.clock,
+ 					diff: migrated.value,
++					isReadonly: session.isReadonly,
+ 				})
+ 			} else {
+ 				// calculate the changes since the time the client last saw
+@@ -827,6 +828,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					protocolVersion: getTlsyncProtocolVersion(),
+ 					serverClock: this.clock,
+ 					diff: migrated.value,
++					isReadonly: session.isReadonly,
+ 				})
+ 			}
+ 		})
+
+commit fad02725381a223ba634d7d4bf02211c218e0140
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Oct 7 12:17:18 2024 +0100
+
+    [sync] refine error handling + room.closeSession method (#4660)
+    
+    - refine and consolidate error handling, using `socket.close(code,
+    reason)` for unrecoverable errors instead of the message protocol.
+    - allow SDK users to evict sessions from a room, either terminally (by
+    supplying a reason which gets passed to socket.close) or just to force
+    them to reconnect.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    - [x] `api`
+    
+    ### Release notes
+    
+    - Adds a `closeSession` to the `TLSocketRoom` class, for terminating or
+    restarting a client's socket connection.
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 4629b677c..851eecd59 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -31,6 +31,7 @@ import {
+ 	SESSION_START_WAIT_TIME,
+ } from './RoomSession'
+ import { TLSyncLog } from './TLSocketRoom'
++import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from './TLSyncClient'
+ import {
+ 	NetworkDiff,
+ 	ObjectDiff,
+@@ -53,7 +54,7 @@ import {
+ export interface TLRoomSocket<R extends UnknownRecord> {
+ 	isOpen: boolean
+ 	sendMessage(msg: TLSocketServerSentEvent<R>): void
+-	close(): void
++	close(code?: number, reason?: string): void
+ }
+ 
+ // the max number of tombstones to keep in the store
+@@ -480,7 +481,8 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		}
+ 	}
+ 
+-	private removeSession(sessionId: string) {
++	/** @internal */
++	private removeSession(sessionId: string, fatalReason?: string) {
+ 		const session = this.sessions.get(sessionId)
+ 		if (!session) {
+ 			this.log?.warn?.('Tried to remove unknown session')
+@@ -493,7 +495,11 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 
+ 		try {
+ 			if (session.socket.isOpen) {
+-				session.socket.close()
++				if (fatalReason) {
++					session.socket.close(TLSyncErrorCloseEventCode, fatalReason)
++				} else {
++					session.socket.close()
++				}
+ 			}
+ 		} catch (_e) {
+ 			// noop
+@@ -537,6 +543,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			cancellationTime: Date.now(),
+ 			meta: session.meta,
+ 			isReadonly: session.isReadonly,
++			requiresLegacyRejection: session.requiresLegacyRejection,
+ 		})
+ 	}
+ 
+@@ -560,10 +567,10 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			if (!res.ok) {
+ 				// disconnect client and send incompatibility error
+ 				this.rejectSession(
+-					session,
++					session.sessionId,
+ 					res.error === MigrationFailureReason.TargetVersionTooNew
+-						? TLIncompatibilityReason.ServerTooOld
+-						: TLIncompatibilityReason.ClientTooOld
++						? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
++						: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+ 				)
+ 				return
+ 			}
+@@ -599,6 +606,8 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			sessionStartTime: Date.now(),
+ 			meta,
+ 			isReadonly: isReadonly ?? false,
++			// this gets set later during handleConnectMessage
++			requiresLegacyRejection: false,
+ 		})
+ 		return this
+ 	}
+@@ -678,18 +687,48 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 	}
+ 
+ 	/** If the client is out of date, or we are out of date, we need to let them know */
+-	private rejectSession(session: RoomSession<R, SessionMeta>, reason: TLIncompatibilityReason) {
+-		try {
+-			if (session.socket.isOpen) {
+-				session.socket.sendMessage({
+-					type: 'incompatibility_error',
+-					reason,
+-				})
++	rejectSession(sessionId: string, fatalReason?: TLSyncErrorCloseEventReason | string) {
++		const session = this.sessions.get(sessionId)
++		if (!session) return
++		if (!fatalReason) {
++			this.removeSession(sessionId)
++			return
++		}
++		if (session.requiresLegacyRejection) {
++			try {
++				if (session.socket.isOpen) {
++					// eslint-disable-next-line deprecation/deprecation
++					let legacyReason: TLIncompatibilityReason
++					switch (fatalReason) {
++						case TLSyncErrorCloseEventReason.CLIENT_TOO_OLD:
++							// eslint-disable-next-line deprecation/deprecation
++							legacyReason = TLIncompatibilityReason.ClientTooOld
++							break
++						case TLSyncErrorCloseEventReason.SERVER_TOO_OLD:
++							// eslint-disable-next-line deprecation/deprecation
++							legacyReason = TLIncompatibilityReason.ServerTooOld
++							break
++						case TLSyncErrorCloseEventReason.INVALID_RECORD:
++							// eslint-disable-next-line deprecation/deprecation
++							legacyReason = TLIncompatibilityReason.InvalidRecord
++							break
++						default:
++							// eslint-disable-next-line deprecation/deprecation
++							legacyReason = TLIncompatibilityReason.InvalidOperation
++							break
++					}
++					session.socket.sendMessage({
++						type: 'incompatibility_error',
++						reason: legacyReason,
++					})
++				}
++			} catch (e) {
++				// noop
++			} finally {
++				this.removeSession(sessionId)
+ 			}
+-		} catch (e) {
+-			// noop
+-		} finally {
+-			this.removeSession(session.sessionId)
++		} else {
++			this.removeSession(sessionId, fatalReason)
+ 		}
+ 	}
+ 
+@@ -705,23 +744,28 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		if (theirProtocolVersion === 5) {
+ 			theirProtocolVersion = 6
+ 		}
++		// 6 is almost the same as 7
++		session.requiresLegacyRejection = theirProtocolVersion === 6
++		if (theirProtocolVersion === 6) {
++			theirProtocolVersion++
++		}
+ 		if (theirProtocolVersion == null || theirProtocolVersion < getTlsyncProtocolVersion()) {
+-			this.rejectSession(session, TLIncompatibilityReason.ClientTooOld)
++			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+ 			return
+ 		} else if (theirProtocolVersion > getTlsyncProtocolVersion()) {
+-			this.rejectSession(session, TLIncompatibilityReason.ServerTooOld)
++			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.SERVER_TOO_OLD)
+ 			return
+ 		}
+ 		// If the client's store is at a different version to ours, it could cause corruption.
+ 		// We should disconnect the client and ask them to refresh.
+ 		if (message.schema == null) {
+-			this.rejectSession(session, TLIncompatibilityReason.ClientTooOld)
++			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+ 			return
+ 		}
+ 		const migrations = this.schema.getMigrationsSince(message.schema)
+ 		// if the client's store is at a different version to ours, we can't support them
+ 		if (!migrations.ok || migrations.value.some((m) => m.scope === 'store' || !m.down)) {
+-			this.rejectSession(session, TLIncompatibilityReason.ClientTooOld)
++			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+ 			return
+ 		}
+ 
+@@ -741,6 +785,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				outstandingDataMessages: [],
+ 				meta: session.meta,
+ 				isReadonly: session.isReadonly,
++				requiresLegacyRejection: session.requiresLegacyRejection,
+ 			})
+ 			this.sendMessage(session.sessionId, msg)
+ 		}
+@@ -764,10 +809,10 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				if (!migrated.ok) {
+ 					rollback()
+ 					this.rejectSession(
+-						session,
++						session.sessionId,
+ 						migrated.error === MigrationFailureReason.TargetVersionTooNew
+-							? TLIncompatibilityReason.ServerTooOld
+-							: TLIncompatibilityReason.ClientTooOld
++							? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
++							: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+ 					)
+ 					return
+ 				}
+@@ -812,10 +857,10 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				if (!migrated.ok) {
+ 					rollback()
+ 					this.rejectSession(
+-						session,
++						session.sessionId,
+ 						migrated.error === MigrationFailureReason.TargetVersionTooNew
+-							? TLIncompatibilityReason.ServerTooOld
+-							: TLIncompatibilityReason.ClientTooOld
++							? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
++							: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+ 					)
+ 					return
+ 				}
+@@ -866,15 +911,18 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				changes.diff[id] = op
+ 			}
+ 
+-			const fail = (reason: TLIncompatibilityReason): Result<void, void> => {
++			const fail = (
++				reason: TLSyncErrorCloseEventReason,
++				underlyingError?: Error
++			): Result<void, void> => {
+ 				rollback()
+ 				if (session) {
+-					this.rejectSession(session, reason)
++					this.rejectSession(session.sessionId, reason)
+ 				} else {
+-					throw new Error('failed to apply changes: ' + reason)
++					throw new Error('failed to apply changes: ' + reason, underlyingError)
+ 				}
+ 				if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
+-					this.log?.error?.('failed to apply push', reason, message)
++					this.log?.error?.('failed to apply push', reason, message, underlyingError)
+ 				}
+ 				return Result.err(undefined)
+ 			}
+@@ -886,8 +934,8 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				if (res.type === 'error') {
+ 					return fail(
+ 						res.reason === MigrationFailureReason.TargetVersionTooOld // target version is our version
+-							? TLIncompatibilityReason.ServerTooOld
+-							: TLIncompatibilityReason.ClientTooOld
++							? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
++							: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+ 					)
+ 				}
+ 				const { value: state } = res
+@@ -900,7 +948,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					// but propagate a diff rather than the entire value
+ 					const diff = doc.replaceState(state, this.clock)
+ 					if (!diff.ok) {
+-						return fail(TLIncompatibilityReason.InvalidRecord)
++						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+ 					}
+ 					if (diff.value) {
+ 						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
+@@ -910,7 +958,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					// create the document and propagate the put op
+ 					const result = this.addDocument(id, state, this.clock)
+ 					if (!result.ok) {
+-						return fail(TLIncompatibilityReason.InvalidRecord)
++						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+ 					}
+ 					propagateOp(changes, id, [RecordOpType.Put, state])
+ 				}
+@@ -932,14 +980,14 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					? this.schema.migratePersistedRecord(doc.state, session.serializedSchema, 'down')
+ 					: { type: 'success' as const, value: doc.state }
+ 				if (downgraded.type === 'error') {
+-					return fail(TLIncompatibilityReason.ClientTooOld)
++					return fail(TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+ 				}
+ 
+ 				if (downgraded.value === doc.state) {
+ 					// If the versions are compatible, apply the patch and propagate the patch op
+ 					const diff = doc.mergeDiff(patch, this.clock)
+ 					if (!diff.ok) {
+-						return fail(TLIncompatibilityReason.InvalidRecord)
++						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+ 					}
+ 					if (diff.value) {
+ 						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
+@@ -955,12 +1003,12 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 						: { type: 'success' as const, value: patched }
+ 					// If the client's version is too old, we'll hit an error
+ 					if (upgraded.type === 'error') {
+-						return fail(TLIncompatibilityReason.ClientTooOld)
++						return fail(TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+ 					}
+ 					// replace the state with the upgraded version and propagate the patch op
+ 					const diff = doc.replaceState(upgraded.value, this.clock)
+ 					if (!diff.ok) {
+-						return fail(TLIncompatibilityReason.InvalidRecord)
++						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+ 					}
+ 					if (diff.value) {
+ 						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
+@@ -1007,7 +1055,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 							// Try to add the document.
+ 							// If we're putting a record with a type that we don't recognize, fail
+ 							if (!this.documentTypes.has(op[1].typeName)) {
+-								return fail(TLIncompatibilityReason.InvalidRecord)
++								return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+ 							}
+ 							const res = addDocument(docChanges, id, op[1])
+ 							// if res.ok is false here then we already called `fail` and we should stop immediately
+@@ -1028,11 +1076,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 								continue
+ 							}
+ 
+-							// If the doc is not a type that we recognize, fail
+-							if (!this.documentTypes.has(doc.state.typeName)) {
+-								return fail(TLIncompatibilityReason.InvalidOperation)
+-							}
+-
+ 							// Delete the document and propagate the delete op
+ 							this.removeDocument(id, this.clock)
+ 							// Schedule a pruneTombstones call to happen on the next call stack
+@@ -1086,8 +1129,8 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					if (!migrateResult.ok) {
+ 						return fail(
+ 							migrateResult.error === MigrationFailureReason.TargetVersionTooNew
+-								? TLIncompatibilityReason.ServerTooOld
+-								: TLIncompatibilityReason.ClientTooOld
++								? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
++								: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+ 						)
+ 					}
+ 					// If the migration worked, send the rebased diff to the client
+
+commit 9894eb43b99ee673f0d42cd4a7069c83865ded7d
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Mon Oct 21 14:26:32 2024 +0100
+
+    botcom: account menu [bk] (#4683)
+    
+    [bk=burger king, as Alex says] kinda funky b/c i'm doing these
+    MaybeProviders in `TlaRootProviders.tsx`. but it does work. lemme know
+    what you think — we can rework from here.
+    
+    <img width="708" alt="Screenshot 2024-10-07 at 22 12 33"
+    src="https://github.com/user-attachments/assets/554be50a-1842-4659-adff-dfed8fc4e0a5">
+    
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 851eecd59..92ddaa034 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -43,6 +43,7 @@ import {
+ } from './diff'
+ import { interval } from './interval'
+ import {
++	TLConnectRequest,
+ 	TLIncompatibilityReason,
+ 	TLSocketClientSentEvent,
+ 	TLSocketServerSentDataEvent,
+@@ -377,6 +378,18 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		return this.state.get().documents[id]
+ 	}
+ 
++	private getTombstoneIds(message?: TLConnectRequest) {
++		let deletedDocs = Object.entries(this.state.get().tombstones)
++		if (message) {
++			deletedDocs = deletedDocs.filter(
++				([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock
++			)
++		}
++
++		const deletedDocsIds = deletedDocs.map(([id]) => id)
++		return deletedDocsIds
++	}
++
+ 	private addDocument(id: string, state: R, clock: number): Result<void, Error> {
+ 		let { documents, tombstones } = this.state.get()
+ 		if (hasOwnProperty(tombstones, id)) {
+@@ -667,6 +680,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			this.log?.warn?.('Received message from unknown session')
+ 			return
+ 		}
++
+ 		switch (message.type) {
+ 			case 'connect': {
+ 				return this.handleConnectRequest(session, message)
+@@ -799,9 +813,10 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				// or if the server exits/crashes with unpersisted changes
+ 				message.lastServerClock > this.clock
+ 			) {
++				const deletedDocsIds = this.getTombstoneIds(message)
+ 				const diff: NetworkDiff<R> = {}
+ 				for (const [id, doc] of Object.entries(this.state.get().documents)) {
+-					if (id !== session.presenceId) {
++					if (id !== session.presenceId && !deletedDocsIds.includes(id)) {
+ 						diff[id] = [RecordOpType.Put, doc.state]
+ 					}
+ 				}
+@@ -839,9 +854,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 								doc.state.id !== session.presenceId
+ 						)
+ 					: []
+-				const deletedDocsIds = Object.entries(this.state.get().tombstones)
+-					.filter(([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock)
+-					.map(([id]) => id)
+ 
+ 				for (const doc of updatedDocs) {
+ 					diff[doc.state.id] = [RecordOpType.Put, doc.state]
+@@ -850,6 +862,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					diff[doc.state.id] = [RecordOpType.Put, doc.state]
+ 				}
+ 
++				const deletedDocsIds = this.getTombstoneIds(message)
+ 				for (const docId of deletedDocsIds) {
+ 					diff[docId] = [RecordOpType.Remove]
+ 				}
+
+commit b3e308b2d497eab2840ece99554115258a3db04b
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Oct 22 14:07:05 2024 +0100
+
+    [botcom] Fix file deletion and creation (#4751)
+    
+    - make file deletion work properly
+    - There was a problem with one of the sql queries preventing the records
+    from being removed
+    - Need to also kick people out of the room when the file is deleted and
+    remove the blob from R2
+    - fix the file creation interaction (was not showing up in sidebar)
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 92ddaa034..851eecd59 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -43,7 +43,6 @@ import {
+ } from './diff'
+ import { interval } from './interval'
+ import {
+-	TLConnectRequest,
+ 	TLIncompatibilityReason,
+ 	TLSocketClientSentEvent,
+ 	TLSocketServerSentDataEvent,
+@@ -378,18 +377,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		return this.state.get().documents[id]
+ 	}
+ 
+-	private getTombstoneIds(message?: TLConnectRequest) {
+-		let deletedDocs = Object.entries(this.state.get().tombstones)
+-		if (message) {
+-			deletedDocs = deletedDocs.filter(
+-				([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock
+-			)
+-		}
+-
+-		const deletedDocsIds = deletedDocs.map(([id]) => id)
+-		return deletedDocsIds
+-	}
+-
+ 	private addDocument(id: string, state: R, clock: number): Result<void, Error> {
+ 		let { documents, tombstones } = this.state.get()
+ 		if (hasOwnProperty(tombstones, id)) {
+@@ -680,7 +667,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			this.log?.warn?.('Received message from unknown session')
+ 			return
+ 		}
+-
+ 		switch (message.type) {
+ 			case 'connect': {
+ 				return this.handleConnectRequest(session, message)
+@@ -813,10 +799,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 				// or if the server exits/crashes with unpersisted changes
+ 				message.lastServerClock > this.clock
+ 			) {
+-				const deletedDocsIds = this.getTombstoneIds(message)
+ 				const diff: NetworkDiff<R> = {}
+ 				for (const [id, doc] of Object.entries(this.state.get().documents)) {
+-					if (id !== session.presenceId && !deletedDocsIds.includes(id)) {
++					if (id !== session.presenceId) {
+ 						diff[id] = [RecordOpType.Put, doc.state]
+ 					}
+ 				}
+@@ -854,6 +839,9 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 								doc.state.id !== session.presenceId
+ 						)
+ 					: []
++				const deletedDocsIds = Object.entries(this.state.get().tombstones)
++					.filter(([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock)
++					.map(([id]) => id)
+ 
+ 				for (const doc of updatedDocs) {
+ 					diff[doc.state.id] = [RecordOpType.Put, doc.state]
+@@ -862,7 +850,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					diff[doc.state.id] = [RecordOpType.Put, doc.state]
+ 				}
+ 
+-				const deletedDocsIds = this.getTombstoneIds(message)
+ 				for (const docId of deletedDocsIds) {
+ 					diff[docId] = [RecordOpType.Remove]
+ 				}
+
+commit b301aeb64e5ff7bcd55928d7200a39092da8c501
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Wed Oct 23 15:55:42 2024 +0100
+
+    npm: upgrade eslint v8 → v9 (#4757)
+    
+    As I worked on the i18n PR (https://github.com/tldraw/tldraw/pull/4719)
+    I noticed that `react-intl` required a new version of `eslint`. That led
+    me down a bit of a rabbit hole of upgrading v8 → v9. There were a couple
+    things to upgrade to make this work.
+    
+    - ran `npx @eslint/migrate-config .eslintrc.js` to upgrade to the new
+    `eslint.config.mjs`
+    - `.eslintignore` is now deprecated and part of `eslint.config.mjs`
+    - some packages are no longer relevant, of note: `eslint-plugin-local`
+    and `eslint-plugin-deprecation`
+    - the upgrade caught a couple bugs/dead code
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Upgrade eslint v8 → v9
+    
+    ---------
+    
+    Co-authored-by: alex <alex@dytry.ch>
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 851eecd59..11e092547 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -257,7 +257,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			)
+ 		}
+ 
+-		this.presenceType = presenceTypes.values().next()?.value
++		this.presenceType = presenceTypes.values().next()?.value ?? null
+ 
+ 		if (!snapshot) {
+ 			snapshot = {
+@@ -310,7 +310,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			store: Object.fromEntries(
+ 				objectMapEntries(documents).map(([id, { state }]) => [id, state as R])
+ 			) as Record<IdOf<R>, R>,
+-			// eslint-disable-next-line deprecation/deprecation
++			// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 			schema: snapshot.schema ?? this.schema.serializeEarliestVersion(),
+ 		})
+ 
+@@ -501,7 +501,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 					session.socket.close()
+ 				}
+ 			}
+-		} catch (_e) {
++		} catch {
+ 			// noop
+ 		}
+ 
+@@ -697,23 +697,23 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		if (session.requiresLegacyRejection) {
+ 			try {
+ 				if (session.socket.isOpen) {
+-					// eslint-disable-next-line deprecation/deprecation
++					// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 					let legacyReason: TLIncompatibilityReason
+ 					switch (fatalReason) {
+ 						case TLSyncErrorCloseEventReason.CLIENT_TOO_OLD:
+-							// eslint-disable-next-line deprecation/deprecation
++							// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 							legacyReason = TLIncompatibilityReason.ClientTooOld
+ 							break
+ 						case TLSyncErrorCloseEventReason.SERVER_TOO_OLD:
+-							// eslint-disable-next-line deprecation/deprecation
++							// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 							legacyReason = TLIncompatibilityReason.ServerTooOld
+ 							break
+ 						case TLSyncErrorCloseEventReason.INVALID_RECORD:
+-							// eslint-disable-next-line deprecation/deprecation
++							// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 							legacyReason = TLIncompatibilityReason.InvalidRecord
+ 							break
+ 						default:
+-							// eslint-disable-next-line deprecation/deprecation
++							// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 							legacyReason = TLIncompatibilityReason.InvalidOperation
+ 							break
+ 					}
+@@ -722,7 +722,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 						reason: legacyReason,
+ 					})
+ 				}
+-			} catch (e) {
++			} catch {
+ 				// noop
+ 			} finally {
+ 				this.removeSession(sessionId)
+
+commit 1dda67252787c27dd2b297dd78dd04e9b76b364d
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Jan 15 10:04:47 2025 +0000
+
+    close sockets on 'close' event (#5214)
+    
+    apparently it is necessary to call .close on the server socket to make
+    the tcp connection close cleanly, even after the client has called
+    .close() ?
+    
+    before
+    
+    ![Kapture 2025-01-14 at 11 27
+    52](https://github.com/user-attachments/assets/a13c5061-48d8-401e-84c4-151fd864c4c9)
+    
+    
+    after
+    
+    ![Kapture 2025-01-14 at 11 26
+    22](https://github.com/user-attachments/assets/6133080e-e7da-410b-a6ef-283a00d8e898)
+    
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - sync: close the server sockets on disconnect to proactively clean up
+    socket connections.
+
+diff --git a/packages/sync-core/src/lib/TLSyncRoom.ts b/packages/sync-core/src/lib/TLSyncRoom.ts
+index 11e092547..5d3b1606a 100644
+--- a/packages/sync-core/src/lib/TLSyncRoom.ts
++++ b/packages/sync-core/src/lib/TLSyncRoom.ts
+@@ -494,15 +494,13 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 		const presence = this.getDocument(session.presenceId ?? '')
+ 
+ 		try {
+-			if (session.socket.isOpen) {
+-				if (fatalReason) {
+-					session.socket.close(TLSyncErrorCloseEventCode, fatalReason)
+-				} else {
+-					session.socket.close()
+-				}
++			if (fatalReason) {
++				session.socket.close(TLSyncErrorCloseEventCode, fatalReason)
++			} else {
++				session.socket.close()
+ 			}
+ 		} catch {
+-			// noop
++			// noop, calling .close() multiple times is fine
+ 		}
+ 
+ 		if (presence) {
+@@ -545,6 +543,12 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
+ 			isReadonly: session.isReadonly,
+ 			requiresLegacyRejection: session.requiresLegacyRejection,
+ 		})
++
++		try {
++			session.socket.close()
++		} catch {
++			// noop, calling .close() multiple times is fine
++		}
+ 	}
+ 
+ 	/**
+

@@ -1,0 +1,4659 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+
+commit ab9833c09df9c5d51ffdb3537866f352e9d42444
+Author: alex <alex@dytry.ch>
+Date:   Wed Sep 18 11:17:57 2024 +0100
+
+    Clean up `apps` directory (#4548)
+    
+    Post 3.0 spring cleaning?
+    
+    There a new `internal` folder with things that people who don't work at
+    tldraw should never need to look at. The apps folder contains just our
+    actual apps, with the various dotcom services under `apps/dotcom`.
+    
+    vercel deploy will fail on this until it's ready to land, at which point
+    i'll update the vercel config to point at the new script locations
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+new file mode 100644
+index 000000000..172a230b5
+--- /dev/null
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -0,0 +1,431 @@
++/// <reference no-default-lib="true"/>
++/// <reference types="@cloudflare/workers-types" />
++
++import { SupabaseClient } from '@supabase/supabase-js'
++import {
++	READ_ONLY_LEGACY_PREFIX,
++	READ_ONLY_PREFIX,
++	ROOM_OPEN_MODE,
++	ROOM_PREFIX,
++	type RoomOpenMode,
++} from '@tldraw/dotcom-shared'
++import {
++	RoomSnapshot,
++	TLCloseEventCode,
++	TLSocketRoom,
++	type PersistedRoomSnapshotForSupabase,
++} from '@tldraw/sync-core'
++import { TLRecord } from '@tldraw/tlschema'
++import { assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
++import { createPersistQueue, createSentry } from '@tldraw/worker-shared'
++import { IRequest, Router } from 'itty-router'
++import { AlarmScheduler } from './AlarmScheduler'
++import { PERSIST_INTERVAL_MS } from './config'
++import { getR2KeyForRoom } from './r2'
++import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
++import { createSupabaseClient } from './utils/createSupabaseClient'
++import { getSlug } from './utils/roomOpenMode'
++import { throttle } from './utils/throttle'
++
++const MAX_CONNECTIONS = 50
++
++// increment this any time you make a change to this type
++const CURRENT_DOCUMENT_INFO_VERSION = 0
++interface DocumentInfo {
++	version: number
++	slug: string
++}
++
++const ROOM_NOT_FOUND = Symbol('room_not_found')
++
++export class TLDrawDurableObject {
++	// A unique identifier for this instance of the Durable Object
++	id: DurableObjectId
++
++	// For TLSyncRoom
++	_room: Promise<TLSocketRoom<TLRecord, { storeId: string }>> | null = null
++
++	getRoom() {
++		if (!this._documentInfo) {
++			throw new Error('documentInfo must be present when accessing room')
++		}
++		const slug = this._documentInfo.slug
++		if (!this._room) {
++			this._room = this.loadFromDatabase(slug).then((result) => {
++				switch (result.type) {
++					case 'room_found': {
++						const room = new TLSocketRoom<TLRecord, { storeId: string }>({
++							initialSnapshot: result.snapshot,
++							onSessionRemoved: async (room, args) => {
++								this.logEvent({
++									type: 'client',
++									roomId: slug,
++									name: 'leave',
++									instanceId: args.sessionId,
++									localClientId: args.meta.storeId,
++								})
++
++								if (args.numSessionsRemaining > 0) return
++								if (!this._room) return
++								this.logEvent({
++									type: 'client',
++									roomId: slug,
++									name: 'last_out',
++									instanceId: args.sessionId,
++									localClientId: args.meta.storeId,
++								})
++								try {
++									await this.persistToDatabase()
++								} catch (err) {
++									// already logged
++								}
++								// make sure nobody joined the room while we were persisting
++								if (room.getNumActiveSessions() > 0) return
++								this._room = null
++								this.logEvent({ type: 'room', roomId: slug, name: 'room_empty' })
++								room.close()
++							},
++							onDataChange: () => {
++								this.triggerPersistSchedule()
++							},
++							onBeforeSendMessage: ({ message, stringified }) => {
++								this.logEvent({
++									type: 'send_message',
++									roomId: slug,
++									messageType: message.type,
++									messageLength: stringified.length,
++								})
++							},
++						})
++						this.logEvent({ type: 'room', roomId: slug, name: 'room_start' })
++						return room
++					}
++					case 'room_not_found': {
++						throw ROOM_NOT_FOUND
++					}
++					case 'error': {
++						throw result.error
++					}
++					default: {
++						exhaustiveSwitchError(result)
++					}
++				}
++			})
++		}
++		return this._room
++	}
++
++	// For storage
++	storage: DurableObjectStorage
++
++	// For persistence
++	supabaseClient: SupabaseClient | void
++
++	// For analytics
++	measure: Analytics | undefined
++
++	// For error tracking
++	sentryDSN: string | undefined
++
++	readonly supabaseTable: string
++	readonly r2: {
++		readonly rooms: R2Bucket
++		readonly versionCache: R2Bucket
++	}
++
++	_documentInfo: DocumentInfo | null = null
++
++	constructor(
++		private state: DurableObjectState,
++		private env: Environment
++	) {
++		this.id = state.id
++		this.storage = state.storage
++		this.sentryDSN = env.SENTRY_DSN
++		this.measure = env.MEASURE
++		this.supabaseClient = createSupabaseClient(env)
++
++		this.supabaseTable = env.TLDRAW_ENV === 'production' ? 'drawings' : 'drawings_staging'
++		this.r2 = {
++			rooms: env.ROOMS,
++			versionCache: env.ROOMS_HISTORY_EPHEMERAL,
++		}
++
++		state.blockConcurrencyWhile(async () => {
++			const existingDocumentInfo = (await this.storage.get('documentInfo')) as DocumentInfo | null
++			if (existingDocumentInfo?.version !== CURRENT_DOCUMENT_INFO_VERSION) {
++				this._documentInfo = null
++			} else {
++				this._documentInfo = existingDocumentInfo
++			}
++		})
++	}
++
++	readonly router = Router()
++		.get(
++			`/${ROOM_PREFIX}/:roomId`,
++			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
++			(req) => this.onRequest(req)
++		)
++		.get(
++			`/${READ_ONLY_LEGACY_PREFIX}/:roomId`,
++			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_ONLY_LEGACY),
++			(req) => this.onRequest(req)
++		)
++		.get(
++			`/${READ_ONLY_PREFIX}/:roomId`,
++			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_ONLY),
++			(req) => this.onRequest(req)
++		)
++		.post(
++			`/${ROOM_PREFIX}/:roomId/restore`,
++			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
++			(req) => this.onRestore(req)
++		)
++		.all('*', () => new Response('Not found', { status: 404 }))
++
++	readonly scheduler = new AlarmScheduler({
++		storage: () => this.storage,
++		alarms: {
++			persist: async () => {
++				this.persistToDatabase()
++			},
++		},
++	})
++
++	// eslint-disable-next-line no-restricted-syntax
++	get documentInfo() {
++		return assertExists(this._documentInfo, 'documentInfo must be present')
++	}
++	async extractDocumentInfoFromRequest(req: IRequest, roomOpenMode: RoomOpenMode) {
++		const slug = assertExists(
++			await getSlug(this.env, req.params.roomId, roomOpenMode),
++			'roomId must be present'
++		)
++		if (this._documentInfo) {
++			assert(this._documentInfo.slug === slug, 'slug must match')
++		} else {
++			this._documentInfo = {
++				version: CURRENT_DOCUMENT_INFO_VERSION,
++				slug,
++			}
++		}
++	}
++
++	// Handle a request to the Durable Object.
++	async fetch(req: IRequest) {
++		const sentry = createSentry(this.state, this.env, req)
++
++		try {
++			return await this.router.fetch(req)
++		} catch (err) {
++			console.error(err)
++			// eslint-disable-next-line deprecation/deprecation
++			sentry?.captureException(err)
++			return new Response('Something went wrong', {
++				status: 500,
++				statusText: 'Internal Server Error',
++			})
++		}
++	}
++
++	_isRestoring = false
++	async onRestore(req: IRequest) {
++		this._isRestoring = true
++		try {
++			const roomId = this.documentInfo.slug
++			const roomKey = getR2KeyForRoom(roomId)
++			const timestamp = ((await req.json()) as any).timestamp
++			if (!timestamp) {
++				return new Response('Missing timestamp', { status: 400 })
++			}
++			const data = await this.r2.versionCache.get(`${roomKey}/${timestamp}`)
++			if (!data) {
++				return new Response('Version not found', { status: 400 })
++			}
++			const dataText = await data.text()
++			await this.r2.rooms.put(roomKey, dataText)
++			const room = await this.getRoom()
++
++			const snapshot: RoomSnapshot = JSON.parse(dataText)
++			room.loadSnapshot(snapshot)
++
++			return new Response()
++		} finally {
++			this._isRestoring = false
++		}
++	}
++
++	async onRequest(req: IRequest) {
++		// extract query params from request, should include instanceId
++		const url = new URL(req.url)
++		const params = Object.fromEntries(url.searchParams.entries())
++		let { sessionId, storeId } = params
++
++		// handle legacy param names
++		sessionId ??= params.sessionKey ?? params.instanceId
++		storeId ??= params.localClientId
++		const isNewSession = !this._room
++
++		// Create the websocket pair for the client
++		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
++		serverWebSocket.accept()
++
++		try {
++			const room = await this.getRoom()
++			// Don't connect if we're already at max connections
++			if (room.getNumActiveSessions() >= MAX_CONNECTIONS) {
++				return new Response('Room is full', { status: 403 })
++			}
++
++			// all good
++			room.handleSocketConnect({
++				sessionId: sessionId,
++				socket: serverWebSocket,
++				meta: { storeId },
++			})
++			if (isNewSession) {
++				this.logEvent({
++					type: 'client',
++					roomId: this.documentInfo.slug,
++					name: 'room_reopen',
++					instanceId: sessionId,
++					localClientId: storeId,
++				})
++			}
++			this.logEvent({
++				type: 'client',
++				roomId: this.documentInfo.slug,
++				name: 'enter',
++				instanceId: sessionId,
++				localClientId: storeId,
++			})
++			return new Response(null, { status: 101, webSocket: clientWebSocket })
++		} catch (e) {
++			if (e === ROOM_NOT_FOUND) {
++				serverWebSocket.close(TLCloseEventCode.NOT_FOUND, 'Room not found')
++				return new Response(null, { status: 101, webSocket: clientWebSocket })
++			}
++			throw e
++		}
++	}
++
++	triggerPersistSchedule = throttle(() => {
++		this.schedulePersist()
++	}, 2000)
++
++	private writeEvent(
++		name: string,
++		{ blobs, indexes, doubles }: { blobs?: string[]; indexes?: [string]; doubles?: number[] }
++	) {
++		this.measure?.writeDataPoint({
++			blobs: [name, this.env.WORKER_NAME ?? 'development-tldraw-multiplayer', ...(blobs ?? [])],
++			doubles,
++			indexes,
++		})
++	}
++
++	logEvent(event: TLServerEvent) {
++		switch (event.type) {
++			case 'room': {
++				// we would add user/connection ids here if we could
++				this.writeEvent(event.name, { blobs: [event.roomId] })
++				break
++			}
++			case 'client': {
++				// we would add user/connection ids here if we could
++				this.writeEvent(event.name, {
++					blobs: [event.roomId, 'unused', event.instanceId],
++					indexes: [event.localClientId],
++				})
++				break
++			}
++			case 'send_message': {
++				this.writeEvent(event.type, {
++					blobs: [event.roomId, event.messageType],
++					doubles: [event.messageLength],
++				})
++				break
++			}
++			default: {
++				exhaustiveSwitchError(event)
++			}
++		}
++	}
++
++	// Load the room's drawing data. First we check the R2 bucket, then we fallback to supabase (legacy).
++	async loadFromDatabase(persistenceKey: string): Promise<DBLoadResult> {
++		try {
++			const key = getR2KeyForRoom(persistenceKey)
++			// when loading, prefer to fetch documents from the bucket
++			const roomFromBucket = await this.r2.rooms.get(key)
++			if (roomFromBucket) {
++				return { type: 'room_found', snapshot: await roomFromBucket.json() }
++			}
++
++			// if we don't have a room in the bucket, try to load from supabase
++			if (!this.supabaseClient) return { type: 'room_not_found' }
++			const { data, error } = await this.supabaseClient
++				.from(this.supabaseTable)
++				.select('*')
++				.eq('slug', persistenceKey)
++
++			if (error) {
++				this.logEvent({ type: 'room', roomId: persistenceKey, name: 'failed_load_from_db' })
++
++				console.error('failed to retrieve document', persistenceKey, error)
++				return { type: 'error', error: new Error(error.message) }
++			}
++			// if it didn't find a document, data will be an empty array
++			if (data.length === 0) {
++				return { type: 'room_not_found' }
++			}
++
++			const roomFromSupabase = data[0] as PersistedRoomSnapshotForSupabase
++			return { type: 'room_found', snapshot: roomFromSupabase.drawing }
++		} catch (error) {
++			this.logEvent({ type: 'room', roomId: persistenceKey, name: 'failed_load_from_db' })
++
++			console.error('failed to fetch doc', persistenceKey, error)
++			return { type: 'error', error: error as Error }
++		}
++	}
++
++	_lastPersistedClock: number | null = null
++	_persistQueue = createPersistQueue(async () => {
++		// check whether the worker was woken up to persist after having gone to sleep
++		if (!this._room) return
++		const slug = this.documentInfo.slug
++		const room = await this.getRoom()
++		const clock = room.getCurrentDocumentClock()
++		if (this._lastPersistedClock === clock) return
++		if (this._isRestoring) return
++
++		const snapshot = JSON.stringify(room.getCurrentSnapshot())
++
++		const key = getR2KeyForRoom(slug)
++		await Promise.all([
++			this.r2.rooms.put(key, snapshot),
++			this.r2.versionCache.put(key + `/` + new Date().toISOString(), snapshot),
++		])
++		this._lastPersistedClock = clock
++		// use a shorter timeout for this 'inner' loop than the 'outer' alarm-scheduled loop
++		// just in case there's any possibility of setting up a neverending queue
++	}, PERSIST_INTERVAL_MS / 2)
++
++	// Save the room to supabase
++	async persistToDatabase() {
++		await this._persistQueue()
++	}
++
++	async schedulePersist() {
++		await this.scheduler.scheduleAlarmAfter('persist', PERSIST_INTERVAL_MS, {
++			overwrite: 'if-sooner',
++		})
++	}
++
++	// Will be called automatically when the alarm ticks.
++	async alarm() {
++		await this.scheduler.onAlarm()
++	}
++}
+
+commit e3ca52603451ccbe4ae99c2ce9e066d6af5e043c
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Sep 30 12:36:52 2024 +0100
+
+    [botcom] use tlsync as prototype backend (#4617)
+    
+    phew that was a beefy one.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 172a230b5..e5eaf50fa 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -13,9 +13,10 @@ import {
+ 	RoomSnapshot,
+ 	TLCloseEventCode,
+ 	TLSocketRoom,
++	TLSyncRoom,
+ 	type PersistedRoomSnapshotForSupabase,
+ } from '@tldraw/sync-core'
+-import { TLRecord } from '@tldraw/tlschema'
++import { TLRecord, createTLSchema } from '@tldraw/tlschema'
+ import { assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
+ import { createPersistQueue, createSentry } from '@tldraw/worker-shared'
+ import { IRequest, Router } from 'itty-router'
+@@ -161,9 +162,25 @@ export class TLDrawDurableObject {
+ 		})
+ 	}
+ 
++	_isApp: boolean | null = null
++
++	_setIsApp(isApp: boolean) {
++		if (this._isApp === null) {
++			this._isApp = isApp
++		} else if (this._isApp !== isApp) {
++			throw new Error('Cannot change app status')
++		}
++	}
++
+ 	readonly router = Router()
++		.all('*', (req) => {
++			const pathname = new URL(req.url).pathname
++			const isApp = pathname.startsWith('/app/')
++			this._setIsApp(isApp)
++		})
+ 		.get(
+ 			`/${ROOM_PREFIX}/:roomId`,
++			this._setIsApp.bind(this, false),
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
+ 			(req) => this.onRequest(req)
+ 		)
+@@ -177,6 +194,11 @@ export class TLDrawDurableObject {
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_ONLY),
+ 			(req) => this.onRequest(req)
+ 		)
++		.get(
++			`/app/file/:roomId`,
++			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
++			(req) => this.onRequest(req)
++		)
+ 		.post(
+ 			`/${ROOM_PREFIX}/:roomId/restore`,
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
+@@ -229,12 +251,17 @@ export class TLDrawDurableObject {
+ 		}
+ 	}
+ 
++	// eslint-disable-next-line no-restricted-syntax
++	get isApp(): boolean {
++		return assertExists(this._isApp, 'isApp must be present')
++	}
++
+ 	_isRestoring = false
+ 	async onRestore(req: IRequest) {
+ 		this._isRestoring = true
+ 		try {
+ 			const roomId = this.documentInfo.slug
+-			const roomKey = getR2KeyForRoom(roomId)
++			const roomKey = getR2KeyForRoom({ slug: roomId, isApp: this.isApp })
+ 			const timestamp = ((await req.json()) as any).timestamp
+ 			if (!timestamp) {
+ 				return new Response('Missing timestamp', { status: 400 })
+@@ -354,26 +381,35 @@ export class TLDrawDurableObject {
+ 	}
+ 
+ 	// Load the room's drawing data. First we check the R2 bucket, then we fallback to supabase (legacy).
+-	async loadFromDatabase(persistenceKey: string): Promise<DBLoadResult> {
++	async loadFromDatabase(slug: string): Promise<DBLoadResult> {
+ 		try {
+-			const key = getR2KeyForRoom(persistenceKey)
++			const key = getR2KeyForRoom({ slug, isApp: this.isApp })
+ 			// when loading, prefer to fetch documents from the bucket
+ 			const roomFromBucket = await this.r2.rooms.get(key)
+ 			if (roomFromBucket) {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 
++			if (this.isApp) {
++				return {
++					type: 'room_found',
++					snapshot: new TLSyncRoom({
++						schema: createTLSchema(),
++					}).getSnapshot(),
++				}
++			}
++
+ 			// if we don't have a room in the bucket, try to load from supabase
+ 			if (!this.supabaseClient) return { type: 'room_not_found' }
+ 			const { data, error } = await this.supabaseClient
+ 				.from(this.supabaseTable)
+ 				.select('*')
+-				.eq('slug', persistenceKey)
++				.eq('slug', slug)
+ 
+ 			if (error) {
+-				this.logEvent({ type: 'room', roomId: persistenceKey, name: 'failed_load_from_db' })
++				this.logEvent({ type: 'room', roomId: slug, name: 'failed_load_from_db' })
+ 
+-				console.error('failed to retrieve document', persistenceKey, error)
++				console.error('failed to retrieve document', slug, error)
+ 				return { type: 'error', error: new Error(error.message) }
+ 			}
+ 			// if it didn't find a document, data will be an empty array
+@@ -384,9 +420,9 @@ export class TLDrawDurableObject {
+ 			const roomFromSupabase = data[0] as PersistedRoomSnapshotForSupabase
+ 			return { type: 'room_found', snapshot: roomFromSupabase.drawing }
+ 		} catch (error) {
+-			this.logEvent({ type: 'room', roomId: persistenceKey, name: 'failed_load_from_db' })
++			this.logEvent({ type: 'room', roomId: slug, name: 'failed_load_from_db' })
+ 
+-			console.error('failed to fetch doc', persistenceKey, error)
++			console.error('failed to fetch doc', slug, error)
+ 			return { type: 'error', error: error as Error }
+ 		}
+ 	}
+@@ -403,7 +439,7 @@ export class TLDrawDurableObject {
+ 
+ 		const snapshot = JSON.stringify(room.getCurrentSnapshot())
+ 
+-		const key = getR2KeyForRoom(slug)
++		const key = getR2KeyForRoom({ slug: slug, isApp: this.isApp })
+ 		await Promise.all([
+ 			this.r2.rooms.put(key, snapshot),
+ 			this.r2.versionCache.put(key + `/` + new Date().toISOString(), snapshot),
+
+commit 0ec64b2500006beb91eb78efa4b80e8b65c6cd7b
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Oct 2 15:41:22 2024 +0100
+
+    [botcom] Use auth on backend (#4639)
+    
+    This PR
+    
+    - Renames the socket endpoint `/app/:userId` to just `/app`, and uses
+    the access token to get the user id from clerk
+    - Uses the access token to gate 'owned' files.
+    
+    
+    TO DO in follow ups
+    - Allow shared files (will require asking the owner's DO for permission
+    to establish a socket connection, and figuring out a way to revoke an
+    already-established connection.
+    - Add web hook to update a user's info if they change it on
+    google/whatever.
+    
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [x] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index e5eaf50fa..173ae1036 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -7,6 +7,7 @@ import {
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+ 	ROOM_PREFIX,
++	TldrawAppFileRecordType,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+ import {
+@@ -25,16 +26,21 @@ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
++import { requireAuth } from './utils/getAuth'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+ 
+ const MAX_CONNECTIONS = 50
+ 
+ // increment this any time you make a change to this type
+-const CURRENT_DOCUMENT_INFO_VERSION = 0
++const CURRENT_DOCUMENT_INFO_VERSION = 1
+ interface DocumentInfo {
+ 	version: number
+ 	slug: string
++	isApp: boolean
++	// if this room loaded as a temporary room this will be true,
++	// even if the room later was claimed by a user (which will be checked every time while still unclaimed)
++	isOrWasTemporary: boolean
+ }
+ 
+ const ROOM_NOT_FOUND = Symbol('room_not_found')
+@@ -224,12 +230,17 @@ export class TLDrawDurableObject {
+ 			await getSlug(this.env, req.params.roomId, roomOpenMode),
+ 			'roomId must be present'
+ 		)
++		const isApp = new URL(req.url).pathname.startsWith('/app/')
++		const isOrWasTemporary = isApp && new URL(req.url).searchParams.get('temporary') === 'true'
++
+ 		if (this._documentInfo) {
+ 			assert(this._documentInfo.slug === slug, 'slug must match')
+ 		} else {
+ 			this._documentInfo = {
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug,
++				isApp,
++				isOrWasTemporary,
+ 			}
+ 		}
+ 	}
+@@ -283,6 +294,22 @@ export class TLDrawDurableObject {
+ 		}
+ 	}
+ 
++	_ownerId: string | null = null
++	async getOwnerId() {
++		if (!this._ownerId) {
++			const slug = this.documentInfo.slug
++			const fileId = TldrawAppFileRecordType.createId(slug)
++			const row = await this.env.DB.prepare('SELECT topicId as ownerId FROM records WHERE id = ?')
++				.bind(fileId)
++				.first()
++
++			if (row) {
++				this._ownerId = row.ownerId as string
++			}
++		}
++		return this._ownerId
++	}
++
+ 	async onRequest(req: IRequest) {
+ 		// extract query params from request, should include instanceId
+ 		const url = new URL(req.url)
+@@ -298,6 +325,29 @@ export class TLDrawDurableObject {
+ 		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+ 		serverWebSocket.accept()
+ 
++		const closeSocket = (code: number, message: string) => {
++			serverWebSocket.close(code, message)
++			return new Response(null, { status: 101, webSocket: clientWebSocket })
++		}
++
++		if (this.isApp) {
++			const ownerId = await this.getOwnerId()
++
++			if (ownerId) {
++				const auth = await requireAuth(req, this.env)
++				if (ownerId !== auth.userId) {
++					return closeSocket(TLCloseEventCode.FORBIDDEN, 'Not authorized')
++				}
++			} else if (!this.documentInfo.isOrWasTemporary) {
++				// If there is no owner that means it's a temporary room, but if they didn't add the temporary
++				// flag don't let them in.
++				// This prevents people from just creating rooms by typing extra chars in the URL because we only
++				// add that flag in temporary rooms.
++				return closeSocket(TLCloseEventCode.NOT_FOUND, 'Room not found')
++			}
++			// otherwise, it's a temporary room and we let them in
++		}
++
+ 		try {
+ 			const room = await this.getRoom()
+ 			// Don't connect if we're already at max connections
+
+commit 2e89a0621e311843b14995b57471857fccdbd8ed
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Oct 2 16:03:36 2024 +0100
+
+    [sync] readonly mode (#4648)
+    
+    This PR adds readonly mode for tldraw sync.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [x] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - [tldraw sync] Adds `isReadonly` mode for socket connections.
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 173ae1036..9930ddf28 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -188,22 +188,22 @@ export class TLDrawDurableObject {
+ 			`/${ROOM_PREFIX}/:roomId`,
+ 			this._setIsApp.bind(this, false),
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
+-			(req) => this.onRequest(req)
++			(req) => this.onRequest(req, ROOM_OPEN_MODE.READ_WRITE)
+ 		)
+ 		.get(
+ 			`/${READ_ONLY_LEGACY_PREFIX}/:roomId`,
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_ONLY_LEGACY),
+-			(req) => this.onRequest(req)
++			(req) => this.onRequest(req, ROOM_OPEN_MODE.READ_ONLY_LEGACY)
+ 		)
+ 		.get(
+ 			`/${READ_ONLY_PREFIX}/:roomId`,
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_ONLY),
+-			(req) => this.onRequest(req)
++			(req) => this.onRequest(req, ROOM_OPEN_MODE.READ_ONLY)
+ 		)
+ 		.get(
+ 			`/app/file/:roomId`,
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
+-			(req) => this.onRequest(req)
++			(req) => this.onRequest(req, ROOM_OPEN_MODE.READ_WRITE)
+ 		)
+ 		.post(
+ 			`/${ROOM_PREFIX}/:roomId/restore`,
+@@ -310,7 +310,7 @@ export class TLDrawDurableObject {
+ 		return this._ownerId
+ 	}
+ 
+-	async onRequest(req: IRequest) {
++	async onRequest(req: IRequest, openMode: RoomOpenMode) {
+ 		// extract query params from request, should include instanceId
+ 		const url = new URL(req.url)
+ 		const params = Object.fromEntries(url.searchParams.entries())
+@@ -360,6 +360,8 @@ export class TLDrawDurableObject {
+ 				sessionId: sessionId,
+ 				socket: serverWebSocket,
+ 				meta: { storeId },
++				isReadonly:
++					openMode === ROOM_OPEN_MODE.READ_ONLY || openMode === ROOM_OPEN_MODE.READ_ONLY_LEGACY,
+ 			})
+ 			if (isNewSession) {
+ 				this.logEvent({
+
+commit fad02725381a223ba634d7d4bf02211c218e0140
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Oct 7 12:17:18 2024 +0100
+
+    [sync] refine error handling + room.closeSession method (#4660)
+    
+    - refine and consolidate error handling, using `socket.close(code,
+    reason)` for unrecoverable errors instead of the message protocol.
+    - allow SDK users to evict sessions from a room, either terminally (by
+    supplying a reason which gets passed to socket.close) or just to force
+    them to reconnect.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    - [x] `api`
+    
+    ### Release notes
+    
+    - Adds a `closeSession` to the `TLSocketRoom` class, for terminating or
+    restarting a client's socket connection.
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 9930ddf28..9c12aa05e 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -12,8 +12,9 @@ import {
+ } from '@tldraw/dotcom-shared'
+ import {
+ 	RoomSnapshot,
+-	TLCloseEventCode,
+ 	TLSocketRoom,
++	TLSyncErrorCloseEventCode,
++	TLSyncErrorCloseEventReason,
+ 	TLSyncRoom,
+ 	type PersistedRoomSnapshotForSupabase,
+ } from '@tldraw/sync-core'
+@@ -325,8 +326,8 @@ export class TLDrawDurableObject {
+ 		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+ 		serverWebSocket.accept()
+ 
+-		const closeSocket = (code: number, message: string) => {
+-			serverWebSocket.close(code, message)
++		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
++			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
+@@ -336,14 +337,14 @@ export class TLDrawDurableObject {
+ 			if (ownerId) {
+ 				const auth = await requireAuth(req, this.env)
+ 				if (ownerId !== auth.userId) {
+-					return closeSocket(TLCloseEventCode.FORBIDDEN, 'Not authorized')
++					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
+ 			} else if (!this.documentInfo.isOrWasTemporary) {
+ 				// If there is no owner that means it's a temporary room, but if they didn't add the temporary
+ 				// flag don't let them in.
+ 				// This prevents people from just creating rooms by typing extra chars in the URL because we only
+ 				// add that flag in temporary rooms.
+-				return closeSocket(TLCloseEventCode.NOT_FOUND, 'Room not found')
++				return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+ 			}
+ 			// otherwise, it's a temporary room and we let them in
+ 		}
+@@ -382,8 +383,7 @@ export class TLDrawDurableObject {
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		} catch (e) {
+ 			if (e === ROOM_NOT_FOUND) {
+-				serverWebSocket.close(TLCloseEventCode.NOT_FOUND, 'Room not found')
+-				return new Response(null, { status: 101, webSocket: clientWebSocket })
++				return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+ 			}
+ 			throw e
+ 		}
+
+commit 3a3d6c5de857260bb5dc7c8ba493172f507a9b3a
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Oct 8 13:08:54 2024 +0100
+
+    [botcom] sharing (#4654)
+    
+    This PR adds initial support for sharing.
+    
+    - Using the file's `shared` flag to gate access to guests
+    https://github.com/tldraw/tldraw/blob/1879c3a4b41529bb6b42992410ec5cf0ba3b6492/packages/dotcom-shared/src/tla-schema/TldrawAppFile.ts#L16
+    - Kicking guests out of the room if the `shared` flips from `true` to
+    `false`
+    - Allow guests to not be logged in
+    - Changing between readonly and readwrite changes the UI and editor mode
+    on guests' machines.
+    - Simplified routing
+      - `/q/local` -> `/q`
+      - Remove defunct redirect pages
+    - Renamed `'temporary'` flag to `'isCreateMode'` and use it to fix the
+    race condition when creating new rooms
+    - (temporary fix) allow guests to see the document's file name
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [x] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 9c12aa05e..fbb5e20d2 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -7,6 +7,7 @@ import {
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+ 	ROOM_PREFIX,
++	TldrawAppFile,
+ 	TldrawAppFileRecordType,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+@@ -18,40 +19,46 @@ import {
+ 	TLSyncRoom,
+ 	type PersistedRoomSnapshotForSupabase,
+ } from '@tldraw/sync-core'
+-import { TLRecord, createTLSchema } from '@tldraw/tlschema'
++import { TLDOCUMENT_ID, TLDocument, TLRecord, createTLSchema } from '@tldraw/tlschema'
+ import { assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
+ import { createPersistQueue, createSentry } from '@tldraw/worker-shared'
++import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+-import { requireAuth } from './utils/getAuth'
++import { getAuth } from './utils/getAuth'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+ 
+ const MAX_CONNECTIONS = 50
+ 
+ // increment this any time you make a change to this type
+-const CURRENT_DOCUMENT_INFO_VERSION = 1
++const CURRENT_DOCUMENT_INFO_VERSION = 2
+ interface DocumentInfo {
+ 	version: number
+ 	slug: string
+ 	isApp: boolean
+-	// if this room loaded as a temporary room this will be true,
+-	// even if the room later was claimed by a user (which will be checked every time while still unclaimed)
+-	isOrWasTemporary: boolean
++	// Create mode is used by the app to bypass the 'room not found' check.
++	// i.e. if this is a new file it creates the file, even if it wasn't
++	// added to the user's app database yet.
++	isOrWasCreateMode: boolean
+ }
+ 
+ const ROOM_NOT_FOUND = Symbol('room_not_found')
+ 
+-export class TLDrawDurableObject {
++interface SessionMeta {
++	storeId: string
++	userId: string | null
++}
++
++export class TLDrawDurableObject extends DurableObject {
+ 	// A unique identifier for this instance of the Durable Object
+ 	id: DurableObjectId
+ 
+-	// For TLSyncRoom
+-	_room: Promise<TLSocketRoom<TLRecord, { storeId: string }>> | null = null
++	_room: Promise<TLSocketRoom<TLRecord, SessionMeta>> | null = null
+ 
+ 	getRoom() {
+ 		if (!this._documentInfo) {
+@@ -62,7 +69,7 @@ export class TLDrawDurableObject {
+ 			this._room = this.loadFromDatabase(slug).then((result) => {
+ 				switch (result.type) {
+ 					case 'room_found': {
+-						const room = new TLSocketRoom<TLRecord, { storeId: string }>({
++						const room = new TLSocketRoom<TLRecord, SessionMeta>({
+ 							initialSnapshot: result.snapshot,
+ 							onSessionRemoved: async (room, args) => {
+ 								this.logEvent({
+@@ -145,8 +152,9 @@ export class TLDrawDurableObject {
+ 
+ 	constructor(
+ 		private state: DurableObjectState,
+-		private env: Environment
++		override env: Environment
+ 	) {
++		super(state, env)
+ 		this.id = state.id
+ 		this.storage = state.storage
+ 		this.sentryDSN = env.SENTRY_DSN
+@@ -169,25 +177,9 @@ export class TLDrawDurableObject {
+ 		})
+ 	}
+ 
+-	_isApp: boolean | null = null
+-
+-	_setIsApp(isApp: boolean) {
+-		if (this._isApp === null) {
+-			this._isApp = isApp
+-		} else if (this._isApp !== isApp) {
+-			throw new Error('Cannot change app status')
+-		}
+-	}
+-
+ 	readonly router = Router()
+-		.all('*', (req) => {
+-			const pathname = new URL(req.url).pathname
+-			const isApp = pathname.startsWith('/app/')
+-			this._setIsApp(isApp)
+-		})
+ 		.get(
+ 			`/${ROOM_PREFIX}/:roomId`,
+-			this._setIsApp.bind(this, false),
+ 			(req) => this.extractDocumentInfoFromRequest(req, ROOM_OPEN_MODE.READ_WRITE),
+ 			(req) => this.onRequest(req, ROOM_OPEN_MODE.READ_WRITE)
+ 		)
+@@ -226,28 +218,32 @@ export class TLDrawDurableObject {
+ 	get documentInfo() {
+ 		return assertExists(this._documentInfo, 'documentInfo must be present')
+ 	}
++	setDocumentInfo(info: DocumentInfo) {
++		this._documentInfo = info
++		this.storage.put('documentInfo', info)
++	}
+ 	async extractDocumentInfoFromRequest(req: IRequest, roomOpenMode: RoomOpenMode) {
+ 		const slug = assertExists(
+ 			await getSlug(this.env, req.params.roomId, roomOpenMode),
+ 			'roomId must be present'
+ 		)
+ 		const isApp = new URL(req.url).pathname.startsWith('/app/')
+-		const isOrWasTemporary = isApp && new URL(req.url).searchParams.get('temporary') === 'true'
++		const isOrWasCreateMode = isApp && new URL(req.url).searchParams.get('isCreateMode') === 'true'
+ 
+ 		if (this._documentInfo) {
+ 			assert(this._documentInfo.slug === slug, 'slug must match')
+ 		} else {
+-			this._documentInfo = {
++			this.setDocumentInfo({
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug,
+ 				isApp,
+-				isOrWasTemporary,
+-			}
++				isOrWasCreateMode,
++			})
+ 		}
+ 	}
+ 
+ 	// Handle a request to the Durable Object.
+-	async fetch(req: IRequest) {
++	override async fetch(req: IRequest) {
+ 		const sentry = createSentry(this.state, this.env, req)
+ 
+ 		try {
+@@ -263,17 +259,12 @@ export class TLDrawDurableObject {
+ 		}
+ 	}
+ 
+-	// eslint-disable-next-line no-restricted-syntax
+-	get isApp(): boolean {
+-		return assertExists(this._isApp, 'isApp must be present')
+-	}
+-
+ 	_isRestoring = false
+ 	async onRestore(req: IRequest) {
+ 		this._isRestoring = true
+ 		try {
+ 			const roomId = this.documentInfo.slug
+-			const roomKey = getR2KeyForRoom({ slug: roomId, isApp: this.isApp })
++			const roomKey = getR2KeyForRoom({ slug: roomId, isApp: this.documentInfo.isApp })
+ 			const timestamp = ((await req.json()) as any).timestamp
+ 			if (!timestamp) {
+ 				return new Response('Missing timestamp', { status: 400 })
+@@ -331,16 +322,26 @@ export class TLDrawDurableObject {
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
+-		if (this.isApp) {
++		const auth = await getAuth(req, this.env)
++		if (this.documentInfo.isApp) {
+ 			const ownerId = await this.getOwnerId()
+ 
+ 			if (ownerId) {
+-				const auth = await requireAuth(req, this.env)
+-				if (ownerId !== auth.userId) {
+-					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
++				if (ownerId !== auth?.userId) {
++					const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(ownerId))
++					const shareType = await ownerDurableObject.getFileShareType(
++						TldrawAppFileRecordType.createId(this.documentInfo.slug),
++						ownerId
++					)
++					if (shareType === 'private') {
++						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
++					}
++					if (shareType === 'view') {
++						openMode = ROOM_OPEN_MODE.READ_ONLY
++					}
+ 				}
+-			} else if (!this.documentInfo.isOrWasTemporary) {
+-				// If there is no owner that means it's a temporary room, but if they didn't add the temporary
++			} else if (!this.documentInfo.isOrWasCreateMode) {
++				// If there is no owner that means it's a temporary room, but if they didn't add the create
+ 				// flag don't let them in.
+ 				// This prevents people from just creating rooms by typing extra chars in the URL because we only
+ 				// add that flag in temporary rooms.
+@@ -360,7 +361,7 @@ export class TLDrawDurableObject {
+ 			room.handleSocketConnect({
+ 				sessionId: sessionId,
+ 				socket: serverWebSocket,
+-				meta: { storeId },
++				meta: { storeId, userId: auth?.userId ?? null },
+ 				isReadonly:
+ 					openMode === ROOM_OPEN_MODE.READ_ONLY || openMode === ROOM_OPEN_MODE.READ_ONLY_LEGACY,
+ 			})
+@@ -435,14 +436,14 @@ export class TLDrawDurableObject {
+ 	// Load the room's drawing data. First we check the R2 bucket, then we fallback to supabase (legacy).
+ 	async loadFromDatabase(slug: string): Promise<DBLoadResult> {
+ 		try {
+-			const key = getR2KeyForRoom({ slug, isApp: this.isApp })
++			const key = getR2KeyForRoom({ slug, isApp: this.documentInfo.isApp })
+ 			// when loading, prefer to fetch documents from the bucket
+ 			const roomFromBucket = await this.r2.rooms.get(key)
+ 			if (roomFromBucket) {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 
+-			if (this.isApp) {
++			if (this.documentInfo.isApp) {
+ 				return {
+ 					type: 'room_found',
+ 					snapshot: new TLSyncRoom({
+@@ -491,7 +492,7 @@ export class TLDrawDurableObject {
+ 
+ 		const snapshot = JSON.stringify(room.getCurrentSnapshot())
+ 
+-		const key = getR2KeyForRoom({ slug: slug, isApp: this.isApp })
++		const key = getR2KeyForRoom({ slug: slug, isApp: this.documentInfo.isApp })
+ 		await Promise.all([
+ 			this.r2.rooms.put(key, snapshot),
+ 			this.r2.versionCache.put(key + `/` + new Date().toISOString(), snapshot),
+@@ -513,7 +514,47 @@ export class TLDrawDurableObject {
+ 	}
+ 
+ 	// Will be called automatically when the alarm ticks.
+-	async alarm() {
++	override async alarm() {
+ 		await this.scheduler.onAlarm()
+ 	}
++
++	async appFileRecordDidUpdate(file: TldrawAppFile, ownerId: string) {
++		if (!this._documentInfo) {
++			this.setDocumentInfo({
++				version: CURRENT_DOCUMENT_INFO_VERSION,
++				slug: TldrawAppFileRecordType.parseId(file.id),
++				isApp: true,
++				isOrWasCreateMode: false,
++			})
++		}
++		const room = await this.getRoom()
++
++		// if the app file record updated, it might mean that the file name changed
++		const documentRecord = room.getRecord(TLDOCUMENT_ID) as TLDocument
++		if (documentRecord.name !== file.name) {
++			room.updateStore((store) => {
++				store.put({ ...documentRecord, name: file.name })
++			})
++		}
++
++		// if the app file record updated, it might mean that the sharing state was updated
++		// in which case we should kick people out or change their permissions
++		const roomIsReadOnlyForGuests = file.shared && file.sharedLinkType === 'view'
++
++		for (const session of room.getSessions()) {
++			// allow the owner to stay connected
++			if (session.meta.userId === ownerId) continue
++
++			if (!file.shared) {
++				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.FORBIDDEN)
++			} else if (
++				// if the file is still shared but the readonly state changed, make them reconnect
++				(session.isReadonly && !roomIsReadOnlyForGuests) ||
++				(!session.isReadonly && roomIsReadOnlyForGuests)
++			) {
++				// not passing a reason means they will try to reconnect
++				room.closeSession(session.sessionId)
++			}
++		}
++	}
+ }
+
+commit 68920e553386fa757a071fb051929f7e7e4e12d6
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Sun Oct 20 19:20:27 2024 +0100
+
+    [botcom] use single DurableObject for whole app (#4698)
+    
+    This PR moves the backend to a single DO.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index fbb5e20d2..4b58a8a0c 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -9,6 +9,8 @@ import {
+ 	ROOM_PREFIX,
+ 	TldrawAppFile,
+ 	TldrawAppFileRecordType,
++	TldrawAppUserId,
++	TldrawAppUserRecordType,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+ import {
+@@ -25,6 +27,7 @@ import { createPersistQueue, createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
++import { APP_ID } from './TLAppDurableObject'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+@@ -51,7 +54,7 @@ const ROOM_NOT_FOUND = Symbol('room_not_found')
+ 
+ interface SessionMeta {
+ 	storeId: string
+-	userId: string | null
++	userId: TldrawAppUserId | null
+ }
+ 
+ export class TLDrawDurableObject extends DurableObject {
+@@ -291,12 +294,15 @@ export class TLDrawDurableObject extends DurableObject {
+ 		if (!this._ownerId) {
+ 			const slug = this.documentInfo.slug
+ 			const fileId = TldrawAppFileRecordType.createId(slug)
+-			const row = await this.env.DB.prepare('SELECT topicId as ownerId FROM records WHERE id = ?')
++			const row = await this.env.DB.prepare('SELECT record FROM records WHERE id = ?')
+ 				.bind(fileId)
+ 				.first()
+ 
+ 			if (row) {
+-				this._ownerId = row.ownerId as string
++				this._ownerId = JSON.parse(row.record as any).ownerId as string
++				if (typeof this._ownerId !== 'string') {
++					throw new Error('ownerId must be a string')
++				}
+ 			}
+ 		}
+ 		return this._ownerId
+@@ -327,11 +333,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 			const ownerId = await this.getOwnerId()
+ 
+ 			if (ownerId) {
+-				if (ownerId !== auth?.userId) {
+-					const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(ownerId))
++				if (ownerId !== TldrawAppUserRecordType.createId(auth?.userId)) {
++					const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
+ 					const shareType = await ownerDurableObject.getFileShareType(
+-						TldrawAppFileRecordType.createId(this.documentInfo.slug),
+-						ownerId
++						TldrawAppFileRecordType.createId(this.documentInfo.slug)
+ 					)
+ 					if (shareType === 'private') {
+ 						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+@@ -361,7 +366,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 			room.handleSocketConnect({
+ 				sessionId: sessionId,
+ 				socket: serverWebSocket,
+-				meta: { storeId, userId: auth?.userId ?? null },
++				meta: {
++					storeId,
++					userId: auth?.userId ? TldrawAppUserRecordType.createId(auth.userId) : null,
++				},
+ 				isReadonly:
+ 					openMode === ROOM_OPEN_MODE.READ_ONLY || openMode === ROOM_OPEN_MODE.READ_ONLY_LEGACY,
+ 			})
+@@ -518,7 +526,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 		await this.scheduler.onAlarm()
+ 	}
+ 
+-	async appFileRecordDidUpdate(file: TldrawAppFile, ownerId: string) {
++	async appFileRecordDidUpdate(file: TldrawAppFile) {
+ 		if (!this._documentInfo) {
+ 			this.setDocumentInfo({
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+@@ -543,7 +551,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 		for (const session of room.getSessions()) {
+ 			// allow the owner to stay connected
+-			if (session.meta.userId === ownerId) continue
++			if (session.meta.userId === (await this.getOwnerId())) continue
+ 
+ 			if (!file.shared) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.FORBIDDEN)
+
+commit d1ff2ffc73ebef1e58c83a1843667569499f8c8b
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Mon Oct 21 17:06:37 2024 +0100
+
+    botcom: redirect to intended room when signing in (#4725)
+    
+    also, fixes up the not authenticated/forbidden error msg (was always
+    sending down forbidden accidentally)
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 4b58a8a0c..e9004778a 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -333,6 +333,9 @@ export class TLDrawDurableObject extends DurableObject {
+ 			const ownerId = await this.getOwnerId()
+ 
+ 			if (ownerId) {
++				if (!auth) {
++					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
++				}
+ 				if (ownerId !== TldrawAppUserRecordType.createId(auth?.userId)) {
+ 					const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
+ 					const shareType = await ownerDurableObject.getFileShareType(
+
+commit b3e308b2d497eab2840ece99554115258a3db04b
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Tue Oct 22 14:07:05 2024 +0100
+
+    [botcom] Fix file deletion and creation (#4751)
+    
+    - make file deletion work properly
+    - There was a problem with one of the sql queries preventing the records
+    from being removed
+    - Need to also kick people out of the room when the file is deleted and
+    remove the blob from R2
+    - fix the file creation interaction (was not showing up in sidebar)
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index e9004778a..39b0b51e6 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -568,4 +568,25 @@ export class TLDrawDurableObject extends DurableObject {
+ 			}
+ 		}
+ 	}
++
++	async appFileRecordDidDelete(slug: string) {
++		if (!this._documentInfo) {
++			this.setDocumentInfo({
++				version: CURRENT_DOCUMENT_INFO_VERSION,
++				slug,
++				isApp: true,
++				isOrWasCreateMode: false,
++			})
++		}
++		const room = await this.getRoom()
++		for (const session of room.getSessions()) {
++			room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
++		}
++		room.close()
++		// setting _room to null will prevent any further persists from going through
++		this._room = null
++		// delete from R2
++		const key = getR2KeyForRoom({ slug, isApp: true })
++		await this.r2.rooms.delete(key)
++	}
+ }
+
+commit a653cd237bf45d36566d9e2ec6cbdb2f53efb7af
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Tue Oct 22 14:07:51 2024 +0100
+
+    botcom: only redirect when logged out and the file is private (#4753)
+    
+    followup to https://github.com/tldraw/tldraw/pull/4725
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 39b0b51e6..3396ab55b 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -333,14 +333,14 @@ export class TLDrawDurableObject extends DurableObject {
+ 			const ownerId = await this.getOwnerId()
+ 
+ 			if (ownerId) {
+-				if (!auth) {
++				const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
++				const shareType = await ownerDurableObject.getFileShareType(
++					TldrawAppFileRecordType.createId(this.documentInfo.slug)
++				)
++				if (!auth && shareType === 'private') {
+ 					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
+ 				if (ownerId !== TldrawAppUserRecordType.createId(auth?.userId)) {
+-					const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
+-					const shareType = await ownerDurableObject.getFileShareType(
+-						TldrawAppFileRecordType.createId(this.documentInfo.slug)
+-					)
+ 					if (shareType === 'private') {
+ 						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+ 					}
+
+commit b301aeb64e5ff7bcd55928d7200a39092da8c501
+Author: Mime Čuvalo <mimecuvalo@gmail.com>
+Date:   Wed Oct 23 15:55:42 2024 +0100
+
+    npm: upgrade eslint v8 → v9 (#4757)
+    
+    As I worked on the i18n PR (https://github.com/tldraw/tldraw/pull/4719)
+    I noticed that `react-intl` required a new version of `eslint`. That led
+    me down a bit of a rabbit hole of upgrading v8 → v9. There were a couple
+    things to upgrade to make this work.
+    
+    - ran `npx @eslint/migrate-config .eslintrc.js` to upgrade to the new
+    `eslint.config.mjs`
+    - `.eslintignore` is now deprecated and part of `eslint.config.mjs`
+    - some packages are no longer relevant, of note: `eslint-plugin-local`
+    and `eslint-plugin-deprecation`
+    - the upgrade caught a couple bugs/dead code
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Upgrade eslint v8 → v9
+    
+    ---------
+    
+    Co-authored-by: alex <alex@dytry.ch>
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+    Co-authored-by: Steve Ruiz <steveruizok@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 3396ab55b..e029f5717 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -94,7 +94,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 								})
+ 								try {
+ 									await this.persistToDatabase()
+-								} catch (err) {
++								} catch {
+ 									// already logged
+ 								}
+ 								// make sure nobody joined the room while we were persisting
+@@ -253,7 +253,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			return await this.router.fetch(req)
+ 		} catch (err) {
+ 			console.error(err)
+-			// eslint-disable-next-line deprecation/deprecation
++			// eslint-disable-next-line @typescript-eslint/no-deprecated
+ 			sentry?.captureException(err)
+ 			return new Response('Something went wrong', {
+ 				status: 500,
+
+commit 24d636d83dfc584356af73eaa6d025e2290a2397
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Oct 25 10:47:27 2024 +0100
+
+    [botcom] fix file deletion (#4784)
+    
+    There was a race condition preventing file deletions from working
+    properly most of the time. I also spotted an issue where the clock value
+    was not being set properly on the sync room for the app DO 🤦🏼
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index e029f5717..8d5852d15 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -23,7 +23,7 @@ import {
+ } from '@tldraw/sync-core'
+ import { TLDOCUMENT_ID, TLDocument, TLRecord, createTLSchema } from '@tldraw/tlschema'
+ import { assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
+-import { createPersistQueue, createSentry } from '@tldraw/worker-shared'
++import { ExecutionQueue, createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+@@ -492,30 +492,41 @@ export class TLDrawDurableObject extends DurableObject {
+ 	}
+ 
+ 	_lastPersistedClock: number | null = null
+-	_persistQueue = createPersistQueue(async () => {
+-		// check whether the worker was woken up to persist after having gone to sleep
+-		if (!this._room) return
+-		const slug = this.documentInfo.slug
+-		const room = await this.getRoom()
+-		const clock = room.getCurrentDocumentClock()
+-		if (this._lastPersistedClock === clock) return
+-		if (this._isRestoring) return
+-
+-		const snapshot = JSON.stringify(room.getCurrentSnapshot())
+-
+-		const key = getR2KeyForRoom({ slug: slug, isApp: this.documentInfo.isApp })
+-		await Promise.all([
+-			this.r2.rooms.put(key, snapshot),
+-			this.r2.versionCache.put(key + `/` + new Date().toISOString(), snapshot),
+-		])
+-		this._lastPersistedClock = clock
+-		// use a shorter timeout for this 'inner' loop than the 'outer' alarm-scheduled loop
+-		// just in case there's any possibility of setting up a neverending queue
+-	}, PERSIST_INTERVAL_MS / 2)
++
++	executionQueue = new ExecutionQueue()
+ 
+ 	// Save the room to supabase
+ 	async persistToDatabase() {
+-		await this._persistQueue()
++		try {
++			await this.executionQueue.push(async () => {
++				// check whether the worker was woken up to persist after having gone to sleep
++				if (!this._room) return
++				const slug = this.documentInfo.slug
++				const room = await this.getRoom()
++				const clock = room.getCurrentDocumentClock()
++				if (this._lastPersistedClock === clock) return
++				if (this._isRestoring) return
++
++				const snapshot = JSON.stringify(room.getCurrentSnapshot())
++
++				const key = getR2KeyForRoom({ slug: slug, isApp: this.documentInfo.isApp })
++				await Promise.all([
++					this.r2.rooms.put(key, snapshot),
++					this.r2.versionCache.put(key + `/` + new Date().toISOString(), snapshot),
++				])
++				this._lastPersistedClock = clock
++			})
++		} catch (e) {
++			this.reportError(e)
++		}
++	}
++	private reportError(e: unknown) {
++		const sentryDSN = this.sentryDSN
++		if (sentryDSN) {
++			const sentry = createSentry(this.state, this.env)
++			// eslint-disable-next-line @typescript-eslint/no-deprecated
++			sentry?.captureException(e)
++		}
+ 	}
+ 
+ 	async schedulePersist() {
+@@ -570,23 +581,26 @@ export class TLDrawDurableObject extends DurableObject {
+ 	}
+ 
+ 	async appFileRecordDidDelete(slug: string) {
+-		if (!this._documentInfo) {
+-			this.setDocumentInfo({
+-				version: CURRENT_DOCUMENT_INFO_VERSION,
+-				slug,
+-				isApp: true,
+-				isOrWasCreateMode: false,
+-			})
+-		}
+-		const room = await this.getRoom()
+-		for (const session of room.getSessions()) {
+-			room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
+-		}
+-		room.close()
+-		// setting _room to null will prevent any further persists from going through
+-		this._room = null
+-		// delete from R2
+-		const key = getR2KeyForRoom({ slug, isApp: true })
+-		await this.r2.rooms.delete(key)
++		// force isOrWasCreateMode to be false so next open will check the database
++		this.setDocumentInfo({
++			version: CURRENT_DOCUMENT_INFO_VERSION,
++			slug,
++			isApp: true,
++			isOrWasCreateMode: false,
++		})
++
++		this.executionQueue.push(async () => {
++			const room = await this.getRoom()
++			for (const session of room.getSessions()) {
++				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
++			}
++			room.close()
++			// setting _room to null will prevent any further persists from going through
++			this._room = null
++			this._ownerId = null
++			// delete from R2
++			const key = getR2KeyForRoom({ slug, isApp: true })
++			await this.r2.rooms.delete(key)
++		})
+ 	}
+ }
+
+commit bc1a4d8c98f20460685fae3c28f34a630c9e2be7
+Author: Steve Ruiz <steveruizok@gmail.com>
+Date:   Mon Oct 28 14:11:39 2024 +0000
+
+    [botcom] Duplicate / Publish / Create / Delete files on the server  (#4798)
+    
+    This PR improves and creates functionality on the backend.
+    
+    For the most part, simple changes such as creating a file or changing
+    its name rely on optimistic updates. However, some actions rely on
+    either sending information to the server directly. While we can make
+    optimistic updates in these situations, we also need to revert those
+    changes if the request fails.
+    
+    ## Duplicating files
+    
+    This PR adds duplication on the server. Previously, the duplicate
+    feature required that the duplicating file be open, so duplicating other
+    files (from the sidebar) would duplicate the current open file instead.
+    Now the server will pull the latest file from the tldraw worker and
+    duplicate that instead.
+    
+    If the user is viewing the duplicated page, we redirect them to the new
+    page.
+    
+    ## Deleting / forgetting files
+    
+    This PR adds deletion on the server. If the user owns a file, they will
+    optimistically delete the file and all states associated with the file;
+    if the user does not, then they'll only "forget" the file by
+    optimistically deleting all of their own states associated with the
+    file. Meanwhile, the server will actually delete the file and the file's
+    published snapshot. If the delete fails, the user's optimistic updates
+    will be reversed.
+    
+    If the user is viewing the deleted / forgotten file, we redirect them to
+    the root.
+    
+    ## Publishing / un-publishing files
+    
+    This PR adds publishing on the server. Previously, the user would upload
+    the current editor state to the server. Now, the server pulls the latest
+    file from the tldraw worker and creates a published snapshot based on
+    that instead.
+    
+    I'd still like to build the "publish history" of versions that a user
+    has published for a given file, rather than overwriting the single
+    published snapshot file.
+    
+    ## Creating files
+    
+    This PR adds support for .tldr file drops. Files are created on the
+    server and then added to the user's own files.
+    
+    ## Cleanup
+    
+    The sync-worker was getting pretty messy so I did some cleanup. Mostly,
+    I've moved the endpoints that are related to the app to a `tla` folder,
+    as I've done elsewhere. It wasn't clear to me which endpoints were
+    "purely" working for the app layer and which weren't.
+    
+    ### Change type
+    
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 8d5852d15..1e97b5f66 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -32,9 +32,9 @@ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+-import { getAuth } from './utils/getAuth'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
++import { getAuth } from './utils/tla/getAuth'
+ 
+ const MAX_CONNECTIONS = 50
+ 
+@@ -603,4 +603,12 @@ export class TLDrawDurableObject extends DurableObject {
+ 			await this.r2.rooms.delete(key)
+ 		})
+ 	}
++
++	/**
++	 * @internal
++	 */
++	async getCurrentSerializedSnapshot() {
++		const room = await this.getRoom()
++		return room.getCurrentSerializedSnapshot()
++	}
+ }
+
+commit 51310c28a1933528586ca540c039289c3e7de496
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 11 11:10:41 2024 +0000
+
+    [wip] custom botcom backend (#4879)
+    
+    Describe what your pull request does. If you can, add GIFs or images
+    showing the before and after of your change.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+    
+    ---------
+    
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 1e97b5f66..497ad263c 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -7,10 +7,8 @@ import {
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+ 	ROOM_PREFIX,
+-	TldrawAppFile,
+-	TldrawAppFileRecordType,
+-	TldrawAppUserId,
+-	TldrawAppUserRecordType,
++	TlaFile,
++	TlaFileOpenMode,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+ import {
+@@ -27,7 +25,7 @@ import { ExecutionQueue, createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+-import { APP_ID } from './TLAppDurableObject'
++import type { TLPostgresReplicator } from './TLPostgresReplicator'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+@@ -39,7 +37,7 @@ import { getAuth } from './utils/tla/getAuth'
+ const MAX_CONNECTIONS = 50
+ 
+ // increment this any time you make a change to this type
+-const CURRENT_DOCUMENT_INFO_VERSION = 2
++const CURRENT_DOCUMENT_INFO_VERSION = 3
+ interface DocumentInfo {
+ 	version: number
+ 	slug: string
+@@ -47,14 +45,16 @@ interface DocumentInfo {
+ 	// Create mode is used by the app to bypass the 'room not found' check.
+ 	// i.e. if this is a new file it creates the file, even if it wasn't
+ 	// added to the user's app database yet.
+-	isOrWasCreateMode: boolean
++	appMode: TlaFileOpenMode
++	duplicateId: string | null
++	deleted: boolean
+ }
+ 
+ const ROOM_NOT_FOUND = Symbol('room_not_found')
+ 
+ interface SessionMeta {
+ 	storeId: string
+-	userId: TldrawAppUserId | null
++	userId: string | null
+ }
+ 
+ export class TLDrawDurableObject extends DurableObject {
+@@ -69,7 +69,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 		const slug = this._documentInfo.slug
+ 		if (!this._room) {
+-			this._room = this.loadFromDatabase(slug).then((result) => {
++			this._room = this.loadFromDatabase(slug).then(async (result) => {
+ 				switch (result.type) {
+ 					case 'room_found': {
+ 						const room = new TLSocketRoom<TLRecord, SessionMeta>({
+@@ -115,6 +115,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 								})
+ 							},
+ 						})
++
+ 						this.logEvent({ type: 'room', roomId: slug, name: 'room_start' })
+ 						return room
+ 					}
+@@ -231,7 +232,11 @@ export class TLDrawDurableObject extends DurableObject {
+ 			'roomId must be present'
+ 		)
+ 		const isApp = new URL(req.url).pathname.startsWith('/app/')
+-		const isOrWasCreateMode = isApp && new URL(req.url).searchParams.get('isCreateMode') === 'true'
++		const appMode = isApp
++			? (new URL(req.url).searchParams.get('mode') as TlaFileOpenMode) ?? null
++			: null
++
++		const duplicateId = isApp ? new URL(req.url).searchParams.get('duplicateId') : null
+ 
+ 		if (this._documentInfo) {
+ 			assert(this._documentInfo.slug === slug, 'slug must match')
+@@ -240,7 +245,9 @@ export class TLDrawDurableObject extends DurableObject {
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug,
+ 				isApp,
+-				isOrWasCreateMode,
++				appMode,
++				duplicateId,
++				deleted: false,
+ 			})
+ 		}
+ 	}
+@@ -289,23 +296,16 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	_ownerId: string | null = null
+-	async getOwnerId() {
+-		if (!this._ownerId) {
+-			const slug = this.documentInfo.slug
+-			const fileId = TldrawAppFileRecordType.createId(slug)
+-			const row = await this.env.DB.prepare('SELECT record FROM records WHERE id = ?')
+-				.bind(fileId)
+-				.first()
+-
+-			if (row) {
+-				this._ownerId = JSON.parse(row.record as any).ownerId as string
+-				if (typeof this._ownerId !== 'string') {
+-					throw new Error('ownerId must be a string')
+-				}
+-			}
++	// this might return null if the file doesn't exist yet in the backend, or if it was deleted
++	async getAppFileRecord(): Promise<TlaFile | null> {
++		const stub = this.env.TL_PG_REPLICATOR.get(
++			this.env.TL_PG_REPLICATOR.idFromName('0')
++		) as any as TLPostgresReplicator
++		try {
++			return await stub.getFileRecord(this.documentInfo.slug)
++		} catch (_e) {
++			return null
+ 		}
+-		return this._ownerId
+ 	}
+ 
+ 	async onRequest(req: IRequest, openMode: RoomOpenMode) {
+@@ -324,31 +324,33 @@ export class TLDrawDurableObject extends DurableObject {
+ 		serverWebSocket.accept()
+ 
+ 		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
++			console.error('CLOSING SOCKET', reason, new Error().stack)
+ 			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
++		if (this.documentInfo.deleted) {
++			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
++		}
++
+ 		const auth = await getAuth(req, this.env)
+ 		if (this.documentInfo.isApp) {
+-			const ownerId = await this.getOwnerId()
+-
+-			if (ownerId) {
+-				const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
+-				const shareType = await ownerDurableObject.getFileShareType(
+-					TldrawAppFileRecordType.createId(this.documentInfo.slug)
+-				)
+-				if (!auth && shareType === 'private') {
++			openMode = ROOM_OPEN_MODE.READ_WRITE
++			const file = await this.getAppFileRecord()
++
++			if (file) {
++				if (!auth && !file.shared) {
+ 					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
+-				if (ownerId !== TldrawAppUserRecordType.createId(auth?.userId)) {
+-					if (shareType === 'private') {
++				if (file.ownerId !== auth?.userId) {
++					if (!file.shared) {
+ 						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+ 					}
+-					if (shareType === 'view') {
++					if (file.sharedLinkType === 'view') {
+ 						openMode = ROOM_OPEN_MODE.READ_ONLY
+ 					}
+ 				}
+-			} else if (!this.documentInfo.isOrWasCreateMode) {
++			} else if (!this.documentInfo.appMode) {
+ 				// If there is no owner that means it's a temporary room, but if they didn't add the create
+ 				// flag don't let them in.
+ 				// This prevents people from just creating rooms by typing extra chars in the URL because we only
+@@ -371,7 +373,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				socket: serverWebSocket,
+ 				meta: {
+ 					storeId,
+-					userId: auth?.userId ? TldrawAppUserRecordType.createId(auth.userId) : null,
++					userId: auth?.userId ? auth.userId : null,
+ 				},
+ 				isReadonly:
+ 					openMode === ROOM_OPEN_MODE.READ_ONLY || openMode === ROOM_OPEN_MODE.READ_ONLY_LEGACY,
+@@ -454,7 +456,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 
+-			if (this.documentInfo.isApp) {
++			if (this.documentInfo.appMode === 'create') {
+ 				return {
+ 					type: 'room_found',
+ 					snapshot: new TLSyncRoom({
+@@ -463,6 +465,29 @@ export class TLDrawDurableObject extends DurableObject {
+ 				}
+ 			}
+ 
++			if (this.documentInfo.appMode === 'duplicate') {
++				assert(this.documentInfo.duplicateId, 'duplicateId must be present')
++				// load the duplicate id
++				let data: string | undefined = undefined
++				try {
++					const otherRoom = this.env.TLDR_DOC.get(
++						this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${this.documentInfo.duplicateId}`)
++					) as any as TLDrawDurableObject
++					data = await otherRoom.getCurrentSerializedSnapshot()
++				} catch (_e) {
++					data = await this.r2.rooms
++						.get(getR2KeyForRoom({ slug: this.documentInfo.duplicateId, isApp: true }))
++						.then((r) => r?.text())
++				}
++
++				if (!data) {
++					return { type: 'room_not_found' }
++				}
++				// otherwise copy the snapshot
++				await this.r2.rooms.put(key, data)
++				return { type: 'room_found', snapshot: JSON.parse(data) }
++			}
++
+ 			// if we don't have a room in the bucket, try to load from supabase
+ 			if (!this.supabaseClient) return { type: 'room_not_found' }
+ 			const { data, error } = await this.supabaseClient
+@@ -540,13 +565,19 @@ export class TLDrawDurableObject extends DurableObject {
+ 		await this.scheduler.onAlarm()
+ 	}
+ 
+-	async appFileRecordDidUpdate(file: TldrawAppFile) {
++	async appFileRecordDidUpdate(file: TlaFile) {
++		if (!file) {
++			console.error('file record updated but no file found')
++			return
++		}
+ 		if (!this._documentInfo) {
+ 			this.setDocumentInfo({
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+-				slug: TldrawAppFileRecordType.parseId(file.id),
++				slug: file.id,
+ 				isApp: true,
+-				isOrWasCreateMode: false,
++				appMode: null,
++				duplicateId: null,
++				deleted: false,
+ 			})
+ 		}
+ 		const room = await this.getRoom()
+@@ -565,7 +596,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 		for (const session of room.getSessions()) {
+ 			// allow the owner to stay connected
+-			if (session.meta.userId === (await this.getOwnerId())) continue
++			if (session.meta.userId === file.ownerId) continue
+ 
+ 			if (!file.shared) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.FORBIDDEN)
+@@ -580,16 +611,20 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	async appFileRecordDidDelete(slug: string) {
++	async appFileRecordDidDelete() {
+ 		// force isOrWasCreateMode to be false so next open will check the database
++		if (this._documentInfo?.deleted) return
++
+ 		this.setDocumentInfo({
+ 			version: CURRENT_DOCUMENT_INFO_VERSION,
+-			slug,
++			slug: this.documentInfo.slug,
+ 			isApp: true,
+-			isOrWasCreateMode: false,
++			appMode: null,
++			duplicateId: null,
++			deleted: true,
+ 		})
+ 
+-		this.executionQueue.push(async () => {
++		await this.executionQueue.push(async () => {
+ 			const room = await this.getRoom()
+ 			for (const session of room.getSessions()) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
+@@ -597,10 +632,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			room.close()
+ 			// setting _room to null will prevent any further persists from going through
+ 			this._room = null
+-			this._ownerId = null
+-			// delete from R2
+-			const key = getR2KeyForRoom({ slug, isApp: true })
+-			await this.r2.rooms.delete(key)
++			// delete should be handled by the delete endpoint now
+ 		})
+ 	}
+ 
+
+commit 2e534b6f70c2950a1b754e12359bd786a62890f3
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 11 11:39:22 2024 +0000
+
+    Revert "[wip] custom botcom backend" (#4883)
+    
+    Reverts tldraw/tldraw#487
+    
+    - [x] other
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 497ad263c..1e97b5f66 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -7,8 +7,10 @@ import {
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+ 	ROOM_PREFIX,
+-	TlaFile,
+-	TlaFileOpenMode,
++	TldrawAppFile,
++	TldrawAppFileRecordType,
++	TldrawAppUserId,
++	TldrawAppUserRecordType,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+ import {
+@@ -25,7 +27,7 @@ import { ExecutionQueue, createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+-import type { TLPostgresReplicator } from './TLPostgresReplicator'
++import { APP_ID } from './TLAppDurableObject'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+@@ -37,7 +39,7 @@ import { getAuth } from './utils/tla/getAuth'
+ const MAX_CONNECTIONS = 50
+ 
+ // increment this any time you make a change to this type
+-const CURRENT_DOCUMENT_INFO_VERSION = 3
++const CURRENT_DOCUMENT_INFO_VERSION = 2
+ interface DocumentInfo {
+ 	version: number
+ 	slug: string
+@@ -45,16 +47,14 @@ interface DocumentInfo {
+ 	// Create mode is used by the app to bypass the 'room not found' check.
+ 	// i.e. if this is a new file it creates the file, even if it wasn't
+ 	// added to the user's app database yet.
+-	appMode: TlaFileOpenMode
+-	duplicateId: string | null
+-	deleted: boolean
++	isOrWasCreateMode: boolean
+ }
+ 
+ const ROOM_NOT_FOUND = Symbol('room_not_found')
+ 
+ interface SessionMeta {
+ 	storeId: string
+-	userId: string | null
++	userId: TldrawAppUserId | null
+ }
+ 
+ export class TLDrawDurableObject extends DurableObject {
+@@ -69,7 +69,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 		const slug = this._documentInfo.slug
+ 		if (!this._room) {
+-			this._room = this.loadFromDatabase(slug).then(async (result) => {
++			this._room = this.loadFromDatabase(slug).then((result) => {
+ 				switch (result.type) {
+ 					case 'room_found': {
+ 						const room = new TLSocketRoom<TLRecord, SessionMeta>({
+@@ -115,7 +115,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 								})
+ 							},
+ 						})
+-
+ 						this.logEvent({ type: 'room', roomId: slug, name: 'room_start' })
+ 						return room
+ 					}
+@@ -232,11 +231,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			'roomId must be present'
+ 		)
+ 		const isApp = new URL(req.url).pathname.startsWith('/app/')
+-		const appMode = isApp
+-			? (new URL(req.url).searchParams.get('mode') as TlaFileOpenMode) ?? null
+-			: null
+-
+-		const duplicateId = isApp ? new URL(req.url).searchParams.get('duplicateId') : null
++		const isOrWasCreateMode = isApp && new URL(req.url).searchParams.get('isCreateMode') === 'true'
+ 
+ 		if (this._documentInfo) {
+ 			assert(this._documentInfo.slug === slug, 'slug must match')
+@@ -245,9 +240,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug,
+ 				isApp,
+-				appMode,
+-				duplicateId,
+-				deleted: false,
++				isOrWasCreateMode,
+ 			})
+ 		}
+ 	}
+@@ -296,16 +289,23 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	// this might return null if the file doesn't exist yet in the backend, or if it was deleted
+-	async getAppFileRecord(): Promise<TlaFile | null> {
+-		const stub = this.env.TL_PG_REPLICATOR.get(
+-			this.env.TL_PG_REPLICATOR.idFromName('0')
+-		) as any as TLPostgresReplicator
+-		try {
+-			return await stub.getFileRecord(this.documentInfo.slug)
+-		} catch (_e) {
+-			return null
++	_ownerId: string | null = null
++	async getOwnerId() {
++		if (!this._ownerId) {
++			const slug = this.documentInfo.slug
++			const fileId = TldrawAppFileRecordType.createId(slug)
++			const row = await this.env.DB.prepare('SELECT record FROM records WHERE id = ?')
++				.bind(fileId)
++				.first()
++
++			if (row) {
++				this._ownerId = JSON.parse(row.record as any).ownerId as string
++				if (typeof this._ownerId !== 'string') {
++					throw new Error('ownerId must be a string')
++				}
++			}
+ 		}
++		return this._ownerId
+ 	}
+ 
+ 	async onRequest(req: IRequest, openMode: RoomOpenMode) {
+@@ -324,33 +324,31 @@ export class TLDrawDurableObject extends DurableObject {
+ 		serverWebSocket.accept()
+ 
+ 		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
+-			console.error('CLOSING SOCKET', reason, new Error().stack)
+ 			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
+-		if (this.documentInfo.deleted) {
+-			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+-		}
+-
+ 		const auth = await getAuth(req, this.env)
+ 		if (this.documentInfo.isApp) {
+-			openMode = ROOM_OPEN_MODE.READ_WRITE
+-			const file = await this.getAppFileRecord()
+-
+-			if (file) {
+-				if (!auth && !file.shared) {
++			const ownerId = await this.getOwnerId()
++
++			if (ownerId) {
++				const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
++				const shareType = await ownerDurableObject.getFileShareType(
++					TldrawAppFileRecordType.createId(this.documentInfo.slug)
++				)
++				if (!auth && shareType === 'private') {
+ 					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
+-				if (file.ownerId !== auth?.userId) {
+-					if (!file.shared) {
++				if (ownerId !== TldrawAppUserRecordType.createId(auth?.userId)) {
++					if (shareType === 'private') {
+ 						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+ 					}
+-					if (file.sharedLinkType === 'view') {
++					if (shareType === 'view') {
+ 						openMode = ROOM_OPEN_MODE.READ_ONLY
+ 					}
+ 				}
+-			} else if (!this.documentInfo.appMode) {
++			} else if (!this.documentInfo.isOrWasCreateMode) {
+ 				// If there is no owner that means it's a temporary room, but if they didn't add the create
+ 				// flag don't let them in.
+ 				// This prevents people from just creating rooms by typing extra chars in the URL because we only
+@@ -373,7 +371,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				socket: serverWebSocket,
+ 				meta: {
+ 					storeId,
+-					userId: auth?.userId ? auth.userId : null,
++					userId: auth?.userId ? TldrawAppUserRecordType.createId(auth.userId) : null,
+ 				},
+ 				isReadonly:
+ 					openMode === ROOM_OPEN_MODE.READ_ONLY || openMode === ROOM_OPEN_MODE.READ_ONLY_LEGACY,
+@@ -456,7 +454,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 
+-			if (this.documentInfo.appMode === 'create') {
++			if (this.documentInfo.isApp) {
+ 				return {
+ 					type: 'room_found',
+ 					snapshot: new TLSyncRoom({
+@@ -465,29 +463,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 				}
+ 			}
+ 
+-			if (this.documentInfo.appMode === 'duplicate') {
+-				assert(this.documentInfo.duplicateId, 'duplicateId must be present')
+-				// load the duplicate id
+-				let data: string | undefined = undefined
+-				try {
+-					const otherRoom = this.env.TLDR_DOC.get(
+-						this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${this.documentInfo.duplicateId}`)
+-					) as any as TLDrawDurableObject
+-					data = await otherRoom.getCurrentSerializedSnapshot()
+-				} catch (_e) {
+-					data = await this.r2.rooms
+-						.get(getR2KeyForRoom({ slug: this.documentInfo.duplicateId, isApp: true }))
+-						.then((r) => r?.text())
+-				}
+-
+-				if (!data) {
+-					return { type: 'room_not_found' }
+-				}
+-				// otherwise copy the snapshot
+-				await this.r2.rooms.put(key, data)
+-				return { type: 'room_found', snapshot: JSON.parse(data) }
+-			}
+-
+ 			// if we don't have a room in the bucket, try to load from supabase
+ 			if (!this.supabaseClient) return { type: 'room_not_found' }
+ 			const { data, error } = await this.supabaseClient
+@@ -565,19 +540,13 @@ export class TLDrawDurableObject extends DurableObject {
+ 		await this.scheduler.onAlarm()
+ 	}
+ 
+-	async appFileRecordDidUpdate(file: TlaFile) {
+-		if (!file) {
+-			console.error('file record updated but no file found')
+-			return
+-		}
++	async appFileRecordDidUpdate(file: TldrawAppFile) {
+ 		if (!this._documentInfo) {
+ 			this.setDocumentInfo({
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+-				slug: file.id,
++				slug: TldrawAppFileRecordType.parseId(file.id),
+ 				isApp: true,
+-				appMode: null,
+-				duplicateId: null,
+-				deleted: false,
++				isOrWasCreateMode: false,
+ 			})
+ 		}
+ 		const room = await this.getRoom()
+@@ -596,7 +565,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 		for (const session of room.getSessions()) {
+ 			// allow the owner to stay connected
+-			if (session.meta.userId === file.ownerId) continue
++			if (session.meta.userId === (await this.getOwnerId())) continue
+ 
+ 			if (!file.shared) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.FORBIDDEN)
+@@ -611,20 +580,16 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	async appFileRecordDidDelete() {
++	async appFileRecordDidDelete(slug: string) {
+ 		// force isOrWasCreateMode to be false so next open will check the database
+-		if (this._documentInfo?.deleted) return
+-
+ 		this.setDocumentInfo({
+ 			version: CURRENT_DOCUMENT_INFO_VERSION,
+-			slug: this.documentInfo.slug,
++			slug,
+ 			isApp: true,
+-			appMode: null,
+-			duplicateId: null,
+-			deleted: true,
++			isOrWasCreateMode: false,
+ 		})
+ 
+-		await this.executionQueue.push(async () => {
++		this.executionQueue.push(async () => {
+ 			const room = await this.getRoom()
+ 			for (const session of room.getSessions()) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
+@@ -632,7 +597,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 			room.close()
+ 			// setting _room to null will prevent any further persists from going through
+ 			this._room = null
+-			// delete should be handled by the delete endpoint now
++			this._ownerId = null
++			// delete from R2
++			const key = getR2KeyForRoom({ slug, isApp: true })
++			await this.r2.rooms.delete(key)
+ 		})
+ 	}
+ 
+
+commit 8d8471f530a48377b3223b8cb64647ef3e590a36
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 11 11:49:21 2024 +0000
+
+    [botcom] New backend (again) (#4884)
+    
+    re-attempt at #4879
+    So it turns out you have to delete a durable object class in two
+    deploys:
+    
+    1. stop using it
+    2. add the 'delete' migration in wrangler.toml
+    
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 1e97b5f66..497ad263c 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -7,10 +7,8 @@ import {
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+ 	ROOM_PREFIX,
+-	TldrawAppFile,
+-	TldrawAppFileRecordType,
+-	TldrawAppUserId,
+-	TldrawAppUserRecordType,
++	TlaFile,
++	TlaFileOpenMode,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+ import {
+@@ -27,7 +25,7 @@ import { ExecutionQueue, createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+-import { APP_ID } from './TLAppDurableObject'
++import type { TLPostgresReplicator } from './TLPostgresReplicator'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+@@ -39,7 +37,7 @@ import { getAuth } from './utils/tla/getAuth'
+ const MAX_CONNECTIONS = 50
+ 
+ // increment this any time you make a change to this type
+-const CURRENT_DOCUMENT_INFO_VERSION = 2
++const CURRENT_DOCUMENT_INFO_VERSION = 3
+ interface DocumentInfo {
+ 	version: number
+ 	slug: string
+@@ -47,14 +45,16 @@ interface DocumentInfo {
+ 	// Create mode is used by the app to bypass the 'room not found' check.
+ 	// i.e. if this is a new file it creates the file, even if it wasn't
+ 	// added to the user's app database yet.
+-	isOrWasCreateMode: boolean
++	appMode: TlaFileOpenMode
++	duplicateId: string | null
++	deleted: boolean
+ }
+ 
+ const ROOM_NOT_FOUND = Symbol('room_not_found')
+ 
+ interface SessionMeta {
+ 	storeId: string
+-	userId: TldrawAppUserId | null
++	userId: string | null
+ }
+ 
+ export class TLDrawDurableObject extends DurableObject {
+@@ -69,7 +69,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 		const slug = this._documentInfo.slug
+ 		if (!this._room) {
+-			this._room = this.loadFromDatabase(slug).then((result) => {
++			this._room = this.loadFromDatabase(slug).then(async (result) => {
+ 				switch (result.type) {
+ 					case 'room_found': {
+ 						const room = new TLSocketRoom<TLRecord, SessionMeta>({
+@@ -115,6 +115,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 								})
+ 							},
+ 						})
++
+ 						this.logEvent({ type: 'room', roomId: slug, name: 'room_start' })
+ 						return room
+ 					}
+@@ -231,7 +232,11 @@ export class TLDrawDurableObject extends DurableObject {
+ 			'roomId must be present'
+ 		)
+ 		const isApp = new URL(req.url).pathname.startsWith('/app/')
+-		const isOrWasCreateMode = isApp && new URL(req.url).searchParams.get('isCreateMode') === 'true'
++		const appMode = isApp
++			? (new URL(req.url).searchParams.get('mode') as TlaFileOpenMode) ?? null
++			: null
++
++		const duplicateId = isApp ? new URL(req.url).searchParams.get('duplicateId') : null
+ 
+ 		if (this._documentInfo) {
+ 			assert(this._documentInfo.slug === slug, 'slug must match')
+@@ -240,7 +245,9 @@ export class TLDrawDurableObject extends DurableObject {
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug,
+ 				isApp,
+-				isOrWasCreateMode,
++				appMode,
++				duplicateId,
++				deleted: false,
+ 			})
+ 		}
+ 	}
+@@ -289,23 +296,16 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	_ownerId: string | null = null
+-	async getOwnerId() {
+-		if (!this._ownerId) {
+-			const slug = this.documentInfo.slug
+-			const fileId = TldrawAppFileRecordType.createId(slug)
+-			const row = await this.env.DB.prepare('SELECT record FROM records WHERE id = ?')
+-				.bind(fileId)
+-				.first()
+-
+-			if (row) {
+-				this._ownerId = JSON.parse(row.record as any).ownerId as string
+-				if (typeof this._ownerId !== 'string') {
+-					throw new Error('ownerId must be a string')
+-				}
+-			}
++	// this might return null if the file doesn't exist yet in the backend, or if it was deleted
++	async getAppFileRecord(): Promise<TlaFile | null> {
++		const stub = this.env.TL_PG_REPLICATOR.get(
++			this.env.TL_PG_REPLICATOR.idFromName('0')
++		) as any as TLPostgresReplicator
++		try {
++			return await stub.getFileRecord(this.documentInfo.slug)
++		} catch (_e) {
++			return null
+ 		}
+-		return this._ownerId
+ 	}
+ 
+ 	async onRequest(req: IRequest, openMode: RoomOpenMode) {
+@@ -324,31 +324,33 @@ export class TLDrawDurableObject extends DurableObject {
+ 		serverWebSocket.accept()
+ 
+ 		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
++			console.error('CLOSING SOCKET', reason, new Error().stack)
+ 			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
++		if (this.documentInfo.deleted) {
++			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
++		}
++
+ 		const auth = await getAuth(req, this.env)
+ 		if (this.documentInfo.isApp) {
+-			const ownerId = await this.getOwnerId()
+-
+-			if (ownerId) {
+-				const ownerDurableObject = this.env.TLAPP_DO.get(this.env.TLAPP_DO.idFromName(APP_ID))
+-				const shareType = await ownerDurableObject.getFileShareType(
+-					TldrawAppFileRecordType.createId(this.documentInfo.slug)
+-				)
+-				if (!auth && shareType === 'private') {
++			openMode = ROOM_OPEN_MODE.READ_WRITE
++			const file = await this.getAppFileRecord()
++
++			if (file) {
++				if (!auth && !file.shared) {
+ 					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
+-				if (ownerId !== TldrawAppUserRecordType.createId(auth?.userId)) {
+-					if (shareType === 'private') {
++				if (file.ownerId !== auth?.userId) {
++					if (!file.shared) {
+ 						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+ 					}
+-					if (shareType === 'view') {
++					if (file.sharedLinkType === 'view') {
+ 						openMode = ROOM_OPEN_MODE.READ_ONLY
+ 					}
+ 				}
+-			} else if (!this.documentInfo.isOrWasCreateMode) {
++			} else if (!this.documentInfo.appMode) {
+ 				// If there is no owner that means it's a temporary room, but if they didn't add the create
+ 				// flag don't let them in.
+ 				// This prevents people from just creating rooms by typing extra chars in the URL because we only
+@@ -371,7 +373,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				socket: serverWebSocket,
+ 				meta: {
+ 					storeId,
+-					userId: auth?.userId ? TldrawAppUserRecordType.createId(auth.userId) : null,
++					userId: auth?.userId ? auth.userId : null,
+ 				},
+ 				isReadonly:
+ 					openMode === ROOM_OPEN_MODE.READ_ONLY || openMode === ROOM_OPEN_MODE.READ_ONLY_LEGACY,
+@@ -454,7 +456,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 
+-			if (this.documentInfo.isApp) {
++			if (this.documentInfo.appMode === 'create') {
+ 				return {
+ 					type: 'room_found',
+ 					snapshot: new TLSyncRoom({
+@@ -463,6 +465,29 @@ export class TLDrawDurableObject extends DurableObject {
+ 				}
+ 			}
+ 
++			if (this.documentInfo.appMode === 'duplicate') {
++				assert(this.documentInfo.duplicateId, 'duplicateId must be present')
++				// load the duplicate id
++				let data: string | undefined = undefined
++				try {
++					const otherRoom = this.env.TLDR_DOC.get(
++						this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${this.documentInfo.duplicateId}`)
++					) as any as TLDrawDurableObject
++					data = await otherRoom.getCurrentSerializedSnapshot()
++				} catch (_e) {
++					data = await this.r2.rooms
++						.get(getR2KeyForRoom({ slug: this.documentInfo.duplicateId, isApp: true }))
++						.then((r) => r?.text())
++				}
++
++				if (!data) {
++					return { type: 'room_not_found' }
++				}
++				// otherwise copy the snapshot
++				await this.r2.rooms.put(key, data)
++				return { type: 'room_found', snapshot: JSON.parse(data) }
++			}
++
+ 			// if we don't have a room in the bucket, try to load from supabase
+ 			if (!this.supabaseClient) return { type: 'room_not_found' }
+ 			const { data, error } = await this.supabaseClient
+@@ -540,13 +565,19 @@ export class TLDrawDurableObject extends DurableObject {
+ 		await this.scheduler.onAlarm()
+ 	}
+ 
+-	async appFileRecordDidUpdate(file: TldrawAppFile) {
++	async appFileRecordDidUpdate(file: TlaFile) {
++		if (!file) {
++			console.error('file record updated but no file found')
++			return
++		}
+ 		if (!this._documentInfo) {
+ 			this.setDocumentInfo({
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+-				slug: TldrawAppFileRecordType.parseId(file.id),
++				slug: file.id,
+ 				isApp: true,
+-				isOrWasCreateMode: false,
++				appMode: null,
++				duplicateId: null,
++				deleted: false,
+ 			})
+ 		}
+ 		const room = await this.getRoom()
+@@ -565,7 +596,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 		for (const session of room.getSessions()) {
+ 			// allow the owner to stay connected
+-			if (session.meta.userId === (await this.getOwnerId())) continue
++			if (session.meta.userId === file.ownerId) continue
+ 
+ 			if (!file.shared) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.FORBIDDEN)
+@@ -580,16 +611,20 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	async appFileRecordDidDelete(slug: string) {
++	async appFileRecordDidDelete() {
+ 		// force isOrWasCreateMode to be false so next open will check the database
++		if (this._documentInfo?.deleted) return
++
+ 		this.setDocumentInfo({
+ 			version: CURRENT_DOCUMENT_INFO_VERSION,
+-			slug,
++			slug: this.documentInfo.slug,
+ 			isApp: true,
+-			isOrWasCreateMode: false,
++			appMode: null,
++			duplicateId: null,
++			deleted: true,
+ 		})
+ 
+-		this.executionQueue.push(async () => {
++		await this.executionQueue.push(async () => {
+ 			const room = await this.getRoom()
+ 			for (const session of room.getSessions()) {
+ 				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
+@@ -597,10 +632,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			room.close()
+ 			// setting _room to null will prevent any further persists from going through
+ 			this._room = null
+-			this._ownerId = null
+-			// delete from R2
+-			const key = getR2KeyForRoom({ slug, isApp: true })
+-			await this.r2.rooms.delete(key)
++			// delete should be handled by the delete endpoint now
+ 		})
+ 	}
+ 
+
+commit 509ccb3ce441011137c8fee9002ee3137e5beefa
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Nov 13 18:24:59 2024 +0100
+
+    Add rate limiting. (#4898)
+    
+    Should we rate limit something else? Used session id to rate limit no
+    auth users, I guess that should be ok.
+    
+    Resolves INT-458
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 497ad263c..3bc77f18d 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -30,6 +30,7 @@ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
++import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+ import { getAuth } from './utils/tla/getAuth'
+@@ -342,6 +343,17 @@ export class TLDrawDurableObject extends DurableObject {
+ 				if (!auth && !file.shared) {
+ 					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
++				if (auth?.userId) {
++					const rateLimited = await isRateLimited(this.env, auth?.userId)
++					if (rateLimited) {
++						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
++					}
++				} else {
++					const rateLimited = await isRateLimited(this.env, sessionId)
++					if (rateLimited) {
++						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
++					}
++				}
+ 				if (file.ownerId !== auth?.userId) {
+ 					if (!file.shared) {
+ 						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+
+commit 314d4eab1f9aa2040e20843172af0cb9cfd3aa14
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Wed Nov 20 09:22:59 2024 +0000
+
+    Lazy replicator (#4926)
+    
+    - the pg replicator only stores data for the users who are currently
+    active
+    - even then it only stores the users' ids, along with any guest file ids
+    they have access to.
+    - each user DO fetches their replica directly from postgres, and syncs
+    via messages from the pg replicator
+    - user DOs keep their replica in memory rather than sqlite, since they
+    are so small.
+    
+    still need to debug and stress test this, but it should be a lot more
+    scalable than the current thing.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+    
+    ### Test plan
+    
+    1. Create a shape...
+    2.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Fixed a bug with…
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 3bc77f18d..f5168927a 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -25,11 +25,11 @@ import { ExecutionQueue, createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+-import type { TLPostgresReplicator } from './TLPostgresReplicator'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
++import { getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+@@ -299,9 +299,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 	// this might return null if the file doesn't exist yet in the backend, or if it was deleted
+ 	async getAppFileRecord(): Promise<TlaFile | null> {
+-		const stub = this.env.TL_PG_REPLICATOR.get(
+-			this.env.TL_PG_REPLICATOR.idFromName('0')
+-		) as any as TLPostgresReplicator
++		const stub = getReplicator(this.env)
+ 		try {
+ 			return await stub.getFileRecord(this.documentInfo.slug)
+ 		} catch (_e) {
+@@ -325,7 +323,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 		serverWebSocket.accept()
+ 
+ 		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
+-			console.error('CLOSING SOCKET', reason, new Error().stack)
+ 			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+
+commit 9ee855d8db05d1eb3e7ab5ee5d9e8620d3221da3
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Nov 25 10:43:31 2024 +0100
+
+    Add a trigger to update the `updatedAt` field when we either update file metadata or the file's contents (#4967)
+    
+    Update the file's `updatedAt` field.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Open a file.
+    2. Print out the files `updatedAt` field in the console.
+    3. Rename the file.
+    4. Print out the `updatedAt` again. It should have updated.
+    5. Do the same as above but draw something. After some time (8s) it
+    should also update.
+    
+    - [ ] Unit tests
+    - [ ] End to end tests
+    
+    ### Release notes
+    
+    - Update the file's `updatedAt` field.
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index f5168927a..851a65fec 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -26,6 +26,7 @@ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+ import { PERSIST_INTERVAL_MS } from './config'
++import { getPostgres } from './getPostgres'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+@@ -529,7 +530,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 	executionQueue = new ExecutionQueue()
+ 
+-	// Save the room to supabase
++	// Save the room to r2
+ 	async persistToDatabase() {
+ 		try {
+ 			await this.executionQueue.push(async () => {
+@@ -549,6 +550,12 @@ export class TLDrawDurableObject extends DurableObject {
+ 					this.r2.versionCache.put(key + `/` + new Date().toISOString(), snapshot),
+ 				])
+ 				this._lastPersistedClock = clock
++
++				// Update the updatedAt timestamp in the database
++				if (this.documentInfo.isApp) {
++					const pg = getPostgres(this.env)
++					await pg`UPDATE public.file SET "updatedAt" = ${new Date().getTime()} WHERE id = ${this.documentInfo.slug}`
++				}
+ 			})
+ 		} catch (e) {
+ 			this.reportError(e)
+
+commit a1c5822f22fefb237644dc71fb3741bcc5f07c20
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Nov 25 12:48:49 2024 +0000
+
+    [botcom] allow creating rooms quickly (#4990)
+    
+    Before this PR, if you clicked the new room button a bunch of times
+    quickly, it would trigger a race condition where the room would end up
+    never actually being created and added to R2, which would result in
+    `404`s being returned from the server when you went to look at the rooms
+    you created later. This PR fixes that by having a fallback to check that
+    a file has been added to the DB but not R2 yet.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 851a65fec..90acfc18c 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -498,6 +498,18 @@ export class TLDrawDurableObject extends DurableObject {
+ 				return { type: 'room_found', snapshot: JSON.parse(data) }
+ 			}
+ 
++			if (this.documentInfo.isApp) {
++				// finally check whether the file exists in the DB but not in R2 yet
++				const file = await this.getAppFileRecord()
++				if (!file) {
++					return { type: 'room_not_found' }
++				}
++				return {
++					type: 'room_found',
++					snapshot: new TLSyncRoom({ schema: createTLSchema() }).getSnapshot(),
++				}
++			}
++
+ 			// if we don't have a room in the bucket, try to load from supabase
+ 			if (!this.supabaseClient) return { type: 'room_not_found' }
+ 			const { data, error } = await this.supabaseClient
+
+commit d9448fa3621c301a2b3a5de9ee2e5b67e14ff3a4
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Mon Nov 25 18:30:53 2024 +0100
+
+    Soft deleting of files (#4992)
+    
+    Instead of deleting the files we now soft delete them. I kept the whole
+    delete logic the same as before, which should allow us to delete the
+    file from postgres which will trigger all other necessary file deletes.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [x] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    - Add soft deleting of files.
+    
+    ---------
+    
+    Co-authored-by: David Sheldrick <d.j.sheldrick@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 90acfc18c..9adaa87cb 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -338,6 +338,9 @@ export class TLDrawDurableObject extends DurableObject {
+ 			const file = await this.getAppFileRecord()
+ 
+ 			if (file) {
++				if (file.isDeleted) {
++					return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
++				}
+ 				if (!auth && !file.shared) {
+ 					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+ 				}
+@@ -623,6 +626,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 		const roomIsReadOnlyForGuests = file.shared && file.sharedLinkType === 'view'
+ 
+ 		for (const session of room.getSessions()) {
++			if (file.isDeleted) {
++				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
++				continue
++			}
+ 			// allow the owner to stay connected
+ 			if (session.meta.userId === file.ownerId) continue
+ 
+
+commit 8329c84b1049d98fd94d1ff46e29901205394fea
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Nov 28 10:17:27 2024 +0000
+
+    [botcom] auto migrations again (#5014)
+    
+    redoing #5005 with pooled postgres connections
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 9adaa87cb..656d74da9 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -568,7 +568,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 				// Update the updatedAt timestamp in the database
+ 				if (this.documentInfo.isApp) {
+-					const pg = getPostgres(this.env)
++					const pg = getPostgres(this.env, { pooled: true })
+ 					await pg`UPDATE public.file SET "updatedAt" = ${new Date().getTime()} WHERE id = ${this.documentInfo.slug}`
+ 				}
+ 			})
+
+commit ed6ef06a7ec72f91e0718df4bdca162499c81383
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Dec 2 13:11:48 2024 +0000
+
+    [dotcom] Handle max connections properly (#5044)
+    
+    This PR adds a first class failure mode for limiting the number of users
+    in a room. Before this PR the websocket connection would just hang and
+    the user would see a spinner forever. Now the socket is closed and users
+    see this
+    
+    <img width="681" alt="image"
+    src="https://github.com/user-attachments/assets/33eec135-37b5-4085-9bec-60da8c8fb77b">
+    
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 656d74da9..fce7bf3d3 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -376,8 +376,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 		try {
+ 			const room = await this.getRoom()
+ 			// Don't connect if we're already at max connections
+-			if (room.getNumActiveSessions() >= MAX_CONNECTIONS) {
+-				return new Response('Room is full', { status: 403 })
++			if (room.getNumActiveSessions() > MAX_CONNECTIONS) {
++				return closeSocket(TLSyncErrorCloseEventReason.ROOM_FULL)
+ 			}
+ 
+ 			// all good
+
+commit ca54db7c3c7a7c89f38b688254f69740893ec857
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Thu Dec 5 17:47:37 2024 +0100
+
+    Add gecko analytics (#5028)
+    
+    Adds basic analytics for our newly introduced durable objects.
+    
+    I also created a few more visualizations in our on our Events grafana
+    dashboard. You can now also choose which environment you want to look at
+    using the filter on the top left of the dashboard.
+    
+    Link to [check the
+    events](https://tldraw.grafana.net/d/adgumkhou3chsd/events?orgId=1&from=now-2d&to=now&timezone=browser&var-environment=pr-5028)
+    for this PR. Data is quite sparse now.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [ ] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index fce7bf3d3..aee5f6b52 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -29,6 +29,7 @@ import { PERSIST_INTERVAL_MS } from './config'
+ import { getPostgres } from './getPostgres'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
++import { EventData, writeDataPoint } from './utils/analytics'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+ import { getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+@@ -347,11 +348,23 @@ export class TLDrawDurableObject extends DurableObject {
+ 				if (auth?.userId) {
+ 					const rateLimited = await isRateLimited(this.env, auth?.userId)
+ 					if (rateLimited) {
++						this.logEvent({
++							type: 'client',
++							userId: auth.userId,
++							localClientId: storeId,
++							name: 'rate_limited',
++						})
+ 						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+ 					}
+ 				} else {
+ 					const rateLimited = await isRateLimited(this.env, sessionId)
+ 					if (rateLimited) {
++						this.logEvent({
++							type: 'client',
++							userId: auth?.userId,
++							localClientId: storeId,
++							name: 'rate_limited',
++						})
+ 						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+ 					}
+ 				}
+@@ -420,15 +433,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 		this.schedulePersist()
+ 	}, 2000)
+ 
+-	private writeEvent(
+-		name: string,
+-		{ blobs, indexes, doubles }: { blobs?: string[]; indexes?: [string]; doubles?: number[] }
+-	) {
+-		this.measure?.writeDataPoint({
+-			blobs: [name, this.env.WORKER_NAME ?? 'development-tldraw-multiplayer', ...(blobs ?? [])],
+-			doubles,
+-			indexes,
+-		})
++	private writeEvent(name: string, eventData: EventData) {
++		writeDataPoint(this.measure, this.env, name, eventData)
+ 	}
+ 
+ 	logEvent(event: TLServerEvent) {
+@@ -439,11 +445,18 @@ export class TLDrawDurableObject extends DurableObject {
+ 				break
+ 			}
+ 			case 'client': {
+-				// we would add user/connection ids here if we could
+-				this.writeEvent(event.name, {
+-					blobs: [event.roomId, 'unused', event.instanceId],
+-					indexes: [event.localClientId],
+-				})
++				if (event.name === 'rate_limited') {
++					this.writeEvent(event.name, {
++						blobs: [event.userId ?? 'anon-user'],
++						indexes: [event.localClientId],
++					})
++				} else {
++					// we would add user/connection ids here if we could
++					this.writeEvent(event.name, {
++						blobs: [event.roomId, 'unused', event.instanceId],
++						indexes: [event.localClientId],
++					})
++				}
+ 				break
+ 			}
+ 			case 'send_message': {
+
+commit 698ca2fef91463a61371593e7acdc18fec79680d
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Dec 6 13:15:14 2024 +0000
+
+    [botcom] cache file record in file DO (#5075)
+    
+    Ease the burden on the replicator slightly by caching file records so we
+    don't need to fetch it every time a user opens a socket connection.
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index aee5f6b52..18872cae8 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -300,10 +300,15 @@ export class TLDrawDurableObject extends DurableObject {
+ 	}
+ 
+ 	// this might return null if the file doesn't exist yet in the backend, or if it was deleted
++	_fileRecordCache: TlaFile | null = null
+ 	async getAppFileRecord(): Promise<TlaFile | null> {
++		if (this._fileRecordCache) {
++			return this._fileRecordCache
++		}
+ 		const stub = getReplicator(this.env)
+ 		try {
+-			return await stub.getFileRecord(this.documentInfo.slug)
++			this._fileRecordCache = await stub.getFileRecord(this.documentInfo.slug)
++			return this._fileRecordCache
+ 		} catch (_e) {
+ 			return null
+ 		}
+@@ -614,6 +619,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			console.error('file record updated but no file found')
+ 			return
+ 		}
++		this._fileRecordCache = file
+ 		if (!this._documentInfo) {
+ 			this.setDocumentInfo({
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+@@ -663,6 +669,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 		// force isOrWasCreateMode to be false so next open will check the database
+ 		if (this._documentInfo?.deleted) return
+ 
++		this._fileRecordCache = null
++
+ 		this.setDocumentInfo({
+ 			version: CURRENT_DOCUMENT_INFO_VERSION,
+ 			slug: this.documentInfo.slug,
+
+commit 4ecbef54a7fe82634fe682ed148165bc496b7b56
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Dec 6 13:52:44 2024 +0000
+
+    [botcom] slurp local files on sign in (#5059)
+    
+    This PR replaces the temporary multiplayer room from the logged out root
+    page with the previous local editor, and 'slurps' the data into a new
+    room during the sign in flow.
+    
+    If something goes wrong the user sees this:
+    <img width="541" alt="image"
+    src="https://github.com/user-attachments/assets/92413d9a-a90c-43b6-b05d-4e0acdc7db30">
+    
+    follow up work:
+    
+    - [ ] e2e tests
+    - [ ] add Terms and conditions checkbox to sign in
+    
+    I'll create tickets for these upon merging.
+    
+    
+    ### Change type
+    
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 18872cae8..ce4b3a15d 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -20,8 +20,8 @@ import {
+ 	type PersistedRoomSnapshotForSupabase,
+ } from '@tldraw/sync-core'
+ import { TLDOCUMENT_ID, TLDocument, TLRecord, createTLSchema } from '@tldraw/tlschema'
+-import { assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
+-import { ExecutionQueue, createSentry } from '@tldraw/worker-shared'
++import { ExecutionQueue, assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
++import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+ import { AlarmScheduler } from './AlarmScheduler'
+
+commit a152d144c03801a2166afb1680c86fcbca7b7f08
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Dec 17 11:06:00 2024 +0100
+
+    Close connections (#5128)
+    
+    This makes sure we close connections when we run migrations and also
+    from the `TLDrawDurableObject`. It also gets the file record data
+    straight from pg instead of going through the replicator.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index ce4b3a15d..2292f74f2 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -31,7 +31,6 @@ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { EventData, writeDataPoint } from './utils/analytics'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+-import { getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+@@ -305,9 +304,12 @@ export class TLDrawDurableObject extends DurableObject {
+ 		if (this._fileRecordCache) {
+ 			return this._fileRecordCache
+ 		}
+-		const stub = getReplicator(this.env)
+ 		try {
+-			this._fileRecordCache = await stub.getFileRecord(this.documentInfo.slug)
++			const postgres = getPostgres(this.env, { pooled: true })
++			const fileRecord =
++				await postgres`SELECT * FROM public.file WHERE ID = ${this.documentInfo.slug}`
++			this._fileRecordCache = fileRecord[0] as TlaFile
++			postgres.end()
+ 			return this._fileRecordCache
+ 		} catch (_e) {
+ 			return null
+@@ -588,6 +590,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				if (this.documentInfo.isApp) {
+ 					const pg = getPostgres(this.env, { pooled: true })
+ 					await pg`UPDATE public.file SET "updatedAt" = ${new Date().getTime()} WHERE id = ${this.documentInfo.slug}`
++					await pg.end()
+ 				}
+ 			})
+ 		} catch (e) {
+
+commit de9694fbb08e31bc97f51721be5a8b0f8fb53ade
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Dec 17 13:26:31 2024 +0100
+
+    Add name and timeout params. (#5129)
+    
+    Improve `getPostgres` helper.:
+    - We can now pass in a name, which allows us to see the who is holding
+    an open connection in `pg_stat_activity`. See `application_name` column
+    below.
+    ![CleanShot 2024-12-16 at 15 47
+    58@2x](https://github.com/user-attachments/assets/a9f62e5c-4198-478d-9020-12a74841c48e)
+    - `idleTimeout` option with a default of 30.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 2292f74f2..cd2277ad5 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -305,7 +305,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			return this._fileRecordCache
+ 		}
+ 		try {
+-			const postgres = getPostgres(this.env, { pooled: true })
++			const postgres = getPostgres(this.env, { pooled: true, name: 'TLDrawDurableObject' })
+ 			const fileRecord =
+ 				await postgres`SELECT * FROM public.file WHERE ID = ${this.documentInfo.slug}`
+ 			this._fileRecordCache = fileRecord[0] as TlaFile
+@@ -588,7 +588,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 				// Update the updatedAt timestamp in the database
+ 				if (this.documentInfo.isApp) {
+-					const pg = getPostgres(this.env, { pooled: true })
++					const pg = getPostgres(this.env, { pooled: true, name: 'TLDrawDurableObject' })
+ 					await pg`UPDATE public.file SET "updatedAt" = ${new Date().getTime()} WHERE id = ${this.documentInfo.slug}`
+ 					await pg.end()
+ 				}
+
+commit ae594c621212de1d5694b8ce17b2585f1dae1983
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Jan 8 10:22:26 2025 +0100
+
+    Move to kysely (#5140)
+    
+    Switches from using postgres js to kysely. We still use postgres js for
+    subscription to the db.
+    
+    During stress tests we noticed that postgres js was not good at managing
+    the connection pool. Kysely performed much better.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index cd2277ad5..c49b65235 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -3,6 +3,7 @@
+ 
+ import { SupabaseClient } from '@supabase/supabase-js'
+ import {
++	DB,
+ 	READ_ONLY_LEGACY_PREFIX,
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+@@ -24,9 +25,10 @@ import { ExecutionQueue, assert, assertExists, exhaustiveSwitchError } from '@tl
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
++import { Kysely } from 'kysely'
+ import { AlarmScheduler } from './AlarmScheduler'
+ import { PERSIST_INTERVAL_MS } from './config'
+-import { getPostgres } from './getPostgres'
++import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { EventData, writeDataPoint } from './utils/analytics'
+@@ -156,6 +158,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 	_documentInfo: DocumentInfo | null = null
+ 
++	db: Kysely<DB>
++
+ 	constructor(
+ 		private state: DurableObjectState,
+ 		override env: Environment
+@@ -181,6 +185,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				this._documentInfo = existingDocumentInfo
+ 			}
+ 		})
++		this.db = createPostgresConnectionPool(env, 'TLDrawDurableObject')
+ 	}
+ 
+ 	readonly router = Router()
+@@ -305,11 +310,11 @@ export class TLDrawDurableObject extends DurableObject {
+ 			return this._fileRecordCache
+ 		}
+ 		try {
+-			const postgres = getPostgres(this.env, { pooled: true, name: 'TLDrawDurableObject' })
+-			const fileRecord =
+-				await postgres`SELECT * FROM public.file WHERE ID = ${this.documentInfo.slug}`
+-			this._fileRecordCache = fileRecord[0] as TlaFile
+-			postgres.end()
++			this._fileRecordCache = await this.db
++				.selectFrom('file')
++				.where('id', '=', this.documentInfo.slug)
++				.selectAll()
++				.executeTakeFirstOrThrow()
+ 			return this._fileRecordCache
+ 		} catch (_e) {
+ 			return null
+@@ -588,9 +593,11 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 				// Update the updatedAt timestamp in the database
+ 				if (this.documentInfo.isApp) {
+-					const pg = getPostgres(this.env, { pooled: true, name: 'TLDrawDurableObject' })
+-					await pg`UPDATE public.file SET "updatedAt" = ${new Date().getTime()} WHERE id = ${this.documentInfo.slug}`
+-					await pg.end()
++					await this.db
++						.updateTable('file')
++						.set({ updatedAt: new Date().getTime() })
++						.where('id', '=', this.documentInfo.slug)
++						.execute()
+ 				}
+ 			})
+ 		} catch (e) {
+
+commit e81e3057aaacae9064c64f62e7e998a92380e4ef
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Jan 14 15:07:07 2025 +0100
+
+    Allow slurping of legacy multiplayer routes. (#5181)
+    
+    When a logged in user visits a legacy multiplayer room (`/q/r/roomId`)
+    they can now click the `Copy to my files` button to slurp the
+    multiplayer room to a file that gets created.
+    
+    This currently reuses all the existing assets - the files don't get
+    re-uploaded. We will need to re-upload them so that we will be able to
+    associate them with the user. Decided to skip this step for now and come
+    back to it once we have the assets/user/file associations ready.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Test plan
+    
+    1. Create a legacy multiplayer room.
+    2. Login to the app and use the multiplayer room link, but prefix it
+    with `/q` (so something like `/q/r/roomId`
+    3. Click the `Copy to my files` button.
+    4. You should now see the same contents in the newly created file.
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index c49b65235..4da82d85a 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -494,7 +494,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 
+-			if (this.documentInfo.appMode === 'create') {
++			if (
++				this.documentInfo.appMode === 'create' ||
++				this.documentInfo.appMode === 'slurp-legacy-file'
++			) {
+ 				return {
+ 					type: 'room_found',
+ 					snapshot: new TLSyncRoom({
+
+commit 5c4b0489690d5cc4fe1f444c015b9d0fba51f0e8
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Jan 22 14:05:00 2025 +0100
+
+    Asset uploads (#5218)
+    
+    Changes:
+    * We now use the main sync worker for tldraw app asset uploads. For old
+    assets we still continue to use the assets worker.
+    * Image resize worker is now deployed as part of our deploy dotcom
+    action. It receives the multiplayer worker url. If the asset origin is
+    same as the multiplayer url (we are fetching tldraw app asset) it uses a
+    service binding to request the asset. This is to avoid some permissions
+    issues we encountered when the image worker fetched directly from the
+    multiplayer worker. The fetching for existing assets should remain the
+    same. I added `IMAGE_WORKER` env variable to different environments for
+    our github actions.
+    * We now associate assets with files. We do this in two ways: 1. when
+    users upload the files we immediately add the `fileId` to the asset's
+    `meta` property. We then also write an entry into a new postgres table
+    called `asset`. 2. in some cases we do this server side (duplicating a
+    room, copy pasting tldraw content, slurping legacy multiplayer rooms).
+    The way it works is that the server checks all the tldraw app assets and
+    makes sure their meta is associated to the correct file. If it is not it
+    re-uploads the file to the uploads bucket and it updates the asset. It
+    does this when persisting a file and also on restore.
+    * There are some public API changes listed that were necessary to make
+    this work. They are listed below.
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+    
+    ### Release notes
+    
+    **Breaking change**
+    
+    - `@tldraw/tlschema`: `TLAssetStore.upload` used to return just the
+    `src` of the uploaded asset. It now returns `{src: string, meta?:
+    JsonObject}`. The returned metadata will be added to the asset record
+    and thus allows the users to add some additional data to them when
+    uploading.
+    - `@tldraw/editor`: `Editor.uploadAsset` used to return
+    `Promise<string>` and now returns `Promise<{ src: string; meta?:
+    JsonObject }> `
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 4da82d85a..a34de21c3 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -21,7 +21,13 @@ import {
+ 	type PersistedRoomSnapshotForSupabase,
+ } from '@tldraw/sync-core'
+ import { TLDOCUMENT_ID, TLDocument, TLRecord, createTLSchema } from '@tldraw/tlschema'
+-import { ExecutionQueue, assert, assertExists, exhaustiveSwitchError } from '@tldraw/utils'
++import {
++	ExecutionQueue,
++	assert,
++	assertExists,
++	exhaustiveSwitchError,
++	uniqueId,
++} from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+ import { DurableObject } from 'cloudflare:workers'
+ import { IRequest, Router } from 'itty-router'
+@@ -36,7 +42,7 @@ import { createSupabaseClient } from './utils/createSupabaseClient'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+-import { getAuth } from './utils/tla/getAuth'
++import { getAuthFromSearchParams } from './utils/tla/getAuth'
+ 
+ const MAX_CONNECTIONS = 50
+ 
+@@ -121,6 +127,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 						})
+ 
+ 						this.logEvent({ type: 'room', roomId: slug, name: 'room_start' })
++						// Also associate file assets after we load the room
++						setTimeout(this.maybeAssociateFileAssets.bind(this), PERSIST_INTERVAL_MS)
+ 						return room
+ 					}
+ 					case 'room_not_found': {
+@@ -296,6 +304,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 			const snapshot: RoomSnapshot = JSON.parse(dataText)
+ 			room.loadSnapshot(snapshot)
++			this.maybeAssociateFileAssets()
+ 
+ 			return new Response()
+ 		} finally {
+@@ -345,7 +354,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+ 		}
+ 
+-		const auth = await getAuth(req, this.env)
++		const auth = await getAuthFromSearchParams(req, this.env)
+ 		if (this.documentInfo.isApp) {
+ 			openMode = ROOM_OPEN_MODE.READ_WRITE
+ 			const file = await this.getAppFileRecord()
+@@ -573,6 +582,54 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 	executionQueue = new ExecutionQueue()
+ 
++	// We use this to make sure that all of the assets in a tldraw app file are associated with that file.
++	// This is needed for a few cases like duplicating a file, copy pasting images between files, slurping legacy files.
++	async maybeAssociateFileAssets() {
++		if (!this.documentInfo.isApp) return
++
++		const slug = this.documentInfo.slug
++		const room = await this.getRoom()
++		const assetsToUpdate: { objectName: string; fileId: string }[] = []
++		await room.updateStore(async (store) => {
++			const records = store.getAll()
++			for (const record of records) {
++				if (record.typeName !== 'asset') continue
++				const asset = record as any
++				const meta = asset.meta
++
++				if (meta?.fileId === slug) continue
++				const src = asset.props.src
++				if (!src) continue
++				const objectName = src.split('/').pop()
++				if (!objectName) continue
++				const currentAsset = await this.env.UPLOADS.get(objectName)
++				if (!currentAsset) continue
++
++				const split = objectName.split('-')
++				const fileType = split.length > 1 ? split.pop() : null
++				const id = uniqueId()
++				const newObjectName = fileType ? `${id}-${fileType}` : id
++				await this.env.UPLOADS.put(newObjectName, currentAsset.body, {
++					httpMetadata: currentAsset.httpMetadata,
++				})
++				asset.props.src = asset.props.src.replace(objectName, newObjectName)
++				asset.meta.fileId = slug
++				store.put(asset)
++				assetsToUpdate.push({ objectName: newObjectName, fileId: slug })
++			}
++		})
++
++		if (assetsToUpdate.length === 0) return
++
++		await this.db
++			.insertInto('asset')
++			.values(assetsToUpdate)
++			.onConflict((oc) => {
++				return oc.column('objectName').doUpdateSet({ fileId: slug })
++			})
++			.execute()
++	}
++
+ 	// Save the room to r2
+ 	async persistToDatabase() {
+ 		try {
+@@ -586,6 +643,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				if (this._isRestoring) return
+ 
+ 				const snapshot = JSON.stringify(room.getCurrentSnapshot())
++				this.maybeAssociateFileAssets()
+ 
+ 				const key = getR2KeyForRoom({ slug: slug, isApp: this.documentInfo.isApp })
+ 				await Promise.all([
+
+commit 1fd10567568eb9eb2f2a3aaa73024edb1aeca19f
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Thu Jan 23 16:03:00 2025 +0100
+
+    Fix an issue with legacy assets not getting their urls changed when they get slurped. (#5270)
+    
+    Looks like this change was lost (might have forgot to push it).
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index a34de21c3..14d2f885f 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -613,6 +613,13 @@ export class TLDrawDurableObject extends DurableObject {
+ 					httpMetadata: currentAsset.httpMetadata,
+ 				})
+ 				asset.props.src = asset.props.src.replace(objectName, newObjectName)
++				if (asset.props.src.includes(this.env.ASSET_UPLOAD_ORIGIN)) {
++					asset.props.src.replace(
++						this.env.ASSET_UPLOAD_ORIGIN,
++						`${this.env.MULTIPLAYER_SERVER}/api/app`
++					)
++				}
++
+ 				asset.meta.fileId = slug
+ 				store.put(asset)
+ 				assetsToUpdate.push({ objectName: newObjectName, fileId: slug })
+
+commit 15e81d46070f725ec2964ec48965218fe65d9f9f
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Thu Jan 23 17:34:09 2025 +0100
+
+    Fix url (#5276)
+    
+    Fix?
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 14d2f885f..bc3b6d2c7 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -613,12 +613,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 					httpMetadata: currentAsset.httpMetadata,
+ 				})
+ 				asset.props.src = asset.props.src.replace(objectName, newObjectName)
+-				if (asset.props.src.includes(this.env.ASSET_UPLOAD_ORIGIN)) {
+-					asset.props.src.replace(
+-						this.env.ASSET_UPLOAD_ORIGIN,
+-						`${this.env.MULTIPLAYER_SERVER}/api/app`
+-					)
+-				}
++				assert(this.env.MULTIPLAYER_SERVER, 'MULTIPLAYER_SERVER must be present')
++				asset.props.src = `${this.env.MULTIPLAYER_SERVER.replace(/^ws/, 'http')}/api/app/uploads/${newObjectName}`
+ 
+ 				asset.meta.fileId = slug
+ 				store.put(asset)
+
+commit 9eec0b31251a46f0476813329e2f8a42a993b607
+Author: alex <alex@dytry.ch>
+Date:   Thu Jan 30 10:53:54 2025 +0000
+
+    support react 19 (#5293)
+    
+    This diff adds support for react 19. React 19 is backwards compatible
+    with react 18, excluding the removal of some deprecated APIs. React 18.3
+    (which we already use) warns when these APIs are used.
+    
+    "adding support" here involves two things:
+    1. upgrading our depenencies to ones that specify react 19 in their peer
+    deps array. I just upgraded everything that had a non-breaking upgrade
+    to go to.
+    2. adding react 19 to our own list of peer dependencies
+    
+    We want to make sure that we can still be used with react 18, so we're
+    not upgrading to react 19 internally because we don't want to make use
+    of any of the new APIs that aren't 18-compatible.
+    
+    I've made the decision here not to do anything like running tests
+    against both react versions. I think that this would be more effort to
+    set up (and have more on-going cost on CI times etc) than it would be
+    worth, and I trust react's guarantees about react 19's backwards
+    compatibility and the warnings in 18.3.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - tldraw now supports react 19
+    
+    ---------
+    
+    Co-authored-by: Mime Čuvalo <mimecuvalo@gmail.com>
+    Co-authored-by: huppy-bot[bot] <128400622+huppy-bot[bot]@users.noreply.github.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index bc3b6d2c7..171516501 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -248,7 +248,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 		)
+ 		const isApp = new URL(req.url).pathname.startsWith('/app/')
+ 		const appMode = isApp
+-			? (new URL(req.url).searchParams.get('mode') as TlaFileOpenMode) ?? null
++			? ((new URL(req.url).searchParams.get('mode') as TlaFileOpenMode) ?? null)
+ 			: null
+ 
+ 		const duplicateId = isApp ? new URL(req.url).searchParams.get('duplicateId') : null
+
+commit da8c7dd47ae25f45ca09626b173f75fcca4a0c8e
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Jan 31 11:24:17 2025 +0000
+
+    fix duplicating + publishing rooms with big snapshots (#5333)
+    
+    We had a bug where if the room snapshots were bigger than 1mb,
+    duplicating and publishing would fail.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 171516501..a88436e72 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -39,6 +39,7 @@ import { getR2KeyForRoom } from './r2'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { EventData, writeDataPoint } from './utils/analytics'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
++import { getRoomDurableObject } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+@@ -518,17 +519,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 			if (this.documentInfo.appMode === 'duplicate') {
+ 				assert(this.documentInfo.duplicateId, 'duplicateId must be present')
+ 				// load the duplicate id
+-				let data: string | undefined = undefined
+-				try {
+-					const otherRoom = this.env.TLDR_DOC.get(
+-						this.env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${this.documentInfo.duplicateId}`)
+-					) as any as TLDrawDurableObject
+-					data = await otherRoom.getCurrentSerializedSnapshot()
+-				} catch (_e) {
+-					data = await this.r2.rooms
+-						.get(getR2KeyForRoom({ slug: this.documentInfo.duplicateId, isApp: true }))
+-						.then((r) => r?.text())
+-				}
++				await getRoomDurableObject(this.env, this.documentInfo.duplicateId).awaitPersist()
++				const data = await this.r2.rooms
++					.get(getR2KeyForRoom({ slug: this.documentInfo.duplicateId, isApp: true }))
++					.then((r) => r?.text())
+ 
+ 				if (!data) {
+ 					return { type: 'room_not_found' }
+@@ -657,11 +651,16 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 				// Update the updatedAt timestamp in the database
+ 				if (this.documentInfo.isApp) {
+-					await this.db
++					// don't await on this because otherwise
++					// if this logic is invoked during another db transaction
++					// (e.g. when publishing a file)
++					// that transaction will deadlock
++					this.db
+ 						.updateTable('file')
+ 						.set({ updatedAt: new Date().getTime() })
+ 						.where('id', '=', this.documentInfo.slug)
+ 						.execute()
++						.catch((e) => this.reportError(e))
+ 				}
+ 			})
+ 		} catch (e) {
+@@ -769,8 +768,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 	/**
+ 	 * @internal
+ 	 */
+-	async getCurrentSerializedSnapshot() {
+-		const room = await this.getRoom()
+-		return room.getCurrentSerializedSnapshot()
++	async awaitPersist() {
++		if (!this._documentInfo) return
++		await this.persistToDatabase()
+ 	}
+ }
+
+commit 86aae29d7f4a3bfb258730c51f051c8889e20e2c
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Wed Feb 5 09:01:10 2025 +0100
+
+    Move to server side slurping. (#5348)
+    
+    This moves duplication and legacy room slurping to the backend:
+    * It removes the the file open mode logic (no more setting it when
+    navigating, no more sending search params to the backend).
+    * We now insert a file into the db with an additional column called
+    `createSource` which is in the form of `f/kZTr6Zdx6TClE6I4qExV4`. In
+    this case this means duplication of an existing app file. For legacy
+    files we'd similarly use `/r|ro|v|s/kZTr6Zdx6TClE6I4qExV4` to use that
+    existing legacy file as a starting point.
+    * Room DO then sees this column and reads the data from the appropriate
+    source and initializes the room.
+    * We now retry getting the file record from the db, because otherwise we
+    could still end up with a "Not found" issue since the navigation might
+    happen before the replicator tells the room DO about the file creation.
+    * Assets will get re-uploaded with our existing
+    `maybeAssociateFileAssets` logic, that makes sure all the assets are
+    associated with the file.
+    
+    We had to do this because in some cases the file got created in the db,
+    then an file update was dispatched to the replicator (due to the trigger
+    we have on the file table), which incorrectly the set room DO (its
+    document info was set to a non app file without the creation params). If
+    this happened before the user navigation hit the worker it would mean
+    that duplication as well as slurping legacy files end up in a "Not
+    found" error, even though the file was correctly inserted into the db.
+    
+    ### Change type
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Move duplicating and legacy file slurping to the server.
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index a88436e72..99a31893c 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -4,12 +4,13 @@
+ import { SupabaseClient } from '@supabase/supabase-js'
+ import {
+ 	DB,
++	FILE_PREFIX,
+ 	READ_ONLY_LEGACY_PREFIX,
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+ 	ROOM_PREFIX,
++	SNAPSHOT_PREFIX,
+ 	TlaFile,
+-	TlaFileOpenMode,
+ 	type RoomOpenMode,
+ } from '@tldraw/dotcom-shared'
+ import {
+@@ -26,6 +27,7 @@ import {
+ 	assert,
+ 	assertExists,
+ 	exhaustiveSwitchError,
++	retry,
+ 	uniqueId,
+ } from '@tldraw/utils'
+ import { createSentry } from '@tldraw/worker-shared'
+@@ -44,6 +46,7 @@ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+ import { getAuthFromSearchParams } from './utils/tla/getAuth'
++import { getLegacyRoomData } from './utils/tla/getLegacyRoomData'
+ 
+ const MAX_CONNECTIONS = 50
+ 
+@@ -53,11 +56,6 @@ interface DocumentInfo {
+ 	version: number
+ 	slug: string
+ 	isApp: boolean
+-	// Create mode is used by the app to bypass the 'room not found' check.
+-	// i.e. if this is a new file it creates the file, even if it wasn't
+-	// added to the user's app database yet.
+-	appMode: TlaFileOpenMode
+-	duplicateId: string | null
+ 	deleted: boolean
+ }
+ 
+@@ -248,11 +246,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 			'roomId must be present'
+ 		)
+ 		const isApp = new URL(req.url).pathname.startsWith('/app/')
+-		const appMode = isApp
+-			? ((new URL(req.url).searchParams.get('mode') as TlaFileOpenMode) ?? null)
+-			: null
+-
+-		const duplicateId = isApp ? new URL(req.url).searchParams.get('duplicateId') : null
+ 
+ 		if (this._documentInfo) {
+ 			assert(this._documentInfo.slug === slug, 'slug must match')
+@@ -261,8 +254,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug,
+ 				isApp,
+-				appMode,
+-				duplicateId,
+ 				deleted: false,
+ 			})
+ 		}
+@@ -316,16 +307,28 @@ export class TLDrawDurableObject extends DurableObject {
+ 	// this might return null if the file doesn't exist yet in the backend, or if it was deleted
+ 	_fileRecordCache: TlaFile | null = null
+ 	async getAppFileRecord(): Promise<TlaFile | null> {
+-		if (this._fileRecordCache) {
+-			return this._fileRecordCache
+-		}
+ 		try {
+-			this._fileRecordCache = await this.db
+-				.selectFrom('file')
+-				.where('id', '=', this.documentInfo.slug)
+-				.selectAll()
+-				.executeTakeFirstOrThrow()
+-			return this._fileRecordCache
++			return await retry(
++				async () => {
++					if (this._fileRecordCache) {
++						return this._fileRecordCache
++					}
++					const result = await this.db
++						.selectFrom('file')
++						.where('id', '=', this.documentInfo.slug)
++						.selectAll()
++						.executeTakeFirst()
++					if (!result) {
++						throw new Error('File not found')
++					}
++					this._fileRecordCache = result
++					return this._fileRecordCache
++				},
++				{
++					attempts: 10,
++					waitDuration: 100,
++				}
++			)
+ 		} catch (_e) {
+ 			return null
+ 		}
+@@ -398,14 +401,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 						openMode = ROOM_OPEN_MODE.READ_ONLY
+ 					}
+ 				}
+-			} else if (!this.documentInfo.appMode) {
+-				// If there is no owner that means it's a temporary room, but if they didn't add the create
+-				// flag don't let them in.
+-				// This prevents people from just creating rooms by typing extra chars in the URL because we only
+-				// add that flag in temporary rooms.
+-				return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+ 			}
+-			// otherwise, it's a temporary room and we let them in
+ 		}
+ 
+ 		try {
+@@ -494,6 +490,44 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
++	async handleFileCreateFromSource() {
++		assert(this._fileRecordCache, 'we need to have a file record to create a file from source')
++		const split = this._fileRecordCache.createSource?.split('/')
++		if (!split || split?.length !== 2) {
++			return { type: 'room_not_found' as const }
++		}
++
++		let data: string | null | undefined = undefined
++		const [prefix, id] = split
++		switch (prefix) {
++			case FILE_PREFIX: {
++				await getRoomDurableObject(this.env, id).awaitPersist()
++				data = await this.r2.rooms
++					.get(getR2KeyForRoom({ slug: id, isApp: true }))
++					.then((r) => r?.text())
++				break
++			}
++			case ROOM_PREFIX:
++				data = await getLegacyRoomData(this.env, id, ROOM_OPEN_MODE.READ_WRITE)
++				break
++			case READ_ONLY_PREFIX:
++				data = await getLegacyRoomData(this.env, id, ROOM_OPEN_MODE.READ_ONLY)
++				break
++			case READ_ONLY_LEGACY_PREFIX:
++				data = await getLegacyRoomData(this.env, id, ROOM_OPEN_MODE.READ_ONLY_LEGACY)
++				break
++			case SNAPSHOT_PREFIX:
++				data = await getLegacyRoomData(this.env, id, 'snapshot')
++				break
++		}
++
++		if (!data) {
++			return { type: 'room_not_found' as const }
++		}
++		await this.r2.rooms.put(this._fileRecordCache.id, data)
++		return { type: 'room_found' as const, snapshot: JSON.parse(data) }
++	}
++
+ 	// Load the room's drawing data. First we check the R2 bucket, then we fallback to supabase (legacy).
+ 	async loadFromDatabase(slug: string): Promise<DBLoadResult> {
+ 		try {
+@@ -503,33 +537,17 @@ export class TLDrawDurableObject extends DurableObject {
+ 			if (roomFromBucket) {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+-
+-			if (
+-				this.documentInfo.appMode === 'create' ||
+-				this.documentInfo.appMode === 'slurp-legacy-file'
+-			) {
+-				return {
+-					type: 'room_found',
+-					snapshot: new TLSyncRoom({
+-						schema: createTLSchema(),
+-					}).getSnapshot(),
+-				}
+-			}
+-
+-			if (this.documentInfo.appMode === 'duplicate') {
+-				assert(this.documentInfo.duplicateId, 'duplicateId must be present')
+-				// load the duplicate id
+-				await getRoomDurableObject(this.env, this.documentInfo.duplicateId).awaitPersist()
+-				const data = await this.r2.rooms
+-					.get(getR2KeyForRoom({ slug: this.documentInfo.duplicateId, isApp: true }))
+-					.then((r) => r?.text())
+-
+-				if (!data) {
+-					return { type: 'room_not_found' }
++			if (this._fileRecordCache?.createSource) {
++				const roomData = await this.handleFileCreateFromSource()
++				// Room found and created, so we can clean the create source field
++				if (roomData.type === 'room_found') {
++					await this.db
++						.updateTable('file')
++						.set({ createSource: null })
++						.where('id', '=', this._fileRecordCache.id)
++						.execute()
+ 				}
+-				// otherwise copy the snapshot
+-				await this.r2.rooms.put(key, data)
+-				return { type: 'room_found', snapshot: JSON.parse(data) }
++				return roomData
+ 			}
+ 
+ 			if (this.documentInfo.isApp) {
+@@ -687,6 +705,19 @@ export class TLDrawDurableObject extends DurableObject {
+ 		await this.scheduler.onAlarm()
+ 	}
+ 
++	async appFileRecordCreated(file: TlaFile) {
++		if (this._fileRecordCache) return
++		this._fileRecordCache = file
++
++		this.setDocumentInfo({
++			version: CURRENT_DOCUMENT_INFO_VERSION,
++			slug: file.id,
++			isApp: true,
++			deleted: false,
++		})
++		await this.getRoom()
++	}
++
+ 	async appFileRecordDidUpdate(file: TlaFile) {
+ 		if (!file) {
+ 			console.error('file record updated but no file found')
+@@ -698,8 +729,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 				version: CURRENT_DOCUMENT_INFO_VERSION,
+ 				slug: file.id,
+ 				isApp: true,
+-				appMode: null,
+-				duplicateId: null,
+ 				deleted: false,
+ 			})
+ 		}
+@@ -748,8 +777,6 @@ export class TLDrawDurableObject extends DurableObject {
+ 			version: CURRENT_DOCUMENT_INFO_VERSION,
+ 			slug: this.documentInfo.slug,
+ 			isApp: true,
+-			appMode: null,
+-			duplicateId: null,
+ 			deleted: true,
+ 		})
+ 
+
+commit 8792d999aa74842b2d392833662bea5be77988e8
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Feb 7 14:46:50 2025 +0000
+
+    Improve published file experience (#5371)
+    
+    This is by no means a perfect solution, but it's a lot better than the
+    current situation for logged in users, which is bad mainly because it
+    shows the sidebar. Showing the sidebar for published files:
+    
+    - fails to give the file owner a sense of how other people will see the
+    published version
+    - prevents the viewer from really _feeling_ how published files are
+    different
+    - puts the sidebar in a confusing navigational state where nothing is
+    selected
+    
+    With this PR
+    
+    1. Logged in users see the 'anonymous' view (no sidebar) but with a
+    share button instead of the sign in button.
+    2. Logged in users also get a 'copy to my files' affordance in the three
+    dots menu.
+    3. We replace the 'Save a copy' menu item (which opens the file picker)
+    with a 'Download file' menu item (which downloads straight to the
+    downloads folder).
+    4. Clicking the tldraw logo takes you back to the main app view
+    
+    I think there's still a lot of room for improvement here, but this feels
+    like a quick win to land ahead of launch
+    
+    ### Change type
+    
+    - [ ] `bugfix`
+    - [x] `improvement`
+    - [ ] `feature`
+    - [ ] `api`
+    - [ ] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 99a31893c..fdde558a3 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -5,6 +5,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
+ import {
+ 	DB,
+ 	FILE_PREFIX,
++	PUBLISH_PREFIX,
+ 	READ_ONLY_LEGACY_PREFIX,
+ 	READ_ONLY_PREFIX,
+ 	ROOM_OPEN_MODE,
+@@ -38,6 +39,7 @@ import { AlarmScheduler } from './AlarmScheduler'
+ import { PERSIST_INTERVAL_MS } from './config'
+ import { createPostgresConnectionPool } from './postgres'
+ import { getR2KeyForRoom } from './r2'
++import { getPublishedRoomSnapshot } from './routes/tla/getPublishedFile'
+ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { EventData, writeDataPoint } from './utils/analytics'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+@@ -497,7 +499,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			return { type: 'room_not_found' as const }
+ 		}
+ 
+-		let data: string | null | undefined = undefined
++		let data: RoomSnapshot | string | null | undefined = undefined
+ 		const [prefix, id] = split
+ 		switch (prefix) {
+ 			case FILE_PREFIX: {
+@@ -519,13 +521,18 @@ export class TLDrawDurableObject extends DurableObject {
+ 			case SNAPSHOT_PREFIX:
+ 				data = await getLegacyRoomData(this.env, id, 'snapshot')
+ 				break
++			case PUBLISH_PREFIX:
++				data = await getPublishedRoomSnapshot(this.env, id)
++				break
+ 		}
+ 
+ 		if (!data) {
+ 			return { type: 'room_not_found' as const }
+ 		}
+-		await this.r2.rooms.put(this._fileRecordCache.id, data)
+-		return { type: 'room_found' as const, snapshot: JSON.parse(data) }
++		const serialized = typeof data === 'string' ? data : JSON.stringify(data)
++		const snapshot = typeof data === 'string' ? JSON.parse(data) : data
++		await this.r2.rooms.put(this._fileRecordCache.id, serialized)
++		return { type: 'room_found' as const, snapshot }
+ 	}
+ 
+ 	// Load the room's drawing data. First we check the R2 bucket, then we fallback to supabase (legacy).
+
+commit b78121f8fa3f4c684bdf2755de054a06cc1c2777
+Author: Mitja Bezenšek <mitja.bezensek@gmail.com>
+Date:   Tue Feb 11 10:52:41 2025 +0100
+
+    Make sure we only allow asset uploads. (#5404)
+    
+    Limit the types of urls we allow to be passed through.
+    
+    ### Change type
+    
+    - [x] `improvement`
+    
+    ### Release notes
+    
+    - Lock down our image resize worker to only allow asset upload urls to
+    pass through.
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index fdde558a3..36db59f00 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -3,6 +3,7 @@
+ 
+ import { SupabaseClient } from '@supabase/supabase-js'
+ import {
++	APP_ASSET_UPLOAD_ENDPOINT,
+ 	DB,
+ 	FILE_PREFIX,
+ 	PUBLISH_PREFIX,
+@@ -633,7 +634,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 				})
+ 				asset.props.src = asset.props.src.replace(objectName, newObjectName)
+ 				assert(this.env.MULTIPLAYER_SERVER, 'MULTIPLAYER_SERVER must be present')
+-				asset.props.src = `${this.env.MULTIPLAYER_SERVER.replace(/^ws/, 'http')}/api/app/uploads/${newObjectName}`
++				asset.props.src = `${this.env.MULTIPLAYER_SERVER.replace(/^ws/, 'http')}${APP_ASSET_UPLOAD_ENDPOINT}${newObjectName}`
+ 
+ 				asset.meta.fileId = slug
+ 				store.put(asset)
+
+commit 29a715ba1170810aef1b2f1929f97a2c665df6d3
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Feb 21 09:32:02 2025 +0000
+
+    retry slurping document records if need be (#5460)
+    
+    There was a hole in the local file slurping logic where it would retry
+    slurping assets but not the document records themselves. So if the user
+    switched away from the slurped file before tlsync had a chance to finsih
+    doing its thing, the data would seem to disappear.
+    
+    This patches that hole by using the `createSource` column to signify
+    that an app file should be initialized by slurping from a local file,
+    rather than an ephemeral property on the TldrawApp instance. That way
+    when we open such a file we can check whether the
+    document.meta.slurpPersistenceKey has been added, and if so it means the
+    records slurp happened successfully.
+    
+    ### Change type
+    
+    - [x] `bugfix`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 36db59f00..f208421e8 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -6,6 +6,7 @@ import {
+ 	APP_ASSET_UPLOAD_ENDPOINT,
+ 	DB,
+ 	FILE_PREFIX,
++	LOCAL_FILE_PREFIX,
+ 	PUBLISH_PREFIX,
+ 	READ_ONLY_LEGACY_PREFIX,
+ 	READ_ONLY_PREFIX,
+@@ -525,6 +526,10 @@ export class TLDrawDurableObject extends DurableObject {
+ 			case PUBLISH_PREFIX:
+ 				data = await getPublishedRoomSnapshot(this.env, id)
+ 				break
++			case LOCAL_FILE_PREFIX:
++				// create empty room, the client will populate it
++				data = new TLSyncRoom({ schema: createTLSchema() }).getSnapshot()
++				break
+ 		}
+ 
+ 		if (!data) {
+@@ -546,16 +551,12 @@ export class TLDrawDurableObject extends DurableObject {
+ 				return { type: 'room_found', snapshot: await roomFromBucket.json() }
+ 			}
+ 			if (this._fileRecordCache?.createSource) {
+-				const roomData = await this.handleFileCreateFromSource()
+-				// Room found and created, so we can clean the create source field
+-				if (roomData.type === 'room_found') {
+-					await this.db
+-						.updateTable('file')
+-						.set({ createSource: null })
+-						.where('id', '=', this._fileRecordCache.id)
+-						.execute()
++				const res = await this.handleFileCreateFromSource()
++				if (res.type === 'room_found') {
++					// save it to the bucket so we don't try to create from source again
++					await this.r2.rooms.put(key, JSON.stringify(res.snapshot))
+ 				}
+-				return roomData
++				return res
+ 			}
+ 
+ 			if (this.documentInfo.isApp) {
+
+commit 74380a338ae9f9f7c191f482b37cb2b6dc715c99
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Feb 28 16:07:46 2025 +0000
+
+    Do hard deletes reactively (#5522)
+    
+    Before this PR the only path we had available for hard deletes was via
+    client-side mutations. If we deleted the row manually in the db (e.g.
+    because a user asked us to wipe their data) it would not result in the
+    R2/KV artefacts being cleaned up.
+    
+    Before this PR we also needed to get the publsihedSlug from the row
+    before deleting it so we could clean up the publishing artefacts.
+    
+    Now I added the publishedSlug to the file table primary key so we get it
+    in delete events. Then when we handle those delete events in the file
+    durable object, it does the cleanup there.
+    
+    We'd end up doing this during the switch to zero anyway I think.
+    
+    (note this wasn't totally safe to do before because file deletes may
+    have happened while the replicator didn't have an open subscription to
+    Postgres. But now we use a persistent replication slot this should
+    always work)
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index f208421e8..be8bd11f6 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -776,12 +776,15 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 
+-	async appFileRecordDidDelete() {
+-		// force isOrWasCreateMode to be false so next open will check the database
++	async appFileRecordDidDelete({
++		id,
++		publishedSlug,
++	}: Pick<TlaFile, 'id' | 'ownerId' | 'publishedSlug'>) {
+ 		if (this._documentInfo?.deleted) return
+ 
+ 		this._fileRecordCache = null
+ 
++		// prevent new connections while we clean everything up
+ 		this.setDocumentInfo({
+ 			version: CURRENT_DOCUMENT_INFO_VERSION,
+ 			slug: this.documentInfo.slug,
+@@ -790,14 +793,43 @@ export class TLDrawDurableObject extends DurableObject {
+ 		})
+ 
+ 		await this.executionQueue.push(async () => {
+-			const room = await this.getRoom()
+-			for (const session of room.getSessions()) {
+-				room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
++			if (this._room) {
++				const room = await this.getRoom()
++				for (const session of room.getSessions()) {
++					room.closeSession(session.sessionId, TLSyncErrorCloseEventReason.NOT_FOUND)
++				}
++				room.close()
+ 			}
+-			room.close()
+ 			// setting _room to null will prevent any further persists from going through
+ 			this._room = null
+ 			// delete should be handled by the delete endpoint now
++
++			// Delete published slug mapping
++			await this.env.SNAPSHOT_SLUG_TO_PARENT_SLUG.delete(publishedSlug)
++
++			// remove published files
++			const publishedPrefixKey = getR2KeyForRoom({
++				slug: `${id}/${publishedSlug}`,
++				isApp: true,
++			})
++
++			const publishedHistory = await listAllObjectKeys(this.env.ROOM_SNAPSHOTS, publishedPrefixKey)
++			if (publishedHistory.length > 0) {
++				await this.env.ROOM_SNAPSHOTS.delete(publishedHistory)
++			}
++
++			// remove edit history
++			const r2Key = getR2KeyForRoom({ slug: id, isApp: true })
++			const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, r2Key)
++			if (editHistory.length > 0) {
++				await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
++			}
++
++			// remove main file
++			await this.env.ROOMS.delete(r2Key)
++
++			// finally clear storage so we don't keep the data around
++			this.ctx.storage.deleteAll()
+ 		})
+ 	}
+ 
+@@ -809,3 +841,16 @@ export class TLDrawDurableObject extends DurableObject {
+ 		await this.persistToDatabase()
+ 	}
+ }
++
++async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
++	const keys: string[] = []
++	let cursor: string | undefined
++
++	do {
++		const result = await bucket.list({ prefix, cursor })
++		keys.push(...result.objects.map((o) => o.key))
++		cursor = result.truncated ? result.cursor : undefined
++	} while (cursor)
++
++	return keys
++}
+
+commit 5530d0bb35f443592686b1d52b732b42637838d1
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Thu Mar 20 16:15:07 2025 +0000
+
+    [dotcom] Create admin UI for hard deleting files (#5712)
+    
+    hard deleting files cleanly is kinda impossible to do right now, this
+    fixes that
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index be8bd11f6..0e395f559 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -840,6 +840,48 @@ export class TLDrawDurableObject extends DurableObject {
+ 		if (!this._documentInfo) return
+ 		await this.persistToDatabase()
+ 	}
++
++	async __admin__hardDeleteIfLegacy() {
++		if (!this._documentInfo || this.documentInfo.deleted || this.documentInfo.isApp) return false
++		this.setDocumentInfo({
++			version: CURRENT_DOCUMENT_INFO_VERSION,
++			slug: this.documentInfo.slug,
++			isApp: false,
++			deleted: true,
++		})
++		if (this._room) {
++			const room = await this.getRoom()
++			room.close()
++		}
++		const slug = this.documentInfo.slug
++		const roomKey = getR2KeyForRoom({ slug, isApp: false })
++
++		// remove edit history
++		const editHistory = await listAllObjectKeys(this.env.ROOMS_HISTORY_EPHEMERAL, roomKey)
++		if (editHistory.length > 0) {
++			await this.env.ROOMS_HISTORY_EPHEMERAL.delete(editHistory)
++		}
++
++		// remove main file
++		await this.env.ROOMS.delete(roomKey)
++
++		return true
++	}
++
++	async __admin__createLegacyRoom(id: string) {
++		this.setDocumentInfo({
++			version: CURRENT_DOCUMENT_INFO_VERSION,
++			slug: id,
++			isApp: false,
++			deleted: false,
++		})
++		const key = getR2KeyForRoom({ slug: id, isApp: false })
++		await this.r2.rooms.put(
++			key,
++			JSON.stringify(new TLSyncRoom({ schema: createTLSchema() }).getSnapshot())
++		)
++		await this.getRoom()
++	}
+ }
+ 
+ async function listAllObjectKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
+
+commit 10d4563919ca3af6c0610f91357b5737c5885716
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Mon Mar 24 14:08:57 2025 +0000
+
+    [dotcom backend] Wrap writeDataPoint in try/catch to make it safe (#5739)
+    
+    This seems to have been causing errors since the deploy yesterday
+    
+    We were disptaching more analytics events than normal it seems? And this
+    was throwing errors in our business logic and making things reset when
+    they shouldn't.
+    
+    
+    ### Change type
+    
+    - [x] `other`
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 0e395f559..7b06bc918 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -76,6 +76,8 @@ export class TLDrawDurableObject extends DurableObject {
+ 
+ 	_room: Promise<TLSocketRoom<TLRecord, SessionMeta>> | null = null
+ 
++	sentry: ReturnType<typeof createSentry> | null = null
++
+ 	getRoom() {
+ 		if (!this._documentInfo) {
+ 			throw new Error('documentInfo must be present when accessing room')
+@@ -180,6 +182,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 		this.storage = state.storage
+ 		this.sentryDSN = env.SENTRY_DSN
+ 		this.measure = env.MEASURE
++		this.sentry = createSentry(this.state, this.env)
+ 		this.supabaseClient = createSupabaseClient(env)
+ 
+ 		this.supabaseTable = env.TLDRAW_ENV === 'production' ? 'drawings' : 'drawings_staging'
+@@ -456,7 +459,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 	}, 2000)
+ 
+ 	private writeEvent(name: string, eventData: EventData) {
+-		writeDataPoint(this.measure, this.env, name, eventData)
++		writeDataPoint(this.sentry, this.measure, this.env, name, eventData)
+ 	}
+ 
+ 	logEvent(event: TLServerEvent) {
+@@ -695,12 +698,9 @@ export class TLDrawDurableObject extends DurableObject {
+ 		}
+ 	}
+ 	private reportError(e: unknown) {
+-		const sentryDSN = this.sentryDSN
+-		if (sentryDSN) {
+-			const sentry = createSentry(this.state, this.env)
+-			// eslint-disable-next-line @typescript-eslint/no-deprecated
+-			sentry?.captureException(e)
+-		}
++		// eslint-disable-next-line @typescript-eslint/no-deprecated
++		this.sentry?.captureException(e)
++		console.error(e)
+ 	}
+ 
+ 	async schedulePersist() {
+
+commit 75f2bf1ab8f626f2407fd4a655eec079d771f214
+Author: David Sheldrick <d.j.sheldrick@gmail.com>
+Date:   Fri Apr 11 10:57:01 2025 +0100
+
+    trying out zero custom mutators (#5814)
+    
+    ### Change type
+    
+    
+    - [x] `other`
+    
+    ---------
+    
+    Co-authored-by: Mitja Bezenšek <mitja.bezensek@gmail.com>
+
+diff --git a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+index 7b06bc918..e692593ff 100644
+--- a/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
++++ b/apps/dotcom/sync-worker/src/TLDrawDurableObject.ts
+@@ -49,7 +49,7 @@ import { getRoomDurableObject } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+-import { getAuthFromSearchParams } from './utils/tla/getAuth'
++import { getAuth } from './utils/tla/getAuth'
+ import { getLegacyRoomData } from './utils/tla/getLegacyRoomData'
+ 
+ const MAX_CONNECTIONS = 50
+@@ -365,7 +365,7 @@ export class TLDrawDurableObject extends DurableObject {
+ 			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+ 		}
+ 
+-		const auth = await getAuthFromSearchParams(req, this.env)
++		const auth = await getAuth(req, this.env)
+ 		if (this.documentInfo.isApp) {
+ 			openMode = ROOM_OPEN_MODE.READ_WRITE
+ 			const file = await this.getAppFileRecord()
+
