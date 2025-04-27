@@ -1,0 +1,460 @@
+--- ghostty_src_renderer_Thread.zig_expectedoutput.txt (expected)+++ ghostty_src_renderer_Thread.zig_extracted.txt (actual)@@ -1,5 +1,3 @@-//! Represents the renderer thread logic. The renderer thread is able to
+-//! be woken up to render.
+ pub const Thread = @This();
+ 
+ const std = @import("std");
+@@ -28,17 +26,16 @@ /// Allocator used for some state
+ alloc: std.mem.Allocator,
+ 
+-/// The main event loop for the application. The user data of this loop
+-/// is always the allocator used to create the loop. This is a convenience
++/// The main event loop for the application. This is a convenience
+ /// so that users of the loop always have an allocator.
+ loop: xev.Loop,
+ 
+-/// This can be used to wake up the renderer and force a render safely from
++/// This async handle is used to "wake up" the renderer and force a render safely from
+ /// any thread.
+ wakeup: xev.Async,
+ wakeup_c: xev.Completion = .{},
+ 
+-/// This can be used to stop the renderer on the next loop iteration.
++/// This async handle is used to stop the loop and force the thread to end.
+ stop: xev.Async,
+ stop_c: xev.Completion = .{},
+ 
+@@ -72,8 +69,7 @@ /// Pointer to the shared state that is used to generate the final render.
+ state: *rendererpkg.State,
+ 
+-/// The mailbox that can be used to send this thread messages. Note
+-/// this is a blocking queue so if it is full you will get errors (or block).
++/// The mailbox that can be used to send this thread messages.
+ mailbox: *Mailbox,
+ 
+ /// Mailbox to send messages to the app thread
+@@ -83,21 +79,14 @@ config: DerivedConfig,
+ 
+ flags: packed struct {
+-    /// This is true when a blinking cursor should be visible and false
+-    /// when it should not be visible. This is toggled on a timer by the
+-    /// thread automatically.
+-    cursor_blink_visible: bool = false,
++    /// This is true when the view is visible.
++    visible: bool = true,
++
++    /// This is true when the view is focused.
++    focused: bool = true,
+ 
+     /// This is true when the inspector is active.
+     has_inspector: bool = false,
+-
+-    /// This is true when the view is visible. This is used to determine
+-    /// if we should be rendering or not.
+-    visible: bool = true,
+-
+-    /// This is true when the view is focused. This defaults to true
+-    /// and it is up to the apprt to set the correct value.
+-    focused: bool = true,
+ } = .{},
+ 
+ pub const DerivedConfig = struct {
+@@ -110,9 +99,6 @@     }
+ };
+ 
+-/// Initialize the thread. This does not START the thread. This only sets
+-/// up all the internal state necessary prior to starting the thread. It
+-/// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
+     config: *const configpkg.Config,
+@@ -121,35 +107,27 @@     state: *rendererpkg.State,
+     app_mailbox: App.Mailbox,
+ ) !Thread {
+-    // Create our event loop.
+     var loop = try xev.Loop.init(.{});
+     errdefer loop.deinit();
+ 
+-    // This async handle is used to "wake up" the renderer and force a render.
+     var wakeup_h = try xev.Async.init();
+     errdefer wakeup_h.deinit();
+ 
+-    // This async handle is used to stop the loop and force the thread to end.
+     var stop_h = try xev.Async.init();
+     errdefer stop_h.deinit();
+ 
+-    // The primary timer for rendering.
+     var render_h = try xev.Timer.init();
+     errdefer render_h.deinit();
+ 
+-    // Draw timer, see comments.
+     var draw_h = try xev.Timer.init();
+     errdefer draw_h.deinit();
+ 
+-    // Draw now async, see comments.
+     var draw_now = try xev.Async.init();
+     errdefer draw_now.deinit();
+ 
+-    // Setup a timer for blinking the cursor
+     var cursor_timer = try xev.Timer.init();
+     errdefer cursor_timer.deinit();
+ 
+-    // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+ 
+@@ -171,8 +149,6 @@     };
+ }
+ 
+-/// Clean up the thread. This is only safe to call once the thread
+-/// completes executing; the caller must join prior to this.
+ pub fn deinit(self: *Thread) void {
+     self.stop.deinit();
+     self.wakeup.deinit();
+@@ -182,15 +158,11 @@     self.cursor_h.deinit();
+     self.loop.deinit();
+ 
+-    // Nothing can possibly access the mailbox anymore, destroy it.
+     self.mailbox.destroy(self.alloc);
+ }
+ 
+-/// The main entrypoint for the thread.
+ pub fn threadMain(self: *Thread) void {
+-    // Call child function so we can use errors...
+-    self.threadMain_() catch |err| {
+-        // In the future, we should expose this on the thread struct.
++    threadMain_(self) catch |err| {
+         log.warn("error in renderer err={}", .{err});
+     };
+ }
+@@ -212,12 +184,6 @@     const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
+     if (has_loop) try self.renderer.loopEnter(self);
+     defer if (has_loop) self.renderer.loopExit();
+-
+-    // Run our thread start/end callbacks. This is important because some
+-    // renderers have to do per-thread setup. For example, OpenGL has to set
+-    // some thread-local state since that is how it works.
+-    try self.renderer.threadEnter(self.surface);
+-    defer self.renderer.threadExit();
+ 
+     // Start the async handlers
+     self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
+@@ -240,9 +206,7 @@     // Start the draw timer
+     self.startDrawTimer();
+ 
+-    // Run
+     log.debug("starting renderer thread", .{});
+-    defer log.debug("starting renderer thread shutdown", .{});
+     _ = try self.loop.run(.until_done);
+ }
+ 
+@@ -251,21 +215,8 @@     if (comptime !builtin.target.os.tag.isDarwin()) return;
+ 
+     const class: internal_os.macos.QosClass = class: {
+-        // If we aren't visible (our view is fully occluded) then we
+-        // always drop our rendering priority down because it's just
+-        // mostly wasted work.
+-        //
+-        // The renderer itself should be doing this as well (for example
+-        // Metal will stop our DisplayLink) but this also helps with
+-        // general forced updates and CPU usage i.e. a rebuild cells call.
+         if (!self.flags.visible) break :class .utility;
+-
+-        // If we're not focused, but we're visible, then we set a higher
+-        // than default priority because framerates still matter but it isn't
+-        // as important as when we're focused.
+         if (!self.flags.focused) break :class .user_initiated;
+-
+-        // We are focused and visible, we are the definition of user interactive.
+         break :class .user_interactive;
+     };
+ 
+@@ -282,14 +233,9 @@     if (!self.renderer.hasAnimations()) return;
+     if (self.config.custom_shader_animation == .false) return;
+ 
+-    // Set our active state so it knows we're running. We set this before
+-    // even checking the active state in case we have a pending shutdown.
+     self.draw_active = true;
+-
+-    // If our draw timer is already active, then we don't have to do anything.
+     if (self.draw_c.state() == .active) return;
+ 
+-    // Start the timer which loops
+     self.draw_h.run(
+         &self.loop,
+         &self.draw_c,
+@@ -313,51 +259,19 @@             .crash => @panic("crash request, crashing intentionally"),
+ 
+             .visible => |v| visible: {
+-                // If our state didn't change we do nothing.
+                 if (self.flags.visible == v) break :visible;
+-
+-                // Set our visible state
+                 self.flags.visible = v;
+-
+-                // Visibility affects our QoS class
+                 self.setQosClass();
+-
+-                // If we became visible then we immediately trigger a draw.
+-                // We don't need to update frame data because that should
+-                // still be happening.
+                 if (v) self.drawFrame(false);
+-
+-                // Notify the renderer so it can update any state.
+                 self.renderer.setVisible(v);
+-
+-                // Note that we're explicitly today not stopping any
+-                // cursor timers, draw timers, etc. These things have very
+-                // little resource cost and properly maintaining their active
+-                // state across different transitions is going to be bug-prone,
+-                // so its easier to just let them keep firing and have them
+-                // check the visible state themselves to control their behavior.
+             },
+ 
+             .focus => |v| focus: {
+-                // If our state didn't change we do nothing.
+                 if (self.flags.focused == v) break :focus;
+-
+-                // Set our state
+                 self.flags.focused = v;
+-
+-                // Focus affects our QoS class
+                 self.setQosClass();
+-
+-                // Set it on the renderer
+                 try self.renderer.setFocus(v);
+-
+                 if (!v) {
+-                    if (self.config.custom_shader_animation != .always) {
+-                        // Stop the draw timer
+-                        self.stopDrawTimer();
+-                    }
+-
+-                    // If we're not focused, then we stop the cursor blink
+                     if (self.cursor_c.state() == .active and
+                         self.cursor_c_cancel.state() == .dead)
+                     {
+@@ -371,11 +285,6 @@                         );
+                     }
+                 } else {
+-                    // Start the draw timer
+-                    self.startDrawTimer();
+-
+-                    // If we're focused, we immediately show the cursor again
+-                    // and then restart the timer.
+                     if (self.cursor_c.state() != .active) {
+                         self.flags.cursor_blink_visible = true;
+                         self.cursor_h.run(
+@@ -432,9 +341,6 @@                 defer config.alloc.destroy(config.impl);
+                 try self.changeConfig(config.thread);
+                 try self.renderer.changeConfig(config.impl);
+-
+-                // Stop and start the draw timer to capture the new
+-                // hasAnimations value.
+                 self.stopDrawTimer();
+                 self.startDrawTimer();
+             },
+@@ -469,16 +375,61 @@     if (rendererpkg.Renderer == rendererpkg.OpenGL and
+         rendererpkg.OpenGL.single_threaded_draw)
+     {
+-        _ = self.app_mailbox.push(
+-            .{ .redraw_surface = self.surface },
+-            .{ .instant = {} },
+-        );
++        _ = self.app_mailbox.push(.{ .redraw_surface = self.surface }, .{ .instant = {} });
+     } else {
+         self.renderer.drawFrame(self.surface) catch |err|
+             log.warn("error drawing err={}", .{err});
+     }
+ }
+ 
++fn drawNowCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Async.WaitError!void,
++) xev.CallbackAction {
++    _ = r catch |err| {
++        log.err("error in draw now err={}", .{err});
++        return .rearm;
++    };
++
++    const t = self_.?;
++    t.drawFrame(true);
++
++    return .rearm;
++}
++
++fn drawCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
++    _ = r catch unreachable;
++    const t: *Thread = self_ orelse {
++        log.warn("render callback fired without data set", .{});
++        return .disarm;
++    };
++
++    // If we're doing single-threaded GPU calls then we just wake up the
++    // app thread to redraw at this point.
++    if (rendererpkg.Renderer == rendererpkg.OpenGL and
++        rendererpkg.OpenGL.single_threaded_draw)
++    {
++        _ = t.app_mailbox.push(.{ .redraw_surface = t.surface }, .{ .instant = {} });
++    } else {
++        t.renderer.drawFrame(t.surface) catch |err|
++            log.warn("error drawing err={}", .{err});
++    }
++
++    // Only continue if we're still active
++    if (t.draw_active) {
++        t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
++    }
++
++    return .disarm;
++}
++
+ fn wakeupCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+@@ -490,12 +441,12 @@         return .rearm;
+     };
+ 
+-    const t = self_.?;
+-
+-    // When we wake up, we check the mailbox. Mailbox producers should
+-    // wake up our thread after publishing.
+-    t.drainMailbox() catch |err|
+-        log.err("error draining mailbox err={}", .{err});
++    const t: *Thread = self_ orelse {
++        log.warn("render callback fired without data set", .{});
++        return .rearm;
++    };
++
++    t.drainMailbox() catch |err| log.err("error draining mailbox err={}", .{err});
+ 
+     // Render immediately
+     _ = renderCallback(t, undefined, undefined, {});
+@@ -520,25 +471,7 @@     return .rearm;
+ }
+ 
+-fn drawNowCallback(
+-    self_: ?*Thread,
+-    _: *xev.Loop,
+-    _: *xev.Completion,
+-    r: xev.Async.WaitError!void,
+-) xev.CallbackAction {
+-    _ = r catch |err| {
+-        log.err("error in draw now err={}", .{err});
+-        return .rearm;
+-    };
+-
+-    // Draw immediately
+-    const t = self_.?;
+-    t.drawFrame(true);
+-
+-    return .rearm;
+-}
+-
+-fn drawCallback(
++fn renderCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+     _: *xev.Completion,
+@@ -546,31 +479,6 @@ ) xev.CallbackAction {
+     _ = r catch unreachable;
+     const t: *Thread = self_ orelse {
+-        // This shouldn't happen so we log it.
+-        log.warn("render callback fired without data set", .{});
+-        return .disarm;
+-    };
+-
+-    // Draw
+-    t.drawFrame(false);
+-
+-    // Only continue if we're still active
+-    if (t.draw_active) {
+-        t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
+-    }
+-
+-    return .disarm;
+-}
+-
+-fn renderCallback(
+-    self_: ?*Thread,
+-    _: *xev.Loop,
+-    _: *xev.Completion,
+-    r: xev.Timer.RunError!void,
+-) xev.CallbackAction {
+-    _ = r catch unreachable;
+-    const t: *Thread = self_ orelse {
+-        // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+         return .disarm;
+     };
+@@ -585,10 +493,20 @@         t.surface,
+         t.state,
+         t.flags.cursor_blink_visible,
++        rendererpkg.OpenGL.single_threaded_draw,
+     ) catch |err|
+-        log.warn("error rendering err={}", .{err});
+-
+-    // Draw
++        log.warn("error updating frame data err={}", .{err});
++
++    // If we're doing single-threaded GPU calls then we also wake up the
++    // app thread to redraw at this point.
++    if (rendererpkg.Renderer == rendererpkg.OpenGL and
++        rendererpkg.OpenGL.single_threaded_draw)
++    {
++        _ = t.app_mailbox.push(.{ .redraw_surface = t.surface }, .{ .instant = {} });
++        return .disarm;
++    }
++
++    // Draw immediately
+     t.drawFrame(false);
+ 
+     return .disarm;
+@@ -603,7 +521,6 @@     _ = r catch |err| switch (err) {
+         // This is sent when our timer is canceled. That's fine.
+         error.Canceled => return .disarm,
+-
+         else => {
+             log.warn("error in cursor timer callback err={}", .{err});
+             unreachable;
+@@ -611,15 +528,20 @@     };
+ 
+     const t: *Thread = self_ orelse {
+-        // This shouldn't happen so we log it.
+         log.warn("render callback fired without data set", .{});
+         return .disarm;
+     };
+ 
+     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
+     t.wakeup.notify() catch {};
+-
+-    t.cursor_h.run(&t.loop, &t.cursor_c, CURSOR_BLINK_INTERVAL, Thread, t, cursorTimerCallback);
++    t.cursor_h.run(
++        &t.loop,
++        &t.cursor_c,
++        CURSOR_BLINK_INTERVAL,
++        Thread,
++        self_,
++        cursorTimerCallback,
++    );
+     return .disarm;
+ }
+ 
+@@ -649,12 +571,6 @@     return .disarm;
+ }
+ 
+-// fn prepFrameCallback(h: *libuv.Prepare) void {
+-//     _ = h;
+-//
+-//     tracy.frameMark();
+-// }
+-
+ fn stopCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
