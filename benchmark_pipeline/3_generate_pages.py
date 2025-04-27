@@ -972,35 +972,27 @@ function initializeChart(chartData) {
                                 
                                 // Get basic stats
                                 const successRate = context.raw;
-                                const successful = modelData.overall.successful;
-                                const attempts = modelData.overall.attempts;
                                 
-                                // Get confidence interval (for selected languages)
+                                // Use filtered data if available, otherwise fall back to overall data
+                                let successful, attempts;
+                                
+                                // Check if we have filtered data for this bucket and model
+                                if (bucketData.filteredData && bucketData.filteredData[modelName]) {
+                                    successful = bucketData.filteredData[modelName].successful;
+                                    attempts = bucketData.filteredData[modelName].attempts;
+                                } else {
+                                    // Fall back to overall data (before filtering)
+                                    successful = modelData.overall.successful;
+                                    attempts = modelData.overall.attempts;
+                                }
+                                
+                                // Get confidence interval
                                 let ciInfo = '';
                                 const ciElement = document.getElementById('show-confidence-intervals');
-                                if (ciElement && ciElement.checked) {
-                                    // Find if we have data to calculate CIs
-                                    let langSuccessful = 0;
-                                    let langAttempts = 0;
-                                    
-                                    const checkboxes = document.querySelectorAll('input[data-language]:checked');
-                                    if (checkboxes && checkboxes.length > 0) {
-                                        const selectedLanguages = Array.from(checkboxes)
-                                            .map(checkbox => checkbox.getAttribute('data-language'))
-                                            .filter(lang => lang); // Filter out any null/undefined values
-                                        
-                                        selectedLanguages.forEach(language => {
-                                            if (modelData.languages && modelData.languages[language]) {
-                                                langSuccessful += modelData.languages[language].successful;
-                                                langAttempts += modelData.languages[language].attempts;
-                                            }
-                                        });
-                                        
-                                        if (langAttempts > 0) {
-                                            const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
-                                            ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
-                                        }
-                                    }
+                                if (ciElement && ciElement.checked && attempts > 0) {
+                                    // Use the filtered counts we already have for CI calculation
+                                    const [lower, upper] = wilson_score_interval(successful, attempts);
+                                    ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
                                 }
                                 
                                 return [
@@ -1027,6 +1019,11 @@ function initializeChart(chartData) {
         const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
             .map(checkbox => checkbox.getAttribute('data-language'));
         
+        // Clear filteredData from previous filter selections
+        chartData.buckets.forEach(bucket => {
+            bucket.filteredData = {};
+        });
+        
         // Clear current datasets
         chart.data.datasets = [];
         
@@ -1034,8 +1031,8 @@ function initializeChart(chartData) {
         selectedModels.forEach((model, index) => {
             const color = colors[index % colors.length];
             
-            // Calculate data points
-            const dataPoints = chartData.buckets.map(bucket => {
+            // Calculate data points and store filtered data for tooltip
+            const dataPoints = chartData.buckets.map((bucket, bucketIndex) => {
                 const modelData = bucket.models[model];
                 
                 // Filter by selected languages
@@ -1054,6 +1051,19 @@ function initializeChart(chartData) {
                         }
                     });
                 }
+                
+                // Store filtered data for this bucket and model for tooltip access
+                if (!bucket.filteredData) {
+                    bucket.filteredData = {};
+                }
+                if (!bucket.filteredData[model]) {
+                    bucket.filteredData[model] = {};
+                }
+                
+                bucket.filteredData[model] = {
+                    successful: successful,
+                    attempts: attempts
+                };
                 
                 // Calculate success rate
                 return attempts > 0 ? (successful / attempts * 100) : null;
