@@ -1,0 +1,817 @@
+```zig
+const std = @import("std");
+const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const glfw = @import("glfw");
+const macos = @import("macos");
+const objc = @import("objc");
+const input = @import("../input.zig");
+const terminal = @import("../terminal/main.zig");
+const renderer = @import("../renderer.zig");
+const Renderer = renderer.Renderer;
+const apprt = @import("../apprt.zig");
+const CoreApp = @import("../App.zig");
+const CoreSurface = @import("../Surface.zig");
+const Config = @import("../config.zig").Config;
+const configpkg = @import("../config.zig");
+const cli = @import("../cli.zig");
+const internal_os = @import("../os/main.zig");
+
+// True if darwin‐specific logic is enabled (standalone .exe on macOS).
+const darwin_enabled = builtin.target.os.tag.isDarwin() and
+    build_config.artifact == .exe;
+
+// Get native API access on certain platforms.
+const glfwNative = glfw.Native(.{
+    .cocoa = builtin.target.os.tag.isDarwin(),
+    .x11 = builtin.os.tag == .linux,
+});
+
+const log = std.log.scoped(.glfw);
+
+pub const App = struct {
+    app: *CoreApp,
+    config: Config,
+    quit: bool = false,
+    darwin: if (darwin_enabled) Darwin else void,
+
+    pub const Options = struct {};
+
+    pub fn init(core_app: *CoreApp, _: Options) !App {
+        if (comptime builtin.target.os.tag.isDarwin()) {
+            log.warn("WARNING WARNING WARNING: GLFW ON MAC HAS BUGS.", .{});
+            log.warn("You should use the AppKit‐based app instead. The official download", .{});
+            log.warn("is properly built and available from GitHub. If you're building from", .{});
+            log.warn("source, see the README for details on how to build the AppKit app.", .{});
+        }
+
+        if (!glfw.init(.{})) {
+            if (glfw.getError()) |err| {
+                log.err("error initializing GLFW err={} msg={s}", .{
+                    err.error_code,
+                    err.description,
+                });
+                return err.error_code;
+            }
+            return error.GlfwInitFailedUnknownReason;
+        }
+        glfw.setErrorCallback(glfwErrorCallback);
+
+        var darwin = if (darwin_enabled) try Darwin.init() else {};
+        errdefer if (darwin_enabled) darwin.deinit();
+
+        var config = try Config.load(core_app.alloc);
+        errdefer config.deinit();
+
+        if (!config._diagnostics.empty()) {
+            var buf = std.ArrayList(u8).init(core_app.alloc);
+            defer buf.deinit();
+            for (config._diagnostics.items()) |diag| {
+                try diag.write(buf.writer());
+                log.warn("configuration error: {s}", .{buf.items});
+                buf.clearRetainingCapacity();
+            }
+        }
+
+        // If there were CLI errors, exit immediately.
+        if (config._diagnostics.containsLocation(.cli)) {
+            log.warn("CLI errors detected, exiting", .{});
+            _ = core_app.mailbox.push(.{ .quit = {} }, .{ .forever = {} });
+        }
+
+        // Launch one window on startup.
+        _ = core_app.mailbox.push(.{ .new_window = {} }, .{ .forever = {} });
+        glfw.postEmptyEvent();
+
+        return .{
+            .app = core_app,
+            .config = config,
+            .darwin = darwin,
+        };
+    }
+
+    pub fn terminate(self: *App) void {
+        self.config.deinit();
+        glfw.terminate();
+    }
+
+    pub fn run(self: *App) !void {
+        while (true) {
+            glfw.waitEvents();
+            try self.app.tick(self);
+
+            if (self.quit or self.app.surfaces.items.len == 0) {
+                for (self.app.surfaces.items) |surface| {
+                    surface.close(false);
+                }
+                return;
+            }
+        }
+    }
+
+    pub fn wakeup(self: *App) void {
+        _ = self;
+        glfw.postEmptyEvent();
+    }
+
+    /// Perform a given action. Returns true if handled, false otherwise.
+    pub fn performAction(
+        self: *App,
+        target: apprt.Target,
+        comptime action: apprt.Action.Key,
+        value: apprt.Action.Value(action),
+    ) !bool {
+        switch (action) {
+            .quit => {
+                self.quit = true;
+                return true;
+            },
+            .new_window => _ = try self.newSurface(switch (target) {
+                .app => null,
+                .surface => |v| v,
+            }),
+            .new_tab => try self.newTab(switch (target) {
+                .app => null,
+                .surface => |v| v,
+            }),
+            .open_config => try configpkg.edit.open(self.app.alloc),
+            .reload_config => try self.reloadConfig(target, value),
+            .toggle_fullscreen => self.toggleFullscreen(target),
+            .toggle_maximize => {
+                // Not yet implemented in GLFW.
+                return false;
+            },
+            .ring_bell => {
+                // Not implemented in GLFW.
+                return false;
+            },
+            .toggle_quick_terminal, .toggle_command_palette,
+            .toggle_tab_overview, .toggle_window_decorations,
+            .toggle_visibility, .goto_tab, .move_tab,
+            .reset_window_size, .prompt_title,
+            .close_all_windows, .close_tab, .close_window,
+            .desktop_notification,
+            => {
+                log.info("unimplemented action={}", .{action});
+                return false;
+            },
+        }
+        return true;
+    }
+
+    fn glfwErrorCallback(code: glfw.ErrorCode, desc: [:0]const u8) void {
+        std.log.warn("glfw error={} message={s}", .{ code, desc });
+    }
+
+    fn reloadConfig(
+        self: *App,
+        target: apprt.action.Target,
+        opts: apprt.action.ReloadConfig,
+    ) !void {
+        if (opts.soft) {
+            switch (target) {
+                .app => try self.app.updateConfig(self, &self.config),
+                .surface => |cs| try cs.updateConfig(&self.config),
+            }
+            return;
+        }
+
+        var new_cfg = try Config.load(self.app.alloc);
+        errdefer new_cfg.deinit();
+        // Log diagnostics of reloaded config
+        if (!new_cfg._diagnostics.empty()) {
+            var buf = std.ArrayList(u8).init(self.app.alloc);
+            defer buf.deinit();
+            for (new_cfg._diagnostics.items()) |diag| {
+                try diag.write(buf.writer());
+                log.warn("configuration error on reload: {s}", .{buf.items});
+                buf.clearRetainingCapacity();
+            }
+        }
+
+        switch (target) {
+            .app => try self.app.updateConfig(self, &new_cfg),
+            .surface => |cs| try cs.updateConfig(&new_cfg),
+        }
+        self.config.deinit();
+        self.config = new_cfg;
+    }
+
+    fn toggleFullscreen(self: *App, target: apprt.Target) void {
+        const surface: *Surface = switch (target) {
+            .app => return,
+            .surface => |v| v.rt_surface,
+        };
+        const win = surface.window;
+        if (surface.isFullscreen()) {
+            win.setMonitor(
+                null,
+                @intCast(surface.monitor_dims.position_x),
+                @intCast(surface.monitor_dims.position_y),
+                surface.monitor_dims.width,
+                surface.monitor_dims.height,
+                0,
+            );
+            return;
+        }
+        const monitor = win.getMonitor() orelse monitor: {
+            log.warn("window had null monitor, getting primary monitor", .{});
+            break :monitor glfw.Monitor.getPrimary() orelse {
+                log.warn("cannot find any monitor; skip fullscreen", .{});
+                return;
+            };
+        };
+        const video_mode = monitor.getVideoMode() orelse {
+            log.warn("failed to get video mode; skip fullscreen", .{});
+            return;
+        };
+        const pos = win.getPos();
+        const size = surface.getSize() catch {
+            log.warn("failed to get window size; skip fullscreen", .{});
+            return;
+        };
+        surface.monitor_dims = .{
+            .width = size.width,
+            .height = size.height,
+            .position_x = pos.x,
+            .position_y = pos.y,
+        };
+        win.setMonitor(
+            monitor,
+            0,
+            0,
+            video_mode.getWidth(),
+            video_mode.getHeight(),
+            0,
+        );
+    }
+
+    /// Open the configuration in the system editor.
+    pub fn openConfig(self: *App) !void {
+        try configpkg.edit.open(self.app.alloc);
+    }
+
+    /// Return the keyboard layout; not supported by GLFW.
+    pub fn keyboardLayout(self: *const App) input.KeyboardLayout {
+        _ = self;
+        return .unknown;
+    }
+
+    pub fn newWindow(self: *App, parent_: ?*CoreSurface) !*Surface {
+        _ = try self.newSurface(parent_);
+    }
+
+    fn newTab(self: *App, parent_: ?*CoreSurface) !void {
+        if (comptime !darwin_enabled) {
+            log.warn("tabbing is not supported on this platform", .{});
+            return;
+        }
+        const parent = parent_ orelse {
+            _ = try self.newSurface(null);
+            return;
+        };
+        const window = try self.newSurface(parent);
+        const parent_win = glfwNative.getCocoaWindow(parent.rt_surface.window).?;
+        const other_win = glfwNative.getCocoaWindow(window.window).?;
+        const NSWindowOrderingMode = enum(isize) { below = -1, out = 0, above = 1 };
+        const nswindow = objc.Object.fromId(parent_win);
+        nswindow.msgSend(void, objc.sel("addTabbedWindow:ordered:"), .{
+            objc.Object.fromId(other_win),
+            NSWindowOrderingMode.above,
+        });
+        const size = parent.rt_surface.getSize() catch |err| {
+            log.err("error querying size for new tab callback err={}", .{err});
+            return;
+        };
+        parent.sizeCallback(size) catch |err| {
+            log.err("error in size callback from new tab err={}", .{err});
+            return;
+        };
+    }
+};
+
+const MonitorDimensions = struct {
+    width: u32,
+    height: u32,
+    position_x: usize,
+    position_y: usize,
+};
+
+pub const Surface = struct {
+    window: glfw.Window,
+    cursor: ?glfw.Cursor,
+    app: *App,
+    core_surface: CoreSurface,
+    key_event: ?input.KeyEvent = null,
+    title_text: ?[:0]const u8 = null,
+    monitor_dims: MonitorDimensions,
+
+    pub const Options = struct {};
+
+    pub fn init(self: *Surface, app: *App) !void {
+        const cfg = &app.config;
+
+        // Create our window (possible fullscreen)
+        const win = glfw.Window.create(
+            cfg.@"window-initial-width" > 0 orelse 640,
+            cfg.@"window-initial-height" > 0 orelse 480,
+            "ghostty",
+            if (cfg.fullscreen) glfw.Monitor.getPrimary() else null,
+            null,
+            Renderer.glfwWindowHints(cfg),
+        ) orelse return glfw.mustGetErrorCode();
+        errdefer win.destroy();
+
+        // Set initial position if provided
+        setInitialWindowPosition(
+            win,
+            app.config.@"window-initial-position-x",
+            app.config.@"window-initial-position-y",
+        );
+
+        // Debug DPI logging
+        if (builtin.mode == .Debug) {
+            const monitor = win.getMonitor() orelse monitor: {
+                log.warn("window had null monitor; using primary", .{});
+                break :monitor glfw.Monitor.getPrimary() orelse { return; };
+            };
+            const physical_size = monitor.getPhysicalSize();
+            const video_mode = monitor.getVideoMode() orelse return glfw.mustGetErrorCode();
+            const physical_x_dpi = @as(f32, @floatFromInt(video_mode.getWidth())) /
+                (@as(f32, @floatFromInt(physical_size.width_mm)) / 25.4);
+            const physical_y_dpi = @as(f32, @floatFromInt(video_mode.getHeight())) /
+                (@as(f32, @floatFromInt(physical_size.height_mm)) / 25.4);
+            log.debug("physical dpi x={} y={}", .{ physical_x_dpi, physical_y_dpi });
+        }
+
+        // On Mac, enable tabbing
+        if (comptime darwin_enabled) {
+            const NSWindowTabbingMode = enum(usize) { automatic = 0, preferred = 1, disallowed = 2 };
+            const nswindow = objc.Object.fromId(glfwNative.getCocoaWindow(win).?);
+            nswindow.setProperty("tabbingMode", NSWindowTabbingMode.automatic);
+            nswindow.setProperty("tabbingIdentifier", app.darwin.tabbing_id);
+        }
+
+        // Set callbacks
+        win.setUserPointer(&self.core_surface);
+        win.setSizeCallback(sizeCallback);
+        win.setCharCallback(charCallback);
+        win.setKeyCallback(keyCallback);
+        win.setFocusCallback(focusCallback);
+        win.setRefreshCallback(refreshCallback);
+        win.setScrollCallback(scrollCallback);
+        win.setCursorPosCallback(cursorPosCallback);
+        win.setMouseButtonCallback(mouseButtonCallback);
+        win.setDropCallback(dropCallback);
+
+        // Build our state
+        const pos = win.getPos();
+        const fb = win.getFramebufferSize();
+        const dims: MonitorDimensions = .{
+            .width = fb.width,
+            .height = fb.height,
+            .position_x = pos.x,
+            .position_y = pos.y,
+        };
+        self.* = .{
+            .app = app,
+            .window = win,
+            .cursor = null,
+            .core_surface = undefined,
+            .key_event = null,
+            .title_text = null,
+            .monitor_dims = dims,
+        };
+        errdefer self.* = undefined;
+
+        // Initialize core surface
+        try self.core_surface.init(
+            app.app.alloc,
+            &app.config,
+            app.app,
+            self,
+        );
+        errdefer self.core_surface.deinit();
+
+        try app.app.addSurface(self);
+        errdefer app.app.deleteSurface(self);
+    }
+
+    pub fn deinit(self: *Surface) void {
+        if (self.title_text) |t| self.core_surface.alloc.free(t);
+        self.core_surface.deinit();
+
+        if (comptime darwin_enabled) {
+            const nswindow = objc.Object.fromId(glfwNative.getCocoaWindow(self.window).?);
+            const tabgroup = nswindow.getProperty(objc.Object, "tabGroup");
+            const windows = tabgroup.getProperty(objc.Object, "windows");
+            if (windows.getProperty(usize, "count") == 2 and
+                tabgroup.getProperty(bool, "tabBarVisible"))
+            {
+                nswindow.msgSend(void, objc.sel("toggleTabBar:"), .{nswindow.value});
+            }
+        }
+
+        self.window.destroy();
+        if (self.cursor) |c| {
+            c.destroy();
+            self.cursor = null;
+        }
+    }
+
+    pub fn isFullscreen(self: *Surface) bool {
+        return self.window.getMonitor() != null;
+    }
+
+    pub fn toggleFullscreen(self: *Surface, _: Config.NonNativeFullscreen) void {
+        self.app.toggleFullscreen(self);
+    }
+
+    pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
+        const scale = self.window.getContentScale();
+        return apprt.ContentScale{ .x = scale.x_scale, .y = scale.y_scale };
+    }
+
+    pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
+        const sz = self.window.getFramebufferSize();
+        return apprt.SurfaceSize{ .width = sz.width, .height = sz.height };
+    }
+
+    pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
+        const pos = try self.window.getCursorPos();
+        const pix = try self.cursorPosToPixels(pos);
+        return apprt.CursorPos{ .x = @floatCast(pix.xpos), .y = @floatCast(pix.ypos) };
+    }
+
+    fn cursorPosToPixels(self: *const Surface, pos: glfw.Window.CursorPos) !glfw.Window.CursorPos {
+        const sz = try self.window.getSize();
+        const fb = try self.window.getFramebufferSize();
+        if (sz.width == fb.width and sz.height == fb.height) return pos;
+        const x_scale = @as(f64, @floatFromInt(fb.width)) / @as(f64, @floatFromInt(sz.width));
+        const y_scale = @as(f64, @floatFromInt(fb.height)) / @as(f64, @floatFromInt(sz.height));
+        return .{ .xpos = pos.xpos * x_scale, .ypos = pos.ypos * y_scale };
+    }
+
+    fn sizeCallback(window: glfw.Window, width: i32, height: i32) void {
+        _ = width; _ = height;
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        const size = core_win.rt_surface.getSize() catch |err| {
+            log.err("error in size callback err={}", .{err});
+            return;
+        };
+        core_win.sizeCallback(size) catch |err| {
+            log.err("error in size callback err={}", .{err});
+        };
+    }
+
+    fn charCallback(window: glfw.Window, codepoint: u21) void {
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        var key_evt = core_win.rt_surface.key_event orelse return;
+        core_win.rt_surface.key_event = null;
+
+        // Encode Unicode to UTF-8.
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(codepoint, &buf) catch |err| {
+            log.err("error encoding codepoint={} err={}", .{codepoint, err});
+            return;
+        };
+        key_evt.utf8 = buf[0..len];
+        // On macOS mark Alt as consumed always.
+        if (comptime builtin.target.os.tag.isDarwin()) {
+            key_evt.consumed_mods.alt = true;
+        }
+        _ = core_win.keyCallback(key_evt) catch |err| {
+            log.err("error in key callback err={}", .{err});
+        };
+    }
+
+    fn keyCallback(
+        window: glfw.Window,
+        glfw_key: glfw.Key,
+        scancode: i32,
+        glfw_action: glfw.Action,
+        glfw_mods: glfw.Mods,
+    ) void {
+        _ = scancode;
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+
+        const mods: input.Mods = .{
+            .shift = glfw_mods.shift,
+            .ctrl = glfw_mods.control,
+            .alt = glfw_mods.alt,
+            .super = glfw_mods.super,
+        };
+        const action: input.Action = switch (glfw_action) {
+            .release => .release,
+            .press   => .press,
+            .repeat  => .repeat,
+        };
+        const key: input.Key = switch (glfw_key) {
+            .a => .a, .b => .b, .c => .c, .d => .d, .e => .e, .f => .f,
+            .g => .g, .h => .h, .i => .i, .j => .j, .k => .k, .l => .l,
+            .m => .m, .n => .n, .o => .o, .p => .p, .q => .q, .r => .r,
+            .s => .s, .t => .t, .u => .u, .v => .v, .w => .w, .x => .x,
+            .y => .y, .z => .z, .zero => .zero, .one => .one,
+            .two => .two, .three => .three, .four => .four, .five => .five,
+            .six => .six, .seven => .seven, .eight => .eight, .nine => .nine,
+            .up => .up, .down => .down, .left => .left, .right => .right,
+            .home => .home, .end => .end, .page_up => .page_up, .page_down => .page_down,
+            .escape => .escape, .F1 => .f1, .F2 => .f2, .F3 => .f3, .F4 => .f4,
+            .F5 => .f5, .F6 => .f6, .F7 => .f7, .F8 => .f8, .F9 => .f9, .F10 => .f10,
+            .F11 => .f11, .F12 => .f12, .F13 => .f13, .F14 => .f14, .F15 => .f15,
+            .F16 => .f16, .F17 => .f17, .F18 => .f18, .F19 => .f19, .F20 => .f20,
+            .F21 => .f21, .F22 => .f22, .F23 => .f23, .F24 => .f24, .F25 => .f25,
+            .kp_0 => .kp_0, .kp_1 => .kp_1, .kp_2 => .kp_2, .kp_3 => .kp_3,
+            .kp_4 => .kp_4, .kp_5 => .kp_5, .kp_6 => .kp_6, .kp_7 => .kp_7,
+            .kp_8 => .kp_8, .kp_9 => .kp_9, .kp_decimal => .kp_decimal,
+            .kp_divide => .kp_divide, .kp_multiply => .kp_multiply,
+            .kp_subtract => .kp_subtract, .kp_add => .kp_add,
+            .kp_enter => .kp_enter, .kp_equal => .kp_equal,
+            .grave_accent => .grave_accent, .minus => .minus,
+            .equal => .equal, .space => .space, .semicolon => .semicolon,
+            .apostrophe => .apostrophe, .comma => .comma, .period => .period,
+            .slash => .slash, .left_bracket => .left_bracket,
+            .right_bracket => .right_bracket, .backslash => .backslash,
+            .enter => .enter, .tab => .tab, .backspace => .backspace,
+            .insert => .insert, .delete => .delete, .caps_lock => .caps_lock,
+            .scroll_lock => .scroll_lock, .num_lock => .num_lock,
+            .print_screen => .print_screen, .pause => .pause,
+            .left_shift => .left_shift, .left_control => .left_control,
+            .left_alt => .left_alt, .left_super => .left_super,
+            .right_shift => .right_shift, .right_control => .right_control,
+            .right_alt => .right_alt, .right_super => .right_super,
+            .menu, .world_1, .world_2, .unknown => .invalid,
+        };
+
+        const key_evt: input.KeyEvent = .{
+            .action = action,
+            .key = key,
+            .physical_key = key,
+            .mods = mods,
+            .consumed_mods = .{},
+            .composing = false,
+            .utf8 = "",
+        };
+        const effect = core_win.keyCallback(key_evt) catch |err| {
+            log.err("error in key callback err={}", .{err});
+            return;
+        };
+        if (effect == .closed) return;
+        if (effect == .ignored and (action == .press or action == .repeat)) {
+            core_win.rt_surface.key_event = key_evt;
+        }
+    }
+
+    fn focusCallback(window: glfw.Window, focused: bool) void {
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        core_win.focusCallback(focused) catch |err| {
+            log.err("error in focus callback err={}", .{err});
+        };
+    }
+
+    fn refreshCallback(window: glfw.Window) void {
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        core_win.refreshCallback() catch |err| {
+            log.err("error in refresh callback err={}", .{err});
+        };
+    }
+
+    fn scrollCallback(window: glfw.Window, xoff: f64, yoff: f64) void {
+        // GLFW has no scroll modifiers.
+        const scroll_mods: input.ScrollMods = .{};
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        _ = core_win.scrollCallback(xoff, yoff, scroll_mods) catch |err| {
+            log.err("error in scroll callback err={}", .{err});
+        };
+    }
+
+    fn cursorPosCallback(
+        window: glfw.Window,
+        unscaled_xpos: f64,
+        unscaled_ypos: f64,
+    ) void {
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        const pix = core_win.rt_surface.cursorPosToPixels(.{
+            .xpos = unscaled_xpos,
+            .ypos = unscaled_ypos,
+        }) catch |err| {
+            log.err(
+                "error converting cursor pos in cursorPosCallback err={}",
+                .{err},
+            );
+            return;
+        };
+        core_win.cursorPosCallback(.{
+            .x = @floatCast(pix.xpos),
+            .y = @floatCast(pix.ypos),
+        }, null) catch |err| {
+            log.err("error in cursor pos callback err={}", .{err});
+        };
+    }
+
+    fn mouseButtonCallback(
+        window: glfw.Window,
+        glfw_button: glfw.MouseButton,
+        glfw_action: glfw.Action,
+        glfw_mods: glfw.Mods,
+    ) void {
+        const core_win = window.getUserPointer(CoreSurface) orelse return;
+        const mods: input.Mods = .{
+            .shift = glfw_mods.shift,
+            .ctrl  = glfw_mods.control,
+            .alt   = glfw_mods.alt,
+            .super = glfw_mods.super,
+        };
+        const button: input.MouseButton = switch (glfw_button) {
+            .left => .left, .right => .right, .middle => .middle,
+            .four => .four, .five => .five, .six => .six,
+            .seven => .seven, .eight => .eight,
+        };
+        const action: input.MouseButtonState = switch (glfw_action) {
+            .press   => .press,
+            .release => .release,
+            else     => unreachable,
+        };
+        _ = core_win.mouseButtonCallback(action, button, mods) catch |err| {
+            log.err("error in mouse button callback err={}", .{err});
+        };
+    }
+
+    fn dropCallback(window: glfw.Window, paths: [][*:0]const u8) void {
+        const surface = window.getUserPointer(CoreSurface) orelse return;
+        var list = std.ArrayList(u8).init(surface.alloc);
+        defer list.deinit();
+        for (paths) |path| {
+            const span = std.mem.span(path);
+            // worst-case escape all + space
+            list.ensureTotalCapacity(span.len * 2 + 1) catch |err| {
+                log.err("error in drop callback err={}", .{err});
+                return;
+            };
+            const w = list.writer();
+            for (span) |c| {
+                if (std.mem.indexOfScalar(u8, "\\ ()[]{}<>\"'`!#$&;|*?\t", c)) |_| {
+                    w.print("\\{c}", .{c}) catch unreachable;
+                } else {
+                    w.writeByte(c) catch unreachable;
+                }
+            }
+            w.writeByte(' ') catch unreachable;
+
+            surface.textCallback(list.items) catch |err| {
+                log.err("error in drop callback err={}", .{err});
+                return;
+            };
+            list.clearRetainingCapacity();
+        }
+    }
+
+    pub fn getClipboardString(
+        self: *const Surface,
+        clipboard_type: apprt.Clipboard,
+    ) ![:0]const u8 {
+        _ = self;
+        return switch (clipboard_type) {
+            .standard => glfw.getClipboardString() orelse glfw.mustGetErrorCode(),
+            .selection, .primary => selection: {
+                if (comptime builtin.os.tag != .linux) break :selection "";
+                const raw = glfwNative.getX11SelectionString() orelse
+                    return glfw.mustGetErrorCode();
+                break :selection std.mem.span(raw);
+            },
+        };
+    }
+
+    pub fn clipboardRequest(
+        self: *Surface,
+        state: apprt.ClipboardRequest,
+    ) !void {
+        const str: [:0]const u8 = switch (state.clipboard_type) {
+            .standard => glfw.getClipboardString() orelse return glfw.mustGetErrorCode(),
+            .selection, .primary => selection: {
+                if (comptime builtin.os.tag != .linux) break :selection "";
+                const raw = glfwNative.getX11SelectionString() orelse
+                    return glfw.mustGetErrorCode();
+                break :selection std.mem.span(raw);
+            },
+        };
+        // Always allow unsafe (no prompt) in GLFW.
+        try self.core_surface.completeClipboardRequest(state, str, true);
+    }
+
+    pub fn setClipboardString(
+        self: *const Surface,
+        val: [:0]const u8,
+        clipboard_type: apprt.Clipboard,
+        confirm: bool,
+    ) !void {
+        _ = confirm;
+        _ = self;
+        switch (clipboard_type) {
+            .standard => glfw.setClipboardString(val),
+            .selection, .primary => {
+                if (comptime builtin.os.tag != .linux) return;
+                glfwNative.setX11SelectionString(val.ptr);
+            },
+        }
+    }
+
+    pub fn supportsClipboard(
+        self: *const Surface,
+        clipboard_type: apprt.Clipboard,
+    ) bool {
+        _ = self;
+        return switch (clipboard_type) {
+            .standard => true,
+            .selection, .primary => comptime builtin.os.tag == .linux,
+        };
+    }
+
+    pub fn defaultTermioEnv(self: *Surface) !std.process.EnvMap {
+        return try internal_os.getEnvMap(self.app.app.alloc);
+    }
+
+    fn setInitialWindowPosition(win: glfw.Window, x: ?i16, y: ?i16) void {
+        const X = x orelse return;
+        const Y = y orelse return;
+        log.debug("setting initial window position ({},{})", .{X, Y});
+        win.setPos(.{ .x = X, .y = Y });
+    }
+
+    fn setInitialWindowSize(self: *const Surface, width: u32, height: u32) !void {
+        const monitor = self.window.getMonitor() orelse
+            glfw.Monitor.getPrimary() orelse {
+                log.warn("window not on monitor; skip initial size", .{});
+                return;
+            };
+        const work = monitor.getWorkarea();
+        self.window.setSize(.{
+            .width = @min(width, work.width),
+            .height = @min(height, work.height),
+        });
+    }
+
+    fn setSizeLimits(self: *Surface, min: apprt.SurfaceSize, max_: ?apprt.SurfaceSize) !void {
+        self.window.setSizeLimits(.{
+            .width = min.width,
+            .height = min.height,
+        }, if (max_) |m| .{
+            .width = m.width,
+            .height = m.height,
+        } else .{ .width = null, .height = null });
+    }
+
+    fn setTitle(self: *Surface, slice: [:0]const u8) !void {
+        if (self.title_text) |t| self.core_surface.alloc.free(t);
+        self.title_text = try self.core_surface.alloc.dupeZ(u8, slice);
+        self.window.setTitle(self.title_text.?.ptr);
+    }
+
+    pub fn getTitle(self: *Surface) ?[:0]const u8 {
+        return self.title_text;
+    }
+
+    fn setMouseShape(self: *Surface, shape: terminal.MouseShape) !void {
+        if (comptime builtin.target.os.tag.isDarwin() and
+            !internal_os.macos.isAtLeastVersion(13, 0, 0))
+        {
+            return;
+        }
+        const new = glfw.Cursor.createStandard(switch (shape) {
+            .default => .arrow,
+            .text => .ibeam,
+            .crosshair => .crosshair,
+            .pointer => .pointing_hand,
+            .ew_resize => .resize_ew,
+            .ns_resize => .resize_ns,
+            .nwse_resize => .resize_nwse,
+            .nesw_resize => .resize_nesw,
+            .all_scroll => .resize_all,
+            .not_allowed => .not_allowed,
+            else => return,
+        }) orelse {
+            const err = glfw.mustGetErrorCode();
+            log.warn("error creating cursor: {}", .{err});
+            return;
+        };
+        errdefer new.destroy();
+        self.window.setCursor(new);
+        if (self.cursor) |c| c.destroy();
+        self.cursor = new;
+    }
+
+    fn setMouseVisibility(self: *Surface, visible: bool) void {
+        self.window.setInputModeCursor(if (visible) .normal else .hidden);
+    }
+
+    pub fn mouseOverLink(self: *Surface, uri: ?[]const u8) void {
+        _ = self; _ = uri;
+    }
+
+    pub fn updateRendererHealth(self: *const Surface, health: renderer.Health) void {
+        _ = self; _ = health;
+    }
+};
+```

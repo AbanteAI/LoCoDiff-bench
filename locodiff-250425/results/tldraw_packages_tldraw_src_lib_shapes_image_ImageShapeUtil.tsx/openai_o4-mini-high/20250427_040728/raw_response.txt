@@ -1,0 +1,306 @@
+```typescript
+/* eslint-disable react-hooks/rules-of-hooks */
+import {
+	BaseBoxShapeUtil,
+	Editor,
+	FileHelpers,
+	HTMLContainer,
+	Image,
+	MediaHelpers,
+	SvgExportContext,
+	TLAsset,
+	TLAssetId,
+	TLImageShape,
+	TLImageShapeProps,
+	TLResizeInfo,
+	TLShapePartial,
+	Vec,
+	WeakCache,
+	fetch,
+	imageShapeMigrations,
+	imageShapeProps,
+	resizeBox,
+	structuredClone,
+	toDomPrecision,
+	useEditor,
+	useUniqueSafeId,
+	useValue,
+} from '@tldraw/editor'
+import classNames from 'classnames'
+import { memo, useEffect, useState } from 'react'
+import { BrokenAssetIcon } from '../shared/BrokenAssetIcon'
+import { HyperlinkButton } from '../shared/HyperlinkButton'
+import { getUncroppedSize } from '../shared/crop'
+import { useImageOrVideoAsset } from '../shared/useImageOrVideoAsset'
+import { usePrefersReducedMotion } from '../shared/usePrefersReducedMotion'
+
+async function getDataURIFromURL(url: string): Promise<string> {
+	const response = await fetch(url)
+	const blob = await response.blob()
+	return FileHelpers.blobToDataUrl(blob)
+}
+
+const imageSvgExportCache = new WeakCache<TLAsset, Promise<string | null>>()
+
+/** @public */
+export class ImageShapeUtil extends BaseBoxShapeUtil<TLImageShape> {
+	static override type = 'image' as const
+	static override props = imageShapeProps
+	static override migrations = imageShapeMigrations
+
+	override isAspectRatioLocked() {
+		return true
+	}
+	override canCrop() {
+		return true
+	}
+
+	override getDefaultProps(): TLImageShapeProps {
+		return {
+			w: 100,
+			h: 100,
+			assetId: null,
+			playing: true,
+			url: '',
+			crop: null,
+			flipX: false,
+			flipY: false,
+			altText: '',
+		}
+	}
+
+	override onResize(shape: TLImageShape, info: TLResizeInfo<TLImageShape>) {
+		let resized: TLImageShape = resizeBox(shape, info)
+		const { flipX, flipY } = info.initialShape.props
+		const { scaleX, scaleY, mode } = info
+
+		resized = {
+			...resized,
+			props: {
+				...resized.props,
+				flipX: scaleX < 0 !== flipX,
+				flipY: scaleY < 0 !== flipY,
+			},
+		}
+
+		if (!shape.props.crop) {
+			return resized
+		}
+
+		const flipCropHorizontally =
+			(mode === 'scale_shape' && scaleX === -1) ||
+			(mode === 'resize_bounds' && flipX !== resized.props.flipX)
+		const flipCropVertically =
+			(mode === 'scale_shape' && scaleY === -1) ||
+			(mode === 'resize_bounds' && flipY !== resized.props.flipY)
+
+		const { topLeft, bottomRight } = shape.props.crop
+		resized.props.crop = {
+			topLeft: {
+				x: flipCropHorizontally ? 1 - bottomRight.x : topLeft.x,
+				y: flipCropVertically ? 1 - bottomRight.y : topLeft.y,
+			},
+			bottomRight: {
+				x: flipCropHorizontally ? 1 - topLeft.x : bottomRight.x,
+				y: flipCropVertically ? 1 - topLeft.y : bottomRight.y,
+			},
+		}
+
+		return resized
+	}
+
+	override async toSvg(shape: TLImageShape, ctx: SvgExportContext) {
+		if (!shape.props.assetId) return null
+
+		const asset = this.editor.getAsset(shape.props.assetId)
+		if (!asset) return null
+
+		const { w } = getUncroppedSize(shape.props, shape.props.crop)
+		const src = await imageSvgExportCache.get(asset, async () => {
+			let url = await ctx.resolveAssetUrl(asset.id, w)
+			if (!url) return null
+			if (
+				url.startsWith('blob:') ||
+				url.startsWith('http') ||
+				url.startsWith('/') ||
+				url.startsWith('./')
+			) {
+				url = (await getDataURIFromURL(url)) || ''
+			}
+
+			if (getIsAnimated(this.editor, asset.id)) {
+				const { promise } = getFirstFrameOfAnimatedImage(url)
+				url = await promise
+			}
+
+			return url
+		})
+		if (!src) return null
+
+		return <SvgImage shape={shape} src={src} />
+	}
+
+	override getAriaDescriptor(shape: TLImageShape) {
+		return shape.props.altText
+	}
+
+	override indicator(shape: TLImageShape) {
+		const isCropping = this.editor.getCroppingShapeId() === shape.id
+		if (isCropping) return null
+		return <rect width={toDomPrecision(shape.props.w)} height={toDomPrecision(shape.props.h)} />
+	}
+
+	override onDoubleClickEdge(shape: TLImageShape) {
+		const props = shape.props
+		if (!props) return
+
+		if (this.editor.getCroppingShapeId() !== shape.id) {
+			return
+		}
+
+		const crop = structuredClone(props.crop) || {
+			topLeft: { x: 0, y: 0 },
+			bottomRight: { x: 1, y: 1 },
+		}
+
+		const { w: uncroppedW, h: uncroppedH } = getUncroppedSize(props, props.crop)
+		const w = (1 / (crop.bottomRight.x - crop.topLeft.x)) * uncroppedW
+		const h = (1 / (crop.bottomRight.y - crop.topLeft.y)) * uncroppedH
+		const pointDelta = new Vec(crop.topLeft.x * w, crop.topLeft.y * h).rot(shape.rotation)
+
+		const partial: TLShapePartial<TLImageShape> = {
+			id: shape.id,
+			type: shape.type,
+			x: shape.x - pointDelta.x,
+			y: shape.y - pointDelta.y,
+			props: {
+				crop: {
+					topLeft: { x: 0, y: 0 },
+					bottomRight: { x: 1, y: 1 },
+				},
+				w,
+				h,
+			},
+		}
+
+		this.editor.updateShapes([partial])
+	}
+}
+
+const SvgImage = memo(function SvgImage({ shape, src }: { shape: TLImageShape; src: string }) {
+	const cropClipId = useUniqueSafeId()
+	const containerStyle = getCroppedContainerStyle(shape)
+	const crop = shape.props.crop
+
+	if (containerStyle.transform && crop) {
+		const { transform: cropTransform, width, height } = containerStyle
+		const croppedWidth = (crop.bottomRight.x - crop.topLeft.x) * width
+		const croppedHeight = (crop.bottomRight.y - crop.topLeft.y) * height
+
+		const points = [
+			new Vec(0, 0),
+			new Vec(croppedWidth, 0),
+			new Vec(croppedWidth, croppedHeight),
+			new Vec(0, croppedHeight),
+		]
+
+		const flip = getFlipStyle(shape, { width, height })
+
+		return (
+			<>
+				<defs>
+					<clipPath id={cropClipId}>
+						<polygon points={points.map((p) => `${p.x},${p.y}`).join(',')} />
+					</clipPath>
+				</defs>
+				<g clipPath={`url(#${cropClipId})`}>
+					<image
+						href={src}
+						width={width}
+						height={height}
+						style={
+							flip
+								? { ...flip, transform: `${cropTransform} ${flip.transform}` }
+								: { transform: cropTransform }
+						}
+					/>
+				</g>
+			</>
+		)
+	} else {
+		return (
+			<image
+				href={src}
+				width={shape.props.w}
+				height={shape.props.h}
+				style={getFlipStyle(shape, { width: shape.props.w, height: shape.props.h })}
+			/>
+		)
+	}
+})
+
+function getIsAnimated(editor: Editor, assetId: TLAssetId) {
+	const asset = assetId ? editor.getAsset(assetId) : undefined
+	if (!asset) return false
+	return (
+		('mimeType' in asset.props && MediaHelpers.isAnimatedImageType(asset.props.mimeType)) ||
+		('isAnimated' in asset.props && asset.props.isAnimated)
+	)
+}
+
+function getFirstFrameOfAnimatedImage(url: string) {
+	let cancelled = false
+	const promise = new Promise<string>((resolve) => {
+		const image = Image()
+		image.onload = () => {
+			if (cancelled) return
+			const canvas = document.createElement('canvas')
+			canvas.width = image.width
+			canvas.height = image.height
+
+			const ctx = canvas.getContext('2d')
+			if (!ctx) return
+
+			ctx.drawImage(image, 0, 0)
+			resolve(canvas.toDataURL())
+		}
+		image.crossOrigin = 'anonymous'
+		image.src = url
+	})
+	return { promise, cancel: () => (cancelled = true) }
+}
+
+function getCroppedContainerStyle(shape: TLImageShape) {
+	const crop = shape.props.crop
+	const topLeft = crop?.topLeft
+	if (!topLeft) {
+		return { width: shape.props.w, height: shape.props.h }
+	}
+
+	const w = (1 / (crop.bottomRight.x - crop.topLeft.x)) * shape.props.w
+	const h = (1 / (crop.bottomRight.y - crop.topLeft.y)) * shape.props.h
+	const offsetX = -topLeft.x * w
+	const offsetY = -topLeft.y * h
+
+	return {
+		transform: `translate(${offsetX}px, ${offsetY}px)`,
+		width: w,
+		height: h,
+	}
+}
+
+function getFlipStyle(shape: TLImageShape, size?: { width: number; height: number }) {
+	const { flipX, flipY } = shape.props
+	if (!flipX && !flipY) return undefined
+
+	const scale = `scale(${flipX ? -1 : 1}, ${flipY ? -1 : 1})`
+	const translate = size
+		? `translate(${flipX ? size.width : 0}px, ${flipY ? size.height : 0}px)`
+		: ''
+
+	return {
+		transform: `${translate} ${scale}`,
+		transformOrigin: size ? '0 0' : 'center center',
+	}
+}
+```
