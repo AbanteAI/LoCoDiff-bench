@@ -1,0 +1,584 @@
+```zig
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Face represents a single font face. A single font face has a single set
+//! of properties associated with it such as style, weight, etc.
+//!
+//! A Face isn't typically meant to be used directly. It is usually used
+//! via a Family in order to store it in an Atlas.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const freetype = @import("freetype");
+const harfbuzz = @import("harfbuzz");
+const config = @import("../../config.zig");
+const convert = @import("freetype_convert.zig");
+const fastmem = @import("../../fastmem.zig");
+const quirks = @import("../../quirks.zig");
+const opentype = @import("../opentype.zig");
+
+const assert = std.debug.assert;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const font = @import("../main.zig");
+const Glyph = font.Glyph;
+const Library = font.Library;
+const stb = @import("../../stb/main.zig");
+
+const log = std.log.scoped(.font_face);
+
+pub const Face = struct {
+    /// Our freetype library
+    lib: freetype.Library,
+
+    /// Our font face.
+    face: freetype.Face,
+
+    /// Harfbuzz font corresponding to this face.
+    hb_font: harfbuzz.Font,
+
+    /// Freetype load flags for this font face.
+    load_flags: font.face.FreetypeLoadFlags,
+
+    /// Set quirks.disableDefaultFontFeatures
+    quirks_disable_default_font_features: bool = false,
+
+    /// Set to true to apply a synthetic italic to the face.
+    synthetic: packed struct {
+        italic: bool = false,
+        bold: bool = false,
+    } = .{},
+
+    /// The matrix applied to a regular font to create a synthetic italic.
+    const italic_matrix: freetype.c.FT_Matrix = .{
+        .xx = 0x10000,
+        .xy = 0x044ED, // approx. tan(15)
+        .yx = 0,
+        .yy = 0x10000,
+    };
+
+    pub fn initFile(lib: Library, path: [:0]const u8, index: i32, opts: font.face.Options) !Face {
+        const face = try lib.lib.initFace(path, index);
+        errdefer face.deinit();
+        return try initFace(lib, face, opts);
+    }
+
+    pub fn init(lib: Library, source: [:0]const u8, opts: font.face.Options) !Face {
+        const face = try lib.lib.initMemoryFace(source, 0);
+        errdefer face.deinit();
+        return try initFace(lib, face, opts);
+    }
+
+    fn initFace(lib: Library, face: freetype.Face, opts: font.face.Options) !Face {
+        try face.selectCharmap(.unicode);
+        try setSize_(face, opts.size);
+
+        var hb_font = try harfbuzz.freetype.createFont(face.handle);
+        errdefer hb_font.destroy();
+
+        var result: Face = .{
+            .lib = lib.lib,
+            .face = face,
+            .hb_font = hb_font,
+            .load_flags = opts.freetype_load_flags,
+            .quirks_disable_default_font_features = false,
+            .synthetic = .{ .italic = false, .bold = false },
+        };
+        result.quirks_disable_default_font_features = quirks.disableDefaultFontFeatures(&result);
+
+        // See coretext.zig which has a similar check for mixed color/text glyphs.
+        // Treat mixed color glyph fonts without emoji-range support as text.
+        if (result.face.hasColor() and result.face.getCharIndex('🥸') == null) {
+            log.warn("font has colorized glyphs but isn't emoji, treating as text", .{});
+        }
+
+        if (builtin.mode == .Debug) mmDebug: {
+            if (!face.hasMultipleMasters()) break :mmDebug;
+            var buf: [1024]u8 = undefined;
+            log.debug("variation axes font={s}", .{ try result.name(&buf) });
+            const mm = try face.getMMVar();
+            defer lib.lib.doneMMVar(mm);
+            for (0..mm.num_axis) |i| {
+                const axis = mm.axis[i];
+                const id_raw = std.math.cast(c_int, axis.tag) orelse continue;
+                const id: font.face.Variation.Id = @bitCast(id_raw);
+                log.debug("variation axis: name={s} id={s} min={} max={} def={}", .{
+                    std.mem.sliceTo(axis.name, 0),
+                    id.str(),
+                    axis.minimum >> 16,
+                    axis.maximum >> 16,
+                    axis.def >> 16,
+                });
+            }
+        }
+
+        return result;
+    }
+
+    pub fn deinit(self: *Face) void {
+        self.face.deinit();
+        self.hb_font.destroy();
+        self.* = undefined;
+    }
+
+    pub fn name(self: *const Face, buf: []u8) Allocator.Error![]const u8 {
+        const count = self.face.getSfntNameCount();
+        for (0..count) |i| {
+            const entry = self.face.getSfntName(i) catch continue;
+            if (entry.name_id == freetype.c.TT_NAME_ID_FONT_FAMILY) {
+                return entry.string[0..entry.string_len];
+            }
+        }
+        return "";
+    }
+
+    pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
+        self.face.ref();
+        errdefer self.face.deinit();
+        var f = try initFace(.{ .lib = self.lib }, self.face, opts);
+        f.synthetic = self.synthetic;
+        f.synthetic.italic = true;
+        return f;
+    }
+
+    pub fn syntheticBold(self: *const Face, opts: font.face.Options) !Face {
+        self.face.ref();
+        errdefer self.face.deinit();
+        var f = try initFace(.{ .lib = self.lib }, self.face, opts);
+        f.synthetic = self.synthetic;
+        f.synthetic.bold = true;
+        return f;
+    }
+
+    pub fn setSize(self: *Face, opts: font.face.Options) !void {
+        try setSize_(self.face, opts.size);
+    }
+
+    fn setSize_(face: freetype.Face, size: font.face.DesiredSize) !void {
+        if (face.isScalable()) {
+            const size_26dot6: i32 = @intFromFloat(@round(size.points * 64));
+            try face.setCharSize(0, size_26dot6, size.xdpi, size.ydpi);
+        } else {
+            try selectSizeNearest(face, size.pixels());
+        }
+    }
+
+    fn selectSizeNearest(face: freetype.Face, size: u32) !void {
+        var i: i32 = 0;
+        var best_i: i32 = 0;
+        var best_diff: i32 = 0;
+        while (i < face.handle.*.num_fixed_sizes) : (i += 1) {
+            const width = face.handle.*.available_sizes[@intCast(i)].width;
+            const diff = @as(i32, @intCast(size)) - @as(i32, @intCast(width));
+            if (i == 0 or diff < best_diff) {
+                best_diff = diff;
+                best_i = i;
+            }
+        }
+        try face.selectSize(best_i);
+    }
+
+    pub fn setVariations(self: *Face, vs: []const font.face.Variation, opts: font.face.Options) !void {
+        if (!self.face.hasMultipleMasters() or vs.len == 0) return;
+        const mm = try self.face.getMMVar();
+        defer self.lib.doneMMVar(mm);
+        var coords_buf: [32]freetype.c.FT_Fixed = undefined;
+        var coords = coords_buf[0..@min(coords_buf.len, mm.num_axis)];
+        try self.face.getVarDesignCoordinates(coords);
+        for (0..mm.num_axis) |i| {
+            const axis = mm.axis[i];
+            const id = std.math.cast(u32, axis.tag) orelse continue;
+            for (vs) |v| {
+                if (id == @as(u32, @bitCast(v.id))) {
+                    coords[i] = @intFromFloat(v.value * 65536);
+                    break;
+                }
+            }
+        }
+        try self.face.setVarDesignCoordinates(coords);
+    }
+
+    pub fn glyphIndex(self: Face, cp: u32) ?u32 {
+        return self.face.getCharIndex(cp);
+    }
+
+    pub fn hasColor(self: Face) bool {
+        return self.face.hasColor();
+    }
+
+    pub fn isColorGlyph(self: *const Face, glyph_id: u32) bool {
+        if (self.face.loadGlyph(glyph_id, .{
+            .render = true,
+            .color = self.face.hasColor(),
+            .no_svg = true,
+        })) |{}| else return false;
+        const g = self.face.handle.*.glyph.*;
+        return g.bitmap.pixel_mode == freetype.c.FT_PIXEL_MODE_BGRA;
+    }
+
+    pub fn renderGlyph(
+        self: Face,
+        alloc: Allocator,
+        atlas: *font.Atlas,
+        glyph_index: u32,
+        opts: font.face.RenderOptions,
+    ) !Glyph {
+        const metrics = opts.grid_metrics orelse self.metrics;
+        if (self.synthetic.italic) self.face.setTransform(&italic_matrix, null);
+        defer if (self.synthetic.italic) self.face.setTransform(null, null);
+
+        try self.face.loadGlyph(glyph_index, .{
+            .color = self.face.hasColor(),
+            .render = !self.synthetic.bold,
+            .no_hinting = !self.load_flags.hinting,
+            .force_autohint = !self.load_flags.@"force-autohint",
+            .monochrome = !self.load_flags.monochrome,
+            .no_autohint = !self.load_flags.autohint,
+            .no_svg = true,
+        });
+        const glyph = self.face.handle.*.glyph.*;
+
+        if (self.synthetic.bold) {
+            const height: f64 = @floatFromInt(self.face.handle.*.size.*.metrics.height);
+            const ratio: f64 = 64.0 / 2048.0;
+            const amount = @ceil(height * ratio);
+            _ = freetype.c.FT_Outline_Embolden(&glyph.outline, @intFromFloat(amount));
+            try self.face.renderGlyph(.normal);
+        }
+
+        const bitmap_ft = glyph.bitmap;
+        if (bitmap_ft.rows == 0) return .{ .width = 0, .height = 0, .offset_x = 0, .offset_y = 0, .atlas_x = 0, .atlas_y = 0, .advance_x = 0 };
+
+        const format: ?font.Atlas.Format = switch (bitmap_ft.pixel_mode) {
+            freetype.c.FT_PIXEL_MODE_MONO => null,
+            freetype.c.FT_PIXEL_MODE_GRAY => .grayscale,
+            freetype.c.FT_PIXEL_MODE_BGRA => .rgba,
+            else => {
+                log.warn("glyph={} pixel mode={}", .{ glyph_index, bitmap_ft.pixel_mode });
+                return error.UnsupportedPixelMode;
+            },
+        };
+
+        const bitmap_converted = if (format == null or atlas.format != format.?) blk: {
+            const func = convert.map[bitmap_ft.pixel_mode].get(atlas.format) orelse {
+                log.debug("pixfmt convert from pixel_mode={} to atlas_format={}", .{ bitmap_ft.pixel_mode, atlas.format });
+                return error.UnsupportedPixelMode;
+            };
+            log.debug("converting from pixel_mode={} to atlas_format={}", .{ bitmap_ft.pixel_mode, atlas.format });
+            break :blk try func(alloc, bitmap_ft);
+        } else null;
+        defer if (bitmap_converted) |bm| {
+            const len = @as(usize, @intCast(bm.pitch)) * @as(usize, @intCast(bm.rows));
+            alloc.free(bm.buffer[0..len]);
+        };
+
+        const bitmap_original = bitmap_converted orelse bitmap_ft;
+        const bitmap_resized: ?freetype.c.struct_FT_Bitmap_ = resized: {
+            const original_width = bitmap_original.width;
+            const original_height = bitmap_original.rows;
+            var result = bitmap_original;
+            if (atlas.format != .grayscale and opts.cell_width != null) {
+                const cw = opts.cell_width orelse unreachable;
+                result.width = metrics.cell_width * @as(u32, cw);
+                result.rows = (result.width * original_height) / original_width;
+            } else {
+                result.rows = metrics.cell_height;
+                result.width = (metrics.cell_height * original_width) / original_height;
+            }
+            if (original_height <= result.rows and original_width <= result.width) break :resized null;
+            result.pitch = @as(c_int, @intCast(result.width)) * atlas.format.depth();
+            const buf = try alloc.alloc(u8, @as(usize, @intCast(result.pitch)) * @as(usize, @intCast(result.rows)));
+            result.buffer = buf.ptr;
+            errdefer alloc.free(buf);
+            if (stb.stbir_resize_uint8(
+                bitmap_original.buffer,
+                @intCast(original_width),
+                @intCast(original_height),
+                bitmap_original.pitch,
+                result.buffer,
+                @intCast(result.width),
+                @intCast(result.rows),
+                result.pitch,
+                atlas.format.depth(),
+            ) == 0) {
+                return error.GlyphResizeFailed;
+            }
+            break :resized result;
+        };
+        defer if (bitmap_resized) |bm| {
+            const len = @as(usize, @intCast(bm.pitch)) * @as(usize, @intCast(bm.rows));
+            alloc.free(bm.buffer[0..len]);
+        };
+
+        const bitmap = bitmap_resized orelse bitmap_original;
+        const tgt_w = bitmap.width;
+        const tgt_h = bitmap.rows;
+
+        assert(tgt_w > 0 and tgt_h > 0);
+
+        const region = blkRegion: {
+            const padding = 1;
+            var r = try atlas.reserve(alloc, tgt_w + 2*padding, tgt_h + 2*padding);
+            r.x += padding;
+            r.y += padding;
+            r.width -= padding * 2;
+            r.height -= padding * 2;
+            break :blkRegion r;
+        };
+
+        assert(region.width > 0 and region.height > 0);
+        {
+            const depth = atlas.format.depth();
+            const needs_copy = !(tgt_w == bitmap.width and (bitmap.width * depth) == bitmap.pitch);
+            const buffer = if (needs_copy) blkBuf: {
+                const cnt = tgt_w * tgt_h * depth;
+                const temp = try alloc.alloc(u8, cnt);
+                var dst = temp;
+                var src = bitmap.buffer;
+                for (0..bitmap.rows) |i| {
+                    fastmem.copy(u8, dst, src[0..bitmap.width*depth]);
+                    dst = dst[tgt_w*depth..];
+                    src += @as(usize, @intCast(bitmap.pitch));
+                }
+                break :blkBuf temp;
+            } else bitmap.buffer[0..(tgt_w * tgt_h * depth)];
+            defer if (buffer.ptr != bitmap.buffer) alloc.free(buffer);
+            atlas.set(region, buffer);
+        }
+
+        const offset_y: c_int = blkY: {
+            if (self.face.hasColor() and !self.face.isScalable()) {
+                break :blkY @intCast(tgt_h + (metrics.cell_height -| tgt_h) / 2);
+            }
+            break :blkY glyph.bitmap_top + @intCast(metrics.cell_baseline);
+        };
+
+        const offset_x: i32 = blkX: {
+            var res: i32 = glyph.bitmap_left;
+            if (metrics.original_cell_width) |ow| {
+                if (ow < metrics.cell_width) {
+                    const diff = (metrics.cell_width - ow) / 2;
+                    res += @intCast(diff);
+                }
+            }
+            break :blkX res;
+        };
+
+        return Glyph{
+            .width = tgt_w,
+            .height = tgt_h,
+            .offset_x = offset_x,
+            .offset_y = offset_y,
+            .atlas_x = region.x,
+            .atlas_y = region.y,
+            .advance_x = f26dot6ToFloat(glyph.advance.x),
+        };
+    }
+
+    fn f26dot6ToFloat(v: freetype.c.FT_F26Dot6) f32 {
+        return @floatFromInt(v >> 6);
+    }
+
+    fn f26dot6ToF64(v: freetype.c.FT_F26Dot6) f64 {
+        return @as(opentype.sfnt.F26Dot6, @bitCast(@as(u32, @intCast(v)))).to(f64);
+    }
+
+    /// Copy the font table data for the given tag.
+    pub fn copyTable(self: Face, alloc: Allocator, tag: *const [4]u8) !?[]u8 {
+        return try self.face.loadSfntTable(alloc, freetype.Tag.init(tag));
+    }
+};
+
+test {
+    const testFont = font.embedded.inconsolata;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+    defer atlas.deinit(alloc);
+
+    var ft_font = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    );
+    defer ft_font.deinit();
+
+    try testing.expectEqual(font.Metrics.calc(try ft_font.getMetrics()), ft_font.metrics);
+
+    // Generate all visible ASCII
+    var i: u8 = 32;
+    while (i < 127) : (i += 1) {
+        _ = try ft_font.renderGlyph(
+            alloc,
+            &atlas,
+            ft_font.glyphIndex(i).?,
+            .{ .grid_metrics = font.Metrics.calc(try ft_font.getMetrics()) },
+        );
+    }
+
+    // Test resizing
+    {
+        const g1 = try ft_font.renderGlyph(
+            alloc,
+            &atlas,
+            ft_font.glyphIndex('A').?,
+            .{ .grid_metrics = font.Metrics.calc(try ft_font.getMetrics()) },
+        );
+        try testing.expectEqual(@as(u32, 11), g1.height);
+
+        try ft_font.setSize(.{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } });
+        const g2 = try ft_font.renderGlyph(
+            alloc,
+            &atlas,
+            ft_font.glyphIndex('A').?,
+            .{ .grid_metrics = font.Metrics.calc(try ft_font.getMetrics()) },
+        );
+        try testing.expectEqual(@as(u32, 20), g2.height);
+    }
+}
+
+test "color emoji" {
+    const alloc = testing.allocator;
+    const testFont = font.embedded.emoji;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .rgba);
+    defer atlas.deinit(alloc);
+
+    var ft_font = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    );
+    defer ft_font.deinit();
+
+    _ = try ft_font.renderGlyph(
+        alloc,
+        &atlas,
+        ft_font.glyphIndex('🥸').?,
+        .{ .grid_metrics = font.Metrics.calc(try ft_font.getMetrics()) },
+    );
+
+    {
+        try testing.expect(ft_font.hasColor());
+        const glyph_id = ft_font.glyphIndex('🥸').?;
+        try testing.expect(ft_font.isColorGlyph(glyph_id));
+    }
+
+    {
+        const glyph = try ft_font.renderGlyph(
+            alloc,
+            &atlas,
+            ft_font.glyphIndex('🥸').?,
+            .{ .grid_metrics = .{
+                .cell_width = 10,
+                .cell_height = 24,
+                .cell_baseline = 0,
+                .underline_position = 0,
+                .underline_thickness = 0,
+                .strikethrough_position = 0,
+                .strikethrough_thickness = 0,
+                .overline_position = 0,
+                .overline_thickness = 0,
+                .box_thickness = 0,
+                .cursor_height = 0,
+            } },
+        );
+        try testing.expectEqual(@as(u32, 24), glyph.height);
+    }
+}
+
+test "mono to rgba" {
+    const alloc = testing.allocator;
+    const testFont = font.embedded.emoji;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .rgba);
+    defer atlas.deinit(alloc);
+
+    var ft_font = try Face.init(lib, testFont, .{ .size = .{ .points = 12, .xdpi = 72, .ydpi = 72 } });
+    defer ft_font.deinit();
+
+    _ = try ft_font.renderGlyph(
+        alloc,
+        &atlas,
+        3,
+        .{ .grid_metrics = font.Metrics.calc(try ft_font.getMetrics()) },
+    );
+}
+
+test "svg font table" {
+    const alloc = testing.allocator;
+    const testFont = font.embedded.julia_mono;
+
+    var lib = try font.Library.init();
+    defer lib.deinit();
+
+    var face = try Face.init(lib, testFont, .{ .size = .{ .points = 12, .xdpi = 72, .ydpi = 72 } });
+    defer face.deinit();
+
+    const table = (try face.copyTable(alloc, "SVG ")).?;
+    defer alloc.free(table);
+
+    try testing.expectEqual(430, table.len);
+}
+
+const terminus_i =
+    \\........
+    \\........
+    \\...#....
+    \\...#....
+    \\........
+    \\..##....
+    \\...#....
+    \\...#....
+    \\...#....
+    \\...#....
+    \\...#....
+    \\..###...
+    \\........
+    \\........
+    \\........
+    \\........
+;
+const terminus_i_pitch = 9;
+
+test "bitmap glyph" {
+    const alloc = testing.allocator;
+    const testFont = font.embedded.terminus_ttf;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+    defer atlas.deinit(alloc);
+
+    var ft_font = try Face.init(lib, testFont, .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } });
+    defer ft_font.deinit();
+
+    const glyph = try ft_font.renderGlyph(
+        alloc,
+        &atlas,
+        77,
+        .{ .grid_metrics = font.Metrics.calc(try ft_font.getMetrics()) },
+    );
+
+    try testing.expectEqual(8, glyph.width);
+    try testing.expectEqual(16, glyph.height);
+    for (0..glyph.height) |y| {
+        for (0..glyph.width) |x| {
+            const pixel = terminus_i[y * terminus_i_pitch + x];
+            try testing.expectEqual(
+                @as(u8, if (pixel == '#') 255 else 0),
+                atlas.data[(glyph.atlas_y + y) * atlas.size + (glyph.atlas_x + x)],
+            );
+        }
+    }
+}
+```
