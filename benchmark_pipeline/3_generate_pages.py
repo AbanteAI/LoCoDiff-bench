@@ -997,21 +997,24 @@ function initializeChart(chartData) {
                             }
                             
                             try {
-                                const modelName = context.dataset.label;
+                                // Get display name (which is the label) and the original model name for data lookup
+                                const displayName = context.dataset.label;
+                                // Use originalModel property we added to dataset for data lookup
+                                const originalModel = context.dataset.originalModel || displayName;
                                 
                                 // Safety check for dataIndex
                                 if (context.dataIndex === undefined || !chartData.buckets[context.dataIndex]) {
-                                    return [`${modelName}`];
+                                    return [`${displayName}`];
                                 }
                                 
                                 const bucketData = chartData.buckets[context.dataIndex];
                                 
                                 // Safety check for model data
-                                if (!bucketData.models || !bucketData.models[modelName]) {
-                                    return [`${modelName}: No data available`];
+                                if (!bucketData.models || !bucketData.models[originalModel]) {
+                                    return [`${displayName}: No data available`];
                                 }
                                 
-                                const modelData = bucketData.models[modelName];
+                                const modelData = bucketData.models[originalModel];
                                 
                                 // Get basic stats
                                 const successRate = context.raw;
@@ -1020,9 +1023,9 @@ function initializeChart(chartData) {
                                 let successful, attempts;
                                 
                                 // Check if we have filtered data for this bucket and model
-                                if (bucketData.filteredData && bucketData.filteredData[modelName]) {
-                                    successful = bucketData.filteredData[modelName].successful;
-                                    attempts = bucketData.filteredData[modelName].attempts;
+                                if (bucketData.filteredData && bucketData.filteredData[originalModel]) {
+                                    successful = bucketData.filteredData[originalModel].successful;
+                                    attempts = bucketData.filteredData[originalModel].attempts;
                                 } else {
                                     // Fall back to overall data (before filtering)
                                     successful = modelData.overall.successful;
@@ -1037,11 +1040,6 @@ function initializeChart(chartData) {
                                     const [lower, upper] = wilson_score_interval(successful, attempts);
                                     ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
                                 }
-
-                                // Get display name if available
-                                const displayName = chartData.model_display_names && chartData.model_display_names[modelName] 
-                                    ? chartData.model_display_names[modelName] 
-                                    : modelName;
                                 
                                 return [
                                     `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${attempts})`,
@@ -1167,9 +1165,15 @@ function initializeChart(chartData) {
                 });
             }
             
+            // Get display name if available
+            const displayName = chartData.model_display_names && chartData.model_display_names[model] 
+                ? chartData.model_display_names[model] 
+                : model;
+                
             // Add main dataset
             chart.data.datasets.push({
-                label: model,
+                label: displayName,
+                originalModel: model, // Store original model name for data lookup
                 data: dataPoints,
                 borderColor: color,
                 backgroundColor: color + '33',
@@ -1186,7 +1190,7 @@ function initializeChart(chartData) {
                 // Add lower bound line first (needed for reference by the area dataset)
                 const lowerBoundIndex = chart.data.datasets.length;
                 chart.data.datasets.push({
-                    label: `${model} (95% CI lower)`,
+                    label: `${displayName} (95% CI lower)`,
                     data: lowerBoundPoints,
                     borderColor: 'transparent',
                     backgroundColor: 'transparent',
@@ -1199,7 +1203,7 @@ function initializeChart(chartData) {
                 
                 // Add confidence interval area
                 chart.data.datasets.push({
-                    label: `${model} (95% CI)`,
+                    label: `${displayName} (95% CI)`,
                     data: upperBoundPoints,
                     borderColor: 'transparent',
                     backgroundColor: color + '22', // Very transparent version of the line color
