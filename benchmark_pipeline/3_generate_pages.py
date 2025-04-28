@@ -153,29 +153,35 @@ def infer_language_from_filename(filename: str, ext_to_lang_map: Dict[str, str])
     return "unknown"
 
 
-def load_language_config(config_path: str) -> Dict[str, str]:
+def load_benchmark_config(config_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Loads the language configuration and builds a map from extensions to language names.
+    Loads the benchmark configuration including language mappings and model display names.
 
     Args:
-        config_path: Path to the languages.yaml file
+        config_path: Path to the configuration YAML file
 
     Returns:
-        Dictionary mapping file extensions to language names
+        Tuple containing:
+        - Dictionary mapping file extensions to language names
+        - Dictionary mapping original model names to display names
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
+        # Load language mappings
         ext_to_lang = {}
-        for lang, settings in config.items():
+        for lang, settings in config["languages"].items():
             for ext in settings.get("extensions", []):
                 ext_to_lang[ext] = lang
 
-        return ext_to_lang
+        # Load model display name mappings
+        model_display_names = config["model_display_names"]
+
+        return ext_to_lang, model_display_names
     except (yaml.YAMLError, IOError) as e:
-        print(f"Error loading language config from {config_path}: {e}")
-        # Fallback to basic extensions
+        print(f"Error loading benchmark config from {config_path}: {e}")
+        # Fallback to basic extensions and no model display names
         return {
             ".py": "python",
             ".js": "javascript",
@@ -183,7 +189,7 @@ def load_language_config(config_path: str) -> Dict[str, str]:
             ".ts": "typescript",
             ".tsx": "typescript",
             ".zig": "zig",
-        }
+        }, {}
 
 
 # --- Data Collection Functions ---
@@ -354,6 +360,7 @@ def create_overall_stats_table(
     results_metadata: Dict[Any, Dict[str, Any]],
     all_models: Set[str],
     num_cases: int,
+    model_display_names: Dict[str, str] = {},
 ) -> str:
     """
     Creates an HTML table showing overall statistics for each model.
@@ -362,10 +369,12 @@ def create_overall_stats_table(
         results_metadata: Dictionary mapping (case_prefix, model) to result metadata
         all_models: Set of all model names
         num_cases: Total number of benchmark cases
+        model_display_names: Optional dictionary mapping model names to display names
 
     Returns:
         HTML string containing the table
     """
+
     # Aggregate statistics by model
     model_stats = {}
     for (case_prefix, model), metadata in results_metadata.items():
@@ -410,9 +419,12 @@ def create_overall_stats_table(
         total_cost = stats["total_cost"]
         avg_cost = total_cost / attempts if attempts > 0 else 0
 
+        # Use display name if available
+        display_name = model_display_names.get(model, model)
+
         html += f"""
                 <tr>
-                    <td>{model}</td>
+                    <td>{display_name}</td>
                     <td>{success_rate:.2f}% ({stats["successful"]}/{attempts})</td>
                     <td>{attempts}/{num_cases} ({attempts / num_cases * 100:.2f}%)</td>
                     <td>${total_cost:.6f}</td>
@@ -433,6 +445,7 @@ def create_quartile_stats_table(
     results_metadata: Dict[Any, Dict[str, Any]],
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
+    model_display_names: Dict[str, str] = {},
 ) -> str:
     """
     Creates an HTML table showing success rates by prompt size quartiles.
@@ -441,10 +454,12 @@ def create_quartile_stats_table(
         results_metadata: Dictionary mapping (case_prefix, model) to result metadata
         prompt_metadata: Dictionary of prompt metadata by case prefix
         all_models: Set of all model names
+        model_display_names: Optional dictionary mapping model names to display names
 
     Returns:
         HTML string containing the table
     """
+
     # Extract prompt token counts for quartile calculation
     prompt_tokens_list = []
     for case_prefix, metadata in prompt_metadata.items():
@@ -504,7 +519,9 @@ def create_quartile_stats_table(
     """
 
     for model in sorted(all_models):
-        html += f"<tr><td>{model}</td>"
+        # Use display name if available
+        display_name = model_display_names.get(model, model)
+        html += f"<tr><td>{display_name}</td>"
 
         quartile_stats = model_quartile_stats.get(model, {})
         for i in range(4):
@@ -530,6 +547,7 @@ def create_language_stats_table(
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
     ext_to_lang_map: Dict[str, str],
+    model_display_names: Dict[str, str] = {},
 ) -> str:
     """
     Creates an HTML table showing success rates by programming language.
@@ -539,10 +557,12 @@ def create_language_stats_table(
         prompt_metadata: Dictionary of prompt metadata by case prefix
         all_models: Set of all model names
         ext_to_lang_map: Dictionary mapping file extensions to language names
+        model_display_names: Optional dictionary mapping model names to display names
 
     Returns:
         HTML string containing the table
     """
+
     # First determine language for each case prefix
     case_languages = {}
     for case_prefix, metadata in prompt_metadata.items():
@@ -599,7 +619,9 @@ def create_language_stats_table(
     """
 
     for model in sorted(all_models):
-        html += f"<tr><td>{model}</td>"
+        # Use display name if available
+        display_name = model_display_names.get(model, model)
+        html += f"<tr><td>{display_name}</td>"
 
         language_stats = model_language_stats.get(model, {})
         for language in all_languages:
@@ -662,6 +684,7 @@ def generate_chart_data(
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
     case_languages: Dict[str, str],
+    model_display_names: Dict[str, str] = {},
 ) -> Dict[str, Any]:
     """
     Generates data for the token-based chart.
@@ -670,9 +693,17 @@ def generate_chart_data(
     with each point representing a +/- 10k token bucket.
     Each prompt is included in all buckets whose range covers its length.
 
+    Args:
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        all_models: Set of all model names
+        case_languages: Dictionary mapping case prefixes to language names
+        model_display_names: Optional dictionary mapping model names to display names
+
     Returns:
         Dictionary containing the chart data
     """
+
     # Find max token count (min is always 0)
     token_counts = [meta.get("prompt_tokens", 0) for meta in prompt_metadata.values()]
     max_tokens = 75000  # Default max
@@ -763,10 +794,17 @@ def generate_chart_data(
             for language in model_data["languages"].keys():
                 all_languages.add(language)
 
+    # Create model display name mapping for the chart
+    model_display_map = {}
+    for model in all_models:
+        if model in model_display_names:
+            model_display_map[model] = model_display_names[model]
+
     # Create the chart data object
     chart_data = {
         "buckets": buckets,
         "models": list(sorted(all_models)),
+        "model_display_names": model_display_map,  # Add model display names to chart data
         "languages": list(sorted(all_languages)),
         "min_tokens_k": 0,  # Always start at 0k
         "max_tokens_k": max_tokens_k,
@@ -878,13 +916,18 @@ function initializeChart(chartData) {
     const modelCheckboxes = document.getElementById('model-checkboxes');
     chartData.models.forEach((model, index) => {
         const color = colors[index % colors.length];
+        // Use display name if available, otherwise use original model name
+        const displayName = chartData.model_display_names && chartData.model_display_names[model] 
+            ? chartData.model_display_names[model] 
+            : model;
+        
         const checkbox = document.createElement('div');
         checkbox.className = 'checkbox-item';
         checkbox.innerHTML = `
             <label>
                 <input type="checkbox" data-model="${model}" checked>
                 <span class="checkbox-color" style="background-color: ${color};"></span>
-                ${model}
+                ${displayName}
             </label>
         `;
         modelCheckboxes.appendChild(checkbox);
@@ -954,21 +997,24 @@ function initializeChart(chartData) {
                             }
                             
                             try {
-                                const modelName = context.dataset.label;
+                                // Get display name (which is the label) and the original model name for data lookup
+                                const displayName = context.dataset.label;
+                                // Use originalModel property we added to dataset for data lookup
+                                const originalModel = context.dataset.originalModel || displayName;
                                 
                                 // Safety check for dataIndex
                                 if (context.dataIndex === undefined || !chartData.buckets[context.dataIndex]) {
-                                    return [`${modelName}`];
+                                    return [`${displayName}`];
                                 }
                                 
                                 const bucketData = chartData.buckets[context.dataIndex];
                                 
                                 // Safety check for model data
-                                if (!bucketData.models || !bucketData.models[modelName]) {
-                                    return [`${modelName}: No data available`];
+                                if (!bucketData.models || !bucketData.models[originalModel]) {
+                                    return [`${displayName}: No data available`];
                                 }
                                 
-                                const modelData = bucketData.models[modelName];
+                                const modelData = bucketData.models[originalModel];
                                 
                                 // Get basic stats
                                 const successRate = context.raw;
@@ -977,9 +1023,9 @@ function initializeChart(chartData) {
                                 let successful, attempts;
                                 
                                 // Check if we have filtered data for this bucket and model
-                                if (bucketData.filteredData && bucketData.filteredData[modelName]) {
-                                    successful = bucketData.filteredData[modelName].successful;
-                                    attempts = bucketData.filteredData[modelName].attempts;
+                                if (bucketData.filteredData && bucketData.filteredData[originalModel]) {
+                                    successful = bucketData.filteredData[originalModel].successful;
+                                    attempts = bucketData.filteredData[originalModel].attempts;
                                 } else {
                                     // Fall back to overall data (before filtering)
                                     successful = modelData.overall.successful;
@@ -996,7 +1042,7 @@ function initializeChart(chartData) {
                                 }
                                 
                                 return [
-                                    `${modelName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${attempts})`,
+                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${attempts})`,
                                     `Token Range: ${bucketData.bucket_range}${ciInfo}`
                                 ];
                             } catch (error) {
@@ -1119,9 +1165,15 @@ function initializeChart(chartData) {
                 });
             }
             
+            // Get display name if available
+            const displayName = chartData.model_display_names && chartData.model_display_names[model] 
+                ? chartData.model_display_names[model] 
+                : model;
+                
             // Add main dataset
             chart.data.datasets.push({
-                label: model,
+                label: displayName,
+                originalModel: model, // Store original model name for data lookup
                 data: dataPoints,
                 borderColor: color,
                 backgroundColor: color + '33',
@@ -1138,7 +1190,7 @@ function initializeChart(chartData) {
                 // Add lower bound line first (needed for reference by the area dataset)
                 const lowerBoundIndex = chart.data.datasets.length;
                 chart.data.datasets.push({
-                    label: `${model} (95% CI lower)`,
+                    label: `${displayName} (95% CI lower)`,
                     data: lowerBoundPoints,
                     borderColor: 'transparent',
                     backgroundColor: 'transparent',
@@ -1151,7 +1203,7 @@ function initializeChart(chartData) {
                 
                 // Add confidence interval area
                 chart.data.datasets.push({
-                    label: `${model} (95% CI)`,
+                    label: `${displayName} (95% CI)`,
                     data: upperBoundPoints,
                     borderColor: 'transparent',
                     backgroundColor: color + '22', // Very transparent version of the line color
@@ -1357,9 +1409,12 @@ def main():
     results_dir = benchmark_run_dir / "results"
     docs_dir = Path("docs")
 
-    # Load language configuration
-    languages_config_path = Path("benchmark_pipeline/languages.yaml")
-    ext_to_lang_map = load_language_config(str(languages_config_path))
+    # Load benchmark configuration (languages and model display names)
+    config_path = Path("benchmark_pipeline/benchmark_config.yaml")
+    ext_to_lang_map, model_display_names = load_benchmark_config(str(config_path))
+
+    if model_display_names:
+        print(f"Loaded {len(model_display_names)} model display name mappings")
 
     # Check for required directories
     if not prompts_dir.exists() or not prompts_dir.is_dir():
@@ -1400,7 +1455,11 @@ def main():
     # Generate chart data
     print("Generating chart data...")
     chart_data = generate_chart_data(
-        results_metadata, prompt_metadata, all_models, case_languages
+        results_metadata,
+        prompt_metadata,
+        all_models,
+        case_languages,
+        model_display_names,
     )
 
     # Write chart data to file
@@ -1410,12 +1469,18 @@ def main():
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
-    html_content += create_overall_stats_table(results_metadata, all_models, num_cases)
+    html_content += create_overall_stats_table(
+        results_metadata, all_models, num_cases, model_display_names
+    )
     html_content += create_quartile_stats_table(
-        results_metadata, prompt_metadata, all_models
+        results_metadata, prompt_metadata, all_models, model_display_names
     )
     html_content += create_language_stats_table(
-        results_metadata, prompt_metadata, all_models, ext_to_lang_map
+        results_metadata,
+        prompt_metadata,
+        all_models,
+        ext_to_lang_map,
+        model_display_names,
     )
     html_content += create_token_chart_section()
     html_content += create_cases_placeholder()
