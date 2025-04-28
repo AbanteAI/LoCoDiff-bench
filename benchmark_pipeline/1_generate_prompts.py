@@ -427,12 +427,8 @@ def load_language_config(
             f"Invalid format in {filepath}: Top level must be a dictionary."
         )
 
-    # Extract languages section if present
-    if "languages" in config and isinstance(config["languages"], dict):
-        language_config = config["languages"]
-    else:
-        # Fall back to legacy format where languages are at the top level
-        language_config = config
+    # Extract languages section
+    language_config = config["languages"]
 
     # Basic validation
     for lang, settings in language_config.items():

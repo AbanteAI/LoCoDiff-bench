@@ -171,21 +171,12 @@ def load_benchmark_config(config_path: str) -> Tuple[Dict[str, str], Dict[str, s
 
         # Load language mappings
         ext_to_lang = {}
-        if "languages" in config:
-            for lang, settings in config["languages"].items():
-                for ext in settings.get("extensions", []):
-                    ext_to_lang[ext] = lang
-        else:
-            # Handle old format without 'languages' section for backward compatibility
-            for lang, settings in config.items():
-                if isinstance(settings, dict) and "extensions" in settings:
-                    for ext in settings.get("extensions", []):
-                        ext_to_lang[ext] = lang
+        for lang, settings in config["languages"].items():
+            for ext in settings.get("extensions", []):
+                ext_to_lang[ext] = lang
 
         # Load model display name mappings
-        model_display_names = {}
-        if "model_display_names" in config:
-            model_display_names = config["model_display_names"]
+        model_display_names = config["model_display_names"]
 
         return ext_to_lang, model_display_names
     except (yaml.YAMLError, IOError) as e:
