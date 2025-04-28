@@ -81,6 +81,7 @@ import difflib
 import glob
 import json
 import os
+import random
 import re
 import sys
 from collections import defaultdict
@@ -912,6 +913,10 @@ async def main():
         print("No remaining benchmark cases to run for this model.")
         print("--- Benchmark Run Complete ---")
         return 0
+
+    # Randomize the order of cases for a better sampling distribution
+    random.shuffle(cases_to_run_all)
+    print("Randomized the order of benchmark cases for better sampling.")
 
     # Determine cases to run based on limit
     if args.num_runs == 0:
