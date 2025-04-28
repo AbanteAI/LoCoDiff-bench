@@ -1,0 +1,886 @@
+import { Atom, Reactor, Signal, atom, computed, reactor, transact } from '@tldraw/state'
+import {
+  WeakCache,
+  assert,
+  filterEntries,
+  getOwnProperty,
+  objectMapEntries,
+  objectMapKeys,
+  objectMapValues,
+  throttleToNextFrame,
+  uniqueId,
+} from '@tldraw/utils'
+import isEqual from 'lodash.isequal'
+import { AtomMap } from './AtomMap'
+import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+import { RecordScope } from './RecordType'
+import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+import { StoreQueries } from './StoreQueries'
+import { SerializedSchema, StoreSchema } from './StoreSchema'
+import { StoreSideEffects } from './StoreSideEffects'
+import { devFreeze } from './devFreeze'
+
+/** @public */
+export type RecordFromId<K extends RecordId<UnknownRecord>> =
+  K extends RecordId<infer R> ? R : never
+
+/**
+ * A diff describing the changes to a collection.
+ *
+ * @public
+ */
+export interface CollectionDiff<T> {
+  added?: Set<T>
+  removed?: Set<T>
+}
+
+/** @public */
+export type ChangeSource = 'user' | 'remote'
+
+/** @public */
+export interface StoreListenerFilters {
+  source: ChangeSource | 'all'
+  scope: RecordScope | 'all'
+}
+
+/** @public */
+export interface HistoryEntry<R extends UnknownRecord = UnknownRecord> {
+  changes: RecordsDiff<R>
+  source: ChangeSource
+}
+
+/** @public */
+export type StoreListener<R extends UnknownRecord> = (entry: HistoryEntry<R>) => void
+
+/** @public */
+export interface CreateComputedCacheOpts<Data, R extends UnknownRecord> {
+  areRecordsEqual?(a: R, b: R): boolean
+  areResultsEqual?(a: Data, b: Data): boolean
+}
+
+/** @public */
+export interface ComputedCache<Data, R extends UnknownRecord> {
+  get(id: IdOf<R>): Data | undefined
+}
+
+/** @public */
+export type SerializedStore<R extends UnknownRecord> = Record<IdOf<R>, R>
+
+/** @public */
+export interface StoreSnapshot<R extends UnknownRecord> {
+  store: SerializedStore<R>
+  schema: SerializedSchema
+}
+
+/** @public */
+export interface StoreValidator<R extends UnknownRecord> {
+  validate(record: unknown): R
+  validateUsingKnownGoodVersion?(knownGoodVersion: R, record: unknown): R
+}
+
+/** @public */
+export type StoreValidators<R extends UnknownRecord> = {
+  [K in R['typeName']]: StoreValidator<Extract<R, { typeName: K }>>
+}
+
+/** @public */
+export interface StoreError {
+  error: Error
+  phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests'
+  recordBefore?: unknown
+  recordAfter: unknown
+  isExistingValidationIssue: boolean
+}
+
+/** @internal */
+export type StoreRecord<S extends Store<any>> = S extends Store<infer R> ? R : never
+
+/**
+ * A store of records.
+ *
+ * @public
+ */
+export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+  /**
+   * The random id of the store.
+   */
+  public readonly id: string
+
+  /**
+   * An AtomMap containing the stores records.
+   *
+   * @internal
+   * @readonly
+   */
+  private readonly records: AtomMap<IdOf<R>, R>
+
+  /**
+   * An atom containing the store's history.
+   *
+   * @public
+   * @readonly
+   */
+  readonly history: Atom<number, RecordsDiff<R>>
+
+  /**
+   * A StoreQueries instance for this store.
+   *
+   * @public
+   * @readonly
+   */
+  readonly query: StoreQueries<R>
+
+  /**
+   * A manager for side effects.
+   *
+   * @public
+   * @readonly
+   */
+  public readonly sideEffects: StoreSideEffects<R>
+
+  /**
+   * A set containing listeners that have been added to this store.
+   *
+   * @internal
+   */
+  private listeners = new Set<{ onHistory: StoreListener<R>; filters: StoreListenerFilters }>()
+
+  /**
+   * An array of history entries that have not yet been flushed.
+   *
+   * @internal
+   */
+  private historyAccumulator = new HistoryAccumulator<R>()
+
+  /**
+   * A reactor that responds to changes to the history by squashing the accumulated history and
+   * notifying listeners of the changes.
+   *
+   * @internal
+   */
+  private historyReactor: Reactor
+
+  /**
+   * A function to dispose of any in-flight history reactor.
+   *
+   * @internal
+   */
+  private cancelHistoryReactor(): void {
+    /* noop */
+  }
+
+  /**
+   * The set of types in each scope.
+   *
+   * @public
+   * @readonly
+   */
+  public readonly scopedTypes: { readonly [K in RecordScope]: ReadonlySet<R['typeName']> }
+
+  /** used to avoid running callbacks when rolling back changes in sync client */
+  private _runCallbacks = true
+
+  private isMergingRemoteChanges = false
+
+  private _integrityChecker?: () => void | undefined
+
+  private _isPossiblyCorrupted = false
+
+  constructor(config: {
+    id?: string
+    /** The store's initial data. */
+    initialData?: SerializedStore<R>
+    /**
+     * A map of validators for each record type. A record's validator will be called when the record
+     * is created or updated. It should throw an error if the record is invalid.
+     */
+    schema: StoreSchema<R, Props>
+    props: Props
+  }) {
+    const { initialData, schema, id } = config
+
+    this.id = id ?? uniqueId()
+    this.schema = schema
+    this.props = config.props
+
+    if (initialData) {
+      this.records = new AtomMap(
+        'store',
+        objectMapEntries(initialData).map(([id, record]) => [
+          id,
+          devFreeze(this.schema.validateRecord(this, record, 'initialize', null)),
+        ])
+      )
+    } else {
+      this.records = new AtomMap('store')
+    }
+
+    this.history = atom('history', 0, {
+      historyLength: 1000,
+    })
+
+    this.query = new StoreQueries<R>(this.records, this.history)
+    this.sideEffects = new StoreSideEffects<R>(this)
+
+    this.scopedTypes = {
+      document: new Set(
+        objectMapValues(this.schema.types)
+          .filter((t) => t.scope === 'document')
+          .map((t) => t.typeName)
+      ),
+      session: new Set(
+        objectMapValues(this.schema.types)
+          .filter((t) => t.scope === 'session')
+          .map((t) => t.typeName)
+      ),
+      presence: new Set(
+        objectMapValues(this.schema.types)
+          .filter((t) => t.scope === 'presence')
+          .map((t) => t.typeName)
+      ),
+    }
+
+    this.historyReactor = reactor(
+      'Store.historyReactor',
+      () => {
+        // deref to subscribe
+        this.history.get()
+        this._flushHistory()
+      },
+      { scheduleEffect: (cb) => (this.cancelHistoryReactor = throttleToNextFrame(cb)) }
+    )
+  }
+
+  dispose(): void {
+    this.cancelHistoryReactor()
+  }
+
+  /** @internal */
+  public _flushHistory() {
+    if (this.historyAccumulator.hasChanges()) {
+      const entries = this.historyAccumulator.flush()
+      for (const { changes, source } of entries) {
+        let instanceChanges: RecordsDiff<R> | null = null
+        let documentChanges: RecordsDiff<R> | null = null
+        let presenceChanges: RecordsDiff<R> | null = null
+        for (const { onHistory, filters } of this.listeners) {
+          if (filters.source !== 'all' && filters.source !== source) {
+            continue
+          }
+          if (filters.scope !== 'all') {
+            if (filters.scope === 'document') {
+              documentChanges ??= this.filterChangesByScope(changes, 'document')
+              if (!documentChanges) continue
+              onHistory({ changes: documentChanges, source })
+            } else if (filters.scope === 'session') {
+              instanceChanges ??= this.filterChangesByScope(changes, 'session')
+              if (!instanceChanges) continue
+              onHistory({ changes: instanceChanges, source })
+            } else {
+              presenceChanges ??= this.filterChangesByScope(changes, 'presence')
+              if (!presenceChanges) continue
+              onHistory({ changes: presenceChanges, source })
+            }
+          } else {
+            onHistory({ changes, source })
+          }
+        }
+      }
+    }
+  }
+
+  private updateHistory(changes: RecordsDiff<R>): void {
+    this.historyAccumulator.add({
+      changes,
+      source: this.isMergingRemoteChanges ? 'remote' : 'user',
+    })
+    if (this.listeners.size === 0) {
+      this.historyAccumulator.clear()
+    }
+    this.history.set(this.history.get() + 1, changes)
+  }
+
+  validate(phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests') {
+    this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
+  }
+
+  /**
+   * Add some records to the store. It's an error if they already exist.
+   *
+   * @param records - The records to add.
+   * @param phaseOverride - The phase override.
+   * @public
+   */
+  put(records: R[], phaseOverride?: 'initialize'): void {
+    this.atomic(() => {
+      const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {}
+      const additions: Record<IdOf<UnknownRecord>, R> = {}
+      let didChange = false
+
+      const source: ChangeSource = this.isMergingRemoteChanges ? 'remote' : 'user'
+
+      for (let i = 0, n = records.length; i < n; i++) {
+        let record = records[i]
+        const initialValue = this.records.__unsafe__getWithoutCapture(record.id)
+        if (initialValue) {
+          record = this.sideEffects.handleBeforeChange(initialValue, record, source)
+          const validated = this.schema.validateRecord(
+            this,
+            record,
+            phaseOverride ?? 'updateRecord',
+            initialValue
+          )
+          if (validated === initialValue) continue
+          record = devFreeze(record)
+          this.records.set(record.id, record)
+          didChange = true
+          updates[record.id] = [initialValue, record]
+          this.addDiffForAfterEvent(initialValue, record)
+        } else {
+          record = this.sideEffects.handleBeforeCreate(record, source)
+          record = devFreeze(this.schema.validateRecord(this, record, phaseOverride ?? 'createRecord', null))
+          additions[record.id] = record
+          this.addDiffForAfterEvent(null, record)
+
+          this.records.set(record.id, record)
+          didChange = true
+        }
+      }
+
+      if (!didChange) return
+      this.updateHistory({
+        added: additions,
+        updated: updates,
+        removed: {},
+      })
+    })
+  }
+
+  /**
+   * Remove some records from the store via their ids.
+   *
+   * @param ids - The ids of the records to remove.
+   * @public
+   */
+  remove(ids: IdOf<R>[]): void {
+    this.atomic(() => {
+      const toDelete = new Set(ids)
+      const source: ChangeSource = this.isMergingRemoteChanges ? 'remote' : 'user'
+
+      if (this.sideEffects.isEnabled()) {
+        for (const id of ids) {
+          const record = this.records.__unsafe__getWithoutCapture(id)
+          if (!record) continue
+          if (this.sideEffects.handleBeforeDelete(record, source) === false) {
+            toDelete.delete(id)
+          }
+        }
+      }
+
+      const actuallyDeleted = this.records.deleteMany(toDelete)
+      if (actuallyDeleted.length === 0) return
+
+      const removed: Record<IdOf<R>, R> = {}
+      for (const [id, record] of actuallyDeleted) {
+        removed[id] = record
+        this.addDiffForAfterEvent(record, null)
+      }
+      this.updateHistory({ added: {}, updated: {}, removed })
+    })
+  }
+
+  /**
+   * Get the value of a store record by its id.
+   *
+   * @param id - The id of the record to get.
+   * @public
+   */
+  get<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+    return this.records.get(id) as RecordFromId<K> | undefined
+  }
+
+  /**
+   * Get the value of a store record by its id without updating its epoch.
+   *
+   * @param id - The id of the record to get.
+   * @public
+   */
+  unsafeGetWithoutCapture<K extends IdOf<R>>(id: K): RecordFromId<K> | undefined {
+    return this.records.__unsafe__getWithoutCapture(id) as RecordFromId<K> | undefined
+  }
+
+  /**
+   * Opposite of `serialize`. Creates a JSON payload from the record store.
+   *
+   * @param scope - The scope of records to serialize. Defaults to 'document'.
+   * @returns The record store snapshot as a JSON payload.
+   * @public
+   */
+  serialize(scope: RecordScope | 'all' = 'document'): SerializedStore<R> {
+    const result: SerializedStore<R> = {} as any
+    for (const [id, record] of this.records) {
+      if (scope === 'all' || this.scopedTypes[scope].has(record.typeName)) {
+        result[id as IdOf<R>] = record
+      }
+    }
+    return result
+  }
+
+  /**
+   * Get a serialized snapshot of the store and its schema.
+   *
+   * ```ts
+   * const snapshot = store.getStoreSnapshot()
+   * store.loadStoreSnapshot(snapshot)
+   * ```
+   *
+   * @param scope - The scope of records to serialize. Defaults to 'document'.
+   * @public
+   */
+  getStoreSnapshot(scope: RecordScope | 'all' = 'document'): StoreSnapshot<R> {
+    return {
+      store: this.serialize(scope),
+      schema: this.schema.serialize(),
+    }
+  }
+
+  /**
+   * @deprecated use `getSnapshot` from the 'tldraw' package instead.
+   */
+  getSnapshot(scope: RecordScope | 'all' = 'document') {
+    console.warn(
+      '[tldraw] `Store.getSnapshot` is deprecated and will be removed in a future release. Use `getSnapshot` from the `tldraw` package instead.'
+    )
+    return this.getStoreSnapshot(scope)
+  }
+
+  /**
+   * Migrate a serialized snapshot of the store and its schema.
+   *
+   * ```ts
+   * const snapshot = store.getStoreSnapshot()
+   * store.migrateSnapshot(snapshot)
+   * ```
+   *
+   * @param snapshot - The snapshot to load.
+   * @public
+   */
+  migrateSnapshot(snapshot: StoreSnapshot<R>): StoreSnapshot<R> {
+    const migrationResult = this.schema.migrateStoreSnapshot(snapshot)
+
+    if (migrationResult.type === 'error') {
+      throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
+    }
+
+    return {
+      store: migrationResult.value,
+      schema: this.schema.serialize(),
+    }
+  }
+
+  /**
+   * Load a serialized snapshot.
+   *
+   * ```ts
+   * const snapshot = store.getStoreSnapshot()
+   * store.loadStoreSnapshot(snapshot)
+   * ```
+   *
+   * @param snapshot - The snapshot to load.
+   * @public
+   */
+  loadStoreSnapshot(snapshot: StoreSnapshot<R>): void {
+    const migrationResult = this.schema.migrateStoreSnapshot(snapshot)
+
+    if (migrationResult.type === 'error') {
+      throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`)
+    }
+
+    const prevRun = this._runCallbacks
+    this.atomic(() => {
+      this.clear()
+      this.put(Object.values(migrationResult.value))
+      this.ensureStoreIsUsable()
+    }, prevRun)
+  }
+
+  /**
+   * @deprecated use `loadSnapshot` from the 'tldraw' package instead.
+   */
+  loadSnapshot(snapshot: StoreSnapshot<R>) {
+    console.warn(
+      "[tldraw] `Store.loadSnapshot` is deprecated and will be removed in a future release. Use `loadSnapshot` from the 'tldraw' package instead."
+    )
+    this.loadStoreSnapshot(snapshot)
+  }
+
+  /**
+   * Get an array of all values in the store.
+   *
+   * @returns An array of all values in the store.
+   * @public
+   */
+  allRecords(): R[] {
+    return Array.from(this.records.values())
+  }
+
+  /**
+   * Removes all records from the store.
+   *
+   * @public
+   */
+  clear(): void {
+    this.remove(Array.from(this.records.keys()))
+  }
+
+  /**
+   * Add a new listener to the store.
+   *
+   * @param onHistory - The listener to call when the store updates.
+   * @param filters - Filters to apply to the listener.
+   * @returns A function to remove the listener.
+   * @public
+   */
+  listen(onHistory: StoreListener<R>, filters?: Partial<StoreListenerFilters>) {
+    this._flushHistory()
+    const listener = {
+      onHistory,
+      filters: {
+        source: filters?.source ?? 'all',
+        scope: filters?.scope ?? 'all',
+      },
+    }
+    this.listeners.add(listener)
+
+    if (!this.historyReactor.scheduler.isActivelyListening) {
+      this.historyReactor.start()
+      this.historyReactor.scheduler.execute()
+    }
+
+    return () => {
+      this.listeners.delete(listener)
+      if (this.listeners.size === 0) {
+        this.historyReactor.stop()
+      }
+    }
+  }
+
+  /**
+   * Merge changes from a remote source
+   *
+   * @param fn - A function that merges the external changes.
+   * @public
+   */
+  mergeRemoteChanges(fn: () => void) {
+    if (this.isMergingRemoteChanges) {
+      return fn()
+    }
+
+    try {
+      this.atomic(fn, true, true)
+    } finally {
+      this.isMergingRemoteChanges = false
+      this.ensureStoreIsUsable()
+    }
+  }
+
+  /**
+   * Run `fn` and return a {@link RecordsDiff} of the changes that occurred as a result.
+   */
+  extractingChanges(fn: () => void): RecordsDiff<R> {
+    const changes: RecordsDiff<R>[] = []
+    const dispose = this.historyAccumulator.addInterceptor((entry) => changes.push(entry.changes))
+    try {
+      transact(fn)
+      return squashRecordDiffs(changes)
+    } finally {
+      dispose()
+    }
+  }
+
+  /**
+   * Apply a diff to the store.
+   *
+   * @param diff - The diff to apply
+   * @param options - Options controlling callbacks and ephemeral-key filtering
+   * @public
+   */
+  applyDiff(
+    diff: RecordsDiff<R>,
+    { runCallbacks = true, ignoreEphemeralKeys = false }: { runCallbacks?: boolean; ignoreEphemeralKeys?: boolean } = {}
+  ) {
+    this.atomic(() => {
+      const toPut: R[] = []
+
+      for (const [_, to] of objectMapEntries(diff.added)) {
+        toPut.push(to)
+      }
+      for (const [_, [from, to]] of objectMapEntries(diff.updated)) {
+        const type = this.schema.getType(to.typeName)
+        if (ignoreEphemeralKeys && type.ephemeralKeySet.size) {
+          const existing = this.get(to.id)
+          if (!existing) {
+            toPut.push(to)
+            continue
+          }
+          let changed: R | null = null
+          for (const [key, value] of Object.entries(to)) {
+            if (
+              type.ephemeralKeySet.has(key) ||
+              Object.is(value, getOwnProperty(existing, key))
+            ) {
+              continue
+            }
+            if (!changed) changed = { ...existing } as R
+            ;(changed as any)[key] = value
+          }
+          if (changed) toPut.push(changed)
+        } else {
+          toPut.push(to)
+        }
+      }
+
+      const toRemove = objectMapKeys(diff.removed)
+      if (toPut.length) this.put(toPut)
+      if (toRemove.length) this.remove(toRemove)
+    }, runCallbacks)
+  }
+
+  /**
+   * Create a cache based on values in the store. Pass in a function that takes an ID and a
+   * signal for the underlying record. Return a signal (usually a computed) for the cached value.
+   * For simple derivations, use {@link createComputedCache}. This function is useful for more complex logic.
+   *
+   * @public
+   */
+  createCache<Result, Record extends R = R>(
+    create: (id: IdOf<Record>, recordSignal: Signal<R>) => Signal<Result>
+  ) {
+    const cache = new WeakCache<Signal<any>, Signal<Result>>()
+    return {
+      get(id: IdOf<Record>) {
+        const atom = this.records.getAtom(id)
+        if (!atom) return undefined
+        return cache.get(atom, () => create(id, atom as Signal<R>)).get()
+      },
+    }
+  }
+
+  /**
+   * Create a computed cache.
+   *
+   * @param name - The name of the derivation cache.
+   * @param derive - A function used to derive the value of the cache.
+   * @param opts - Options for record/result equality.
+   * @public
+   */
+  createComputedCache<Result, Record extends R = R>(
+    name: string,
+    derive: (record: Record) => Result | undefined,
+    opts?: CreateComputedCacheOpts<Result, Record>
+  ): ComputedCache<Result, Record> {
+    return this.createCache((id, record) => {
+      const recordSignal = opts?.areRecordsEqual
+        ? computed(`${name}:${id}:isEqual`, () => record.get(), {
+            isEqual: opts.areRecordsEqual,
+          })
+        : record
+
+      return computed<Result | undefined>(
+        `${name}:${id}`,
+        () => derive(recordSignal.get() as Record),
+        { isEqual: opts?.areResultsEqual }
+      )
+    })
+  }
+
+  private pendingAfterEvents: Map<IdOf<R>, { before: R | null; after: R | null }> | null = null
+
+  private addDiffForAfterEvent(before: R | null, after: R | null) {
+    assert(this.pendingAfterEvents, 'must be in event operation')
+    if (before === after) return
+    if (before && after) assert(before.id === after.id)
+    if (!before && !after) return
+    const id = (before || after)!.id
+    const existing = this.pendingAfterEvents.get(id)
+    if (existing) {
+      existing.after = after
+    } else {
+      this.pendingAfterEvents.set(id, { before, after })
+    }
+  }
+
+  private flushAtomicCallbacks(isMergingRemoteChanges: boolean) {
+    let updateDepth = 0
+    let source: ChangeSource = isMergingRemoteChanges ? 'remote' : 'user'
+    while (this.pendingAfterEvents) {
+      const events = this.pendingAfterEvents
+      this.pendingAfterEvents = null
+
+      for (const { before, after } of events.values()) {
+        if (before && after && before !== after && !isEqual(before, after)) {
+          this.sideEffects.handleAfterChange(before, after, source)
+        } else if (before && !after) {
+          this.sideEffects.handleAfterDelete(before, source)
+        } else if (!before && after) {
+          this.sideEffects.handleAfterCreate(after, source)
+        }
+      }
+
+      if (!this.pendingAfterEvents) {
+        this.sideEffects.handleOperationComplete(source)
+      } else {
+        // subsequent events now count as 'user'
+        source = 'user'
+      }
+    }
+  }
+
+  private _isInAtomicOp = false
+
+  /** @internal */
+  atomic<T>(
+    fn: () => T,
+    runCallbacks = true,
+    isMergingRemoteChanges = false
+  ): T {
+    return transact(() => {
+      if (this._isInAtomicOp) {
+        if (!this.pendingAfterEvents) this.pendingAfterEvents = new Map()
+        const prevSideEffectsEnabled = this.sideEffects.isEnabled()
+        assert(!isMergingRemoteChanges, 'cannot call mergeRemoteChanges while in atomic operation')
+        try {
+          if (prevSideEffectsEnabled && !runCallbacks) {
+            this.sideEffects.setIsEnabled(false)
+          }
+          return fn()
+        } finally {
+          this.sideEffects.setIsEnabled(prevSideEffectsEnabled)
+        }
+      }
+
+      this.pendingAfterEvents = new Map()
+      const prevSideEffectsEnabled = this.sideEffects.isEnabled()
+      this.sideEffects.setIsEnabled(runCallbacks)
+      this._isInAtomicOp = true
+
+      if (isMergingRemoteChanges) {
+        this.isMergingRemoteChanges = true
+      }
+
+      try {
+        const result = fn()
+        this.isMergingRemoteChanges = false
+        this.flushAtomicCallbacks(isMergingRemoteChanges)
+        return result
+      } finally {
+        this.pendingAfterEvents = null
+        this.sideEffects.setIsEnabled(prevSideEffectsEnabled)
+        this._isInAtomicOp = false
+        this.isMergingRemoteChanges = false
+      }
+    })
+  }
+
+  /** @internal */
+  ensureStoreIsUsable() {
+    this.atomic(() => {
+      this._integrityChecker ??= this.schema.createIntegrityChecker(this)
+      this._integrityChecker?.()
+    })
+  }
+
+  /** @internal */
+  markAsPossiblyCorrupted() {
+    this._isPossiblyCorrupted = true
+  }
+
+  /** @internal */
+  isPossiblyCorrupted() {
+    return this._isPossiblyCorrupted
+  }
+}
+
+/** @public */
+export function createComputedCache<
+  Context extends Store<any> | { store: Store<any> },
+  Result,
+  Record extends Context extends Store<infer R>
+    ? R
+    : Context extends { store: Store<infer R> }
+    ? R
+    : never
+>(
+  name: string,
+  derive: (context: Context, record: Record) => Result | undefined,
+  opts?: CreateComputedCacheOpts<Result, Record>
+) {
+  const cache = new WeakCache<Context, ComputedCache<Result, Record>>()
+  return {
+    get(context: Context, id: IdOf<Record>) {
+      const computedCache = cache.get(context, () => {
+        const store = (context instanceof Store ? context : context.store) as Store<Record>
+        return store.createComputedCache(name, (record) => derive(context, record), opts)
+      })
+      return computedCache.get(id)
+    },
+  }
+}
+
+class HistoryAccumulator<T extends UnknownRecord> {
+  private _history: HistoryEntry<T>[] = []
+  private _interceptors: Set<(entry: HistoryEntry<T>) => void> = new Set()
+
+  addInterceptor(fn: (entry: HistoryEntry<T>) => void) {
+    this._interceptors.add(fn)
+    return () => {
+      this._interceptors.delete(fn)
+    }
+  }
+
+  add(entry: HistoryEntry<T>) {
+    this._history.push(entry)
+    for (const interceptor of this._interceptors) {
+      interceptor(entry)
+    }
+  }
+
+  flush() {
+    const entries = squashHistoryEntries(this._history)
+    this._history = []
+    return entries
+  }
+
+  clear() {
+    this._history = []
+  }
+
+  hasChanges() {
+    return this._history.length > 0
+  }
+}
+
+function squashHistoryEntries<T extends UnknownRecord>(
+  entries: HistoryEntry<T>[]
+): HistoryEntry<T>[] {
+  if (entries.length === 0) return []
+  const chunked: HistoryEntry<T>[][] = []
+  let chunk: HistoryEntry<T>[] = [entries[0]]
+
+  for (let i = 1; i < entries.length; i++) {
+    const entry = entries[i]
+    if (chunk[0].source !== entry.source) {
+      chunked.push(chunk)
+      chunk = []
+    }
+    chunk.push(entry)
+  }
+  chunked.push(chunk)
+
+  return devFreeze(
+    chunked.map((chunk) => ({
+      source: chunk[0].source,
+      changes: squashRecordDiffs(chunk.map((e) => e.changes)),
+    }))
+  )
+}

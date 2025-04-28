@@ -1,0 +1,290 @@
+import {
+	CubicSpline2d,
+	Group2d,
+	HandleSnapGeometry,
+	Polyline2d,
+	SVGContainer,
+	ShapeUtil,
+	TLHandle,
+	TLLineShape,
+	TLLineShapePoint,
+	TLHandleDragInfo,
+	TLResizeInfo,
+	Vec,
+	WeakCache,
+	ZERO_INDEX_KEY,
+	getIndexAbove,
+	getIndexBetween,
+	getIndices,
+	getPerfectDashProps,
+	lerp,
+	lineShapeMigrations,
+	lineShapeProps,
+	mapObjectMapValues,
+	maybeSnapToGrid,
+	sortByIndex,
+} from '@tldraw/editor'
+import { STROKE_SIZES } from '../arrow/shared'
+import { useDefaultColorTheme } from '../shared/useDefaultColorTheme'
+import { getLineDrawPath, getLineIndicatorPath } from './components/getLinePath'
+import { getDrawLinePathData } from './line-helpers'
+
+const handlesCache = new WeakCache<TLLineShape['props'], TLHandle[]>()
+
+/** @public */
+export class LineShapeUtil extends ShapeUtil<TLLineShape> {
+	static override type = 'line' as const
+	static override props = lineShapeProps
+	static override migrations = lineShapeMigrations
+
+	override canTabTo() {
+		return false
+	}
+	override hideResizeHandles() {
+		return true
+	}
+	override hideRotateHandle() {
+		return true
+	}
+	override hideSelectionBoundsFg() {
+		return true
+	}
+	override hideSelectionBoundsBg() {
+		return true
+	}
+
+	override getDefaultProps(): TLLineShape['props'] {
+		const [start, end] = getIndices(2)
+		return {
+			dash: 'draw',
+			size: 'm',
+			color: 'black',
+			spline: 'line',
+			points: {
+				[start]: { id: start, index: start, x: 0, y: 0 },
+				[end]: { id: end, index: end, x: 0.1, y: 0.1 },
+			},
+			scale: 1,
+		}
+	}
+
+	override onBeforeCreate(next: TLLineShape): void | TLLineShape {
+		const {
+			props: { points },
+		} = next
+		const pointKeys = Object.keys(points)
+		if (pointKeys.length < 2) return
+		const firstPoint = points[pointKeys[0]]
+		const allSame = pointKeys.every((key) => {
+			const point = points[key]
+			return point.x === firstPoint.x && point.y === firstPoint.y
+		})
+		if (allSame) {
+			const lastKey = pointKeys[pointKeys.length - 1]
+			points[lastKey] = {
+				...points[lastKey],
+				x: points[lastKey].x + 0.1,
+				y: points[lastKey].y + 0.1,
+			}
+			return next
+		}
+	}
+
+	override getHandles(shape: TLLineShape) {
+		return handlesCache.get(shape.props, () => {
+			const spline = getGeometryForLineShape(shape)
+			const points = linePointsToArray(shape)
+			const results: TLHandle[] = points.map((point) => ({
+				id: point.index,
+				index: point.index,
+				x: point.x,
+				y: point.y,
+				type: 'vertex',
+				canBind: false,
+				canSnap: true,
+			}))
+			for (let i = 0; i < points.length - 1; i++) {
+				const index = getIndexBetween(points[i].index, points[i + 1].index)
+				const segment = spline.segments[i]
+				const mid = segment.midPoint()
+				results.push({
+					id: index,
+					index,
+					x: mid.x,
+					y: mid.y,
+					type: 'create',
+					canBind: false,
+					canSnap: true,
+				})
+			}
+			return results.sort(sortByIndex)
+		})
+	}
+
+	override onResize(shape: TLLineShape, info: TLResizeInfo<TLLineShape>) {
+		const { scaleX, scaleY } = info
+		return {
+			props: {
+				points: mapObjectMapValues(shape.props.points, (_, { id, index, x, y }) => ({
+					id,
+					index,
+					x: x * scaleX,
+					y: y * scaleY,
+				})),
+			},
+		}
+	}
+
+	override onHandleDrag(shape: TLLineShape, { handle }: TLHandleDragInfo<TLLineShape>) {
+		if (handle.type !== 'vertex') return shape
+		const newPoint = maybeSnapToGrid(new Vec(handle.x, handle.y), this.editor)
+		return {
+			...shape,
+			props: {
+				...shape.props,
+				points: {
+					...shape.props.points,
+					[handle.id]: {
+						id: handle.id,
+						index: handle.index,
+						x: newPoint.x,
+						y: newPoint.y,
+					},
+				},
+			},
+		}
+	}
+
+	override component(shape: TLLineShape) {
+		return (
+			<SVGContainer style={{ minWidth: 50, minHeight: 50 }}>
+				<LineShapeSvg shape={shape} />
+			</SVGContainer>
+		)
+	}
+
+	override indicator(shape: TLLineShape) {
+		const strokeWidth = STROKE_SIZES[shape.props.size] * shape.props.scale
+		const spline = getGeometryForLineShape(shape)
+		const { dash } = shape.props
+
+		let path: string
+
+		if (shape.props.spline === 'line') {
+			const outline = spline.points
+			if (dash === 'solid' || dash === 'dotted' || dash === 'dashed') {
+				path = 'M' + outline[0] + 'L' + outline.slice(1)
+			} else {
+				const [innerPathData] = getDrawLinePathData(shape.id, outline, strokeWidth)
+				path = innerPathData
+			}
+		} else {
+			path = getLineIndicatorPath(shape, spline, strokeWidth)
+		}
+
+		return <path d={path} />
+	}
+
+	override toSvg(shape: TLLineShape) {
+		return <LineShapeSvg shouldScale shape={shape} />
+	}
+
+	override getHandleSnapGeometry(shape: TLLineShape): HandleSnapGeometry {
+		const points = linePointsToArray(shape)
+		return {
+			points,
+			getSelfSnapPoints: (handle) => {
+				const index = this.getHandles(shape)
+					.filter((h) => h.type === 'vertex')
+					.findIndex((h) => h.id === handle.id)!
+				return points.filter((_, i) => Math.abs(i - index) > 1).map(Vec.From)
+			},
+			getSelfSnapOutline: (handle) => {
+				const index = this.getHandles(shape)
+					.filter((h) => h.type === 'vertex')
+					.findIndex((h) => h.id === handle.id)!
+				const segments = getGeometryForLineShape(shape).segments.filter(
+					(_, i) => i !== index - 1 && i !== index
+				)
+				if (!segments.length) return null
+				return new Group2d({ children: segments })
+			},
+		}
+	}
+
+	override getInterpolatedProps(
+		startShape: TLLineShape,
+		endShape: TLLineShape,
+		t: number
+	): TLLineShape['props'] {
+		const startPoints = linePointsToArray(startShape)
+		const endPoints = linePointsToArray(endShape)
+
+		const pointsToUseStart: TLLineShapePoint[] = []
+		const pointsToUseEnd: TLLineShapePoint[] = []
+		let idx = ZERO_INDEX_KEY
+
+		if (startPoints.length > endPoints.length) {
+			for (let i = 0; i < startPoints.length; i++) {
+				pointsToUseStart[i] = { ...startPoints[i] }
+				if (endPoints[i] === undefined) {
+					pointsToUseEnd[i] = { ...endPoints[endPoints.length - 1], id: idx }
+				} else {
+					pointsToUseEnd[i] = { ...endPoints[i], id: idx }
+				}
+				idx = getIndexAbove(idx)
+			}
+		} else if (endPoints.length > startPoints.length) {
+			for (let i = 0; i < endPoints.length; i++) {
+				pointsToUseEnd[i] = { ...endPoints[i] }
+				if (startPoints[i] === undefined) {
+					pointsToUseStart[i] = {
+						...startPoints[startPoints.length - 1],
+						id: idx,
+					}
+				} else {
+					pointsToUseStart[i] = { ...startPoints[i], id: idx }
+				}
+				idx = getIndexAbove(idx)
+			}
+		} else {
+			for (let i = 0; i < endPoints.length; i++) {
+				pointsToUseStart[i] = startPoints[i]
+				pointsToUseEnd[i] = endPoints[i]
+			}
+		}
+
+		return {
+			...(t > 0.5 ? endShape.props : startShape.props),
+			points: Object.fromEntries(
+				pointsToUseStart.map((point, i) => {
+					const endP = pointsToUseEnd[i]
+					return [
+						point.id,
+						{
+							...point,
+							x: lerp(point.x, endP.x, t),
+							y: lerp(point.y, endP.y, t),
+						},
+					]
+				})
+			),
+			scale: lerp(startShape.props.scale, endShape.props.scale, t),
+		}
+	}
+}
+
+function linePointsToArray(shape: TLLineShape) {
+	return Object.values(shape.props.points).sort(sortByIndex)
+}
+
+/** @public */
+export function getGeometryForLineShape(shape: TLLineShape): CubicSpline2d | Polyline2d {
+	const points = linePointsToArray(shape).map(Vec.From)
+	switch (shape.props.spline) {
+		case 'cubic':
+			return new CubicSpline2d({ points })
+		case 'line':
+			return new Polyline2d({ points })
+	}
+}

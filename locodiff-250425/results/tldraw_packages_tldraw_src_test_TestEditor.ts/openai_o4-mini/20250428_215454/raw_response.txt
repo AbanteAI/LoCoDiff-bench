@@ -1,0 +1,592 @@
+```typescript
+import {
+	Box,
+	BoxModel,
+	Editor,
+	HALF_PI,
+	IdOf,
+	Mat,
+	PageRecordType,
+	ROTATE_CORNER_TO_SELECTION_CORNER,
+	RequiredKeys,
+	RotateCorner,
+	SelectionHandle,
+	TLContent,
+	TLEditorOptions,
+	TLEventInfo,
+	TLKeyboardEventInfo,
+	TLPinchEventInfo,
+	TLPointerEventInfo,
+	TLShape,
+	TLShapeId,
+	TLShapePartial,
+	TLStoreOptions,
+	TLWheelEventInfo,
+	Vec,
+	VecLike,
+	compact,
+	computed,
+	createShapeId,
+	createTLStore,
+	isAccelKey,
+	rotateSelectionHandle,
+	tlenv,
+} from '@tldraw/editor'
+import { defaultBindingUtils } from '../lib/defaultBindingUtils'
+import { defaultShapeTools } from '../lib/defaultShapeTools'
+import { defaultShapeUtils } from '../lib/defaultShapeUtils'
+import { registerDefaultSideEffects } from '../lib/defaultSideEffects'
+import { defaultTools } from '../lib/defaultTools'
+import { defaultAddFontsFromNode, tipTapDefaultExtensions } from '../lib/utils/text/richText'
+import { shapesFromJsx } from './test-jsx'
+
+jest.useFakeTimers()
+
+Object.assign(navigator, {
+	clipboard: {
+		write: () => {
+			// noop
+		},
+	},
+})
+
+// @ts-expect-error
+window.ClipboardItem = class {}
+
+declare global {
+	// eslint-disable-next-line @typescript-eslint/no-namespace
+	namespace jest {
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		interface Matchers<R> {
+			toCloselyMatchObject(value: any, precision?: number): void
+		}
+	}
+}
+
+export class TestEditor extends Editor {
+	elm: HTMLElement
+	readonly bounds: {
+		x: number
+		y: number
+		top: number
+		left: number
+		width: number
+		height: number
+		bottom: number
+		right: number
+	}
+	private _lastCreatedShapes: TLShape[] = []
+
+	constructor(
+		options: Partial<Omit<TLEditorOptions, 'store'>> = {},
+		storeOptions: Partial<TLStoreOptions> = {}
+	) {
+		const elm = document.createElement('div')
+		const bounds = {
+			x: 0,
+			y: 0,
+			top: 0,
+			left: 0,
+			width: 1080,
+			height: 720,
+			bottom: 720,
+			right: 1080,
+		}
+		// make the app full screen for the sake of the insets property
+		jest.spyOn(document.body, 'scrollWidth', 'get').mockImplementation(() => bounds.width)
+		jest.spyOn(document.body, 'scrollHeight', 'get').mockImplementation(() => bounds.height)
+
+		elm.tabIndex = 0
+		elm.getBoundingClientRect = () => bounds as DOMRect
+
+		const shapeUtilsWithDefaults = [...defaultShapeUtils, ...(options.shapeUtils ?? [])]
+		const bindingUtilsWithDefaults = [...defaultBindingUtils, ...(options.bindingUtils ?? [])]
+
+		super({
+			...options,
+			store: createTLStore({
+				shapeUtils: shapeUtilsWithDefaults,
+				bindingUtils: bindingUtilsWithDefaults,
+				...storeOptions,
+			}),
+			shapeUtils: shapeUtilsWithDefaults,
+			bindingUtils: bindingUtilsWithDefaults,
+			tools: [...defaultTools, ...defaultShapeTools, ...(options.tools ?? [])],
+			getContainer: () => elm,
+			initialState: 'select',
+			textOptions: {
+				addFontsFromNode: defaultAddFontsFromNode,
+				tipTapConfig: {
+					extensions: tipTapDefaultExtensions,
+				},
+			},
+		})
+
+		this.elm = elm
+		this.bounds = bounds
+		document.body.appendChild(this.elm)
+
+		// Text measurement overrides
+		this.textMeasure.measureText = (
+			textToMeasure: string,
+			opts: {
+				fontStyle: string
+				fontWeight: string
+				fontFamily: string
+				fontSize: number
+				lineHeight: number
+				maxWidth: null | number
+				padding: string
+			}
+		): BoxModel & { scrollWidth: number } => {
+			const breaks = textToMeasure.split('\n')
+			const longest = breaks.reduce((acc, curr) => (curr.length > acc.length ? curr : acc), '')
+			const w = longest.length * (opts.fontSize / 2)
+			return {
+				x: 0,
+				y: 0,
+				w: opts.maxWidth === null ? w : Math.max(w, opts.maxWidth),
+				h:
+					(opts.maxWidth === null
+						? breaks.length
+						: Math.ceil(w % opts.maxWidth) + breaks.length) * opts.fontSize,
+				scrollWidth: opts.maxWidth === null ? w : Math.max(w, opts.maxWidth),
+			}
+		}
+
+		this.textMeasure.measureHtml = (
+			html: string,
+			opts: {
+				fontStyle: string
+				fontWeight: string
+				fontFamily: string
+				fontSize: number
+				lineHeight: number
+				maxWidth: null | number
+				padding: string
+			}
+		): BoxModel & { scrollWidth: number } => {
+			const textToMeasure = html
+				.split('</p><p dir="auto">')
+				.join('\n')
+				.replace(/<[^>]+>/g, '')
+			return this.textMeasure.measureText(textToMeasure, opts)
+		}
+
+		this.textMeasure.measureTextSpans = (textToMeasure, opts) => {
+			const box = this.textMeasure.measureText(textToMeasure, {
+				...opts,
+				lineHeight: opts.lineHeight,
+				maxWidth: opts.maxWidth,
+				padding: opts.padding,
+			})
+			return [{ box, text: textToMeasure }]
+		}
+
+		// Turn off edge scrolling for tests. Tests that require this can turn it back on.
+		this.user.updateUserPreferences({ edgeScrollSpeed: 0 })
+
+		// Side effects & shape tracking
+		registerDefaultSideEffects(this)
+		this.sideEffects.registerAfterCreateHandler('shape', (record) => {
+			this._lastCreatedShapes.push(record)
+		})
+	}
+
+	static defaultShapesIds = {
+		box1: createShapeId('box1'),
+		box2: createShapeId('box2'),
+		ellipse1: createShapeId('ellipse1'),
+	}
+
+	createShapesFromJsx(shapesJsx: React.JSX.Element | React.JSX.Element[]): Record<string, TLShapeId> {
+		const { shapes, assets, ids } = shapesFromJsx(shapesJsx)
+		this.createAssets(assets)
+		this.createShapes(shapes)
+		return ids
+	}
+
+	getLastCreatedShapes(count = 1) {
+		return this._lastCreatedShapes.slice(-count).map((s) => this.getShape(s)!)
+	}
+
+	getLastCreatedShape<T extends TLShape>() {
+		const lastShape = this._lastCreatedShapes[this._lastCreatedShapes.length - 1] as T
+		return this.getShape<T>(lastShape)!
+	}
+
+	getHistory() {
+		return this.history
+	}
+
+	getPageCenter(shape: TLShape) {
+		const pageTransform = this.getShapePageTransform(shape.id)
+		if (!pageTransform) return null
+		const center = this.getShapeGeometry(shape).bounds.center
+		return Mat.applyToPoint(pageTransform, center)
+	}
+
+	getPageRotationById(id: TLShapeId): number {
+		const pageTransform = this.getShapePageTransform(id)
+		if (pageTransform) {
+			return Mat.Decompose(pageTransform).rotation
+		}
+		return 0
+	}
+
+	getPageRotation(shape: TLShape) {
+		return this.getPageRotationById(shape.id)
+	}
+
+	getArrowsBoundTo(shapeId: TLShapeId) {
+		const ids = new Set(
+			this.getBindingsToShape<TLArrowBinding>(shapeId, 'arrow').map((b) => b.fromId)
+		)
+		return compact(Array.from(ids, (id) => this.getShape<TLArrowShape>(id)))
+	}
+
+	getPath() {
+		return this.root.current.get()!.path.get()
+	}
+
+	expectToBeIn(path: string) {
+		expect(this.getPath()).toBe(path)
+		return this
+	}
+
+	expectCameraToBe(x: number, y: number, z: number) {
+		const camera = this.getCamera()
+		expect({
+			x: +camera.x.toFixed(2),
+			y: +camera.y.toFixed(2),
+			z: +camera.z.toFixed(2),
+		}).toCloselyMatchObject({ x, y, z })
+		return this
+	}
+
+	expectShapeToMatch<T extends TLShape = TLShape>(
+		...model: RequiredKeys<Partial<TLShapePartial<T>>, 'id'>[]
+	) {
+		model.forEach((model) => {
+			const shape = this.getShape(model.id!)!
+			const next = { ...shape, ...model }
+			expect(shape).toCloselyMatchObject(next)
+		})
+		return this
+	}
+
+	expectPageBoundsToBe<T extends TLShape = TLShape>(id: IdOf<T>, bounds: Partial<BoxModel>) {
+		const observedBounds = this.getShapePageBounds(id)!
+		expect(observedBounds).toCloselyMatchObject(bounds)
+		return this
+	}
+
+	expectScreenBoundsToBe<T extends TLShape = TLShape>(id: IdOf<T>, bounds: Partial<BoxModel>) {
+		const pageBounds = this.getShapePageBounds(id)!
+		const screenPoint = this.pageToScreen(pageBounds.point)
+		const observedBounds = pageBounds.clone()
+		observedBounds.x = screenPoint.x
+		observedBounds.y = screenPoint.y
+		expect(observedBounds).toCloselyMatchObject(bounds)
+		return this
+	}
+
+	@computed getViewportPageCenter() {
+		return this.getViewportPageBounds().center
+	}
+
+	setScreenBounds(bounds: BoxModel, center = false) {
+		this.bounds.x = bounds.x
+		this.bounds.y = bounds.y
+		this.bounds.top = bounds.y
+		this.bounds.left = bounds.x
+		this.bounds.width = bounds.w
+		this.bounds.height = bounds.h
+		this.bounds.right = bounds.x + bounds.w
+		this.bounds.bottom = bounds.y + bounds.h
+
+		this.updateViewportScreenBounds(Box.From(bounds), center)
+		return this
+	}
+
+	pan(offset: VecLike): this {
+		const { isLocked, panSpeed } = this.getCameraOptions()
+		if (isLocked) return this
+		const { x: cx, y: cy, z: cz } = this.getCamera()
+		this.setCamera(new Vec((cx + offset.x * panSpeed) / cz, (cy + offset.y * panSpeed) / cz, cz), {
+			immediate: true,
+		})
+		return this
+	}
+
+	copy(ids = this.getSelectedShapeIds()) {
+		if (ids.length > 0) {
+			const content = this.getContentFromCurrentPage(ids)
+			if (content) {
+				this.clipboard = content
+			}
+		}
+		return this
+	}
+
+	cut(ids = this.getSelectedShapeIds()) {
+		if (ids.length > 0) {
+			const content = this.getContentFromCurrentPage(ids)
+			if (content) {
+				this.clipboard = content
+			}
+			this.deleteShapes(ids)
+		}
+		return this
+	}
+
+	paste(point?: VecLike) {
+		if (this.clipboard !== null) {
+			const p = this.inputs.shiftKey ? this.inputs.currentPagePoint : point
+			this.markHistoryStoppingPoint('pasting')
+			this.putContentOntoCurrentPage(this.clipboard, {
+				point: p,
+				select: true,
+			})
+		}
+		return this
+	}
+
+	rightClick(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		options?: Partial<TLPointerEventInfo> | TLShapeId,
+		modifiers?: Partial<Pick<TLPointerEventInfo, 'shiftKey' | 'ctrlKey' | 'altKey' | 'metaKey' | 'accelKey'>>
+	) {
+		this.dispatch({
+			...this.getPointerEventInfo(x, y, options, modifiers),
+			name: 'pointer_down',
+			button: 2,
+		}).forceTick()
+		this.dispatch({
+			...this.getPointerEventInfo(x, y, options, modifiers),
+			name: 'pointer_up',
+			button: 2,
+		}).forceTick()
+		return this
+	}
+
+	click(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		options?: Partial<TLPointerEventInfo> | TLShapeId,
+		modifiers?: Partial<Pick<TLPointerEventInfo, 'shiftKey' | 'ctrlKey' | 'altKey' | 'metaKey' | 'accelKey'>>
+	) {
+		this.pointerDown(x, y, options, modifiers)
+		this.pointerUp(x, y, options, modifiers)
+		return this
+	}
+
+	doubleClick(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		options?: Partial<TLPointerEventInfo> | TLShapeId,
+		modifiers?: Partial<Pick<TLPointerEventInfo, 'shiftKey' | 'ctrlKey' | 'altKey' | 'metaKey' | 'accelKey'>>
+	) {
+		this.pointerDown(x, y, options, modifiers)
+		this.pointerUp(x, y, options, modifiers)
+		this.dispatch({
+			...this.getPointerEventInfo(x, y, options, modifiers),
+			type: 'click',
+			name: 'double_click',
+			phase: 'down',
+		}).forceTick()
+		this.dispatch({
+			...this.getPointerEventInfo(x, y, options, modifiers),
+			type: 'click',
+			name: 'double_click',
+			phase: 'up',
+		}).forceTick()
+		return this
+	}
+
+	keyDown(key: string, options = {} as Partial<Omit<TLKeyboardEventInfo, 'key'>>) {
+		this.dispatch({ ...this.getKeyboardEventInfo(key, 'key_down', options) }).forceTick()
+		return this
+	}
+
+	keyRepeat(key: string, options = {} as Partial<Omit<TLKeyboardEventInfo, 'key'>>) {
+		this.dispatch({ ...this.getKeyboardEventInfo(key, 'key_repeat', options) }).forceTick()
+		return this
+	}
+
+	keyUp(key: string, options = {} as Partial<Omit<TLKeyboardEventInfo, 'key'>>) {
+		this.dispatch({
+			...this.getKeyboardEventInfo(key, 'key_up', {
+				shiftKey: this.inputs.shiftKey && key !== 'Shift',
+				ctrlKey: this.inputs.ctrlKey && key !== 'Control',
+				altKey: this.inputs.altKey && key !== 'Alt',
+				metaKey: this.inputs.metaKey && key !== 'Meta',
+				...options,
+			}),
+		}).forceTick()
+		return this
+	}
+
+	wheel(dx: number, dy: number, options = {} as Partial<Omit<TLWheelEventInfo, 'delta'>>) {
+		this.dispatch({
+			type: 'wheel',
+			name: 'wheel',
+			point: new Vec(this.inputs.currentScreenPoint.x, this.inputs.currentScreenPoint.y),
+			shiftKey: this.inputs.shiftKey,
+			ctrlKey: this.inputs.ctrlKey,
+			altKey: this.inputs.altKey,
+			metaKey: this.inputs.metaKey,
+			accelKey: isAccelKey(this.inputs),
+			...options,
+			delta: { x: dx, y: dy },
+		}).forceTick(2)
+		return this
+	}
+
+	pinchStart(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		z: number,
+		dx: number,
+		dy: number,
+		dz: number,
+		options = {} as Partial<Omit<TLPinchEventInfo, 'point' | 'delta' | 'offset'>>
+	) {
+		this.dispatch({
+			type: 'pinch',
+			name: 'pinch_start',
+			shiftKey: this.inputs.shiftKey,
+			ctrlKey: this.inputs.ctrlKey,
+			altKey: this.inputs.altKey,
+			metaKey: this.inputs.metaKey,
+			accelKey: isAccelKey(this.inputs),
+			point: { x, y, z },
+			delta: { x: dx, y: dy, z: dz },
+			...options,
+		}).forceTick()
+		return this
+	}
+
+	pinchTo(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		z: number,
+		dx: number,
+		dy: number,
+		dz: number,
+		options = {} as Partial<Omit<TLPinchEventInfo, 'point' | 'delta' | 'offset'>>
+	) {
+		this.dispatch({
+			type: 'pinch',
+			name: 'pinch_start',
+			shiftKey: this.inputs.shiftKey,
+			ctrlKey: this.inputs.ctrlKey,
+			altKey: this.inputs.altKey,
+			metaKey: this.inputs.metaKey,
+			accelKey: isAccelKey(this.inputs),
+			point: { x, y, z },
+			delta: { x: dx, y: dy, z: dz },
+			...options,
+		}).forceTick()
+		return this
+	}
+
+	pinchEnd(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		z: number,
+		dx: number,
+		dy: number,
+		dz: number,
+		options = {} as Partial<Omit<TLPinchEventInfo, 'point' | 'delta' | 'offset'>>
+	) {
+		this.dispatch({
+			type: 'pinch',
+			name: 'pinch_end',
+			shiftKey: this.inputs.shiftKey,
+			ctrlKey: this.inputs.ctrlKey,
+			altKey: this.inputs.altKey,
+			metaKey: this.inputs.metaKey,
+			accelKey: isAccelKey(this.inputs),
+			point: { x, y, z },
+			delta: { x: dx, y: dy, z: dz },
+			...options,
+		}).forceTick()
+		return this
+	}
+
+	protected getInfo<T extends TLEventInfo>(info: string | T): T {
+		return typeof info === 'string'
+			? ({
+					target: 'shape',
+					shape: this.getShape(info as any),
+			  } as T)
+			: info
+	}
+
+	protected getPointerEventInfo(
+		x = this.inputs.currentScreenPoint.x,
+		y = this.inputs.currentScreenPoint.y,
+		options?: Partial<TLPointerEventInfo> | TLShapeId,
+		modifiers?: Partial<Pick<TLPointerEventInfo, 'shiftKey' | 'ctrlKey' | 'altKey' | 'metaKey' | 'accelKey'>>
+	) {
+		if (typeof options === 'string') {
+			options = { target: 'shape', shape: this.getShape(options) }
+		} else if (options === undefined) {
+			options = { target: 'canvas' }
+		}
+		return {
+			name: 'pointer_down',
+			type: 'pointer',
+			pointerId: 1,
+			shiftKey: this.inputs.shiftKey,
+			ctrlKey: this.inputs.ctrlKey,
+			altKey: this.inputs.altKey,
+			metaKey: this.inputs.metaKey,
+			accelKey: isAccelKey(this.inputs),
+			point: { x, y, z: null },
+			button: 0,
+			isPen: false,
+			...options,
+			...modifiers,
+		} as TLPointerEventInfo
+	}
+
+	protected getKeyboardEventInfo(
+		key: string,
+		name: TLKeyboardEventInfo['name'],
+		options = {} as Partial<Omit<TLKeyboardEventInfo, 'key'>>
+	): TLKeyboardEventInfo {
+		return {
+			shiftKey: key === 'Shift',
+			ctrlKey: key === 'Control',
+			altKey: key === 'Alt',
+			metaKey: key === 'Meta',
+			accelKey: tlenv.isDarwin ? key === 'Meta' : key === 'Control' || key === 'Meta',
+			...options,
+			name,
+			code:
+				key === 'Shift'
+					? 'ShiftLeft'
+					: key === 'Alt'
+					? 'AltLeft'
+					: key === 'Control'
+					? 'CtrlLeft'
+					: key === 'Meta'
+					? 'MetaLeft'
+					: key === ' '
+					? 'Space'
+					: key === 'Enter' ||
+					  key === 'ArrowRight' ||
+					  key === 'ArrowLeft' ||
+					  key === 'ArrowUp' ||
+					  key === 'ArrowDown'
+					? key
+					: 'Key' + key[0].toUpperCase() + key.slice(1),
+			type: 'keyboard',
+			key,
+		}
+	}
+}
+```
