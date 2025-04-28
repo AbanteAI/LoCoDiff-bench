@@ -392,11 +392,11 @@ print('Hello, world!')
 
 # --- Language Configuration Loading ---
 
-DEFAULT_LANGUAGE_CONFIG_PATH = "benchmark_pipeline/languages.yaml"
+DEFAULT_BENCHMARK_CONFIG_PATH = "benchmark_pipeline/benchmark_config.yaml"
 
 
 def load_language_config(
-    filepath: str = DEFAULT_LANGUAGE_CONFIG_PATH,
+    filepath: str = DEFAULT_BENCHMARK_CONFIG_PATH,
 ) -> Dict[str, Dict[str, List[str]]]:
     """
     Loads language configuration from a YAML file.
@@ -414,21 +414,28 @@ def load_language_config(
         ValueError: If the config format is invalid.
     """
     if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Language configuration file not found: {filepath}")
+        raise FileNotFoundError(f"Benchmark configuration file not found: {filepath}")
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        raise yaml.YAMLError(f"Error parsing language config file {filepath}: {e}")
+        raise yaml.YAMLError(f"Error parsing benchmark config file {filepath}: {e}")
 
     if not isinstance(config, dict):
         raise ValueError(
             f"Invalid format in {filepath}: Top level must be a dictionary."
         )
 
+    # Extract languages section if present
+    if "languages" in config and isinstance(config["languages"], dict):
+        language_config = config["languages"]
+    else:
+        # Fall back to legacy format where languages are at the top level
+        language_config = config
+
     # Basic validation
-    for lang, settings in config.items():
+    for lang, settings in language_config.items():
         if not isinstance(settings, dict) or "extensions" not in settings:
             raise ValueError(
                 f"Invalid format for language '{lang}' in {filepath}: Must be a dict with 'extensions' key."
@@ -442,7 +449,7 @@ def load_language_config(
             )
 
     print(f"Loaded language configuration from: {filepath}")
-    return config
+    return language_config
 
 
 def get_all_extensions_from_config(
@@ -1360,7 +1367,7 @@ def main():
             print("Error: No extensions found in language configuration. Exiting.")
             return 1  # Use return inside main()
         print(
-            f"Targeting extensions from {DEFAULT_LANGUAGE_CONFIG_PATH}: {', '.join(sorted(list(all_target_extensions)))}"
+            f"Targeting extensions from {DEFAULT_BENCHMARK_CONFIG_PATH}: {', '.join(sorted(list(all_target_extensions)))}"
         )
     except (FileNotFoundError, yaml.YAMLError, ValueError) as e:
         print(f"Error loading language configuration: {e}")
