@@ -1,0 +1,228 @@
+```zig
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const harfbuzz = @import("harfbuzz");
+const font = @import("../main.zig");
+const Feature = font.shape.Feature;
+const FeatureList = font.shape.FeatureList;
+const default_features = font.shape.default_features;
+const Face = font.Face;
+const Collection = font.Collection;
+const DeferredFace = font.DeferredFace;
+const Library = font.Library;
+const SharedGrid = font.SharedGrid;
+const Style = font.Style;
+const Presentation = font.Presentation;
+const terminal = @import("../../terminal/main.zig");
+
+const log = std.log.scoped(.font_shaper);
+
+/// Shaper that uses Harfbuzz.
+pub const Shaper = struct {
+    alloc: Allocator,
+
+    /// The buffer used for text shaping. We reuse it across multiple shaping
+    /// calls to prevent allocations.
+    hb_buf: harfbuzz.Buffer,
+
+    /// The shared memory used for shaping results.
+    cell_buf: std.ArrayListUnmanaged(font.shape.Cell),
+
+    /// The features to use for shaping.
+    hb_feats: []harfbuzz.Feature,
+
+    /// Initialize a new Harfbuzz shaper with the given allocator and options.
+    pub fn init(alloc: Allocator, opts: font.shape.Options) !Shaper {
+        // Parse all the features we want to use.
+        const hb_feats = hb_feats: {
+            var feature_list: FeatureList = .{};
+            defer feature_list.deinit(alloc);
+            try feature_list.features.appendSlice(alloc, &default_features);
+            for (opts.features) |feature_str| {
+                try feature_list.appendFromString(alloc, feature_str);
+            }
+
+            var list = try alloc.alloc(harfbuzz.Feature, feature_list.features.items.len);
+            errdefer alloc.free(list);
+
+            for (feature_list.features.items, 0..) |feature, i| {
+                list[i] = .{
+                    .tag = std.mem.nativeToBig(u32, @bitCast(feature.tag)),
+                    .value = feature.value,
+                    .start = harfbuzz.c.HB_FEATURE_GLOBAL_START,
+                    .end = harfbuzz.c.HB_FEATURE_GLOBAL_END,
+                };
+            }
+            break :hb_feats list;
+        };
+        errdefer alloc.free(hb_feats);
+
+        return Shaper{
+            .alloc = alloc,
+            .hb_buf = try harfbuzz.Buffer.create(),
+            .cell_buf = .{},
+            .hb_feats = hb_feats,
+        };
+    }
+
+    pub fn deinit(self: *Shaper) void {
+        self.hb_buf.destroy();
+        self.cell_buf.deinit(self.alloc);
+        self.alloc.free(self.hb_feats);
+    }
+
+    pub fn endFrame(self: *const Shaper) void {
+        _ = self;
+    }
+
+    /// Returns an iterator that returns one text run at a time for the
+    /// given terminal row. The `grid` provides font face resolution; `screen`
+    /// and `row` identify the actual text. The `selection` and `cursor_x`
+    /// may split runs for styling boundaries.
+    pub fn runIterator(
+        self: *Shaper,
+        grid: *SharedGrid,
+        screen: *const terminal.Screen,
+        row: terminal.Pin,
+        selection: ?terminal.Selection,
+        cursor_x: ?usize,
+    ) font.shape.RunIterator {
+        return .{
+            .hooks = .{ .shaper = self },
+            .grid = grid,
+            .screen = screen,
+            .row = row,
+            .selection = selection,
+            .cursor_x = cursor_x,
+        };
+    }
+
+    /// Shape the given text run into shaped cells.
+    pub fn shape(self: *Shaper, run: font.shape.TextRun) ![]const font.shape.Cell {
+        // Only shape if not a special-case font
+        if (run.font_index.special() == null) {
+            // Lock for exclusive access
+            run.grid.lock.lock();
+            defer run.grid.lock.unlock();
+            const face = try run.grid.resolver.collection.getFace(run.font_index);
+
+            const i = if (!face.quirks_disable_default_font_features) 0 else default_features.len;
+            harfbuzz.shape(face.hb_font, self.hb_buf, self.hb_feats[i..]);
+        }
+
+        if (self.hb_buf.getLength() == 0) return self.cell_buf.items[0..0];
+        const info = self.hb_buf.getGlyphInfos();
+        const pos = self.hb_buf.getGlyphPositions() orelse return error.HarfbuzzFailed;
+        assert(info.len == pos.len);
+
+        var cell_offset: struct { cluster: u32 = 0; x: i32 = 0; y: i32 = 0; } = .{};
+
+        self.cell_buf.clearRetainingCapacity();
+        for (info, pos) |info_v, pos_v| {
+            if (info_v.cluster != cell_offset.cluster) cell_offset = .{ .cluster = info_v.cluster };
+
+            try self.cell_buf.append(self.alloc, .{
+                .x = @intCast(info_v.cluster),
+                .x_offset = @intCast(cell_offset.x),
+                .y_offset = @intCast(cell_offset.y),
+                .glyph_index = info_v.codepoint,
+            });
+
+            if (font.options.backend.hasFreetype()) {
+                cell_offset.x += pos_v.x_advance >> 6;
+                cell_offset.y += pos_v.y_advance >> 6;
+            } else {
+                cell_offset.x += pos_v.x_advance;
+                cell_offset.y += pos_v.y_advance;
+            }
+        }
+
+        return self.cell_buf.items;
+    }
+};
+
+/// Tests...
+test "run iterator" { /* ... */ }
+test "run iterator: empty cells with background set" { /* ... */ }
+test "shape" { /* ... */ }
+test "shape inconsolata ligs" { /* ... */ }
+test "shape monaspace ligs" { /* ... */ }
+test "shape emoji width" { /* ... */ }
+test "shape emoji width long" { /* ... */ }
+test "shape variation selector VS15" { /* ... */ }
+test "shape variation selector VS16" { /* ... */ }
+test "shape with empty cells in between" { /* ... */ }
+test "shape Chinese characters" { /* ... */ }
+test "shape box glyphs" { /* ... */ }
+test "shape selection boundary" { /* ... */ }
+test "shape cursor boundary" { /* ... */ }
+test "shape cursor boundary and colored emoji" { /* ... */ }
+test "shape cell attribute change" { /* ... */ }
+test "shape arabic forced LTR" { /* ... */ }
+
+const TestShaper = struct {
+    alloc: Allocator,
+    shaper: Shaper,
+    grid: *SharedGrid,
+    lib: Library,
+
+    pub fn deinit(self: *TestShaper) void {
+        self.shaper.deinit();
+        self.grid.deinit(self.alloc);
+        self.alloc.destroy(self.grid);
+        self.lib.deinit();
+    }
+};
+
+const TestFont = enum { inconsolata, monaspace_neon, arabic };
+
+fn testShaper(alloc: Allocator) !TestShaper {
+    return testShaperWithFont(alloc, .inconsolata);
+}
+
+fn testShaperWithFont(alloc: Allocator, font_req: TestFont) !TestShaper {
+    const testEmoji = font.embedded.emoji;
+    const testEmojiText = font.embedded.emoji_text;
+    const testFont = switch (font_req) {
+        .inconsolata => font.embedded.inconsolata,
+        .monaspace_neon => font.embedded.monaspace_neon,
+        .arabic => font.embedded.arabic,
+    };
+
+    var lib = try Library.init();
+    errdefer lib.deinit();
+
+    var c = Collection.init();
+    c.load_options = .{ .library = lib };
+
+    _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(lib, testFont, .{ .size = .{ .points = 12 } }) });
+    if (comptime !font.options.backend.hasCoretext()) {
+        _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(lib, testEmoji, .{ .size = .{ .points = 12 } }) });
+    } else {
+        var disco = font.Discover.init();
+        defer disco.deinit();
+        var disco_it = try disco.discover(alloc, .{ .family = "Apple Color Emoji", .size = 12, .monospace = false });
+        defer disco_it.deinit();
+        var face = (try disco_it.next())?;
+        errdefer face.deinit();
+        _ = try c.add(alloc, .regular, .{ .deferred = face });
+    }
+    _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(lib, testEmojiText, .{ .size = .{ .points = 12 } }) });
+
+    var grid_ptr = try alloc.create(SharedGrid);
+    errdefer alloc.destroy(grid_ptr);
+    grid_ptr.* = try SharedGrid.init(alloc, .{ .collection = c });
+    errdefer grid_ptr.*.deinit(alloc);
+
+    var shaper = try Shaper.init(alloc, .{});
+    errdefer shaper.deinit();
+
+    return TestShaper{
+        .alloc = alloc,
+        .shaper = shaper,
+        .grid = grid_ptr,
+        .lib = lib,
+    };
+}
+```

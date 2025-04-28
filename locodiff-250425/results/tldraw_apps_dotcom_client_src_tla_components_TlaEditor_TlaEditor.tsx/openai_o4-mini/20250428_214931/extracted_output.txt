@@ -1,0 +1,196 @@
+import { useSync } from '@tldraw/sync'
+import { useCallback, useEffect, useMemo } from 'react'
+import {
+  Editor,
+  TLComponents,
+  TLSessionStateSnapshot,
+  TLUiDialogsContextType,
+  Tldraw,
+  createSessionStateSnapshotSignal,
+  parseDeepLinkString,
+  react,
+  throttle,
+  tltime,
+  useAtom,
+  useDialogs,
+  useEditor,
+  useEvent,
+} from 'tldraw'
+import { ThemeUpdater } from '../../../components/ThemeUpdater/ThemeUpdater'
+import { assetUrls } from '../../../utils/assetUrls'
+import { MULTIPLAYER_SERVER } from '../../../utils/config'
+import { createAssetFromUrl } from '../../../utils/createAssetFromUrl'
+import { globalEditor } from '../../../utils/globalEditor'
+import { multiplayerAssetStore } from '../../../utils/multiplayerAssetStore'
+import { useHandleUiEvents } from '../../../utils/useHandleUiEvent'
+import { useMaybeApp } from '../../hooks/useAppState'
+import { ReadyWrapper, useSetIsReady } from '../../hooks/useIsReady'
+import { useTldrawUser } from '../../hooks/useUser'
+import { maybeSlurp } from '../../utils/slurping'
+import { SneakyDarkModeSync } from './SneakyDarkModeSync'
+import { TlaEditorWrapper } from './TlaEditorWrapper'
+import { TlaEditorErrorFallback } from './editor-components/TlaEditorErrorFallback'
+import { TlaEditorMenuPanel } from './editor-components/TlaEditorMenuPanel'
+import { TlaEditorSharePanel } from './editor-components/TlaEditorSharePanel'
+import { TlaEditorTopPanel } from './editor-components/TlaEditorTopPanel'
+import { SneakyTldrawFileDropHandler } from './sneaky/SneakyFileDropHandler'
+import { SneakySetDocumentTitle } from './sneaky/SneakySetDocumentTitle'
+import { useFileEditorOverrides } from './useFileEditorOverrides'
+import styles from './editor.module.css'
+
+/** @internal */
+export const components: TLComponents = {
+  ErrorFallback: TlaEditorErrorFallback,
+  MenuPanel: TlaEditorMenuPanel,
+  TopPanel: TlaEditorTopPanel,
+  SharePanel: TlaEditorSharePanel,
+}
+
+interface TlaEditorProps {
+  fileSlug: string
+  deepLinks?: boolean
+  isEmbed?: boolean
+}
+
+export function TlaEditor(props: TlaEditorProps) {
+  return (
+    <>
+      <SneakySetDocumentTitle />
+      <ReadyWrapper key={props.fileSlug}>
+        <TlaEditorInner {...props} key={props.fileSlug} />
+      </ReadyWrapper>
+    </>
+  )
+}
+
+function TlaEditorInner({ fileSlug, deepLinks }: TlaEditorProps) {
+  const handleUiEvent = useHandleUiEvents()
+  const app = useMaybeApp()
+  const setIsReady = useSetIsReady()
+
+  const fileId = fileSlug
+
+  const user = useTldrawUser()
+  const getUserToken = useEvent(async () => (await user?.getToken()) ?? 'not-logged-in')
+  const hasUser = !!user
+
+  const assets = useMemo(() => multiplayerAssetStore(() => fileId), [fileId])
+
+  const store = useSync({
+    uri: useCallback(async () => {
+      const url = new URL(`${MULTIPLAYER_SERVER}/app/file/${fileSlug}`)
+      if (hasUser) {
+        url.searchParams.set('accessToken', await getUserToken())
+      }
+      return url.toString()
+    }, [fileSlug, hasUser, getUserToken]),
+    assets,
+    userInfo: app?.tlUser.userPreferences,
+  })
+
+  const addDialog: TLUiDialogsContextType['addDialog'] = useEvent((dialog) =>
+    useDialogs().addDialog(dialog)
+  )
+
+  const hideAllShapes = useAtom('hideAllShapes', false)
+  const getShapeVisibility = useCallback(
+    () => (hideAllShapes.get() ? 'hidden' : 'inherit'),
+    [hideAllShapes]
+  )
+  const remountImageShapes = useCallback(() => {
+    hideAllShapes.set(true)
+    requestAnimationFrame(() => hideAllShapes.set(false))
+  }, [hideAllShapes])
+
+  const handleMount = useCallback(
+    (editor: Editor) => {
+      ;(window as any).app = app
+      ;(window as any).editor = editor
+      globalEditor.set(editor)
+      editor.registerExternalAssetHandler('url', createAssetFromUrl)
+
+      const fileState = app?.getFileState(fileId)
+      const deepLink = new URLSearchParams(window.location.search).get('d')
+      if (fileState?.lastSessionState && !deepLink) {
+        editor.loadSnapshot(
+          { session: JSON.parse(fileState.lastSessionState.trim() || 'null') },
+          { forceOverwriteSessionState: true }
+        )
+      } else if (deepLink) {
+        editor.navigateToDeepLink(parseDeepLinkString(deepLink))
+      }
+
+      const sessionState$ = createSessionStateSnapshotSignal(editor.store)
+      const updateSessionState = throttle((state: TLSessionStateSnapshot) => {
+        app?.onFileSessionStateUpdate(fileId, state)
+      }, 5000)
+      let firstTime = true
+      const cleanup = react('update session state', () => {
+        const state = sessionState$.get()
+        if (!state) return
+        if (firstTime) {
+          firstTime = false
+          return
+        }
+        updateSessionState(state)
+      })
+
+      const abortController = new AbortController()
+      maybeSlurp({
+        app,
+        editor,
+        fileId,
+        abortSignal: abortController.signal,
+        addDialog,
+        remountImageShapes,
+      }).then(setIsReady)
+
+      return () => {
+        updateSessionState.flush()
+        abortController.abort()
+        cleanup()
+      }
+    },
+    [addDialog, app, fileId, remountImageShapes, setIsReady]
+  )
+
+  return (
+    <TlaEditorWrapper>
+      <Tldraw
+        store={store}
+        assetUrls={assetUrls}
+        user={app?.tlUser}
+        onMount={handleMount}
+        onUiEvent={handleUiEvent}
+        components={components}
+        options={{ actionShortcutsLocation: 'toolbar' }}
+        deepLinks={deepLinks || undefined}
+        overrides={useFileEditorOverrides({ fileSlug })}
+        getShapeVisibility={getShapeVisibility}
+      >
+        <ThemeUpdater />
+        <SneakyDarkModeSync />
+        {app && <SneakyTldrawFileDropHandler />}
+        <SneakyFileUpdateHandler fileId={fileId} />
+      </Tldraw>
+    </TlaEditorWrapper>
+  )
+}
+
+function SneakyFileUpdateHandler({ fileId }: { fileId: string }) {
+  const app = useMaybeApp()
+  const editor = useEditor()
+  useEffect(() => {
+    const onChange = throttle(() => {
+      if (!app) return
+      app.onFileEdit(fileId)
+    }, 10000)
+    const unsub = editor.store.listen(onChange, { scope: 'document', source: 'user' })
+    return () => {
+      onChange.flush()
+      unsub()
+    }
+  }, [app, fileId, editor])
+
+  return null
+}
