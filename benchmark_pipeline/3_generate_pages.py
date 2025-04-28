@@ -369,7 +369,7 @@ def create_overall_stats_table(
     results_metadata: Dict[Any, Dict[str, Any]],
     all_models: Set[str],
     num_cases: int,
-    model_display_names: Dict[str, str] = None,
+    model_display_names: Dict[str, str] = {},
 ) -> str:
     """
     Creates an HTML table showing overall statistics for each model.
@@ -383,9 +383,6 @@ def create_overall_stats_table(
     Returns:
         HTML string containing the table
     """
-    # Use empty dict if model_display_names is None
-    if model_display_names is None:
-        model_display_names = {}
 
     # Aggregate statistics by model
     model_stats = {}
@@ -457,7 +454,7 @@ def create_quartile_stats_table(
     results_metadata: Dict[Any, Dict[str, Any]],
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
-    model_display_names: Dict[str, str] = None,
+    model_display_names: Dict[str, str] = {},
 ) -> str:
     """
     Creates an HTML table showing success rates by prompt size quartiles.
@@ -471,9 +468,6 @@ def create_quartile_stats_table(
     Returns:
         HTML string containing the table
     """
-    # Use empty dict if model_display_names is None
-    if model_display_names is None:
-        model_display_names = {}
 
     # Extract prompt token counts for quartile calculation
     prompt_tokens_list = []
@@ -562,7 +556,7 @@ def create_language_stats_table(
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
     ext_to_lang_map: Dict[str, str],
-    model_display_names: Dict[str, str] = None,
+    model_display_names: Dict[str, str] = {},
 ) -> str:
     """
     Creates an HTML table showing success rates by programming language.
@@ -577,9 +571,6 @@ def create_language_stats_table(
     Returns:
         HTML string containing the table
     """
-    # Use empty dict if model_display_names is None
-    if model_display_names is None:
-        model_display_names = {}
 
     # First determine language for each case prefix
     case_languages = {}
@@ -702,7 +693,7 @@ def generate_chart_data(
     prompt_metadata: Dict[str, Dict[str, Any]],
     all_models: Set[str],
     case_languages: Dict[str, str],
-    model_display_names: Dict[str, str] = None,
+    model_display_names: Dict[str, str] = {},
 ) -> Dict[str, Any]:
     """
     Generates data for the token-based chart.
@@ -721,9 +712,6 @@ def generate_chart_data(
     Returns:
         Dictionary containing the chart data
     """
-    # Use empty dict if model_display_names is None
-    if model_display_names is None:
-        model_display_names = {}
 
     # Find max token count (min is always 0)
     token_counts = [meta.get("prompt_tokens", 0) for meta in prompt_metadata.values()]
@@ -1427,7 +1415,7 @@ def main():
     docs_dir = Path("docs")
 
     # Load benchmark configuration (languages and model display names)
-    config_path = Path("benchmark_pipeline/languages.yaml")
+    config_path = Path("benchmark_pipeline/benchmark_config.yaml")
     ext_to_lang_map, model_display_names = load_benchmark_config(str(config_path))
 
     if model_display_names:
