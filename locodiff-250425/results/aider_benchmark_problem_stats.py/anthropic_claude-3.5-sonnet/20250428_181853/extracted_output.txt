@@ -1,0 +1,185 @@
+#!/usr/bin/env python
+
+import argparse
+import json
+import shutil
+from collections import defaultdict
+from pathlib import Path
+
+import yaml
+
+from aider.dump import dump  # noqa
+
+HARD_SET_NUM = 3  # Number of models that defines the hard set threshold
+
+
+def get_dirs_from_leaderboard():
+    # Load the leaderboard data
+    with open("aider/website/_data/polyglot_leaderboard.yml") as f:
+        leaderboard = yaml.safe_load(f)
+    return [(entry["dirname"], entry["model"]) for entry in leaderboard]
+
+
+def load_results(dirname):
+    """Load all result files from a benchmark directory"""
+    dirname = Path(dirname)
+
+    benchmark_dir = dirname
+    if not benchmark_dir.exists():
+        benchmark_dir = Path("tmp.benchmarks") / dirname
+        if not benchmark_dir.exists():
+            return None
+
+    all_results = []
+    parse_errors = []  # Track which exercises had parse errors for this model
+
+    # Look in language subdirectories under exercises/practice
+    for fname in benchmark_dir.glob("*/exercises/practice/*/.aider.results.json"):
+        error = False
+        try:
+            results = json.loads(fname.read_text())
+            error = "testcase" not in results
+            if not error:
+                # Add language info to results
+                lang = fname.parts[-5]  # Get language from path
+                results["language"] = lang
+                all_results.append(results)
+
+        except json.JSONDecodeError:
+            error = True
+
+        if error:
+            # Track the parse error for this exercise/model combination
+            lang = fname.parts[-5]
+            exercise = f"{fname.parts[-2]}/{lang}"  # Use directory name as testcase
+            parse_errors.append(exercise)
+            print(f"Bad results file {fname}")
+            continue
+
+    return all_results, parse_errors
+
+
+def analyze_exercise_solutions(dirs=None, topn=None, copy_hard_set=False):
+    PARSE_ERROR_M = 4  # Threshold for number of parse errors to DQ an exercise
+
+    if dirs is None:
+        # Use leaderboard data if no directories specified
+        dir_entries = get_dirs_from_leaderboard()
+    else:
+        # Use provided directories, with dirname as model name
+        dir_entries = [(d, d) for d in dirs]
+
+    # Filter out entries that don't load and sort by pass rate
+    valid_entries = []
+    parse_errors_by_model = {}  # Track which exercises had parse errors for each model
+
+    dump(dir_entries)
+
+    for dirname, model in dir_entries:
+        results_data = load_results(dirname)
+
+        if results_data:
+            results, model_parse_errors = results_data
+            parse_errors_by_model[model] = set(model_parse_errors)
+            # Calculate pass rate for sorting when using custom dirs
+            if dirs is not None:
+                pass_rate = sum(
+                    1 for r in results if r.get("tests_outcomes", []) and r["tests_outcomes"][-1]
+                ) / len(results)
+            else:
+                # Use existing pass rate from leaderboard
+                pass_rate = next(
+                    (
+                        entry["pass_rate_2"]
+                        for entry in yaml.safe_load(
+                            open("aider/website/_data/polyglot_leaderboard.yml")
+                        )
+                        if entry["dirname"] == dirname
+                    ),
+                    0,
+                )
+            valid_entries.append(((dirname, model), results, float(pass_rate)))
+
+    # Sort by pass rate and take top N if specified
+    valid_entries.sort(key=lambda x: x[2], reverse=True)
+    if topn:
+        valid_entries = valid_entries[:topn]
+
+    # Get all exercise names from a complete run
+    all_exercises = set()
+    exercise_solutions = defaultdict(list)
+
+    for (dirname, model), results, _ in valid_entries:
+        if results:
+            for result in results:
+                try:
+                    all_exercises.add(result["testcase"] + "/" + result["language"])
+                except KeyError:
+                    print(f"Warning: Missing testcase in {dirname}", json.dumps(result, indent=4))
+
+    for (dirname, model), results, _ in valid_entries:
+        if not results:
+            print(f"Could not load results for {dirname}")
+            continue
+
+        for result in results:
+            testcase = result.get("testcase")
+            if not testcase:
+                continue
+            lang = result.get("language")
+            if not lang:
+                continue
+
+            testcase = f"{testcase}/{lang}"
+            # Consider it solved if the last test attempt passed
+            tests_outcomes = result.get("tests_outcomes", [])
+            if tests_outcomes and tests_outcomes[-1]:
+                exercise_solutions[testcase].append(model)
+
+    # Print per-exercise statistics
+    print("\nExercise Solution Statistics:")
+    print("-" * 40)
+
+    # Add exercises that were never solved
+    for exercise in all_exercises:
+        if exercise not in exercise_solutions:
+            exercise_solutions[exercise] = []
+
+    # Create a set of (exercise, language) pairs from hard_set
+    hard_set_pairs = {tuple(exercise.split("/")) for exercise in hard_set}
+
+    # Copy each hard set problem's directory
+    copied_by_lang = defaultdict(int)
+    for lang_dir in src_dir.glob("*/exercises/practice"):
+        if not lang_dir.is_dir():
+            continue
+
+        lang = lang_dir.parts[-3]  # Get language from path
+        for problem_dir in lang_dir.glob("*"):
+            if (problem_dir.name, lang) in hard_set_pairs:
+                rel_path = problem_dir.relative_to(src_dir)
+                dst_path = dst_dir / rel_path
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(problem_dir, dst_path)
+                copied_by_lang[lang] += 1
+
+        total_copied = sum(copied_by_lang.values())
+        print(f"\nCopied {total_copied} hard set problems:")
+        for lang in sorted(copied_by_lang):
+            print(f"  {lang}: {copied_by_lang[lang]}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--topn", type=int, help="Only consider top N models by pass rate")
+    parser.add_argument(
+        "dirs", nargs="*", help="Directories to analyze (optional, defaults to leaderboard entries)"
+    )
+    parser.add_argument(
+        "--copy-hard-set",
+        action="store_true",
+        help="Copy hard set problems to tmp.benchmarks/exercism-polygot",
+    )
+    args = parser.parse_args()
+
+    analyze_exercise_solutions(args.dirs if args.dirs else None, args.topn)
