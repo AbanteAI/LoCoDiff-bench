@@ -1406,25 +1406,27 @@ def generate_expected_output_page(
 def generate_actual_output_page(
     case_prefix: str,
     model: str,
-    actual_output: str,
+    raw_response: str,
     original_filename: str,
     docs_dir: Path,
     model_display_names: Dict[str, str] = {},
     success: bool = False,
     expected_output: str = "",
+    extracted_output: str = "",
 ) -> None:
     """
-    Generates a page displaying just the actual output content.
+    Generates a page displaying the raw model response.
 
     Args:
         case_prefix: The benchmark case prefix
         model: The model name
-        actual_output: The actual output content to display
+        raw_response: The raw model response to display
         original_filename: The original filename of the case
         docs_dir: Path to the docs directory
         model_display_names: Optional mapping of model names to display names
         success: Whether the run was successful (matched expected output)
         expected_output: The expected output content (used as fallback)
+        extracted_output: The extracted code from the raw response (used as fallback)
     """
     safe_model = model.replace("/", "_")
     safe_case = case_prefix.replace("/", "_")
@@ -1434,56 +1436,76 @@ def generate_actual_output_page(
     actual_page_path = content_dir / "actual.html"
     display_name = model_display_names.get(model, model)
 
-    # Handle output content based on success status and available content
+    # Handle output content based on available content and success status
     content_section = ""
 
-    # For successful runs, if actual output is empty but expected output exists,
-    # use the expected output as the actual output (they must match)
-    if (
-        success
-        and (not actual_output or actual_output.strip() == "")
-        and expected_output
-    ):
+    # If raw response is available, show it (with success notice if applicable)
+    if raw_response and raw_response.strip():
+        success_note = ""
+        if success:
+            success_note = """
+            <div class="success-message">
+                <p>✓ This model's extracted output matched the expected output exactly</p>
+            </div>
+            """
+
         content_section = f"""
         <section>
-            <h2>Actual Output Content</h2>
+            <h2>Raw Model Response</h2>
+            {success_note}
+            <pre><code class="language-plaintext">{raw_response}</code></pre>
+        </section>
+        """
+    # If no raw response but have extracted output, show it as fallback
+    elif extracted_output and extracted_output.strip():
+        success_note = "❌ This output did not match the expected output"
+        if success:
+            success_note = "✓ This output matched the expected output exactly"
+
+        content_section = f"""
+        <section>
+            <h2>Extracted Model Output</h2>
+            <div class="info-message">
+                <p>Showing extracted code output (raw response unavailable)</p>
+                <p>{success_note}</p>
+            </div>
+            <pre><code class="language-plaintext">{extracted_output}</code></pre>
+        </section>
+        """
+    # For successful runs with no available outputs but expected output exists
+    elif success and expected_output and expected_output.strip():
+        content_section = f"""
+        <section>
+            <h2>Expected Output (Fallback)</h2>
             <div class="success-message">
-                <p>✓ Output matched expected output exactly</p>
-                <p>Showing the expected output, as they are identical:</p>
+                <p>✓ The model output matched this expected output exactly</p>
+                <p>Raw model response unavailable - showing expected output as they are identical</p>
             </div>
             <pre><code class="language-plaintext">{expected_output}</code></pre>
         </section>
         """
-    # For empty output, show appropriate message based on success status
-    elif not actual_output or actual_output.strip() == "":
+    # For empty outputs, show appropriate message based on success status
+    else:
         if success:
             content_section = """
             <section>
-                <h2>Actual Output Content</h2>
+                <h2>Model Response</h2>
                 <div class="success-message">
-                    <p>✓ Output matched expected output exactly</p>
-                    <p>The model produced output that exactly matched the expected output, but the output file is either empty or not available.</p>
+                    <p>✓ Model output matched expected output exactly</p>
+                    <p>The raw response file is not available, but the benchmark was marked as successful.</p>
                 </div>
             </section>
             """
         else:
             content_section = """
             <section>
-                <h2>Actual Output Content</h2>
+                <h2>Model Response</h2>
                 <div class="empty-content-notice">
-                    <p>No actual output content available.</p>
-                    <p>This could be because the model failed to generate a response or the response was empty.</p>
+                    <p>No model response available</p>
+                    <p>This could be because the model failed to generate a response or the response files are missing.</p>
                 </div>
             </section>
             """
-    # For non-empty output, show the actual content
-    else:
-        content_section = f"""
-        <section>
-            <h2>Actual Output Content</h2>
-            <pre><code class="language-plaintext">{actual_output}</code></pre>
-        </section>
-        """
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1507,6 +1529,20 @@ def generate_actual_output_page(
         .empty-content-notice p:first-child {{
             font-weight: bold;
             margin-bottom: 10px;
+        }}
+        
+        .info-message {{
+            background-color: #f1f8ff;
+            border: 1px solid #c8e1ff;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 15px;
+            color: #0366d6;
+        }}
+        
+        .info-message p:first-child {{
+            font-weight: bold;
+            margin-bottom: 5px;
         }}
     </style>
 </head>
@@ -1761,10 +1797,27 @@ def generate_case_page(
         with open(expected_output_path, "r", encoding="utf-8") as f:
             expected_output = f.read()
 
+    # For actual output, try to find both raw response and extracted output
     actual_output = ""
+    raw_response = ""
+
+    # Look for the raw response file first
+    if timestamp_dirs:
+        raw_response_path = timestamp_dirs[0] / "raw_response.txt"
+        if raw_response_path.exists():
+            try:
+                with open(raw_response_path, "r", encoding="utf-8") as f:
+                    raw_response = f.read()
+            except Exception as e:
+                print(f"Error reading raw response file {raw_response_path}: {e}")
+
+    # Then try to get the extracted output (the code from backticks)
     if actual_output_path and actual_output_path.exists():
-        with open(actual_output_path, "r", encoding="utf-8") as f:
-            actual_output = f.read()
+        try:
+            with open(actual_output_path, "r", encoding="utf-8") as f:
+                actual_output = f.read()
+        except Exception as e:
+            print(f"Error reading actual output file {actual_output_path}: {e}")
 
     # Get success status
     success = result_metadata.get("success", False)
@@ -1789,12 +1842,13 @@ def generate_case_page(
     generate_actual_output_page(
         case_prefix,
         model,
-        actual_output,
+        raw_response,  # Use raw response as primary content
         original_filename,
         docs_dir,
         model_display_names,
         success=success,
         expected_output=expected_output,
+        extracted_output=actual_output,  # Pass extracted output as fallback
     )
 
     # Get status
