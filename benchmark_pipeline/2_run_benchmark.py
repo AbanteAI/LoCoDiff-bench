@@ -315,6 +315,9 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
                 native_finish_reason = stats_data.get(
                     "native_finish_reason"
                 )  # Can be None
+                native_tokens_reasoning = stats_data.get(
+                    "native_tokens_reasoning"
+                )  # Can be None
 
                 # Extract the model name (but don't include it in the returned stats)
                 model = stats_data.get("model")
@@ -356,6 +359,9 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
                     else None,
                     "native_finish_reason": str(native_finish_reason)
                     if native_finish_reason is not None
+                    else None,
+                    "native_tokens_reasoning": int(native_tokens_reasoning)
+                    if native_tokens_reasoning is not None
                     else None,
                 }
             else:
