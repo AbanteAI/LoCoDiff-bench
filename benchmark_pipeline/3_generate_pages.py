@@ -1445,6 +1445,19 @@ def main():
         f"Found results for {len(results_metadata)} case-model combinations across {len(all_models)} models"
     )
 
+    # Validate that all models have display names defined
+    missing_models = [model for model in all_models if model not in model_display_names]
+    if missing_models:
+        print(
+            "Error: The following models do not have display names defined in benchmark_config.yaml:"
+        )
+        for model in sorted(missing_models):
+            print(f'  - "{model}"')
+        print(
+            "\nPlease add these models to the model_display_names section in benchmark_pipeline/benchmark_config.yaml"
+        )
+        return 1
+
     # Determine language for each case prefix
     print("Determining languages for benchmark cases...")
     case_languages = {}
