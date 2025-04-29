@@ -1404,11 +1404,6 @@ def main():
         required=True,
         help="Path to the directory containing benchmark run data.",
     )
-    parser.add_argument(
-        "--skip-display-name-check",
-        action="store_true",
-        help="Skip the check that verifies all models have display names defined",
-    )
 
     args = parser.parse_args()
     benchmark_run_dir = args.benchmark_run_dir
@@ -1451,27 +1446,23 @@ def main():
     )
 
     # Validate that all models have display names defined
-    if not args.skip_display_name_check:
-        missing_models = [
-            model for model in all_models if model not in model_display_names
-        ]
-        if missing_models:
-            print(
-                "Error: The following models do not have display names defined in benchmark_config.yaml:"
-            )
-            for model in sorted(missing_models):
-                print(f'  - "{model}"')
-            print(
-                "\nPlease add these models to the model_display_names section in benchmark_pipeline/benchmark_config.yaml"
-            )
-            print("Example:")
-            for model in sorted(missing_models):
-                suggested_name = model.split("/")[-1]
-                print(f'  "{model}": "{suggested_name}"')
-            print(
-                "\nIf you want to skip this check, use the --skip-display-name-check flag"
-            )
-            return 1
+    missing_models = [
+        model for model in all_models if model not in model_display_names
+    ]
+    if missing_models:
+        print(
+            "Error: The following models do not have display names defined in benchmark_config.yaml:"
+        )
+        for model in sorted(missing_models):
+            print(f'  - "{model}"')
+        print(
+            "\nPlease add these models to the model_display_names section in benchmark_pipeline/benchmark_config.yaml"
+        )
+        print("Example:")
+        for model in sorted(missing_models):
+            suggested_name = model.split("/")[-1]
+            print(f'  "{model}": "{suggested_name}"')
+        return 1
 
     # Determine language for each case prefix
     print("Determining languages for benchmark cases...")
