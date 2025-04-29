@@ -316,6 +316,27 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
                     "native_finish_reason"
                 )  # Can be None
 
+                # Extract the model name (but don't include it in the returned stats)
+                model = stats_data.get("model")
+
+                # Special case for openai/o3-2025-04-16: adjust the cost to include OpenAI charges
+                if model == "openai/o3-2025-04-16" and cost_usd is not None:
+                    # Calculate additional costs for OpenAI API usage
+                    additional_cost = 0.0
+
+                    # Add input token cost: $10 per million tokens
+                    if native_prompt_tokens is not None:
+                        additional_cost += (int(native_prompt_tokens) / 1000000) * 10
+
+                    # Add output token cost: $30 per million tokens
+                    if native_completion_tokens is not None:
+                        additional_cost += (
+                            int(native_completion_tokens) / 1000000
+                        ) * 30
+
+                    # Combine with the original cost from OpenRouter
+                    cost_usd = float(cost_usd) + additional_cost
+
                 return {
                     "cost_usd": float(cost_usd) if cost_usd is not None else 0.0,
                     "prompt_tokens": int(prompt_tokens)
