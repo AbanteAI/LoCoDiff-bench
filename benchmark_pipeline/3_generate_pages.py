@@ -1241,14 +1241,792 @@ function initializeChart(chartData) {
 """
 
 
-def create_cases_placeholder() -> str:
-    """Creates a placeholder section for individual benchmark cases."""
-    return """
-    <section id="individual-cases">
-        <h2>Individual Benchmark Cases</h2>
-        <p>Details for individual benchmark cases will be available in a future update.</p>
+def create_cases_section(
+    all_models: Set[str], model_display_names: Dict[str, str] = {}
+) -> str:
+    """Creates a section with links to model-specific benchmark case pages."""
+    html = """
+    <section id="explore-benchmarks">
+        <h2>Explore Benchmark Prompts and Model Outputs</h2>
+        <p>Select a model below to view its benchmark cases:</p>
+        <ul class="model-list">
+    """
+
+    # Add links to model pages
+    for model in sorted(all_models):
+        # Create a safe filename for the model (sanitized)
+        safe_model = model.replace("/", "_")
+        # Use display name if available
+        display_name = model_display_names.get(model, model)
+        html += f"""
+            <li>
+                <a href="models/{safe_model}.html" class="model-link">
+                    {display_name}
+                </a>
+            </li>
+        """
+
+    html += """
+        </ul>
     </section>
     """
+    return html
+
+
+def generate_prompt_page(
+    case_prefix: str,
+    model: str,
+    prompt_content: str,
+    original_filename: str,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page displaying just the prompt content.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        prompt_content: The prompt content to display
+        original_filename: The original filename of the case
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    safe_model = model.replace("/", "_")
+    safe_case = case_prefix.replace("/", "_")
+    content_dir = docs_dir / "content" / safe_model / safe_case
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_page_path = content_dir / "prompt.html"
+    display_name = model_display_names.get(model, model)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prompt: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Prompt: {original_filename}</h1>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>Prompt Content</h2>
+            <pre><code class="language-plaintext">{prompt_content}</code></pre>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            hljs.highlightAll();
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    with open(prompt_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_expected_output_page(
+    case_prefix: str,
+    model: str,
+    expected_output: str,
+    original_filename: str,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page displaying just the expected output content.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        expected_output: The expected output content to display
+        original_filename: The original filename of the case
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    safe_model = model.replace("/", "_")
+    safe_case = case_prefix.replace("/", "_")
+    content_dir = docs_dir / "content" / safe_model / safe_case
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_page_path = content_dir / "expected.html"
+    display_name = model_display_names.get(model, model)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Expected Output: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Expected Output: {original_filename}</h1>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>Expected Output Content</h2>
+            <pre><code class="language-plaintext">{expected_output}</code></pre>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            hljs.highlightAll();
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    with open(expected_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_actual_output_page(
+    case_prefix: str,
+    model: str,
+    raw_response: str,
+    original_filename: str,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+    success: bool = False,
+    expected_output: str = "",
+    extracted_output: str = "",
+) -> None:
+    """
+    Generates a page displaying the raw model response.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        raw_response: The raw model response to display
+        original_filename: The original filename of the case
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+        success: Whether the run was successful (matched expected output)
+        expected_output: The expected output content (used as fallback)
+        extracted_output: The extracted code from the raw response (used as fallback)
+    """
+    safe_model = model.replace("/", "_")
+    safe_case = case_prefix.replace("/", "_")
+    content_dir = docs_dir / "content" / safe_model / safe_case
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    actual_page_path = content_dir / "actual.html"
+    display_name = model_display_names.get(model, model)
+
+    # Handle output content based on available content and success status
+    content_section = ""
+
+    # If raw response is available, show it (with success notice if applicable)
+    if raw_response and raw_response.strip():
+        success_note = ""
+        if success:
+            success_note = """
+            <div class="success-message">
+                <p>✓ This model's extracted output matched the expected output exactly</p>
+            </div>
+            """
+
+        content_section = f"""
+        <section>
+            <h2>Raw Model Response</h2>
+            {success_note}
+            <pre><code class="language-plaintext">{raw_response}</code></pre>
+        </section>
+        """
+    # If no raw response but have extracted output, show it as fallback
+    elif extracted_output and extracted_output.strip():
+        success_note = "❌ This output did not match the expected output"
+        if success:
+            success_note = "✓ This output matched the expected output exactly"
+
+        content_section = f"""
+        <section>
+            <h2>Extracted Model Output</h2>
+            <div class="info-message">
+                <p>Showing extracted code output (raw response unavailable)</p>
+                <p>{success_note}</p>
+            </div>
+            <pre><code class="language-plaintext">{extracted_output}</code></pre>
+        </section>
+        """
+    # For successful runs with no available outputs but expected output exists
+    elif success and expected_output and expected_output.strip():
+        content_section = f"""
+        <section>
+            <h2>Expected Output (Fallback)</h2>
+            <div class="success-message">
+                <p>✓ The model output matched this expected output exactly</p>
+                <p>Raw model response unavailable - showing expected output as they are identical</p>
+            </div>
+            <pre><code class="language-plaintext">{expected_output}</code></pre>
+        </section>
+        """
+    # For empty outputs, show appropriate message based on success status
+    else:
+        if success:
+            content_section = """
+            <section>
+                <h2>Model Response</h2>
+                <div class="success-message">
+                    <p>✓ Model output matched expected output exactly</p>
+                    <p>The raw response file is not available, but the benchmark was marked as successful.</p>
+                </div>
+            </section>
+            """
+        else:
+            content_section = """
+            <section>
+                <h2>Model Response</h2>
+                <div class="empty-content-notice">
+                    <p>No model response available</p>
+                    <p>This could be because the model failed to generate a response or the response files are missing.</p>
+                </div>
+            </section>
+            """
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Actual Output: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <style>
+        .empty-content-notice {{
+            background-color: #f8f8f8;
+            border: 1px dashed #ccc;
+            border-radius: 4px;
+            padding: 20px;
+            text-align: center;
+            color: #666;
+        }}
+        
+        .empty-content-notice p:first-child {{
+            font-weight: bold;
+            margin-bottom: 10px;
+        }}
+        
+        .info-message {{
+            background-color: #f1f8ff;
+            border: 1px solid #c8e1ff;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 15px;
+            color: #0366d6;
+        }}
+        
+        .info-message p:first-child {{
+            font-weight: bold;
+            margin-bottom: 5px;
+        }}
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Actual Output: {original_filename}</h1>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+    </header>
+    <main>
+        {content_section}
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            hljs.highlightAll();
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    with open(actual_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_model_page(
+    model: str,
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
+    benchmark_run_dir: Path,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page for a specific model showing all its benchmark cases.
+
+    Args:
+        model: The model name
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        benchmark_run_dir: Path to the benchmark run directory
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    # Create the models directory if it doesn't exist
+    models_dir = docs_dir / "models"
+    models_dir.mkdir(exist_ok=True)
+
+    # Get the sanitized model name for the filename
+    safe_model = model.replace("/", "_")
+    model_page_path = models_dir / f"{safe_model}.html"
+
+    # Get display name if available
+    display_name = model_display_names.get(model, model)
+
+    # Collect cases for this model
+    model_cases = []
+    for (case_prefix, case_model), metadata in results_metadata.items():
+        if case_model == model:
+            # Get case metadata
+            case_data = {
+                "prefix": case_prefix,
+                "success": metadata.get("success", False),
+                "runtime_seconds": metadata.get("runtime_seconds", 0),
+                "cost_usd": metadata.get("cost_usd", 0),
+                "prompt_tokens": prompt_metadata.get(case_prefix, {}).get(
+                    "prompt_tokens", 0
+                ),
+                "output_tokens": metadata.get("output_tokens", 0),
+                "original_filename": prompt_metadata.get(case_prefix, {}).get(
+                    "original_filename", case_prefix
+                ),
+            }
+            model_cases.append(case_data)
+
+    # Sort cases by prompt tokens (ascending)
+    model_cases.sort(key=lambda x: x["prompt_tokens"])
+
+    # Create page content
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{display_name} - Benchmark Cases</title>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <header>
+        <h1>{display_name} - Benchmark Cases</h1>
+        <p><a href="../index.html">← Back to Overview</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>All Benchmark Cases</h2>
+            <p>{len(model_cases)} cases sorted by prompt token size (smallest to largest)</p>
+            
+            <div class="case-filter">
+                <label>
+                    <input type="checkbox" id="show-successful" checked> Show Successful
+                </label>
+                <label>
+                    <input type="checkbox" id="show-failed" checked> Show Failed
+                </label>
+            </div>
+            
+            <table id="cases-table">
+                <thead>
+                    <tr>
+                        <th>Case</th>
+                        <th>Prompt Tokens</th>
+                        <th>Status</th>
+                        <th>Runtime</th>
+                        <th>Cost</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+
+    # Add case rows
+    for case in model_cases:
+        status_class = "success" if case["success"] else "failure"
+        status_text = "Success" if case["success"] else "Failure"
+
+        # Create a safe case page filename
+        safe_case = case["prefix"].replace("/", "_")
+
+        html_content += f"""
+                    <tr class="case-row {status_class}">
+                        <td>{case["original_filename"]}</td>
+                        <td>{case["prompt_tokens"]}</td>
+                        <td class="{status_class}">{status_text}</td>
+                        <td>{case["runtime_seconds"]:.2f}s</td>
+                        <td>${case["cost_usd"]:.6f}</td>
+                        <td>
+                            <a href="../cases/{safe_model}/{safe_case}.html" class="view-button">View Details</a>
+                        </td>
+                    </tr>
+        """
+
+    html_content += """
+                </tbody>
+            </table>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        // Add filtering functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            const showSuccessfulCheckbox = document.getElementById('show-successful');
+            const showFailedCheckbox = document.getElementById('show-failed');
+            
+            function updateFilters() {
+                const showSuccessful = showSuccessfulCheckbox.checked;
+                const showFailed = showFailedCheckbox.checked;
+                
+                document.querySelectorAll('.case-row').forEach(row => {
+                    if (row.classList.contains('success')) {
+                        row.style.display = showSuccessful ? '' : 'none';
+                    } else {
+                        row.style.display = showFailed ? '' : 'none';
+                    }
+                });
+            }
+            
+            showSuccessfulCheckbox.addEventListener('change', updateFilters);
+            showFailedCheckbox.addEventListener('change', updateFilters);
+        });
+    </script>
+</body>
+</html>
+    """
+
+    # Write the page
+    with open(model_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_case_page(
+    case_prefix: str,
+    model: str,
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
+    benchmark_run_dir: Path,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page for a specific benchmark case and model.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        benchmark_run_dir: Path to the benchmark run directory
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    # Create the cases directory structure if it doesn't exist
+    safe_model = model.replace("/", "_")
+    cases_dir = docs_dir / "cases" / safe_model
+    cases_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get the sanitized case name for the filename
+    safe_case = case_prefix.replace("/", "_")
+    case_page_path = cases_dir / f"{safe_case}.html"
+
+    # Get display name if available
+    display_name = model_display_names.get(model, model)
+
+    # Get metadata
+    result_metadata = results_metadata.get((case_prefix, model), {})
+    case_metadata = prompt_metadata.get(case_prefix, {})
+
+    # Get file paths
+    original_filename = case_metadata.get("original_filename", case_prefix)
+    prompt_file_path = benchmark_run_dir / "prompts" / f"{case_prefix}_prompt.txt"
+    expected_output_path = (
+        benchmark_run_dir / "prompts" / f"{case_prefix}_expectedoutput.txt"
+    )
+
+    # Determine the paths for result files
+    timestamp_dirs = []
+    case_result_dir = benchmark_run_dir / "results" / case_prefix / safe_model
+    if case_result_dir.exists():
+        timestamp_dirs = sorted(
+            [d for d in case_result_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+
+    actual_output_path = None
+    if timestamp_dirs:
+        actual_output_path = timestamp_dirs[0] / "response.txt"
+
+    # Read file contents
+    prompt_content = ""
+    if prompt_file_path.exists():
+        with open(prompt_file_path, "r", encoding="utf-8") as f:
+            prompt_content = f.read()
+
+    expected_output = ""
+    if expected_output_path.exists():
+        with open(expected_output_path, "r", encoding="utf-8") as f:
+            expected_output = f.read()
+
+    # For actual output, try to find both raw response and extracted output
+    actual_output = ""
+    raw_response = ""
+
+    # Look for the raw response file first
+    if timestamp_dirs:
+        raw_response_path = timestamp_dirs[0] / "raw_response.txt"
+        if raw_response_path.exists():
+            try:
+                with open(raw_response_path, "r", encoding="utf-8") as f:
+                    raw_response = f.read()
+            except Exception as e:
+                print(f"Error reading raw response file {raw_response_path}: {e}")
+
+    # Then try to get the extracted output (the code from backticks)
+    if actual_output_path and actual_output_path.exists():
+        try:
+            with open(actual_output_path, "r", encoding="utf-8") as f:
+                actual_output = f.read()
+        except Exception as e:
+            print(f"Error reading actual output file {actual_output_path}: {e}")
+
+    # Get success status
+    success = result_metadata.get("success", False)
+
+    # Generate content-specific pages
+    generate_prompt_page(
+        case_prefix,
+        model,
+        prompt_content,
+        original_filename,
+        docs_dir,
+        model_display_names,
+    )
+    generate_expected_output_page(
+        case_prefix,
+        model,
+        expected_output,
+        original_filename,
+        docs_dir,
+        model_display_names,
+    )
+    generate_actual_output_page(
+        case_prefix,
+        model,
+        raw_response,  # Use raw response as primary content
+        original_filename,
+        docs_dir,
+        model_display_names,
+        success=success,
+        expected_output=expected_output,
+        extracted_output=actual_output,  # Pass extracted output as fallback
+    )
+
+    # Get status
+    success = result_metadata.get("success", False)
+    status_class = "success" if success else "failure"
+    status_text = "Success" if success else "Failure"
+
+    # Create the main case page content with links instead of embedded content
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Case: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../styles.css">
+</head>
+<body>
+    <header>
+        <h1>Case: {original_filename}</h1>
+        <p><a href="../../models/{safe_model}.html">← Back to {display_name} Cases</a> | <a href="../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section class="case-details">
+            <div class="case-info">
+                <h2>Benchmark Case Information</h2>
+                <p><strong>Model:</strong> {display_name}</p>
+                <p><strong>Status:</strong> <span class="{status_class}">{status_text}</span></p>
+                <p><strong>Prompt Tokens:</strong> {case_metadata.get("prompt_tokens", "N/A")}</p>
+                <p><strong>Output Tokens:</strong> {result_metadata.get("output_tokens", "N/A")}</p>
+                <p><strong>Runtime:</strong> {result_metadata.get("runtime_seconds", "N/A")}s</p>
+                <p><strong>Cost:</strong> ${result_metadata.get("cost_usd", "N/A")}</p>
+            </div>
+            
+            <div class="content-links">
+                <h2>View Content</h2>
+                <ul>
+                    <li><a href="../../content/{safe_model}/{safe_case}/prompt.html" class="content-link">View Prompt</a></li>
+                    <li><a href="../../content/{safe_model}/{safe_case}/expected.html" class="content-link">View Expected Output</a></li>
+                    <li><a href="../../content/{safe_model}/{safe_case}/actual.html" class="content-link">View Actual Output</a></li>
+                </ul>
+            </div>
+            
+            <div class="diff-section">
+                <h2>Diff (Expected vs Actual)</h2>
+                <div id="diff-output">
+                    <p>Loading diff...</p>
+                </div>
+            </div>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/4.0.2/diff.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            // Check if this is a successful run
+            const isSuccess = {"true" if success else "false"};
+            
+            if (isSuccess) {{
+                // For successful runs, show a success message instead of a diff
+                document.getElementById("diff-output").innerHTML = '<div class="success-message"><p>✓ No differences found (successful run)</p><p>Expected output matches the model output exactly.</p></div>';
+                return;
+            }}
+            
+            // For failed runs, load expected and actual output for diff
+            Promise.all([
+                fetch("../../content/{safe_model}/{safe_case}/expected.html").then(response => {{
+                    if (!response.ok) {{
+                        throw new Error("Failed to fetch expected output (HTTP " + response.status + ")");
+                    }}
+                    return response.text();
+                }}),
+                fetch("../../content/{safe_model}/{safe_case}/actual.html").then(response => {{
+                    if (!response.ok) {{
+                        throw new Error("Failed to fetch actual output (HTTP " + response.status + ")");
+                    }}
+                    return response.text();
+                }})
+            ])
+            .then(([expectedHtml, actualHtml]) => {{
+                // Extract content from the HTML files using more robust regex
+                // Look for the code block inside the main content section
+                const extractContent = (html) => {{
+                    // First try to find content within the code block
+                    const codeMatch = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
+                    if (codeMatch && codeMatch[1]) {{
+                        return codeMatch[1];
+                    }}
+                    
+                    // Fallback: try to extract from main section if code block not found
+                    const mainMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/);
+                    if (mainMatch && mainMatch[1]) {{
+                        return mainMatch[1].replace(/<[^>]*>/g, '').trim();
+                    }}
+                    
+                    return ""; // Return empty string if nothing found
+                }};
+                
+                const expectedContent = extractContent(expectedHtml);
+                const actualContent = extractContent(actualHtml);
+                
+                if (expectedContent && actualContent) {{
+                    // Check if they're actually different
+                    if (expectedContent === actualContent) {{
+                        document.getElementById("diff-output").innerHTML = '<div class="no-diff-message"><p>No differences found, but run was marked as failed.</p></div>';
+                        return;
+                    }}
+                    
+                    // Create the diff
+                    const diff = Diff.createPatch("file", expectedContent, actualContent);
+                    
+                    // Check if the diff is meaningful
+                    const hasMeaningfulDiff = diff.includes('+') || diff.includes('-');
+                    
+                    if (hasMeaningfulDiff) {{
+                        // Format and display the diff
+                        const formattedDiff = formatDiff(diff);
+                        document.getElementById("diff-output").innerHTML = formattedDiff;
+                    }} else {{
+                        document.getElementById("diff-output").innerHTML = '<div class="no-diff-message"><p>No visible differences found in content.</p><p>The run may have failed due to whitespace or invisible characters.</p></div>';
+                    }}
+                }} else {{
+                    // Show a specific error if either content is empty
+                    if (!expectedContent && !actualContent) {{
+                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from both expected and actual output files.</p>";
+                    }} else if (!expectedContent) {{
+                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from expected output file.</p>";
+                    }} else {{
+                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from actual output file.</p>";
+                    }}
+                }}
+            }})
+            .catch(error => {{
+                document.getElementById("diff-output").innerHTML = "<p>Error loading diff: " + error.message + "</p>";
+                console.error("Error in diff generation:", error);
+            }});
+            
+            // Format the diff with syntax highlighting
+            function formatDiff(diff) {{
+                if (!diff) return '<pre>No differences found</pre>';
+                
+                const lines = diff.split('\\n');
+                let html = '<pre class="diff">';
+                
+                for (let i = 0; i < lines.length; i++) {{
+                    const line = lines[i];
+                    let className = '';
+                    
+                    if (line.startsWith('+')) {{
+                        className = 'diff-added';
+                    }} else if (line.startsWith('-')) {{
+                        className = 'diff-removed';
+                    }} else if (line.startsWith('@')) {{
+                        className = 'diff-info';
+                    }}
+                    
+                    // Escape HTML in the line
+                    const escapedLine = document.createElement('div');
+                    escapedLine.textContent = line;
+                    const escapedText = escapedLine.innerHTML;
+                    
+                    html += '<div class="' + className + '">' + escapedText + '</div>';
+                }}
+                
+                html += '</pre>';
+                return html;
+            }}
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    # Write the page
+    with open(case_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
 
 
 def create_css_file() -> str:
@@ -1378,6 +2156,199 @@ tbody tr:hover {
     margin-bottom: 30px;
 }
 
+/* Explore Benchmarks Section */
+.model-list {
+    list-style-type: none;
+    padding: 0;
+    margin: 20px 0;
+}
+
+.model-list li {
+    margin-bottom: 10px;
+}
+
+.model-link {
+    display: inline-block;
+    padding: 10px 15px;
+    background-color: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #0366d6;
+    text-decoration: none;
+    transition: background-color 0.2s;
+    width: 300px;
+}
+
+.model-link:hover {
+    background-color: #e1e4e8;
+    text-decoration: none;
+}
+
+/* Case status indicators */
+.success {
+    color: #22863a;
+    font-weight: bold;
+}
+
+.failure {
+    color: #cb2431;
+    font-weight: bold;
+}
+
+tr.success:hover, tr.failure:hover {
+    background-color: #f0f4f8;
+}
+
+/* Case filter controls */
+.case-filter {
+    margin-bottom: 15px;
+    display: flex;
+    gap: 20px;
+}
+
+.case-filter label {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.case-filter input[type="checkbox"] {
+    margin-right: 8px;
+}
+
+/* View button */
+.view-button {
+    display: inline-block;
+    padding: 5px 10px;
+    background-color: #0366d6;
+    color: white;
+    border-radius: 4px;
+    font-size: 12px;
+    text-decoration: none;
+    transition: background-color 0.2s;
+}
+
+.view-button:hover {
+    background-color: #0255b3;
+    text-decoration: none;
+}
+
+/* Case detail styles */
+.case-details {
+    margin-bottom: 30px;
+}
+
+.case-info {
+    background-color: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    padding: 15px;
+    margin-bottom: 20px;
+}
+
+/* Content links section */
+.content-links {
+    margin: 20px 0;
+}
+
+.content-links h2 {
+    margin-bottom: 15px;
+}
+
+.content-links ul {
+    list-style-type: none;
+    padding: 0;
+}
+
+.content-links li {
+    margin-bottom: 10px;
+}
+
+.content-link {
+    display: inline-block;
+    padding: 10px 15px;
+    background-color: #0366d6;
+    color: white;
+    border-radius: 4px;
+    text-decoration: none;
+    transition: background-color 0.2s;
+    width: 250px;
+    text-align: center;
+}
+
+.content-link:hover {
+    background-color: #0255b3;
+    text-decoration: none;
+}
+
+/* Diff section */
+.diff-section {
+    margin-top: 30px;
+}
+
+.diff-section h2 {
+    margin-bottom: 15px;
+}
+
+#diff-output {
+    background-color: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    padding: 15px;
+    overflow-x: auto;
+}
+
+/* Success and error messages in diff section */
+.success-message {
+    background-color: #e6ffec;
+    color: #22863a;
+    padding: 15px;
+    border: 1px solid #22863a;
+    border-radius: 4px;
+    text-align: center;
+}
+
+.success-message p:first-child {
+    font-size: 18px;
+    font-weight: bold;
+    margin-bottom: 5px;
+}
+
+.no-diff-message {
+    background-color: #fffbdd;
+    color: #735c0f;
+    padding: 15px;
+    border: 1px solid #d9d0a5;
+    border-radius: 4px;
+    text-align: center;
+}
+
+/* Diff formatting */
+.diff {
+    font-family: monospace;
+    white-space: pre;
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-x: auto;
+}
+
+.diff-added {
+    background-color: #e6ffec;
+    color: #22863a;
+}
+
+.diff-removed {
+    background-color: #ffebe9;
+    color: #cb2431;
+}
+
+.diff-info {
+    color: #6a737d;
+    background-color: #f1f8ff;
+}
+
 /* Footer */
 footer {
     margin-top: 40px;
@@ -1503,8 +2474,41 @@ def main():
         model_display_names,
     )
     html_content += create_token_chart_section()
-    html_content += create_cases_placeholder()
+    html_content += create_cases_section(all_models, model_display_names)
     html_content += create_html_footer(include_chart_js=True)
+
+    # Generate model pages and case pages
+    print("Generating model and case pages...")
+
+    # Create model pages
+    for model in all_models:
+        print(f"Generating page for model: {model}")
+        generate_model_page(
+            model,
+            prompt_metadata,
+            results_metadata,
+            benchmark_run_dir,
+            docs_dir,
+            model_display_names,
+        )
+
+        # Create case pages for this model
+        model_case_count = 0
+        for (case_prefix, case_model), metadata in results_metadata.items():
+            if case_model == model:
+                print(f"  - Generating case page: {case_prefix}")
+                generate_case_page(
+                    case_prefix,
+                    model,
+                    prompt_metadata,
+                    results_metadata,
+                    benchmark_run_dir,
+                    docs_dir,
+                    model_display_names,
+                )
+                model_case_count += 1
+
+        print(f"Generated {model_case_count} case pages for model {model}")
 
     # Write HTML file
     index_path = docs_dir / "index.html"
