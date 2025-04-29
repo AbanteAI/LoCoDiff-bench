@@ -1825,13 +1825,13 @@ def generate_case_page(
             Promise.all([
                 fetch("../../content/{safe_model}/{safe_case}/expected.html").then(response => {{
                     if (!response.ok) {{
-                        throw new Error(`Failed to fetch expected output (HTTP ${response.status})`);
+                        throw new Error("Failed to fetch expected output (HTTP " + response.status + ")");
                     }}
                     return response.text();
                 }}),
                 fetch("../../content/{safe_model}/{safe_case}/actual.html").then(response => {{
                     if (!response.ok) {{
-                        throw new Error(`Failed to fetch actual output (HTTP ${response.status})`);
+                        throw new Error("Failed to fetch actual output (HTTP " + response.status + ")");
                     }}
                     return response.text();
                 }})
@@ -1890,7 +1890,7 @@ def generate_case_page(
                 }}
             }})
             .catch(error => {{
-                document.getElementById("diff-output").innerHTML = `<p>Error loading diff: ${{error.message}}</p>`;
+                document.getElementById("diff-output").innerHTML = "<p>Error loading diff: " + error.message + "</p>";
                 console.error("Error in diff generation:", error);
             }});
             
@@ -1918,7 +1918,7 @@ def generate_case_page(
                     escapedLine.textContent = line;
                     const escapedText = escapedLine.innerHTML;
                     
-                    html += `<div class="${{className}}">${{escapedText}}</div>`;
+                    html += '<div class="' + className + '">' + escapedText + '</div>';
                 }}
                 
                 html += '</pre>';
