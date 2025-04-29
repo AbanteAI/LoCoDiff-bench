@@ -1870,7 +1870,10 @@ def generate_case_page(
                 html_lines = []
 
                 for line in lines:
-                    if line.startswith("+"):
+                    # Special handling for file header lines
+                    if line.startswith("---") or line.startswith("+++"):
+                        html_lines.append(f'<div class="diff-header">{line}</div>')
+                    elif line.startswith("+"):
                         html_lines.append(f'<div class="diff-added">{line}</div>')
                     elif line.startswith("-"):
                         html_lines.append(f'<div class="diff-removed">{line}</div>')
@@ -2266,6 +2269,12 @@ tr.success:hover, tr.failure:hover {
 .diff-info {
     color: #6a737d;
     background-color: #f1f8ff;
+}
+
+.diff-header {
+    color: #24292e;
+    background-color: #f6f8fa;
+    font-weight: bold;
 }
 
 /* Footer */
