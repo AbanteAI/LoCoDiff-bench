@@ -2388,6 +2388,7 @@ def main():
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
+    html_content += create_token_chart_section()
     html_content += create_overall_stats_table(
         results_metadata, all_models, num_cases, model_display_names
     )
@@ -2401,7 +2402,6 @@ def main():
         ext_to_lang_map,
         model_display_names,
     )
-    html_content += create_token_chart_section()
     html_content += create_cases_section(all_models, model_display_names)
     html_content += create_html_footer(include_chart_js=True)
 
