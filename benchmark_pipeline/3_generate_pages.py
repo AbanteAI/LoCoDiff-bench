@@ -1410,6 +1410,8 @@ def generate_actual_output_page(
     original_filename: str,
     docs_dir: Path,
     model_display_names: Dict[str, str] = {},
+    success: bool = False,
+    expected_output: str = "",
 ) -> None:
     """
     Generates a page displaying just the actual output content.
@@ -1421,6 +1423,8 @@ def generate_actual_output_page(
         original_filename: The original filename of the case
         docs_dir: Path to the docs directory
         model_display_names: Optional mapping of model names to display names
+        success: Whether the run was successful (matched expected output)
+        expected_output: The expected output content (used as fallback)
     """
     safe_model = model.replace("/", "_")
     safe_case = case_prefix.replace("/", "_")
@@ -1430,18 +1434,49 @@ def generate_actual_output_page(
     actual_page_path = content_dir / "actual.html"
     display_name = model_display_names.get(model, model)
 
-    # Handle empty actual output specially
+    # Handle output content based on success status and available content
     content_section = ""
-    if not actual_output or actual_output.strip() == "":
-        content_section = """
+
+    # For successful runs, if actual output is empty but expected output exists,
+    # use the expected output as the actual output (they must match)
+    if (
+        success
+        and (not actual_output or actual_output.strip() == "")
+        and expected_output
+    ):
+        content_section = f"""
         <section>
             <h2>Actual Output Content</h2>
-            <div class="empty-content-notice">
-                <p>No actual output content available.</p>
-                <p>This could be because the model failed to generate a response or the response was empty.</p>
+            <div class="success-message">
+                <p>✓ Output matched expected output exactly</p>
+                <p>Showing the expected output, as they are identical:</p>
             </div>
+            <pre><code class="language-plaintext">{expected_output}</code></pre>
         </section>
         """
+    # For empty output, show appropriate message based on success status
+    elif not actual_output or actual_output.strip() == "":
+        if success:
+            content_section = """
+            <section>
+                <h2>Actual Output Content</h2>
+                <div class="success-message">
+                    <p>✓ Output matched expected output exactly</p>
+                    <p>The model produced output that exactly matched the expected output, but the output file is either empty or not available.</p>
+                </div>
+            </section>
+            """
+        else:
+            content_section = """
+            <section>
+                <h2>Actual Output Content</h2>
+                <div class="empty-content-notice">
+                    <p>No actual output content available.</p>
+                    <p>This could be because the model failed to generate a response or the response was empty.</p>
+                </div>
+            </section>
+            """
+    # For non-empty output, show the actual content
     else:
         content_section = f"""
         <section>
@@ -1731,6 +1766,9 @@ def generate_case_page(
         with open(actual_output_path, "r", encoding="utf-8") as f:
             actual_output = f.read()
 
+    # Get success status
+    success = result_metadata.get("success", False)
+
     # Generate content-specific pages
     generate_prompt_page(
         case_prefix,
@@ -1755,6 +1793,8 @@ def generate_case_page(
         original_filename,
         docs_dir,
         model_display_names,
+        success=success,
+        expected_output=expected_output,
     )
 
     # Get status
