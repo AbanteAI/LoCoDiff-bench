@@ -1246,10 +1246,10 @@ def create_cases_section(
 ) -> str:
     """Creates a section with links to model-specific benchmark case pages."""
     html = """
-    <section id="individual-cases">
-        <h2>Individual Benchmark Cases</h2>
+    <section id="explore-benchmarks">
+        <h2>Explore Benchmark Prompts and Model Outputs</h2>
         <p>Select a model below to view its benchmark cases:</p>
-        <div class="model-links">
+        <ul class="model-list">
     """
 
     # Add links to model pages
@@ -1259,16 +1259,213 @@ def create_cases_section(
         # Use display name if available
         display_name = model_display_names.get(model, model)
         html += f"""
-            <a href="models/{safe_model}.html" class="model-link-button">
-                {display_name}
-            </a>
+            <li>
+                <a href="models/{safe_model}.html" class="model-link">
+                    {display_name}
+                </a>
+            </li>
         """
 
     html += """
-        </div>
+        </ul>
     </section>
     """
     return html
+
+
+def generate_prompt_page(
+    case_prefix: str,
+    model: str,
+    prompt_content: str,
+    original_filename: str,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page displaying just the prompt content.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        prompt_content: The prompt content to display
+        original_filename: The original filename of the case
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    safe_model = model.replace("/", "_")
+    safe_case = case_prefix.replace("/", "_")
+    content_dir = docs_dir / "content" / safe_model / safe_case
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_page_path = content_dir / "prompt.html"
+    display_name = model_display_names.get(model, model)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prompt: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Prompt: {original_filename}</h1>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>Prompt Content</h2>
+            <pre><code class="language-plaintext">{prompt_content}</code></pre>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            hljs.highlightAll();
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    with open(prompt_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_expected_output_page(
+    case_prefix: str,
+    model: str,
+    expected_output: str,
+    original_filename: str,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page displaying just the expected output content.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        expected_output: The expected output content to display
+        original_filename: The original filename of the case
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    safe_model = model.replace("/", "_")
+    safe_case = case_prefix.replace("/", "_")
+    content_dir = docs_dir / "content" / safe_model / safe_case
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_page_path = content_dir / "expected.html"
+    display_name = model_display_names.get(model, model)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Expected Output: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Expected Output: {original_filename}</h1>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>Expected Output Content</h2>
+            <pre><code class="language-plaintext">{expected_output}</code></pre>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            hljs.highlightAll();
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    with open(expected_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_actual_output_page(
+    case_prefix: str,
+    model: str,
+    actual_output: str,
+    original_filename: str,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page displaying just the actual output content.
+
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        actual_output: The actual output content to display
+        original_filename: The original filename of the case
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    safe_model = model.replace("/", "_")
+    safe_case = case_prefix.replace("/", "_")
+    content_dir = docs_dir / "content" / safe_model / safe_case
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    actual_page_path = content_dir / "actual.html"
+    display_name = model_display_names.get(model, model)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Actual Output: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Actual Output: {original_filename}</h1>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>Actual Output Content</h2>
+            <pre><code class="language-plaintext">{actual_output}</code></pre>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            hljs.highlightAll();
+        }});
+    </script>
+</body>
+</html>
+    """
+
+    with open(actual_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
 
 
 def generate_model_page(
@@ -1502,12 +1699,38 @@ def generate_case_page(
         with open(actual_output_path, "r", encoding="utf-8") as f:
             actual_output = f.read()
 
+    # Generate content-specific pages
+    generate_prompt_page(
+        case_prefix,
+        model,
+        prompt_content,
+        original_filename,
+        docs_dir,
+        model_display_names,
+    )
+    generate_expected_output_page(
+        case_prefix,
+        model,
+        expected_output,
+        original_filename,
+        docs_dir,
+        model_display_names,
+    )
+    generate_actual_output_page(
+        case_prefix,
+        model,
+        actual_output,
+        original_filename,
+        docs_dir,
+        model_display_names,
+    )
+
     # Get status
     success = result_metadata.get("success", False)
     status_class = "success" if success else "failure"
     status_text = "Success" if success else "Failure"
 
-    # Create page content - with all JavaScript template literals properly escaped
+    # Create the main case page content with links instead of embedded content
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1515,9 +1738,6 @@ def generate_case_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Case: {original_filename} - {display_name}</title>
     <link rel="stylesheet" href="../../styles.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff/5.1.0/diff.min.js"></script>
 </head>
 <body>
     <header>
@@ -1536,32 +1756,19 @@ def generate_case_page(
                 <p><strong>Cost:</strong> ${result_metadata.get("cost_usd", "N/A")}</p>
             </div>
             
-            <div class="tabs">
-                <div class="tab-buttons">
-                    <button class="tab-button active" data-tab="prompt">Prompt</button>
-                    <button class="tab-button" data-tab="expected">Expected Output</button>
-                    <button class="tab-button" data-tab="actual">Actual Output</button>
-                    <button class="tab-button" data-tab="diff">Diff</button>
-                </div>
-                
-                <div class="tab-content active" id="prompt-tab">
-                    <h3>Prompt</h3>
-                    <pre><code class="language-plaintext">{prompt_content}</code></pre>
-                </div>
-                
-                <div class="tab-content" id="expected-tab">
-                    <h3>Expected Output</h3>
-                    <pre><code class="language-plaintext">{expected_output}</code></pre>
-                </div>
-                
-                <div class="tab-content" id="actual-tab">
-                    <h3>Actual Output</h3>
-                    <pre><code class="language-plaintext">{actual_output}</code></pre>
-                </div>
-                
-                <div class="tab-content" id="diff-tab">
-                    <h3>Diff (Expected vs Actual)</h3>
-                    <div id="diff-output"></div>
+            <div class="content-links">
+                <h2>View Content</h2>
+                <ul>
+                    <li><a href="../../content/{safe_model}/{safe_case}/prompt.html" class="content-link">View Prompt</a></li>
+                    <li><a href="../../content/{safe_model}/{safe_case}/expected.html" class="content-link">View Expected Output</a></li>
+                    <li><a href="../../content/{safe_model}/{safe_case}/actual.html" class="content-link">View Actual Output</a></li>
+                </ul>
+            </div>
+            
+            <div class="diff-section">
+                <h2>Diff (Expected vs Actual)</h2>
+                <div id="diff-output">
+                    <p>Loading diff...</p>
                 </div>
             </div>
         </section>
@@ -1570,79 +1777,68 @@ def generate_case_page(
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
     </footer>
     
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/4.0.2/diff.min.js"></script>
     <script>
-        // Initialize tabs
         document.addEventListener('DOMContentLoaded', function() {{
-            const tabButtons = document.querySelectorAll('.tab-button');
-            const tabContents = document.querySelectorAll('.tab-content');
-            
-            tabButtons.forEach(button => {{
-                button.addEventListener('click', () => {{
-                    // Remove active class from all buttons and contents
-                    tabButtons.forEach(btn => btn.classList.remove('active'));
-                    tabContents.forEach(content => content.classList.remove('active'));
+            // Load expected and actual output for diff
+            Promise.all([
+                fetch("../../content/{safe_model}/{safe_case}/expected.html").then(response => response.text()),
+                fetch("../../content/{safe_model}/{safe_case}/actual.html").then(response => response.text())
+            ])
+            .then(([expectedHtml, actualHtml]) => {{
+                // Extract content from the HTML files
+                const expectedMatch = expectedHtml.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
+                const actualMatch = actualHtml.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
+                
+                if (expectedMatch && actualMatch) {{
+                    const expectedContent = expectedMatch[1];
+                    const actualContent = actualMatch[1];
                     
-                    // Add active class to clicked button and corresponding content
-                    button.classList.add('active');
-                    const tabId = button.getAttribute('data-tab');
-                    document.getElementById(`${{tabId}}-tab`).classList.add('active');
+                    // Create the diff
+                    const diff = Diff.createPatch("file", expectedContent, actualContent);
                     
-                    // If diff tab, generate diff if not already done
-                    if (tabId === 'diff' && !document.getElementById('diff-output').innerHTML) {{
-                        generateDiff();
-                    }}
-                }});
+                    // Format and display the diff
+                    const formattedDiff = formatDiff(diff);
+                    document.getElementById("diff-output").innerHTML = formattedDiff;
+                }} else {{
+                    document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from files.</p>";
+                }}
+            }})
+            .catch(error => {{
+                document.getElementById("diff-output").innerHTML = `<p>Error loading diff: ${{error.message}}</p>`;
             }});
             
-            // Initialize highlight.js for code highlighting
-            hljs.highlightAll();
-        }});
-        
-        // Generate diff between expected and actual outputs
-        function generateDiff() {{
-            const expectedOutput = document.querySelector('#expected-tab code').textContent;
-            const actualOutput = document.querySelector('#actual-tab code').textContent;
-            
-            // Create a diff using the diff library
-            const diff = Diff.createTwoFilesPatch('expected', 'actual', expectedOutput, actualOutput);
-            
-            // Format the diff for display
-            const formattedDiff = formatDiff(diff);
-            document.getElementById('diff-output').innerHTML = formattedDiff;
-        }}
-        
-        // Format the diff with syntax highlighting
-        function formatDiff(diff) {{
-            if (!diff) return '<pre>No difference</pre>';
-            
-            const lines = diff.split('\\n');
-            let html = '<pre class="diff">';
-            
-            for (let i = 0; i < lines.length; i++) {{
-                const line = lines[i];
-                let className = '';
+            // Format the diff with syntax highlighting
+            function formatDiff(diff) {{
+                if (!diff) return '<pre>No differences found</pre>';
                 
-                if (line.startsWith('+')) {{
-                    className = 'diff-added';
-                }} else if (line.startsWith('-')) {{
-                    className = 'diff-removed';
-                }} else if (line.startsWith('@')) {{
-                    className = 'diff-info';
+                const lines = diff.split('\\n');
+                let html = '<pre class="diff">';
+                
+                for (let i = 0; i < lines.length; i++) {{
+                    const line = lines[i];
+                    let className = '';
+                    
+                    if (line.startsWith('+')) {{
+                        className = 'diff-added';
+                    }} else if (line.startsWith('-')) {{
+                        className = 'diff-removed';
+                    }} else if (line.startsWith('@')) {{
+                        className = 'diff-info';
+                    }}
+                    
+                    // Escape HTML in the line
+                    const escapedLine = document.createElement('div');
+                    escapedLine.textContent = line;
+                    const escapedText = escapedLine.innerHTML;
+                    
+                    html += `<div class="${{className}}">${{escapedText}}</div>`;
                 }}
                 
-                html += `<div class="${{className}}">${{escapeHtml(line)}}</div>`;
+                html += '</pre>';
+                return html;
             }}
-            
-            html += '</pre>';
-            return html;
-        }}
-        
-        // Helper function to escape HTML
-        function escapeHtml(text) {{
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }}
+        }});
     </script>
 </body>
 </html>
@@ -1780,15 +1976,18 @@ tbody tr:hover {
     margin-bottom: 30px;
 }
 
-/* Individual Cases Section */
-.model-links {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-top: 20px;
+/* Explore Benchmarks Section */
+.model-list {
+    list-style-type: none;
+    padding: 0;
+    margin: 20px 0;
 }
 
-.model-link-button {
+.model-list li {
+    margin-bottom: 10px;
+}
+
+.model-link {
     display: inline-block;
     padding: 10px 15px;
     background-color: #f6f8fa;
@@ -1799,9 +1998,10 @@ tbody tr:hover {
     color: #0366d6;
     text-decoration: none;
     transition: background-color 0.2s;
+    width: 300px;
 }
 
-.model-link-button:hover {
+.model-link:hover {
     background-color: #e1e4e8;
     text-decoration: none;
 }
@@ -1868,44 +2068,56 @@ tr.success:hover, tr.failure:hover {
     margin-bottom: 20px;
 }
 
-/* Tabs for case details */
-.tabs {
-    margin-top: 20px;
+/* Content links section */
+.content-links {
+    margin: 20px 0;
 }
 
-.tab-buttons {
-    display: flex;
-    border-bottom: 1px solid #e1e4e8;
+.content-links h2 {
     margin-bottom: 15px;
 }
 
-.tab-button {
-    background: none;
-    border: none;
-    padding: 10px 20px;
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-    transition: all 0.2s;
+.content-links ul {
+    list-style-type: none;
+    padding: 0;
 }
 
-.tab-button:hover {
+.content-links li {
+    margin-bottom: 10px;
+}
+
+.content-link {
+    display: inline-block;
+    padding: 10px 15px;
+    background-color: #0366d6;
+    color: white;
+    border-radius: 4px;
+    text-decoration: none;
+    transition: background-color 0.2s;
+    width: 250px;
+    text-align: center;
+}
+
+.content-link:hover {
+    background-color: #0255b3;
+    text-decoration: none;
+}
+
+/* Diff section */
+.diff-section {
+    margin-top: 30px;
+}
+
+.diff-section h2 {
+    margin-bottom: 15px;
+}
+
+#diff-output {
     background-color: #f6f8fa;
-}
-
-.tab-button.active {
-    border-bottom: 2px solid #0366d6;
-    color: #0366d6;
-}
-
-.tab-content {
-    display: none;
-    padding: 15px 0;
-}
-
-.tab-content.active {
-    display: block;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    padding: 15px;
+    overflow-x: auto;
 }
 
 /* Diff formatting */
