@@ -912,10 +912,16 @@ function initializeChart(chartData) {
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
-    // Create model checkboxes
-    const modelCheckboxes = document.getElementById('model-checkboxes');
+    // Create a fixed color mapping for all models first
+    const modelColorMap = {};
     chartData.models.forEach((model, index) => {
-        const color = colors[index % colors.length];
+        modelColorMap[model] = colors[index % colors.length];
+    });
+    
+    // Create model checkboxes using the fixed color mapping
+    const modelCheckboxes = document.getElementById('model-checkboxes');
+    chartData.models.forEach((model) => {
+        const color = modelColorMap[model]; // Use consistent color from the mapping
         // Use display name if available, otherwise use original model name
         const displayName = chartData.model_display_names && chartData.model_display_names[model] 
             ? chartData.model_display_names[model] 
@@ -1074,8 +1080,9 @@ function initializeChart(chartData) {
         chart.data.datasets = [];
         
         // Create datasets for each selected model
-        selectedModels.forEach((model, index) => {
-            const color = colors[index % colors.length];
+        selectedModels.forEach((model) => {
+            // Use the consistent color from our color map
+            const color = modelColorMap[model];
             
             // Calculate data points and store filtered data for tooltip
             const dataPoints = chartData.buckets.map((bucket, bucketIndex) => {
