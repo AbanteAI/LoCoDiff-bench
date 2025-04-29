@@ -1622,7 +1622,7 @@ def generate_case_page(
                     className = 'diff-info';
                 }
                 
-                html += `<div class="${className}">${escapeHtml(line)}</div>`;
+                html += `<div class="${{className}}">${{escapeHtml(line)}}</div>`;
             }
             
             html += '</pre>';
