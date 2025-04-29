@@ -328,11 +328,11 @@ async def get_generation_stats_openrouter(generation_id: str) -> dict | None:
                     if native_prompt_tokens is not None:
                         additional_cost += (int(native_prompt_tokens) / 1000000) * 10
 
-                    # Add output token cost: $30 per million tokens
+                    # Add output token cost: $40 per million tokens
                     if native_completion_tokens is not None:
                         additional_cost += (
                             int(native_completion_tokens) / 1000000
-                        ) * 30
+                        ) * 40
 
                     # Combine with the original cost from OpenRouter
                     cost_usd = float(cost_usd) + additional_cost
