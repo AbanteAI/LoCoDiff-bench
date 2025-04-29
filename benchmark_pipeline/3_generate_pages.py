@@ -1241,14 +1241,408 @@ function initializeChart(chartData) {
 """
 
 
-def create_cases_placeholder() -> str:
-    """Creates a placeholder section for individual benchmark cases."""
-    return """
+def create_cases_section(all_models: Set[str], model_display_names: Dict[str, str] = {}) -> str:
+    """Creates a section with links to model-specific benchmark case pages."""
+    html = """
     <section id="individual-cases">
         <h2>Individual Benchmark Cases</h2>
-        <p>Details for individual benchmark cases will be available in a future update.</p>
+        <p>Select a model below to view its benchmark cases:</p>
+        <div class="model-links">
+    """
+    
+    # Add links to model pages
+    for model in sorted(all_models):
+        # Create a safe filename for the model (sanitized)
+        safe_model = model.replace("/", "_")
+        # Use display name if available
+        display_name = model_display_names.get(model, model)
+        html += f"""
+            <a href="models/{safe_model}.html" class="model-link-button">
+                {display_name}
+            </a>
+        """
+    
+    html += """
+        </div>
     </section>
     """
+    return html
+
+
+def generate_model_page(
+    model: str,
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
+    benchmark_run_dir: Path,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page for a specific model showing all its benchmark cases.
+    
+    Args:
+        model: The model name
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        benchmark_run_dir: Path to the benchmark run directory
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    # Create the models directory if it doesn't exist
+    models_dir = docs_dir / "models"
+    models_dir.mkdir(exist_ok=True)
+    
+    # Get the sanitized model name for the filename
+    safe_model = model.replace("/", "_")
+    model_page_path = models_dir / f"{safe_model}.html"
+    
+    # Get display name if available
+    display_name = model_display_names.get(model, model)
+    
+    # Collect cases for this model
+    model_cases = []
+    for (case_prefix, case_model), metadata in results_metadata.items():
+        if case_model == model:
+            # Get case metadata
+            case_data = {
+                "prefix": case_prefix,
+                "success": metadata.get("success", False),
+                "runtime_seconds": metadata.get("runtime_seconds", 0),
+                "cost_usd": metadata.get("cost_usd", 0),
+                "prompt_tokens": prompt_metadata.get(case_prefix, {}).get("prompt_tokens", 0),
+                "output_tokens": metadata.get("output_tokens", 0),
+                "original_filename": prompt_metadata.get(case_prefix, {}).get("original_filename", case_prefix),
+            }
+            model_cases.append(case_data)
+    
+    # Sort cases by prompt tokens (ascending)
+    model_cases.sort(key=lambda x: x["prompt_tokens"])
+    
+    # Create page content
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{display_name} - Benchmark Cases</title>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <header>
+        <h1>{display_name} - Benchmark Cases</h1>
+        <p><a href="../index.html">← Back to Overview</a></p>
+    </header>
+    <main>
+        <section>
+            <h2>All Benchmark Cases</h2>
+            <p>{len(model_cases)} cases sorted by prompt token size (smallest to largest)</p>
+            
+            <div class="case-filter">
+                <label>
+                    <input type="checkbox" id="show-successful" checked> Show Successful
+                </label>
+                <label>
+                    <input type="checkbox" id="show-failed" checked> Show Failed
+                </label>
+            </div>
+            
+            <table id="cases-table">
+                <thead>
+                    <tr>
+                        <th>Case</th>
+                        <th>Prompt Tokens</th>
+                        <th>Status</th>
+                        <th>Runtime</th>
+                        <th>Cost</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    
+    # Add case rows
+    for case in model_cases:
+        status_class = "success" if case["success"] else "failure"
+        status_text = "Success" if case["success"] else "Failure"
+        
+        # Create a safe case page filename
+        safe_case = case["prefix"].replace("/", "_")
+        
+        html_content += f"""
+                    <tr class="case-row {status_class}">
+                        <td>{case["original_filename"]}</td>
+                        <td>{case["prompt_tokens"]}</td>
+                        <td class="{status_class}">{status_text}</td>
+                        <td>{case["runtime_seconds"]:.2f}s</td>
+                        <td>${case["cost_usd"]:.6f}</td>
+                        <td>
+                            <a href="../cases/{safe_model}/{safe_case}.html" class="view-button">View Details</a>
+                        </td>
+                    </tr>
+        """
+    
+    html_content += """
+                </tbody>
+            </table>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        // Add filtering functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            const showSuccessfulCheckbox = document.getElementById('show-successful');
+            const showFailedCheckbox = document.getElementById('show-failed');
+            
+            function updateFilters() {
+                const showSuccessful = showSuccessfulCheckbox.checked;
+                const showFailed = showFailedCheckbox.checked;
+                
+                document.querySelectorAll('.case-row').forEach(row => {
+                    if (row.classList.contains('success')) {
+                        row.style.display = showSuccessful ? '' : 'none';
+                    } else {
+                        row.style.display = showFailed ? '' : 'none';
+                    }
+                });
+            }
+            
+            showSuccessfulCheckbox.addEventListener('change', updateFilters);
+            showFailedCheckbox.addEventListener('change', updateFilters);
+        });
+    </script>
+</body>
+</html>
+    """
+    
+    # Write the page
+    with open(model_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
+def generate_case_page(
+    case_prefix: str,
+    model: str,
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
+    benchmark_run_dir: Path,
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page for a specific benchmark case and model.
+    
+    Args:
+        case_prefix: The benchmark case prefix
+        model: The model name
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        benchmark_run_dir: Path to the benchmark run directory
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    # Create the cases directory structure if it doesn't exist
+    safe_model = model.replace("/", "_")
+    cases_dir = docs_dir / "cases" / safe_model
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get the sanitized case name for the filename
+    safe_case = case_prefix.replace("/", "_")
+    case_page_path = cases_dir / f"{safe_case}.html"
+    
+    # Get display name if available
+    display_name = model_display_names.get(model, model)
+    
+    # Get metadata
+    result_metadata = results_metadata.get((case_prefix, model), {})
+    case_metadata = prompt_metadata.get(case_prefix, {})
+    
+    # Get file paths
+    original_filename = case_metadata.get("original_filename", case_prefix)
+    prompt_file_path = benchmark_run_dir / "prompts" / f"{case_prefix}_prompt.txt"
+    expected_output_path = benchmark_run_dir / "prompts" / f"{case_prefix}_expectedoutput.txt"
+    
+    # Determine the paths for result files
+    timestamp_dirs = []
+    case_result_dir = benchmark_run_dir / "results" / case_prefix / safe_model
+    if case_result_dir.exists():
+        timestamp_dirs = sorted(
+            [d for d in case_result_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+            reverse=True
+        )
+    
+    actual_output_path = None
+    if timestamp_dirs:
+        actual_output_path = timestamp_dirs[0] / "response.txt"
+    
+    # Read file contents
+    prompt_content = ""
+    if prompt_file_path.exists():
+        with open(prompt_file_path, "r", encoding="utf-8") as f:
+            prompt_content = f.read()
+    
+    expected_output = ""
+    if expected_output_path.exists():
+        with open(expected_output_path, "r", encoding="utf-8") as f:
+            expected_output = f.read()
+    
+    actual_output = ""
+    if actual_output_path and actual_output_path.exists():
+        with open(actual_output_path, "r", encoding="utf-8") as f:
+            actual_output = f.read()
+    
+    # Get status
+    success = result_metadata.get("success", False)
+    status_class = "success" if success else "failure"
+    status_text = "Success" if success else "Failure"
+    
+    # Create page content
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Case: {original_filename} - {display_name}</title>
+    <link rel="stylesheet" href="../../styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff/5.1.0/diff.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Case: {original_filename}</h1>
+        <p><a href="../../models/{safe_model}.html">← Back to {display_name} Cases</a> | <a href="../../index.html">Home</a></p>
+    </header>
+    <main>
+        <section class="case-details">
+            <div class="case-info">
+                <h2>Benchmark Case Information</h2>
+                <p><strong>Model:</strong> {display_name}</p>
+                <p><strong>Status:</strong> <span class="{status_class}">{status_text}</span></p>
+                <p><strong>Prompt Tokens:</strong> {case_metadata.get("prompt_tokens", "N/A")}</p>
+                <p><strong>Output Tokens:</strong> {result_metadata.get("output_tokens", "N/A")}</p>
+                <p><strong>Runtime:</strong> {result_metadata.get("runtime_seconds", "N/A")}s</p>
+                <p><strong>Cost:</strong> ${result_metadata.get("cost_usd", "N/A")}</p>
+            </div>
+            
+            <div class="tabs">
+                <div class="tab-buttons">
+                    <button class="tab-button active" data-tab="prompt">Prompt</button>
+                    <button class="tab-button" data-tab="expected">Expected Output</button>
+                    <button class="tab-button" data-tab="actual">Actual Output</button>
+                    <button class="tab-button" data-tab="diff">Diff</button>
+                </div>
+                
+                <div class="tab-content active" id="prompt-tab">
+                    <h3>Prompt</h3>
+                    <pre><code class="language-plaintext">{prompt_content}</code></pre>
+                </div>
+                
+                <div class="tab-content" id="expected-tab">
+                    <h3>Expected Output</h3>
+                    <pre><code class="language-plaintext">{expected_output}</code></pre>
+                </div>
+                
+                <div class="tab-content" id="actual-tab">
+                    <h3>Actual Output</h3>
+                    <pre><code class="language-plaintext">{actual_output}</code></pre>
+                </div>
+                
+                <div class="tab-content" id="diff-tab">
+                    <h3>Diff (Expected vs Actual)</h3>
+                    <div id="diff-output"></div>
+                </div>
+            </div>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        // Initialize tabs
+        document.addEventListener('DOMContentLoaded', function() {
+            const tabButtons = document.querySelectorAll('.tab-button');
+            const tabContents = document.querySelectorAll('.tab-content');
+            
+            tabButtons.forEach(button => {
+                button.addEventListener('click', () => {
+                    // Remove active class from all buttons and contents
+                    tabButtons.forEach(btn => btn.classList.remove('active'));
+                    tabContents.forEach(content => content.classList.remove('active'));
+                    
+                    // Add active class to clicked button and corresponding content
+                    button.classList.add('active');
+                    const tabId = button.getAttribute('data-tab');
+                    document.getElementById(`${tabId}-tab`).classList.add('active');
+                    
+                    // If diff tab, generate diff if not already done
+                    if (tabId === 'diff' && !document.getElementById('diff-output').innerHTML) {
+                        generateDiff();
+                    }
+                });
+            });
+            
+            // Initialize highlight.js for code highlighting
+            hljs.highlightAll();
+        });
+        
+        // Generate diff between expected and actual outputs
+        function generateDiff() {
+            const expectedOutput = document.querySelector('#expected-tab code').textContent;
+            const actualOutput = document.querySelector('#actual-tab code').textContent;
+            
+            // Create a diff using the diff library
+            const diff = Diff.createTwoFilesPatch('expected', 'actual', expectedOutput, actualOutput);
+            
+            // Format the diff for display
+            const formattedDiff = formatDiff(diff);
+            document.getElementById('diff-output').innerHTML = formattedDiff;
+        }
+        
+        // Format the diff with syntax highlighting
+        function formatDiff(diff) {
+            if (!diff) return '<pre>No difference</pre>';
+            
+            const lines = diff.split('\\n');
+            let html = '<pre class="diff">';
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                let className = '';
+                
+                if (line.startsWith('+')) {
+                    className = 'diff-added';
+                } else if (line.startsWith('-')) {
+                    className = 'diff-removed';
+                } else if (line.startsWith('@')) {
+                    className = 'diff-info';
+                }
+                
+                html += `<div class="${className}">${escapeHtml(line)}</div>`;
+            }
+            
+            html += '</pre>';
+            return html;
+        }
+        
+        // Helper function to escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
+    """
+    
+    # Write the page
+    with open(case_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
 
 
 def create_css_file() -> str:
@@ -1378,6 +1772,158 @@ tbody tr:hover {
     margin-bottom: 30px;
 }
 
+/* Individual Cases Section */
+.model-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.model-link-button {
+    display: inline-block;
+    padding: 10px 15px;
+    background-color: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #0366d6;
+    text-decoration: none;
+    transition: background-color 0.2s;
+}
+
+.model-link-button:hover {
+    background-color: #e1e4e8;
+    text-decoration: none;
+}
+
+/* Case status indicators */
+.success {
+    color: #22863a;
+    font-weight: bold;
+}
+
+.failure {
+    color: #cb2431;
+    font-weight: bold;
+}
+
+tr.success:hover, tr.failure:hover {
+    background-color: #f0f4f8;
+}
+
+/* Case filter controls */
+.case-filter {
+    margin-bottom: 15px;
+    display: flex;
+    gap: 20px;
+}
+
+.case-filter label {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.case-filter input[type="checkbox"] {
+    margin-right: 8px;
+}
+
+/* View button */
+.view-button {
+    display: inline-block;
+    padding: 5px 10px;
+    background-color: #0366d6;
+    color: white;
+    border-radius: 4px;
+    font-size: 12px;
+    text-decoration: none;
+    transition: background-color 0.2s;
+}
+
+.view-button:hover {
+    background-color: #0255b3;
+    text-decoration: none;
+}
+
+/* Case detail styles */
+.case-details {
+    margin-bottom: 30px;
+}
+
+.case-info {
+    background-color: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    padding: 15px;
+    margin-bottom: 20px;
+}
+
+/* Tabs for case details */
+.tabs {
+    margin-top: 20px;
+}
+
+.tab-buttons {
+    display: flex;
+    border-bottom: 1px solid #e1e4e8;
+    margin-bottom: 15px;
+}
+
+.tab-button {
+    background: none;
+    border: none;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+}
+
+.tab-button:hover {
+    background-color: #f6f8fa;
+}
+
+.tab-button.active {
+    border-bottom: 2px solid #0366d6;
+    color: #0366d6;
+}
+
+.tab-content {
+    display: none;
+    padding: 15px 0;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+/* Diff formatting */
+.diff {
+    font-family: monospace;
+    white-space: pre;
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-x: auto;
+}
+
+.diff-added {
+    background-color: #e6ffec;
+    color: #22863a;
+}
+
+.diff-removed {
+    background-color: #ffebe9;
+    color: #cb2431;
+}
+
+.diff-info {
+    color: #6a737d;
+    background-color: #f1f8ff;
+}
+
 /* Footer */
 footer {
     margin-top: 40px;
@@ -1490,8 +2036,41 @@ def main():
         model_display_names,
     )
     html_content += create_token_chart_section()
-    html_content += create_cases_placeholder()
+    html_content += create_cases_section(all_models, model_display_names)
     html_content += create_html_footer(include_chart_js=True)
+    
+    # Generate model pages and case pages
+    print("Generating model and case pages...")
+    
+    # Create model pages
+    for model in all_models:
+        print(f"Generating page for model: {model}")
+        generate_model_page(
+            model, 
+            prompt_metadata, 
+            results_metadata, 
+            benchmark_run_dir, 
+            docs_dir, 
+            model_display_names
+        )
+        
+        # Create case pages for this model
+        model_case_count = 0
+        for (case_prefix, case_model), metadata in results_metadata.items():
+            if case_model == model:
+                print(f"  - Generating case page: {case_prefix}")
+                generate_case_page(
+                    case_prefix,
+                    model,
+                    prompt_metadata,
+                    results_metadata,
+                    benchmark_run_dir,
+                    docs_dir,
+                    model_display_names
+                )
+                model_case_count += 1
+                
+        print(f"Generated {model_case_count} case pages for model {model}")
 
     # Write HTML file
     index_path = docs_dir / "index.html"
