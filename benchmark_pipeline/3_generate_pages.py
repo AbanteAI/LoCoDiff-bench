@@ -1241,7 +1241,9 @@ function initializeChart(chartData) {
 """
 
 
-def create_cases_section(all_models: Set[str], model_display_names: Dict[str, str] = {}) -> str:
+def create_cases_section(
+    all_models: Set[str], model_display_names: Dict[str, str] = {}
+) -> str:
     """Creates a section with links to model-specific benchmark case pages."""
     html = """
     <section id="individual-cases">
@@ -1249,7 +1251,7 @@ def create_cases_section(all_models: Set[str], model_display_names: Dict[str, st
         <p>Select a model below to view its benchmark cases:</p>
         <div class="model-links">
     """
-    
+
     # Add links to model pages
     for model in sorted(all_models):
         # Create a safe filename for the model (sanitized)
@@ -1261,7 +1263,7 @@ def create_cases_section(all_models: Set[str], model_display_names: Dict[str, st
                 {display_name}
             </a>
         """
-    
+
     html += """
         </div>
     </section>
@@ -1279,7 +1281,7 @@ def generate_model_page(
 ) -> None:
     """
     Generates a page for a specific model showing all its benchmark cases.
-    
+
     Args:
         model: The model name
         prompt_metadata: Dictionary of prompt metadata by case prefix
@@ -1291,14 +1293,14 @@ def generate_model_page(
     # Create the models directory if it doesn't exist
     models_dir = docs_dir / "models"
     models_dir.mkdir(exist_ok=True)
-    
+
     # Get the sanitized model name for the filename
     safe_model = model.replace("/", "_")
     model_page_path = models_dir / f"{safe_model}.html"
-    
+
     # Get display name if available
     display_name = model_display_names.get(model, model)
-    
+
     # Collect cases for this model
     model_cases = []
     for (case_prefix, case_model), metadata in results_metadata.items():
@@ -1309,15 +1311,19 @@ def generate_model_page(
                 "success": metadata.get("success", False),
                 "runtime_seconds": metadata.get("runtime_seconds", 0),
                 "cost_usd": metadata.get("cost_usd", 0),
-                "prompt_tokens": prompt_metadata.get(case_prefix, {}).get("prompt_tokens", 0),
+                "prompt_tokens": prompt_metadata.get(case_prefix, {}).get(
+                    "prompt_tokens", 0
+                ),
                 "output_tokens": metadata.get("output_tokens", 0),
-                "original_filename": prompt_metadata.get(case_prefix, {}).get("original_filename", case_prefix),
+                "original_filename": prompt_metadata.get(case_prefix, {}).get(
+                    "original_filename", case_prefix
+                ),
             }
             model_cases.append(case_data)
-    
+
     # Sort cases by prompt tokens (ascending)
     model_cases.sort(key=lambda x: x["prompt_tokens"])
-    
+
     # Create page content
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1359,15 +1365,15 @@ def generate_model_page(
                 </thead>
                 <tbody>
     """
-    
+
     # Add case rows
     for case in model_cases:
         status_class = "success" if case["success"] else "failure"
         status_text = "Success" if case["success"] else "Failure"
-        
+
         # Create a safe case page filename
         safe_case = case["prefix"].replace("/", "_")
-        
+
         html_content += f"""
                     <tr class="case-row {status_class}">
                         <td>{case["original_filename"]}</td>
@@ -1380,7 +1386,7 @@ def generate_model_page(
                         </td>
                     </tr>
         """
-    
+
     html_content += """
                 </tbody>
             </table>
@@ -1416,7 +1422,7 @@ def generate_model_page(
 </body>
 </html>
     """
-    
+
     # Write the page
     with open(model_page_path, "w", encoding="utf-8") as f:
         f.write(html_content)
@@ -1433,7 +1439,7 @@ def generate_case_page(
 ) -> None:
     """
     Generates a page for a specific benchmark case and model.
-    
+
     Args:
         case_prefix: The benchmark case prefix
         model: The model name
@@ -1447,23 +1453,25 @@ def generate_case_page(
     safe_model = model.replace("/", "_")
     cases_dir = docs_dir / "cases" / safe_model
     cases_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Get the sanitized case name for the filename
     safe_case = case_prefix.replace("/", "_")
     case_page_path = cases_dir / f"{safe_case}.html"
-    
+
     # Get display name if available
     display_name = model_display_names.get(model, model)
-    
+
     # Get metadata
     result_metadata = results_metadata.get((case_prefix, model), {})
     case_metadata = prompt_metadata.get(case_prefix, {})
-    
+
     # Get file paths
     original_filename = case_metadata.get("original_filename", case_prefix)
     prompt_file_path = benchmark_run_dir / "prompts" / f"{case_prefix}_prompt.txt"
-    expected_output_path = benchmark_run_dir / "prompts" / f"{case_prefix}_expectedoutput.txt"
-    
+    expected_output_path = (
+        benchmark_run_dir / "prompts" / f"{case_prefix}_expectedoutput.txt"
+    )
+
     # Determine the paths for result files
     timestamp_dirs = []
     case_result_dir = benchmark_run_dir / "results" / case_prefix / safe_model
@@ -1471,35 +1479,35 @@ def generate_case_page(
         timestamp_dirs = sorted(
             [d for d in case_result_dir.iterdir() if d.is_dir()],
             key=lambda d: d.name,
-            reverse=True
+            reverse=True,
         )
-    
+
     actual_output_path = None
     if timestamp_dirs:
         actual_output_path = timestamp_dirs[0] / "response.txt"
-    
+
     # Read file contents
     prompt_content = ""
     if prompt_file_path.exists():
         with open(prompt_file_path, "r", encoding="utf-8") as f:
             prompt_content = f.read()
-    
+
     expected_output = ""
     if expected_output_path.exists():
         with open(expected_output_path, "r", encoding="utf-8") as f:
             expected_output = f.read()
-    
+
     actual_output = ""
     if actual_output_path and actual_output_path.exists():
         with open(actual_output_path, "r", encoding="utf-8") as f:
             actual_output = f.read()
-    
+
     # Get status
     success = result_metadata.get("success", False)
     status_class = "success" if success else "failure"
     status_text = "Success" if success else "Failure"
-    
-    # Create page content
+
+    # Create page content - with all JavaScript template literals properly escaped
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1564,12 +1572,12 @@ def generate_case_page(
     
     <script>
         // Initialize tabs
-        document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', function() {{
             const tabButtons = document.querySelectorAll('.tab-button');
             const tabContents = document.querySelectorAll('.tab-content');
             
-            tabButtons.forEach(button => {
-                button.addEventListener('click', () => {
+            tabButtons.forEach(button => {{
+                button.addEventListener('click', () => {{
                     // Remove active class from all buttons and contents
                     tabButtons.forEach(btn => btn.classList.remove('active'));
                     tabContents.forEach(content => content.classList.remove('active'));
@@ -1580,18 +1588,18 @@ def generate_case_page(
                     document.getElementById(`${{tabId}}-tab`).classList.add('active');
                     
                     // If diff tab, generate diff if not already done
-                    if (tabId === 'diff' && !document.getElementById('diff-output').innerHTML) {
+                    if (tabId === 'diff' && !document.getElementById('diff-output').innerHTML) {{
                         generateDiff();
-                    }
-                });
-            });
+                    }}
+                }});
+            }});
             
             // Initialize highlight.js for code highlighting
             hljs.highlightAll();
-        });
+        }});
         
         // Generate diff between expected and actual outputs
-        function generateDiff() {
+        function generateDiff() {{
             const expectedOutput = document.querySelector('#expected-tab code').textContent;
             const actualOutput = document.querySelector('#actual-tab code').textContent;
             
@@ -1601,45 +1609,45 @@ def generate_case_page(
             // Format the diff for display
             const formattedDiff = formatDiff(diff);
             document.getElementById('diff-output').innerHTML = formattedDiff;
-        }
+        }}
         
         // Format the diff with syntax highlighting
-        function formatDiff(diff) {
+        function formatDiff(diff) {{
             if (!diff) return '<pre>No difference</pre>';
             
             const lines = diff.split('\\n');
             let html = '<pre class="diff">';
             
-            for (let i = 0; i < lines.length; i++) {
+            for (let i = 0; i < lines.length; i++) {{
                 const line = lines[i];
                 let className = '';
                 
-                if (line.startsWith('+')) {
+                if (line.startsWith('+')) {{
                     className = 'diff-added';
-                } else if (line.startsWith('-')) {
+                }} else if (line.startsWith('-')) {{
                     className = 'diff-removed';
-                } else if (line.startsWith('@')) {
+                }} else if (line.startsWith('@')) {{
                     className = 'diff-info';
-                }
+                }}
                 
                 html += `<div class="${{className}}">${{escapeHtml(line)}}</div>`;
-            }
+            }}
             
             html += '</pre>';
             return html;
-        }
+        }}
         
         // Helper function to escape HTML
-        function escapeHtml(text) {
+        function escapeHtml(text) {{
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
-        }
+        }}
     </script>
 </body>
 </html>
     """
-    
+
     # Write the page
     with open(case_page_path, "w", encoding="utf-8") as f:
         f.write(html_content)
@@ -2038,22 +2046,22 @@ def main():
     html_content += create_token_chart_section()
     html_content += create_cases_section(all_models, model_display_names)
     html_content += create_html_footer(include_chart_js=True)
-    
+
     # Generate model pages and case pages
     print("Generating model and case pages...")
-    
+
     # Create model pages
     for model in all_models:
         print(f"Generating page for model: {model}")
         generate_model_page(
-            model, 
-            prompt_metadata, 
-            results_metadata, 
-            benchmark_run_dir, 
-            docs_dir, 
-            model_display_names
+            model,
+            prompt_metadata,
+            results_metadata,
+            benchmark_run_dir,
+            docs_dir,
+            model_display_names,
         )
-        
+
         # Create case pages for this model
         model_case_count = 0
         for (case_prefix, case_model), metadata in results_metadata.items():
@@ -2066,10 +2074,10 @@ def main():
                     results_metadata,
                     benchmark_run_dir,
                     docs_dir,
-                    model_display_names
+                    model_display_names,
                 )
                 model_case_count += 1
-                
+
         print(f"Generated {model_case_count} case pages for model {model}")
 
     # Write HTML file
