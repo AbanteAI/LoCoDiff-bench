@@ -1446,9 +1446,7 @@ def main():
     )
 
     # Validate that all models have display names defined
-    missing_models = [
-        model for model in all_models if model not in model_display_names
-    ]
+    missing_models = [model for model in all_models if model not in model_display_names]
     if missing_models:
         print(
             "Error: The following models do not have display names defined in benchmark_config.yaml:"
