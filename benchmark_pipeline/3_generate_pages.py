@@ -1456,10 +1456,6 @@ def main():
         print(
             "\nPlease add these models to the model_display_names section in benchmark_pipeline/benchmark_config.yaml"
         )
-        print("Example:")
-        for model in sorted(missing_models):
-            suggested_name = model.split("/")[-1]
-            print(f'  "{model}": "{suggested_name}"')
         return 1
 
     # Determine language for each case prefix
