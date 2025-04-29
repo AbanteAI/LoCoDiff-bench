@@ -1,0 +1,215 @@
+Here is the exact content of the file `src/renderer/metal/shaders.zig` based on the git log history:
+
+```zig
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+const macos = @import("macos");
+const objc = @import("objc");
+const math = @import("../../math.zig");
+
+const mtl = @import("api.zig");
+
+const log = std.log.scoped(.metal);
+
+/// This contains the state for the shaders used by the Metal renderer.
+pub const Shaders = struct {
+    library: objc.Object,
+
+    /// Renders cell foreground elements (text, decorations).
+    cell_text_pipeline: objc.Object,
+
+    /// The cell background shader is the shader used to render the
+    /// background of terminal cells.
+    cell_bg_pipeline: objc.Object,
+
+    /// The image shader is the shader used to render images for things
+    /// like the Kitty image protocol.
+    image_pipeline: objc.Object,
+
+    /// Custom shaders to run against the final drawable texture. This
+    /// can be used to apply a lot of effects. Each shader is run in sequence
+    /// against the output of the previous shader.
+    post_pipelines: []const objc.Object,
+
+    /// Initialize our shader set.
+    ///
+    /// "post_shaders" is an optional list of postprocess shaders to run
+    /// against the final drawable texture. This is an array of shader source
+    /// code, not file paths.
+    pub fn init(
+        alloc: Allocator,
+        device: objc.Object,
+        post_shaders: []const [:0]const u8,
+        pixel_format: mtl.MTLPixelFormat,
+    ) !Shaders {
+        const library = try initLibrary(device);
+        errdefer library.msgSend(void, objc.sel("release"), .{});
+
+        const cell_text_pipeline = try initCellTextPipeline(device, library, pixel_format);
+        errdefer cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+
+        const cell_bg_pipeline = try initCellBgPipeline(device, library, pixel_format);
+        errdefer cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+
+        const image_pipeline = try initImagePipeline(device, library, pixel_format);
+        errdefer image_pipeline.msgSend(void, objc.sel("release"), .{});
+
+        const post_pipelines: []const objc.Object = initPostPipelines(
+            alloc,
+            device,
+            library,
+            post_shaders,
+            pixel_format,
+        ) catch |err| err: {
+            // If an error happens while building postprocess shaders we
+            // want to just not use any postprocess shaders since we don't
+            // want to block Ghostty from working.
+            log.warn("error initializing postprocess shaders err={}", .{err});
+            break :err &.{};
+        };
+        errdefer if (post_pipelines.len > 0) {
+            for (post_pipelines) |pipeline| pipeline.msgSend(void, objc.sel("release"), .{});
+            alloc.free(post_pipelines);
+        };
+
+        return .{
+            .library = library,
+            .cell_text_pipeline = cell_text_pipeline,
+            .cell_bg_pipeline = cell_bg_pipeline,
+            .image_pipeline = image_pipeline,
+            .post_pipelines = post_pipelines,
+        };
+    }
+
+    pub fn deinit(self: *Shaders, alloc: Allocator) void {
+        // Release our primary shaders
+        self.cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+        self.cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+        self.image_pipeline.msgSend(void, objc.sel("release"), .{});
+        self.library.msgSend(void, objc.sel("release"), .{});
+
+        // Release our postprocess shaders
+        if (self.post_pipelines.len > 0) {
+            for (self.post_pipelines) |pipeline| {
+                pipeline.msgSend(void, objc.sel("release"), .{});
+            }
+            alloc.free(self.post_pipelines);
+        }
+    }
+};
+
+/// Single parameter for the image shader. See shader for field details.
+pub const Image = extern struct {
+    grid_pos: [2]f32,
+    cell_offset: [2]f32,
+    source_rect: [4]f32,
+    dest_size: [2]f32,
+};
+
+/// The uniforms that are passed to the terminal cell shader.
+pub const Uniforms = extern struct {
+    // Note: all of the explicit aligmnments are copied from the
+    // MSL developer reference just so that we can be sure that we got
+    // it all exactly right.
+
+    /// The projection matrix for turning world coordinates to normalized.
+    /// This is calculated based on the size of the screen.
+    projection_matrix: math.Mat align(16),
+
+    /// Size of a single cell in pixels, unscaled.
+    cell_size: [2]f32 align(8),
+
+    /// Size of the grid in columns and rows.
+    grid_size: [2]u16 align(4),
+
+    /// The padding around the terminal grid in pixels. In order:
+    /// top, right, bottom, left.
+    grid_padding: [4]f32 align(16),
+
+    /// Bit mask defining which directions to
+    /// extend cell colors in to the padding.
+    /// Order, LSB first: left, right, up, down
+    padding_extend: PaddingExtend align(1),
+
+    /// The minimum contrast ratio for text. The contrast ratio is calculated
+    /// according to the WCAG 2.0 spec.
+    min_contrast: f32 align(4),
+
+    /// The cursor position and color.
+    cursor_pos: [2]u16 align(4),
+    cursor_color: [4]u8 align(4),
+
+    /// The background color for the whole surface.
+    bg_color: [4]u8 align(4),
+
+    /// Whether the cursor is 2 cells wide.
+    cursor_wide: bool align(1),
+
+    /// Indicates that colors provided to the shader are already in
+    /// the P3 color space, so they don't need to be converted from
+    /// sRGB.
+    use_display_p3: bool align(1),
+
+    /// Indicates that the color attachments for the shaders have
+    /// an `*_srgb` pixel format, which means the shaders need to
+    /// output linear RGB colors rather than gamma encoded colors,
+    /// since blending will be performed in linear space and then
+    /// Metal itself will re-encode the colors for storage.
+    use_linear_blending: bool align(1),
+
+    /// Enables a weight correction step that makes text rendered
+    /// with linear alpha blending have a similar apparent weight
+    /// (thickness) to gamma-incorrect blending.
+    use_linear_correction: bool align(1) = false,
+
+    const PaddingExtend = packed struct(u8) {
+        left: bool = false,
+        right: bool = false,
+        up: bool = false,
+        down: bool = false,
+        _padding: u4 = 0,
+    };
+};
+
+/// The uniforms used for custom postprocess shaders.
+pub const PostUniforms = extern struct {
+    // Note: all of the explicit aligmnments are copied from the
+    // MSL developer reference just so that we can be sure that we got
+    // it all exactly right.
+    resolution: [3]f32 align(16),
+    time: f32 align(4),
+    time_delta: f32 align(4),
+    frame_rate: f32 align(4),
+    frame: i32 align(4),
+    channel_time: [4][4]f32 align(16),
+    channel_resolution: [4][4]f32 align(16),
+    mouse: [4]f32 align(16),
+    date: [4]f32 align(16),
+    sample_rate: f32 align(4),
+};
+
+/// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
+fn initLibrary(device: objc.Object) !objc.Object {
+    const start = try std.time.Instant.now();
+
+    const data = try macos.dispatch.Data.create(
+        @embedFile("ghostty_metallib"),
+        macos.dispatch.queue.getMain(),
+        macos.dispatch.Data.DESTRUCTOR_DEFAULT,
+    );
+    defer data.release();
+
+    var err: ?*anyopaque = null;
+    const library = device.msgSend(
+        objc.Object,
+        objc.sel("newLibraryWithData:error:"),
+        .{
+            data,
+            &err,
+        },
+    );
+    try checkError(err);
+
+    const end = try std.time.Instant.now();
+    log.debug("shader library loaded
