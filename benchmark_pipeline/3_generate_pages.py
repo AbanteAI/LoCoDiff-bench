@@ -1577,7 +1577,7 @@ def generate_case_page(
                     // Add active class to clicked button and corresponding content
                     button.classList.add('active');
                     const tabId = button.getAttribute('data-tab');
-                    document.getElementById(`${tabId}-tab`).classList.add('active');
+                    document.getElementById(`${{tabId}}-tab`).classList.add('active');
                     
                     // If diff tab, generate diff if not already done
                     if (tabId === 'diff' && !document.getElementById('diff-output').innerHTML) {
