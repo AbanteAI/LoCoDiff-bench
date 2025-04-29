@@ -1,0 +1,355 @@
+```zig
+//! Application runtime implementation that uses GLFW (https://www.glfw.org/).
+//!
+//! This works on macOS and Linux with OpenGL and Metal.
+//! (The above sentence may be out of date).
+
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const glfw = @import("glfw");
+const objc = @import("objc");
+const App = @import("../App.zig");
+const internal_os = @import("../os/main.zig");
+const renderer = @import("../renderer.zig");
+const Renderer = renderer.Renderer;
+const apprt = @import("../apprt.zig");
+const CoreWindow = @import("../Window.zig");
+
+// Get native API access on certain platforms so we can do more customization.
+const glfwNative = glfw.Native(.{
+    .cocoa = builtin.target.isDarwin(),
+});
+
+const log = std.log.scoped(.glfw);
+
+pub const Window = struct {
+    /// The glfw window handle
+    window: glfw.Window,
+
+    /// The glfw mouse cursor handle.
+    cursor: glfw.Cursor,
+
+    pub fn init(app: *const App, core_win: *CoreWindow) !Window {
+        // Create our window
+        const win = try glfw.Window.create(
+            640,
+            480,
+            "ghostty",
+            null,
+            null,
+            Renderer.glfwWindowHints(),
+        );
+        errdefer win.destroy();
+
+        if (builtin.mode == .Debug) {
+            // Get our physical DPI - debug only because we don't have a use for
+            // this but the logging of it may be useful
+            const monitor = win.getMonitor() orelse monitor: {
+                log.warn("window had null monitor, getting primary monitor", .{});
+                break :monitor glfw.Monitor.getPrimary().?;
+            };
+            const physical_size = monitor.getPhysicalSize();
+            const video_mode = try monitor.getVideoMode();
+            const physical_x_dpi = @intToFloat(f32, video_mode.getWidth()) / (@intToFloat(f32, physical_size.width_mm) / 25.4);
+            const physical_y_dpi = @intToFloat(f32, video_mode.getHeight()) / (@intToFloat(f32, physical_size.height_mm) / 25.4);
+            log.debug("physical dpi x={} y={}", .{
+                physical_x_dpi,
+                physical_y_dpi,
+            });
+        }
+
+        // On Mac, enable tabbing
+        if (comptime builtin.target.isDarwin()) {
+            const NSWindowTabbingMode = enum(usize) { automatic = 0, preferred = 1, disallowed = 2 };
+            const nswindow = objc.Object.fromId(glfwNative.getCocoaWindow(win).?);
+
+            // Tabbing mode enables tabbing at all
+            nswindow.setProperty("tabbingMode", NSWindowTabbingMode.automatic);
+
+            // All windows within a tab bar must have a matching tabbing ID.
+            // The app sets this up for us.
+            nswindow.setProperty("tabbingIdentifier", app.darwin.tabbing_id);
+        }
+
+        // Create the cursor
+        const cursor = try glfw.Cursor.createStandard(.ibeam);
+        errdefer cursor.destroy();
+        if ((comptime !builtin.target.isDarwin()) or internal_os.macosVersionAtLeast(13, 0, 0)) {
+            // We only set our cursor if we're NOT on Mac, or if we are then the
+            // macOS version is >= 13 (Ventura). On prior versions, glfw crashes
+            // since we use a tab group.
+            try win.setCursor(cursor);
+        }
+
+        // Set our callbacks
+        win.setUserPointer(core_win);
+        win.setSizeCallback(sizeCallback);
+        win.setCharCallback(charCallback);
+        win.setKeyCallback(keyCallback);
+        win.setFocusCallback(focusCallback);
+        win.setRefreshCallback(refreshCallback);
+        win.setScrollCallback(scrollCallback);
+        win.setCursorPosCallback(cursorPosCallback);
+        win.setMouseButtonCallback(mouseButtonCallback);
+
+        // Build our result
+        return Window{
+            .window = win,
+            .cursor = cursor,
+        };
+    }
+
+    pub fn deinit(self: *Window) void {
+        var tabgroup_opt: if (builtin.target.isDarwin()) ?objc.Object else void = undefined;
+        if (comptime builtin.target.isDarwin()) {
+            const nswindow = objc.Object.fromId(glfwNative.getCocoaWindow(self.window).?);
+            const tabgroup = nswindow.getProperty(objc.Object, "tabGroup");
+
+            // On macOS versions prior to Ventura, we lose window focus on tab close
+            // for some reason. We manually fix this by keeping track of the tab
+            // group and just selecting the next window.
+            if (internal_os.macosVersionAtLeast(13, 0, 0))
+                tabgroup_opt = null
+            else
+                tabgroup_opt = tabgroup;
+
+            const windows = tabgroup.getProperty(objc.Object, "windows");
+            switch (windows.getProperty(usize, "count")) {
+                // If we're going down to one window our tab bar is going to be
+                // destroyed so unset it so that the later logic doesn't try to
+                // use it.
+                1 => tabgroup_opt = null,
+
+                // If our tab bar is visible and we are going down to 1 window,
+                // hide the tab bar. The check is "2" because our current window
+                // is still present.
+                2 => if (tabgroup.getProperty(bool, "tabBarVisible")) {
+                    nswindow.msgSend(void, objc.sel("toggleTabBar:"), .{nswindow.value});
+                },
+
+                else => {},
+            }
+        }
+
+        // We can now safely destroy our windows. We have to do this BEFORE
+        // setting up the new focused window below.
+        self.window.destroy();
+        self.cursor.destroy();
+
+        // If we have a tabgroup set, we want to manually focus the next window.
+        // We should NOT have to do this usually, see the comments above.
+        if (comptime builtin.target.isDarwin()) {
+            if (tabgroup_opt) |tabgroup| {
+                const selected = tabgroup.getProperty(objc.Object, "selectedWindow");
+                selected.msgSend(void, objc.sel("makeKeyWindow"), .{});
+            }
+        }
+    }
+
+    /// Returns the content scale for the created window.
+    pub fn getContentScale(self: *const Window) !apprt.ContentScale {
+        const scale = try self.window.getContentScale();
+        return apprt.ContentScale{ .x = scale.x_scale, .y = scale.y_scale };
+    }
+
+    /// Returns the size of the window in pixels. The pixel size may
+    /// not match screen coordinate size but we should be able to convert
+    /// back and forth using getContentScale.
+    pub fn getSize(self: *const Window) !apprt.WindowSize {
+        const size = self.window.getFramebufferSize() catch |err| err: {
+            log.err("error querying window size in pixels, will use screen size err={}", .{err});
+            break :err try self.window.getSize();
+        };
+
+        return apprt.WindowSize{ .width = size.width, .height = size.height };
+    }
+
+    /// Returns the cursor position in scaled pixels relative to the
+    /// upper-left of the window.
+    pub fn getCursorPos(self: *const Window) !apprt.CursorPos {
+        const unscaled_pos = try self.window.getCursorPos();
+        const pos = try self.cursorPosToPixels(unscaled_pos);
+        return apprt.CursorPos{
+            .x = @floatCast(f32, pos.xpos),
+            .y = @floatCast(f32, pos.ypos),
+        };
+    }
+
+    /// Set the flag that notes this window should be closed for the next
+    /// iteration of the event loop.
+    pub fn setShouldClose(self: *Window) void {
+        self.window.setShouldClose(true);
+    }
+
+    /// The cursor position from glfw directly is in screen coordinates but
+    /// all our interface works in pixels.
+    fn cursorPosToPixels(self: *const Window, pos: glfw.Window.CursorPos) !glfw.Window.CursorPos {
+        // The cursor position is in screen coordinates but we
+        // want it in pixels. we need to get both the size of the
+        // window in both to get the ratio to make the conversion.
+        const size = try self.window.getSize();
+        const fb_size = try self.window.getFramebufferSize();
+
+        // If our framebuffer and screen are the same, then there is no scaling
+        // happening and we can short-circuit by returning the pos as-is.
+        if (fb_size.width == size.width and fb_size.height == size.height)
+            return pos;
+
+        const x_scale = @intToFloat(f64, fb_size.width) / @intToFloat(f64, size.width);
+        const y_scale = @intToFloat(f64, fb_size.height) / @intToFloat(f64, size.height);
+        return .{
+            .xpos = pos.xpos * x_scale,
+            .ypos = pos.ypos * y_scale,
+        };
+    }
+
+    /// Read the clipboard. The windowing system is responsible for allocating
+    /// a buffer as necessary. This should be a stable pointer until the next
+    /// time getClipboardString is called.
+    pub fn getClipboardString(self: *const Window) ![:0]const u8 {
+        return try glfw.getClipboardString();
+    }
+
+    /// Set the clipboard.
+    pub fn setClipboardString(self: *const Window, val: [:0]const u8) !void {
+        try glfw.setClipboardString(val);
+    }
+
+    fn sizeCallback(window: glfw.Window, width: i32, height: i32) void {
+        _ = width;
+        _ = height;
+
+        // Get the size. We are given a width/height but this is in screen
+        // coordinates and we want raw pixels. The core window uses the content
+        // scale to scale appropriately.
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        const size = core_win.window.getSize() catch |err| {
+            log.err("error querying window size for size callback err={}", .{err});
+            return;
+        };
+
+        // Call the primary callback.
+        core_win.sizeCallback(size) catch |err| {
+            log.err("error in size callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn charCallback(window: glfw.Window, codepoint: u21) void {
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        core_win.charCallback(codepoint) catch |err| {
+            log.err("error in char callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn keyCallback(
+        window: glfw.Window,
+        glfw_key: glfw.Key,
+        scancode: i32,
+        glfw_action: glfw.Action,
+        glfw_mods: glfw.Mods,
+    ) void {
+        _ = scancode;
+
+        // Convert our glfw types into our input types
+        const mods = @bitCast(input.Mods, glfw_mods);
+        const action: input.Action = switch (glfw_action) {
+            .release => .release,
+            .press => .press,
+            .repeat => .repeat,
+        };
+        const key: input.Key = switch (glfw_key) {
+            // ... key mapping cases ...
+            else => .invalid,
+        };
+
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        core_win.keyCallback(action, key, mods) catch |err| {
+            log.err("error in key callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn focusCallback(window: glfw.Window, focused: bool) void {
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        core_win.focusCallback(focused) catch |err| {
+            log.err("error in focus callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn refreshCallback(window: glfw.Window) void {
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        core_win.refreshCallback() catch |err| {
+            log.err("error in refresh callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn scrollCallback(window: glfw.Window, xoff: f64, yoff: f64) void {
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        core_win.scrollCallback(xoff, yoff) catch |err| {
+            log.err("error in scroll callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn cursorPosCallback(
+        window: glfw.Window,
+        unscaled_xpos: f64,
+        unscaled_ypos: f64,
+    ) void {
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+        const pos = core_win.window.cursorPosToPixels(.{
+            .xpos = unscaled_xpos,
+            .ypos = unscaled_ypos,
+        }) catch |err| {
+            log.err("error converting cursor pos to scaled pixels in cursor pos callback err={}", .{err});
+            return;
+        };
+
+        core_win.cursorPosCallback(.{
+            .x = @floatCast(f32, pos.xpos),
+            .y = @floatCast(f32, pos.ypos),
+        }) catch |err| {
+            log.err("error in cursor pos callback err={}", .{err});
+            return;
+        };
+    }
+
+    fn mouseButtonCallback(
+        window: glfw.Window,
+        glfw_button: glfw.MouseButton,
+        glfw_action: glfw.Action,
+        glfw_mods: glfw.Mods,
+    ) void {
+        const core_win = window.getUserPointer(CoreWindow) orelse return;
+
+        // Convert glfw button to input button
+        const mods = @bitCast(input.Mods, glfw_mods);
+        const button: input.MouseButton = switch (glfw_button) {
+            .left => .left,
+            .right => .right,
+            .middle => .middle,
+            .four => .four,
+            .five => .five,
+            .six => .six,
+            .seven => .seven,
+            .eight => .eight,
+        };
+        const action: input.MouseButtonState = switch (glfw_action) {
+            .press => .press,
+            .release => .release,
+            else => unreachable,
+        };
+
+        core_win.mouseButtonCallback(action, button, mods) catch |err| {
+            log.err("error in scroll callback err={}", .{err});
+            return;
+        };
+    }
+};
+```
