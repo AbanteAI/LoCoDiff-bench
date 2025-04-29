@@ -1,0 +1,440 @@
+const DeferredFace = @This();
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
+const fontconfig = @import("fontconfig");
+const macos = @import("macos");
+
+const font = @import("main.zig");
+const options = @import("main.zig").options;
+const Library = @import("main.zig").Library;
+const Face = @import("main.zig").Face;
+const Presentation = @import("main.zig").Presentation;
+
+const log = std.log.scoped(.deferred_face);
+
+///////////////////////////////////////////////////////////////////////////////
+// Deferred face state
+///////////////////////////////////////////////////////////////////////////////
+
+/// Fontconfig
+fc: if (options.backend == .fontconfig_freetype) ?Fontconfig else void =
+    if (options.backend == .fontconfig_freetype) null else {},
+
+/// CoreText
+ct: if (font.Discover == font.discovery.CoreText) ?CoreText else void =
+    if (font.Discover == font.discovery.CoreText) null else {},
+
+/// Web Canvas
+wc: if (options.backend == .web_canvas) ?WebCanvas else void =
+    if (options.backend == .web_canvas) null else {},
+
+///////////////////////////////////////////////////////////////////////////////
+// Platform-specific structs
+///////////////////////////////////////////////////////////////////////////////
+
+/// Fontconfig specific data. Only present when using the fontconfig backend.
+pub const Fontconfig = struct {
+    /// The render-prepared pattern.
+    pattern: *fontconfig.Pattern,
+
+    /// Charset and langset extracted from `pattern` for quick lookups.
+    charset: *const fontconfig.CharSet,
+    langset: *const fontconfig.LangSet,
+
+    /// Variation axes that should be applied after loading the face.
+    variations: []const font.face.Variation,
+
+    pub fn deinit(self: *Fontconfig) void {
+        self.pattern.destroy();
+        self.* = undefined;
+    }
+};
+
+/// CoreText specific data. Only present when using a CoreText backend.
+pub const CoreText = struct {
+    /// The CoreText font that matched discovery.
+    font: *macos.text.Font,
+
+    /// Variation axes that must be applied after we create a freetype face.
+    /// We store them here since CoreText sometimes “forgets” the variations
+    /// by the time the font collection is resolved.
+    variations: []const font.face.Variation,
+
+    pub fn deinit(self: *CoreText) void {
+        self.font.release();
+        self.* = undefined;
+    }
+};
+
+/// Web-canvas specific data. Only present when using the wasm canvas backend.
+pub const WebCanvas = struct {
+    alloc: Allocator,
+    font_str: [:0]const u8,
+    presentation: Presentation,
+
+    pub fn deinit(self: *WebCanvas) void {
+        self.alloc.free(self.font_str);
+        self.* = undefined;
+    }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Lifecycle helpers
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn deinit(self: *DeferredFace) void {
+    switch (options.backend) {
+        .fontconfig_freetype => if (self.fc) |*fc| fc.deinit(),
+        .coretext,
+        .coretext_freetype,
+        .coretext_harfbuzz,
+        .coretext_noshape,
+        => if (self.ct) |*ct| ct.deinit(),
+        .freetype => {},
+        .web_canvas => if (self.wc) |*wc| wc.deinit(),
+    }
+    self.* = undefined;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Metadata helpers
+///////////////////////////////////////////////////////////////////////////////
+
+/// Return the family name for this face into `buf`.
+pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
+    switch (options.backend) {
+        .freetype => {},
+
+        .fontconfig_freetype => if (self.fc) |fc|
+            return (try fc.pattern.get(.family, 0)).string,
+
+        .coretext,
+        .coretext_freetype,
+        .coretext_harfbuzz,
+        .coretext_noshape,
+        => if (self.ct) |ct| {
+            const family = ct.font.copyAttribute(.family_name) orelse
+                return "unknown";
+            return family.cstringPtr(.utf8) orelse unsupported: {
+                break :unsupported family.cstring(buf, .utf8) orelse
+                    return error.OutOfMemory;
+            };
+        },
+
+        .web_canvas => if (self.wc) |wc| return wc.font_str,
+    }
+
+    return "";
+}
+
+/// Return the full name for this face into `buf`.
+pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
+    switch (options.backend) {
+        .freetype => {},
+
+        .fontconfig_freetype => if (self.fc) |fc|
+            return (try fc.pattern.get(.fullname, 0)).string,
+
+        .coretext,
+        .coretext_freetype,
+        .coretext_harfbuzz,
+        .coretext_noshape,
+        => if (self.ct) |ct| {
+            const disp = ct.font.copyDisplayName();
+            return disp.cstringPtr(.utf8) orelse unsupported: {
+                // Too big to copy cheaply; use provided buffer.
+                break :unsupported disp.cstring(buf, .utf8) orelse
+                    return error.OutOfMemory;
+            };
+        },
+
+        .web_canvas => if (self.wc) |wc| return wc.font_str,
+    }
+
+    return "";
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Loading
+///////////////////////////////////////////////////////////////////////////////
+
+/// Load the actual face and return it.  
+/// Subsequent calls will re-load a new face; callers must cache as needed.
+pub fn load(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    return switch (options.backend) {
+        .fontconfig_freetype => try self.loadFontconfig(lib, opts),
+        .coretext,
+        .coretext_harfbuzz,
+        .coretext_noshape,
+        => try self.loadCoreText(lib, opts),
+        .coretext_freetype => try self.loadCoreTextFreetype(lib, opts),
+        .web_canvas => try self.loadWebCanvas(opts),
+        .freetype => unreachable,
+    };
+}
+
+fn loadFontconfig(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    const fc = self.fc.?;
+
+    const filename = (try fc.pattern.get(.file, 0)).string;
+    const face_index = (try fc.pattern.get(.index, 0)).integer;
+
+    var face = try Face.initFile(lib, filename, face_index, opts);
+    errdefer face.deinit();
+
+    try face.setVariations(fc.variations, opts);
+    return face;
+}
+
+fn loadCoreText(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    _ = lib; // CoreText path doesn’t need FreeType
+    const ct = self.ct.?;
+
+    var face = try Face.initFontCopy(ct.font, opts);
+    errdefer face.deinit();
+
+    try face.setVariations(ct.variations, opts);
+    return face;
+}
+
+fn loadCoreTextFreetype(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    const ct = self.ct.?;
+
+    // Retrieve a file URL we can pass to FreeType.
+    const url = ct.font.copyAttribute(.url) orelse
+        return error.FontHasNoFile;
+    defer url.release();
+
+    const path_ref = url.copyPath() orelse return error.FontHasNoFile;
+    defer path_ref.release();
+
+    // Decode percent escapes.
+    const blank = try macos.foundation.String.createWithBytes("", .utf8, false);
+    defer blank.release();
+    const decoded = try macos.foundation.URL.createStringByReplacingPercentEscapes(
+        path_ref,
+        blank,
+    );
+    defer decoded.release();
+
+    // Copy to stack-backed C string (leave room for terminator).
+    var buf: [1024]u8 = undefined;
+    const slice = decoded.cstring(buf[0 .. buf.len - 1], .utf8) orelse
+        return error.FontPathCantDecode;
+    buf[slice.len] = 0;
+
+    // Index 0 is fine for tests; production builds use pure CoreText.
+    var face = try Face.initFile(lib, buf[0 .. slice.len :0], 0, opts);
+    errdefer face.deinit();
+
+    try face.setVariations(ct.variations, opts);
+    return face;
+}
+
+fn loadWebCanvas(
+    self: *DeferredFace,
+    opts: font.face.Options,
+) !Face {
+    const wc = self.wc.?;
+    return try Face.initNamed(wc.alloc, wc.font_str, opts, wc.presentation);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Capability checks
+///////////////////////////////////////////////////////////////////////////////
+
+/// Return `true` if this deferred face may satisfy `cp`/`p` without loading.
+pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
+    switch (options.backend) {
+        .fontconfig_freetype => {
+            if (self.fc) |fc| {
+                if (!fc.charset.hasChar(cp)) return false;
+
+                if (p) |desired| {
+                    const emoji_lang = "und-zsye";
+                    const actual: Presentation =
+                        if (fc.langset.hasLang(emoji_lang)) .emoji else .text;
+                    return desired == actual;
+                }
+                return true;
+            }
+        },
+
+        .coretext,
+        .coretext_freetype,
+        .coretext_harfbuzz,
+        .coretext_noshape,
+        => {
+            if (self.ct) |ct| {
+                // Presentation check (coarse but fine for emoji)
+                if (p) |desired_p| {
+                    const traits = ct.font.getSymbolicTraits();
+                    const actual_p: Presentation =
+                        if (traits.color_glyphs) .emoji else .text;
+                    if (actual_p != desired_p) return false;
+                }
+
+                // Convert UTF-32 to UTF-16 surrogate pair if required.
+                var unichars: [2]u16 = undefined;
+                const pair = macos.foundation.stringGetSurrogatePairForLongCharacter(
+                    cp,
+                    &unichars,
+                );
+                const len: usize = if (pair) 2 else 1;
+
+                var glyphs = [2]macos.graphics.Glyph{ 0, 0 };
+                return ct.font.getGlyphsForCharacters(
+                    unichars[0 .. len],
+                    glyphs[0 .. len],
+                );
+            }
+        },
+
+        // Canvas: we cannot know; assume true after presentation check
+        .web_canvas => if (self.wc) |wc| {
+            if (p) |desired| if (wc.presentation != desired) return false;
+            return true;
+        },
+
+        .freetype => {},
+    }
+
+    // When discovery fails we must load to know; callers expect false.
+    return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// WASM glue
+///////////////////////////////////////////////////////////////////////////////
+
+pub const Wasm = struct {
+    const wasm = @import("../os/wasm.zig");
+    const alloc = wasm.alloc;
+
+    export fn deferred_face_new(
+        ptr: [*]const u8,
+        len: usize,
+        presentation: u16,
+    ) ?*DeferredFace {
+        return deferred_face_new_(ptr, len, presentation) catch |err| {
+            log.warn("error creating deferred face err={}", .{err});
+            return null;
+        };
+    }
+
+    fn deferred_face_new_(
+        ptr: [*]const u8,
+        len: usize,
+        presentation: u16,
+    ) !*DeferredFace {
+        const font_str = try alloc.dupeZ(u8, ptr[0..len]);
+        errdefer alloc.free(font_str);
+
+        var face: DeferredFace = .{
+            .wc = .{
+                .alloc = alloc,
+                .font_str = font_str,
+                .presentation = @enumFromInt(presentation),
+            },
+        };
+        errdefer face.deinit();
+
+        const result = try alloc.create(DeferredFace);
+        errdefer alloc.destroy(result);
+        result.* = face;
+        return result;
+    }
+
+    export fn deferred_face_free(ptr: ?*DeferredFace) void {
+        if (ptr) |f| {
+            f.deinit();
+            alloc.destroy(f);
+        }
+    }
+
+    export fn deferred_face_load(self: *DeferredFace, pts: f32) void {
+        self.load(.{}, .{ .size = .{ .points = pts } }) catch |err| {
+            log.warn("error loading deferred face err={}", .{err});
+            return;
+        };
+    }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Tests
+///////////////////////////////////////////////////////////////////////////////
+
+test "fontconfig" {
+    if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+
+    const discovery = @import("main.zig").discovery;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var def = blk: {
+        var fc = discovery.Fontconfig.init();
+        var it = try fc.discover(alloc, .{ .family = "monospace", .size = 12 });
+        defer it.deinit();
+        break :blk (try it.next()).?;
+    };
+    defer def.deinit();
+
+    var buf: [1024]u8 = undefined;
+    const n = try def.name(&buf);
+    try testing.expect(n.len > 0);
+
+    const face = try def.load(lib, .{ .size = .{ .points = 12 } });
+    try testing.expect(face.glyphIndex(' ') != null);
+}
+
+test "coretext" {
+    if (options.backend != .coretext and
+        options.backend != .coretext_harfbuzz and
+        options.backend != .coretext_noshape)
+        return error.SkipZigTest;
+
+    const discovery = @import("main.zig").discovery;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var def = blk: {
+        var fc = discovery.CoreText.init();
+        var it = try fc.discover(alloc, .{ .family = "Monaco", .size = 12 });
+        defer it.deinit();
+        break :blk (try it.next()).?;
+    };
+    defer def.deinit();
+    try testing.expect(def.hasCodepoint(' ', null));
+
+    var buf: [1024]u8 = undefined;
+    const n = try def.name(&buf);
+    try testing.expect(n.len > 0);
+
+    const face = try def.load(lib, .{ .size = .{ .points = 12 } });
+    try testing.expect(face.glyphIndex(' ') != null);
+}
