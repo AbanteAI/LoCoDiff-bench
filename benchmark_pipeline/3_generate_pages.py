@@ -1783,8 +1783,10 @@ def generate_case_page(
         )
 
     actual_output_path = None
+    diff_file_path = None
     if timestamp_dirs:
         actual_output_path = timestamp_dirs[0] / "response.txt"
+        diff_file_path = timestamp_dirs[0] / "output.diff"
 
     # Read file contents
     prompt_content = ""
@@ -1851,8 +1853,43 @@ def generate_case_page(
         extracted_output=actual_output,  # Pass extracted output as fallback
     )
 
+    # Load and format the precomputed diff file
+    diff_content = ""
+    if success:
+        # For successful runs, show a success message instead of a diff
+        diff_content = '<div class="success-message"><p>✓ No differences found (successful run)</p><p>Expected output matches the model output exactly.</p></div>'
+    elif diff_file_path and diff_file_path.exists():
+        try:
+            # Read the precomputed diff file
+            with open(diff_file_path, "r", encoding="utf-8") as f:
+                diff_text = f.read()
+
+            # Format the diff with syntax highlighting
+            if diff_text:
+                lines = diff_text.split("\n")
+                html_lines = []
+
+                for line in lines:
+                    if line.startswith("+"):
+                        html_lines.append(f'<div class="diff-added">{line}</div>')
+                    elif line.startswith("-"):
+                        html_lines.append(f'<div class="diff-removed">{line}</div>')
+                    elif line.startswith("@"):
+                        html_lines.append(f'<div class="diff-info">{line}</div>')
+                    else:
+                        html_lines.append(f"<div>{line}</div>")
+
+                diff_content = f'<pre class="diff">{"".join(html_lines)}</pre>'
+            else:
+                diff_content = '<div class="no-diff-message"><p>No diff content available for this case.</p></div>'
+        except Exception as e:
+            print(f"Error reading diff file {diff_file_path}: {e}")
+            diff_content = f'<div class="no-diff-message"><p>Error loading diff file: {str(e)}</p></div>'
+    else:
+        # No diff file found
+        diff_content = '<div class="no-diff-message"><p>No diff file found for this case.</p></div>'
+
     # Get status
-    success = result_metadata.get("success", False)
     status_class = "success" if success else "failure"
     status_text = "Success" if success else "Failure"
 
@@ -1894,7 +1931,7 @@ def generate_case_page(
             <div class="diff-section">
                 <h2>Diff (Expected vs Actual)</h2>
                 <div id="diff-output">
-                    <p>Loading diff...</p>
+                    {diff_content}
                 </div>
             </div>
         </section>
@@ -1902,124 +1939,6 @@ def generate_case_page(
     <footer>
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
     </footer>
-    
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/4.0.2/diff.min.js"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {{
-            // Check if this is a successful run
-            const isSuccess = {"true" if success else "false"};
-            
-            if (isSuccess) {{
-                // For successful runs, show a success message instead of a diff
-                document.getElementById("diff-output").innerHTML = '<div class="success-message"><p>✓ No differences found (successful run)</p><p>Expected output matches the model output exactly.</p></div>';
-                return;
-            }}
-            
-            // For failed runs, load expected and actual output for diff
-            Promise.all([
-                fetch("../../content/{safe_model}/{safe_case}/expected.html").then(response => {{
-                    if (!response.ok) {{
-                        throw new Error("Failed to fetch expected output (HTTP " + response.status + ")");
-                    }}
-                    return response.text();
-                }}),
-                fetch("../../content/{safe_model}/{safe_case}/actual.html").then(response => {{
-                    if (!response.ok) {{
-                        throw new Error("Failed to fetch actual output (HTTP " + response.status + ")");
-                    }}
-                    return response.text();
-                }})
-            ])
-            .then(([expectedHtml, actualHtml]) => {{
-                // Extract content from the HTML files using more robust regex
-                // Look for the code block inside the main content section
-                const extractContent = (html) => {{
-                    // First try to find content within the code block
-                    const codeMatch = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
-                    if (codeMatch && codeMatch[1]) {{
-                        return codeMatch[1];
-                    }}
-                    
-                    // Fallback: try to extract from main section if code block not found
-                    const mainMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/);
-                    if (mainMatch && mainMatch[1]) {{
-                        return mainMatch[1].replace(/<[^>]*>/g, '').trim();
-                    }}
-                    
-                    return ""; // Return empty string if nothing found
-                }};
-                
-                const expectedContent = extractContent(expectedHtml);
-                const actualContent = extractContent(actualHtml);
-                
-                if (expectedContent && actualContent) {{
-                    // Check if they're actually different
-                    if (expectedContent === actualContent) {{
-                        document.getElementById("diff-output").innerHTML = '<div class="no-diff-message"><p>No differences found, but run was marked as failed.</p></div>';
-                        return;
-                    }}
-                    
-                    // Create the diff
-                    const diff = Diff.createPatch("file", expectedContent, actualContent);
-                    
-                    // Check if the diff is meaningful
-                    const hasMeaningfulDiff = diff.includes('+') || diff.includes('-');
-                    
-                    if (hasMeaningfulDiff) {{
-                        // Format and display the diff
-                        const formattedDiff = formatDiff(diff);
-                        document.getElementById("diff-output").innerHTML = formattedDiff;
-                    }} else {{
-                        document.getElementById("diff-output").innerHTML = '<div class="no-diff-message"><p>No visible differences found in content.</p><p>The run may have failed due to whitespace or invisible characters.</p></div>';
-                    }}
-                }} else {{
-                    // Show a specific error if either content is empty
-                    if (!expectedContent && !actualContent) {{
-                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from both expected and actual output files.</p>";
-                    }} else if (!expectedContent) {{
-                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from expected output file.</p>";
-                    }} else {{
-                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from actual output file.</p>";
-                    }}
-                }}
-            }})
-            .catch(error => {{
-                document.getElementById("diff-output").innerHTML = "<p>Error loading diff: " + error.message + "</p>";
-                console.error("Error in diff generation:", error);
-            }});
-            
-            // Format the diff with syntax highlighting
-            function formatDiff(diff) {{
-                if (!diff) return '<pre>No differences found</pre>';
-                
-                const lines = diff.split('\\n');
-                let html = '<pre class="diff">';
-                
-                for (let i = 0; i < lines.length; i++) {{
-                    const line = lines[i];
-                    let className = '';
-                    
-                    if (line.startsWith('+')) {{
-                        className = 'diff-added';
-                    }} else if (line.startsWith('-')) {{
-                        className = 'diff-removed';
-                    }} else if (line.startsWith('@')) {{
-                        className = 'diff-info';
-                    }}
-                    
-                    // Escape HTML in the line
-                    const escapedLine = document.createElement('div');
-                    escapedLine.textContent = line;
-                    const escapedText = escapedLine.innerHTML;
-                    
-                    html += '<div class="' + className + '">' + escapedText + '</div>';
-                }}
-                
-                html += '</pre>';
-                return html;
-            }}
-        }});
-    </script>
 </body>
 </html>
     """
