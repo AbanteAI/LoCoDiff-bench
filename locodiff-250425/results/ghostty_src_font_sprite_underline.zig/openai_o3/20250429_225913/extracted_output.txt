@@ -1,0 +1,225 @@
+//! This file renders underline sprites. To draw underlines, we render the
+//! full cell-width as a sprite and then draw it as a separate pass to the
+//! text.
+//!
+//! We used to render the underlines directly in the GPU shaders but it is
+//! annoying to support multiple types of underlines and also annoying
+//! to maintain and debug another set of shaders for each renderer instead of
+//! just relying on the glyph system we already need to support for text
+//! anyway.
+//!
+//! This also renders strikethrough and overline, so it is really more generally
+//! a “horizontal-line” renderer.
+const std       = @import("std");
+const font      = @import("../main.zig");
+const Allocator = std.mem.Allocator;
+const Sprite    = font.sprite.Sprite;
+
+// Render an underline/overline/strike sprite.
+pub fn renderGlyph(
+    alloc          : Allocator,
+    atlas          : *font.Atlas,
+    sprite         : Sprite,
+    width          : u32,
+    height         : u32,
+    line_pos       : u32,
+    line_thickness : u32,
+) !font.Glyph {
+    // Draw the requested sprite variant.
+    var canvas : font.sprite.Canvas, const y_off : i32 = switch (sprite) {
+        .underline        => try drawSingle (alloc, width, line_thickness),
+        .underline_double => try drawDouble (alloc, width, line_thickness),
+        .underline_dotted => try drawDotted(alloc, width, line_thickness),
+        .underline_dashed => try drawDashed (alloc, width, line_thickness),
+        .underline_curly  => try drawCurly (alloc, width, line_thickness),
+        .strikethrough,
+        .overline         => try drawSingle (alloc, width, line_thickness),
+        else              => unreachable,
+    };
+    defer canvas.deinit();
+
+    const region = try canvas.writeAtlas(alloc, atlas);
+
+    return .{
+        .width      = width,
+        .height     = region.height,
+        .offset_x   = 0,
+        // Glyph.offset_y is measured from the top of the glyph to the bottom of
+        // the cell.  We want the top of the glyph to be `line_pos` from the top
+        // of the cell and then apply any style-specific offset.
+        .offset_y   = @as(i32, @intCast(height -| line_pos)) - y_off,
+        .atlas_x    = region.x,
+        .atlas_y    = region.y,
+        .advance_x  = @floatFromInt(width),
+    };
+}
+
+// A helper tuple: drawn canvas + recommended Y offset.
+const CanvasAndOffset = struct { font.sprite.Canvas, i32 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plain underline (and overline / strike)
+
+fn drawSingle(
+    alloc     : Allocator,
+    width     : u32,
+    thickness : u32,
+) !CanvasAndOffset {
+    const h = thickness;
+    var c   = try font.sprite.Canvas.init(alloc, width, h);
+
+    c.rect(.{ .x = 0, .y = 0, .width = width, .height = thickness }, .on);
+
+    return .{ c, 0 };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Double underline
+
+fn drawDouble(
+    alloc     : Allocator,
+    width     : u32,
+    thickness : u32,
+) !CanvasAndOffset {
+    const gap    = @max(2, thickness);
+    const h      = thickness * 2 * gap;
+    var  c       = try font.sprite.Canvas.init(alloc, width, h);
+
+    c.rect(.{ .x = 0, .y = 0,               .width = width, .height = thickness }, .on);
+    c.rect(.{ .x = 0, .y = thickness + gap, .width = width, .height = thickness }, .on);
+
+    return .{ c, -@as(i32, @intCast(thickness)) };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dotted underline
+
+fn drawDotted(
+    alloc     : Allocator,
+    width     : u32,
+    thickness : u32,
+) !CanvasAndOffset {
+    const h         = thickness;
+    var   c         = try font.sprite.Canvas.init(alloc, width, h);
+    const dot_w     = @max(thickness, 3);
+    const dot_cnt   = @max((width / dot_w) / 2, 1);
+    const gap_w     = try std.math.divCeil(u32, width -| dot_cnt * dot_w, dot_cnt);
+
+    var i: u32 = 0;
+    while (i < dot_cnt) : (i += 1) {
+        const x     = @min(i * (dot_w + gap_w), width - 1);
+        const w     = @min(width - x, dot_w);
+        c.rect(.{ .x = x, .y = 0, .width = w, .height = thickness }, .on);
+    }
+
+    return .{ c, 0 };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dashed underline
+
+fn drawDashed(
+    alloc     : Allocator,
+    width     : u32,
+    thickness : u32,
+) !CanvasAndOffset {
+    const h        = thickness;
+    var   c        = try font.sprite.Canvas.init(alloc, width, h);
+    const dash_w   = width / 3 + 1;
+    const dash_cnt = width / dash_w + 1;
+
+    var i: u32 = 0;
+    while (i < dash_cnt) : (i += 2) {
+        const x = @min(i * dash_w, width - 1);
+        const w = @min(width - x, dash_w);
+        c.rect(.{ .x = x, .y = 0, .width = w, .height = thickness }, .on);
+    }
+
+    return .{ c, 0 };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Curly (undercurl) underline
+
+fn drawCurly(
+    alloc     : Allocator,
+    width     : u32,
+    thickness : u32,
+) !CanvasAndOffset {
+    const f_w   = @as(f64, @floatFromInt(width));
+    // Empirically-determined “nice looking” minimum.
+    const f_t   = @max(0.414, @as(f64, @floatFromInt(thickness -| 1)));
+
+    const ω     = 2.0 * std.math.pi / f_w;          // wave period
+    const a     = 1.0 / ω;                          // half amplitude
+    const y_mid = a + f_t * 0.5 + 1.0;
+
+    const off_fac =
+        @min(1.0, f_t * 0.5 * ω) *
+        @min(1.0, a   * ω);
+
+    const height = @as(u32, @intFromFloat(@ceil(a + f_t + 1) * 2));
+    var   c      = try font.sprite.Canvas.init(alloc, width, height);
+
+    var x: u32 = 0;
+    while (x < width) : (x += 1) {
+        // Sample at centre of pixel column for symmetry
+        const t        = (@as(f64, @floatFromInt(x)) + 0.5) * ω;
+        const t_u      = t + std.math.pi;
+
+        const slope_u  = (@sin(t_u) * @sin(t_u) * off_fac) /
+                         ((1.0 + @cos(t_u / 2) * @cos(t_u / 2) * 2.0) * ω);
+        const slope_l  = (@sin(t)   * @sin(t)   * off_fac) /
+                         ((1.0 + @cos(t  / 2) * @cos(t  / 2) * 2.0) * ω);
+
+        const centre_y = y_mid + a * @cos(t);
+
+        const y_u_f    = centre_y - f_t * 0.5 - slope_u;
+        const y_l_f    = centre_y + f_t * 0.5 + slope_l;
+        const y_u      = @as(u32, @intFromFloat(@floor(y_u_f)));
+        const y_l      = @as(u32, @intFromFloat(@ceil (y_l_f)));
+
+        const α_u: u8  = @as(u8,  @intFromFloat(@round(255 * (1.0 - @abs(y_u_f - @floor(y_u_f))))));
+        const α_l: u8  = @as(u8,  @intFromFloat(@round(255 * (1.0 - @abs(y_l_f - @ceil (y_l_f))))));
+
+        // cap to buffer
+        c.pixel(x, @min(y_u, height - 1), @enumFromInt(α_u));
+        c.pixel(x, @min(y_l, height - 1), @enumFromInt(α_l));
+
+        var y_f: u32 = y_u + 1;
+        while (y_f < y_l) : (y_f += 1) c.pixel(x, y_f, .on);
+    }
+
+    return .{ c, -@as(i32, @intFromFloat(@round(a))) };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+
+test "single" {
+    const T = std.testing;
+    var at  = try font.Atlas.init(T.allocator, 512, .grayscale);
+    defer at.deinit(T.allocator);
+    _ = try renderGlyph(T.allocator, &at, .underline, 36, 18, 9, 2);
+}
+
+test "strikethrough" {
+    const T = std.testing;
+    var at  = try font.Atlas.init(T.allocator, 512, .grayscale);
+    defer at.deinit(T.allocator);
+    _ = try renderGlyph(T.allocator, &at, .strikethrough, 36, 18, 9, 2);
+}
+
+test "large thickness" {
+    const T = std.testing;
+    var at  = try font.Atlas.init(T.allocator, 512, .grayscale);
+    defer at.deinit(T.allocator);
+    _ = try renderGlyph(T.allocator, &at, .underline, 36, 18, 9, 200);
+}
+
+test "curly" {
+    const T = std.testing;
+    var at  = try font.Atlas.init(T.allocator, 512, .grayscale);
+    defer at.deinit(T.allocator);
+    _ = try renderGlyph(T.allocator, &at, .underline_curly, 36, 18, 9, 2);
+}

@@ -1,0 +1,359 @@
+```zig
+const App = @This();
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
+const build_config = @import("build_config.zig");
+
+const apprt   = @import("apprt.zig");
+const Surface = @import("Surface.zig");
+
+const tracy    = @import("tracy");
+const input    = @import("input.zig");
+const configpkg = @import("config.zig");
+const Config    = configpkg.Config;
+
+const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
+
+const renderer    = @import("renderer.zig");
+const font        = @import("font/main.zig");
+const internal_os = @import("os/main.zig");
+
+const macos = @import("macos");
+const objc  = @import("objc");
+
+const log = std.log.scoped(.app);
+
+const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
+
+///////////////////////////////////////////////////////////////////////////////
+// GLOBAL/STRUCT STATE
+///////////////////////////////////////////////////////////////////////////////
+
+// General purpose allocator
+alloc: Allocator,
+
+// List of active surfaces
+surfaces: SurfaceList,
+
+// Whether the application (not necessarily a surface) has focus
+focused: bool = true,
+
+// Last focused surface (may be invalid, check with hasSurface)
+focused_surface: ?*Surface = null,
+
+// Message queue for cross-thread communication
+mailbox: BlockingQueue(Message, 64).Queue,
+
+// Shared font grid cache (lifetime == App lifetime)
+font_grid_set: font.SharedGridSet,
+
+// Rate-limit helpers for desktop notifications
+last_notification_time  : ?std.time.Instant = null,
+last_notification_digest: u64               = 0,
+
+// Default conditional state for config (light/dark, …)
+config_conditional_state: configpkg.ConditionalState = .{},
+
+// False after first surface is created
+first: bool = true,
+
+///////////////////////////////////////////////////////////////////////////////
+// INIT/DEINIT
+///////////////////////////////////////////////////////////////////////////////
+
+pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
+
+pub fn create(alloc: Allocator) CreateError!*App {
+    var app = try alloc.create(App);
+    errdefer alloc.destroy(app);
+
+    var grid_set = try font.SharedGridSet.init(alloc);
+    errdefer grid_set.deinit();
+
+    app.* = .{
+        .alloc              = alloc,
+        .surfaces           = .{},
+        .mailbox            = .{},
+        .font_grid_set      = grid_set,
+        .config_conditional_state = .{},
+    };
+    errdefer app.surfaces.deinit(alloc);
+
+    return app;
+}
+
+pub fn destroy(self: *App) void {
+    for (self.surfaces.items) |s| s.deinit();
+    self.surfaces.deinit(self.alloc);
+
+    // All grids should be gone by now
+    assert(self.font_grid_set.count() == 0);
+    self.font_grid_set.deinit();
+
+    self.alloc.destroy(self);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// CONFIG HANDLING
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn updateConfig(
+    self   : *App,
+    rt_app : *apprt.App,
+    config : *const Config,
+) !void {
+    // Propagate to all existing surfaces
+    for (self.surfaces.items) |s|
+        try s.core_surface.handleMessage(.{ .change_config = config });
+
+    // Apply conditional state to app-level config
+    var tmp_cfg: ?Config = config.changeConditionalState(
+        self.config_conditional_state,
+    ) catch |e| blk: {
+        log.warn("failed to apply conditional state: {}", .{e});
+        break :blk null;
+    };
+    defer if (tmp_cfg) |*c| c.deinit();
+    const applied: *const Config = if (tmp_cfg) |*c| c else config;
+
+    // Notify apprt
+    _ = try rt_app.performAction(
+        .app,
+        .config_change,
+        .{ .config = applied },
+    );
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// SURFACE MANAGEMENT
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn addSurface(self: *App, rt: *apprt.Surface) Allocator.Error!void {
+    try self.surfaces.append(self.alloc, rt);
+
+    // Cancel quit timer (if any)
+    _ = rt.app.performAction(.app, .quit_timer, .stop) catch |e|
+        log.warn("stop quit-timer failed: {}", .{e});
+}
+
+pub fn deleteSurface(self: *App, rt: *apprt.Surface) void {
+    if (self.focused_surface) |f| if (f == &rt.core_surface) self.focused_surface = null;
+
+    var i: usize = 0;
+    while (i < self.surfaces.items.len) {
+        if (self.surfaces.items[i] == rt) {
+            _ = self.surfaces.swapRemove(i);
+        } else i += 1;
+    }
+
+    if (self.surfaces.items.len == 0)
+        _ = rt.app.performAction(.app, .quit_timer, .start) catch |e|
+            log.warn("start quit-timer failed: {}", .{e});
+}
+
+pub fn focusedSurface(self: *const App) ?*Surface {
+    const s = self.focused_surface orelse return null;
+    return if (self.hasSurface(s)) s else null;
+}
+
+pub fn needsConfirmQuit(self: *const App) bool {
+    for (self.surfaces.items) |s|
+        if (s.core_surface.needsConfirmQuit()) return true;
+    return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// EVENT LOOP
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn tick(self: *App, rt_app: *apprt.App) !void {
+    // Close finished surfaces
+    var i: usize = 0;
+    while (i < self.surfaces.items.len) {
+        const s = self.surfaces.items[i];
+        if (s.shouldClose()) s.close() else i += 1;
+    }
+
+    try self.drainMailbox(rt_app);
+}
+
+fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
+    while (self.mailbox.pop()) |m| {
+        log.debug("mailbox {}", .{@tagName(m)});
+        switch (m) {
+            .open_config         => try self.performAction(rt_app, .open_config),
+            .new_window          => |msg| try self.newWindow(rt_app, msg),
+            .close               => |s|  self.closeSurface(s),
+            .surface_message     => |p|  try self.surfaceMessage(p.surface, p.message),
+            .redraw_surface      => |s|  self.redrawSurface(rt_app, s),
+            .redraw_inspector    => |s|  self.redrawInspector(rt_app, s),
+
+            .quit => {
+                log.info("quit message – abort remaining mailbox", .{});
+                _ = try rt_app.performAction(.app, .quit, {});
+                return;
+            },
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// WINDOW/FOCUS EVENTS
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn newWindow(self: *App, rt: *apprt.App, msg: Message.NewWindow) !void {
+    const tgt: apprt.Target = blk: {
+        const p = msg.parent orelse break :blk .app;
+        break :blk if (self.hasSurface(p)) .{ .surface = p } else .app;
+    };
+    _ = try rt.performAction(tgt, .new_window, {});
+}
+
+pub fn focusEvent(self: *App, focused: bool) void {
+    if (self.focused == focused) return;
+    log.debug("app focus={}", .{focused});
+    self.focused = focused;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// KEY INPUT
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn keyEventIsBinding(
+    self  : *App,
+    rt_app: *apprt.App,
+    e     : input.KeyEvent,
+) bool {
+    _ = self;
+    return e.action != .release and rt_app.config.keybind.set.getEvent(e) != null;
+}
+
+pub fn keyEvent(
+    self  : *App,
+    rt_app: *apprt.App,
+    e     : input.KeyEvent,
+) bool {
+    if (e.action == .release) return false;
+
+    const entry = rt_app.config.keybind.set.getEvent(e) orelse return false;
+    const leaf  = switch (entry.value_ptr.*) {
+        .leader => return false,
+        .leaf   => |l| l,
+    };
+
+    // If app not focused only allow global bindings
+    if (!self.focused and !leaf.flags.global) return false;
+
+    if (leaf.flags.global) {
+        self.performAllAction(rt_app, leaf.action) catch |er|
+            log.warn("global action {} failed: {}", .{@tagName(leaf.action), er});
+        return true;
+    }
+
+    // App-scoped binding
+    const app_act = leaf.action.scoped(.app) orelse return false;
+    self.performAction(rt_app, app_act) catch |er|
+        log.warn("app action {} failed: {}", .{@tagName(app_act), er});
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// COLOR SCHEME
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn colorSchemeEvent(
+    self : *App,
+    rt   : *apprt.App,
+    sch  : apprt.ColorScheme,
+) !void {
+    const th: configpkg.ConditionalState.Theme = switch (sch) {
+        .light => .light, .dark => .dark,
+    };
+    if (self.config_conditional_state.theme == th) return;
+
+    self.config_conditional_state.theme = th;
+    _ = try rt.performAction(.app, .reload_config, .{ .soft = true });
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ACTIONS
+///////////////////////////////////////////////////////////////////////////////
+
+pub fn performAction(
+    self  : *App,
+    rt_app: *apprt.App,
+    act   : input.Binding.Action.Scoped(.app),
+) !void {
+    switch (act) {
+        .unbind                => unreachable,
+        .ignore                => {},
+        .quit                  => _ = try rt_app.performAction(.app, .quit, {}),
+        .new_window            => try self.newWindow(rt_app, .{ .parent = null }),
+        .open_config           => _ = try rt_app.performAction(.app, .open_config, {}),
+        .reload_config         => _ = try rt_app.performAction(.app, .reload_config, .{}),
+        .close_all_windows     => _ = try rt_app.performAction(.app, .close_all_windows, {}),
+        .toggle_quick_terminal => _ = try rt_app.performAction(.app, .toggle_quick_terminal, {}),
+        .toggle_visibility     => _ = try rt_app.performAction(.app, .toggle_visibility, {}),
+    }
+}
+
+pub fn performAllAction(
+    self  : *App,
+    rt_app: *apprt.App,
+    act   : input.Binding.Action,
+) !void {
+    switch (act.scope()) {
+        .app     => try self.performAction(rt_app, act.scoped(.app).?),
+        .surface => for (self.surfaces.items) |s|
+            _ = s.core_surface.performBindingAction(act) catch |er|
+                log.warn("surface {} action failed: {}", .{@intFromPtr(s), er});
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// SURFACE FORWARDERS
+///////////////////////////////////////////////////////////////////////////////
+
+fn surfaceMessage(self: *App, win: *Surface, msg: apprt.surface.Message) !void {
+    if (self.hasSurface(win)) try win.handleMessage(msg);
+}
+
+fn redrawSurface(self: *App, rt: *apprt.App, s: *apprt.Surface) void {
+    if (self.hasSurface(&s.core_surface)) rt.redrawSurface(s);
+}
+
+fn redrawInspector(self: *App, rt: *apprt.App, s: *apprt.Surface) void {
+    if (self.hasSurface(&s.core_surface)) rt.redrawInspector(s);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// HELPERS
+///////////////////////////////////////////////////////////////////////////////
+
+fn hasSurface(self: *const App, s: *const Surface) bool {
+    for (self.surfaces.items) |v|
+        if (&v.core_surface == s) return true;
+    return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// MAILBOX MESSAGE TYPES
+///////////////////////////////////////////////////////////////////////////////
+
+pub const Message = union(enum) {
+    open_config : void,
+    new_window  : NewWindow,
+    close       : *Surface,
+
+    surface_message   : struct { surface: *Surface, message: apprt.surface.Message },
+    redraw_surface    : *apprt.Surface,
+    redraw_inspector  : *apprt.Surface,
+
+    quit : void,
+
+    const NewWindow = struct { parent: ?*Surface = null };
+};
+```

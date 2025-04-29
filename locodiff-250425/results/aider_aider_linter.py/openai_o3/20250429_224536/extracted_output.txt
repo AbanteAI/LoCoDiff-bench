@@ -1,0 +1,368 @@
+# Copyright
+# SPDX-License-Identifier: MIT
+"""
+aider.linter
+A collection of lightweight, language-aware linters used by aider to quickly spot
+syntax errors before handing source files off to the AI.  These linters are
+designed to be “good enough” rather than perfect; the goal is to surface the
+most obvious problems with minimal dependencies and maximal speed.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+import traceback
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+
+from grep_ast import TreeContext, filename_to_lang
+from grep_ast.tsl import get_parser  # noqa: E402
+
+from aider.dump import dump  # noqa: F401
+from aider.run_cmd import run_cmd_subprocess  # noqa: F401
+
+# tree-sitter is still emitting a FutureWarning in some environments
+warnings.simplefilter("ignore", category=FutureWarning)
+
+
+class Linter:
+    """
+    A very small abstraction that knows how to pick the right linter for a
+    filename, run it, capture any diagnostics and then format them back to the
+    AI in a way that is easy to consume.
+    """
+
+    def __init__(self, encoding: str = "utf-8", root: str | None = None) -> None:
+        self.encoding = encoding
+        self.root = root
+
+        # Hard-wired set of per-language linters.  At the moment we only have a
+        # bespoke Python linter; everything else falls back to tree-sitter.
+        self.languages: dict[str, object] = {
+            "python": self.py_lint,
+        }
+        self.all_lint_cmd: str | None = None
+
+    # --------------------------------------------------------------------- #
+    # utility helpers
+    # --------------------------------------------------------------------- #
+    def set_linter(self, lang: str | None, cmd: object) -> None:
+        """
+        Allow callers to register an external linter.
+
+        If *lang* is None the command will be used as the default “catch-all”
+        linter for every language that does not already have a bespoke rule.
+        """
+        if lang:
+            self.languages[lang] = cmd
+        else:
+            self.all_lint_cmd = cmd
+
+    def get_rel_fname(self, fname: str) -> str:
+        """Return *fname* relative to *self.root* (if set)."""
+        if self.root:
+            try:
+                return os.path.relpath(fname, self.root)
+            except ValueError:
+                # The file is on a different drive (Windows) – fall back to the
+                # absolute path.
+                return fname
+        return fname
+
+    # --------------------------------------------------------------------- #
+    # generic command runner
+    # --------------------------------------------------------------------- #
+    def run_cmd(self, cmd: str, rel_fname: str, code: str):
+        """
+        Run *cmd* against *rel_fname*, capture stdout+stderr and translate the
+        result into a :class:`LintResult`.
+        """
+        cmd += " " + shlex.quote(rel_fname)
+        cmd_list = cmd.split()
+
+        try:
+            process = subprocess.Popen(
+                cmd_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding=self.encoding,
+                errors="replace",
+                cwd=self.root,
+            )
+        except OSError as err:
+            print(f"Unable to execute lint command: {err}")
+            return
+
+        stdout, _ = process.communicate()
+        if process.returncode == 0:
+            return  # clean exit, nothing to report
+
+        errors = stdout
+        res = f"## Running: {cmd}\n\n{errors}"
+        return self._errors_to_lint_result(rel_fname, res)
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _errors_to_lint_result(rel_fname: str, errors: str):
+        """Turn *errors* into a :class:`LintResult`, extracting line numbers."""
+        if not errors:
+            return
+
+        linenums: list[int] = []
+        fn_line = find_filenames_and_linenums(errors, [rel_fname])
+        if fn_line:
+            _, nums = next(iter(fn_line.items()))
+            linenums = [n - 1 for n in nums]  # zero-index
+
+        return LintResult(text=errors, lines=linenums)
+
+    # --------------------------------------------------------------------- #
+    # public API
+    # --------------------------------------------------------------------- #
+    def lint(self, fname: str, cmd: str | None = None):
+        """
+        Lint *fname* (optionally with an explicit *cmd* override) and return a
+        nicely-formatted error report suitable for feeding directly to the AI.
+        """
+        rel_fname = self.get_rel_fname(fname)
+        try:
+            code = Path(fname).read_text(encoding=self.encoding, errors="replace")
+        except OSError as err:
+            print(f"Unable to read {fname}: {err}")
+            return
+
+        # Decide which linter to run ------------------------------------------------
+        if cmd:
+            chosen_cmd = cmd.strip()
+        else:
+            lang = filename_to_lang(fname)
+            if not lang:
+                return
+
+            if self.all_lint_cmd:
+                chosen_cmd = self.all_lint_cmd
+            else:
+                chosen_cmd = self.languages.get(lang)
+
+        # Run the linter ------------------------------------------------------------
+        if callable(chosen_cmd):
+            lintres = chosen_cmd(fname, rel_fname, code)
+        elif chosen_cmd:
+            lintres = self.run_cmd(chosen_cmd, rel_fname, code)
+        else:
+            lintres = basic_lint(rel_fname, code)
+
+        if not lintres:
+            return
+
+        # Final pretty-printing -----------------------------------------------------
+        res = "# Fix any errors below, if possible.\n\n"
+        res += lintres.text
+        res += "\n"
+        res += tree_context(rel_fname, code, lintres.lines)
+        return res
+
+    # --------------------------------------------------------------------- #
+    # language-specific linters
+    # --------------------------------------------------------------------- #
+    def py_lint(self, fname: str, rel_fname: str, code: str):
+        """
+        Our Python linter is a three-stage affair:
+
+        1.  A super-fast tree-sitter pass to flag gross syntax errors.
+        2.  A ``compile()`` round-trip to catch run-time syntax errors
+            (eg. indentation).
+        3.  A pared-down ``flake8`` run looking only for fatal codes.
+        """
+        basic_res = basic_lint(rel_fname, code)
+        compile_res = lint_python_compile(fname, code)
+        flake_res = self._flake8_lint(rel_fname)
+
+        text = ""
+        lines: set[int] = set()
+        for res in (basic_res, compile_res, flake_res):
+            if not res:
+                continue
+            if text:
+                text += "\n"
+            text += res.text
+            lines.update(res.lines)
+
+        if text or lines:
+            return LintResult(text, lines)
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    def _flake8_lint(self, rel_fname: str):
+        """Run a very small subset of flake8 and capture any diagnostics."""
+        fatal = "E9,F821,F823,F831,F406,F407,F701,F702,F704,F706"
+        flake8_cmd = [
+            sys.executable,
+            "-m",
+            "flake8",
+            f"--select={fatal}",
+            "--show-source",
+            "--isolated",
+            rel_fname,
+        ]
+
+        try:
+            result = subprocess.run(
+                flake8_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                encoding=self.encoding,
+                errors="replace",
+                cwd=self.root,
+            )
+            errors = result.stdout + result.stderr
+        except Exception as exc:  # pragma: no cover
+            errors = f"Error running flake8: {exc}"
+
+        if not errors.strip():
+            return
+
+        text = f"## Running: {' '.join(flake8_cmd)}\n\n{errors}"
+        return self._errors_to_lint_result(rel_fname, text)
+
+
+# -------------------------------------------------------------------------- #
+# Trivial dataclass used by the various helpers above
+# -------------------------------------------------------------------------- #
+@dataclass
+class LintResult:
+    text: str
+    lines: list[int]
+
+
+# -------------------------------------------------------------------------- #
+# standalone helpers – used by the Python linter and by the generic fallback
+# -------------------------------------------------------------------------- #
+def lint_python_compile(fname: str, code: str):
+    """Round-trip the code through ``compile()`` to catch late-binding errors."""
+    try:
+        compile(code, fname, "exec")  # noqa: S102
+        return
+    except Exception as err:  # pragma: no cover
+        end_lineno = getattr(err, "end_lineno", err.lineno)
+        line_numbers = list(range(err.lineno - 1, end_lineno))
+
+        tb_lines = traceback.format_exception(type(err), err, err.__traceback__)
+        # Trim the traceback down to the frames _after_ our sentinel comment
+        sentinel = "# USE TRACEBACK BELOW HERE"
+        for i, line in enumerate(tb_lines):
+            if sentinel in line:
+                tb_lines = tb_lines[:1] + tb_lines[i + 1 :]
+                break
+
+        res = "".join(tb_lines)
+        return LintResult(text=res, lines=line_numbers)
+
+
+def basic_lint(fname: str, code: str):
+    """
+    A very thin tree-sitter wrapper that looks for parse errors in *code*.
+    """
+    lang = filename_to_lang(fname)
+    if not lang or lang == "typescript":  # tree-sitter TS is too noisy (#1132)
+        return
+
+    try:
+        parser = get_parser(lang)
+    except Exception as err:  # pragma: no cover
+        print(f"Unable to load parser: {err}")
+        return
+
+    tree = parser.parse(code.encode())
+    try:
+        errors = traverse_tree(tree.root_node)
+    except RecursionError:  # pragma: no cover
+        print(f"Unable to lint {fname} due to RecursionError")
+        return
+
+    if not errors:
+        return
+
+    return LintResult(text="", lines=errors)
+
+
+# -------------------------------------------------------------------------- #
+# misc helpers
+# -------------------------------------------------------------------------- #
+def tree_context(fname: str, code: str, line_nums: list[int]):
+    """
+    Pretty-print *code* with the given lines of interest highlighted by
+    grep-ast’s :class:`TreeContext`.
+    """
+    ctx = TreeContext(
+        fname,
+        code,
+        color=False,
+        line_number=True,
+        child_context=False,
+        last_line=False,
+        margin=0,
+        mark_lois=True,
+        loi_pad=3,
+        show_top_of_file_parent_scope=False,
+    )
+    ctx.add_lines_of_interest(line_nums)
+    ctx.add_context()
+
+    s = "s" if len(line_nums) != 1 else ""
+    out = f"## See relevant line{s} below marked with █.\n\n{fname}:\n"
+    out += ctx.format()
+    return out
+
+
+def traverse_tree(node):
+    """Recursively walk the tree-sitter AST collecting error node line numbers."""
+    errors = []
+    if node.type == "ERROR" or getattr(node, "is_missing", False):
+        errors.append(node.start_point[0])
+
+    for child in node.children:
+        errors.extend(traverse_tree(child))
+
+    return errors
+
+
+def find_filenames_and_linenums(text: str, fnames: list[str]):
+    """
+    Scan *text* for ``<filename>:<linenum>`` patterns and return a mapping
+    ``{filename: {lineno, ...}}`` limited to the supplied *fnames*.
+    """
+    pattern = re.compile(r"(\b(?:" + "|".join(re.escape(f) for f in fnames) + r"):\d+\b)")
+    matches = pattern.findall(text)
+    result: dict[str, set[int]] = {}
+    for match in matches:
+        fname, linenum = match.rsplit(":", 1)
+        result.setdefault(fname, set()).add(int(linenum))
+    return result
+
+
+# -------------------------------------------------------------------------- #
+# CLI entry-point – handy for debugging
+# -------------------------------------------------------------------------- #
+def main() -> None:  # pragma: no cover
+    if len(sys.argv) < 2:
+        print("Usage: python linter.py <file1> [file2 ...]")
+        raise SystemExit(1)
+
+    linter = Linter(root=os.getcwd())
+    for path in sys.argv[1:]:
+        res = linter.lint(path)
+        if res:
+            print(res)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
