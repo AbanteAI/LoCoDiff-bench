@@ -1430,6 +1430,26 @@ def generate_actual_output_page(
     actual_page_path = content_dir / "actual.html"
     display_name = model_display_names.get(model, model)
 
+    # Handle empty actual output specially
+    content_section = ""
+    if not actual_output or actual_output.strip() == "":
+        content_section = """
+        <section>
+            <h2>Actual Output Content</h2>
+            <div class="empty-content-notice">
+                <p>No actual output content available.</p>
+                <p>This could be because the model failed to generate a response or the response was empty.</p>
+            </div>
+        </section>
+        """
+    else:
+        content_section = f"""
+        <section>
+            <h2>Actual Output Content</h2>
+            <pre><code class="language-plaintext">{actual_output}</code></pre>
+        </section>
+        """
+
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1439,6 +1459,21 @@ def generate_actual_output_page(
     <link rel="stylesheet" href="../../../../styles.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <style>
+        .empty-content-notice {{
+            background-color: #f8f8f8;
+            border: 1px dashed #ccc;
+            border-radius: 4px;
+            padding: 20px;
+            text-align: center;
+            color: #666;
+        }}
+        
+        .empty-content-notice p:first-child {{
+            font-weight: bold;
+            margin-bottom: 10px;
+        }}
+    </style>
 </head>
 <body>
     <header>
@@ -1446,10 +1481,7 @@ def generate_actual_output_page(
         <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
-        <section>
-            <h2>Actual Output Content</h2>
-            <pre><code class="language-plaintext">{actual_output}</code></pre>
-        </section>
+        {content_section}
     </main>
     <footer>
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
@@ -1780,32 +1812,86 @@ def generate_case_page(
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/4.0.2/diff.min.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {{
-            // Load expected and actual output for diff
+            // Check if this is a successful run
+            const isSuccess = {"true" if success else "false"};
+            
+            if (isSuccess) {{
+                // For successful runs, show a success message instead of a diff
+                document.getElementById("diff-output").innerHTML = '<div class="success-message"><p>✓ No differences found (successful run)</p><p>Expected output matches the model output exactly.</p></div>';
+                return;
+            }}
+            
+            // For failed runs, load expected and actual output for diff
             Promise.all([
-                fetch("../../content/{safe_model}/{safe_case}/expected.html").then(response => response.text()),
-                fetch("../../content/{safe_model}/{safe_case}/actual.html").then(response => response.text())
+                fetch("../../content/{safe_model}/{safe_case}/expected.html").then(response => {{
+                    if (!response.ok) {{
+                        throw new Error(`Failed to fetch expected output (HTTP ${response.status})`);
+                    }}
+                    return response.text();
+                }}),
+                fetch("../../content/{safe_model}/{safe_case}/actual.html").then(response => {{
+                    if (!response.ok) {{
+                        throw new Error(`Failed to fetch actual output (HTTP ${response.status})`);
+                    }}
+                    return response.text();
+                }})
             ])
             .then(([expectedHtml, actualHtml]) => {{
-                // Extract content from the HTML files
-                const expectedMatch = expectedHtml.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
-                const actualMatch = actualHtml.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
+                // Extract content from the HTML files using more robust regex
+                // Look for the code block inside the main content section
+                const extractContent = (html) => {{
+                    // First try to find content within the code block
+                    const codeMatch = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
+                    if (codeMatch && codeMatch[1]) {{
+                        return codeMatch[1];
+                    }}
+                    
+                    // Fallback: try to extract from main section if code block not found
+                    const mainMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/);
+                    if (mainMatch && mainMatch[1]) {{
+                        return mainMatch[1].replace(/<[^>]*>/g, '').trim();
+                    }}
+                    
+                    return ""; // Return empty string if nothing found
+                }};
                 
-                if (expectedMatch && actualMatch) {{
-                    const expectedContent = expectedMatch[1];
-                    const actualContent = actualMatch[1];
+                const expectedContent = extractContent(expectedHtml);
+                const actualContent = extractContent(actualHtml);
+                
+                if (expectedContent && actualContent) {{
+                    // Check if they're actually different
+                    if (expectedContent === actualContent) {{
+                        document.getElementById("diff-output").innerHTML = '<div class="no-diff-message"><p>No differences found, but run was marked as failed.</p></div>';
+                        return;
+                    }}
                     
                     // Create the diff
                     const diff = Diff.createPatch("file", expectedContent, actualContent);
                     
-                    // Format and display the diff
-                    const formattedDiff = formatDiff(diff);
-                    document.getElementById("diff-output").innerHTML = formattedDiff;
+                    // Check if the diff is meaningful
+                    const hasMeaningfulDiff = diff.includes('+') || diff.includes('-');
+                    
+                    if (hasMeaningfulDiff) {{
+                        // Format and display the diff
+                        const formattedDiff = formatDiff(diff);
+                        document.getElementById("diff-output").innerHTML = formattedDiff;
+                    }} else {{
+                        document.getElementById("diff-output").innerHTML = '<div class="no-diff-message"><p>No visible differences found in content.</p><p>The run may have failed due to whitespace or invisible characters.</p></div>';
+                    }}
                 }} else {{
-                    document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from files.</p>";
+                    // Show a specific error if either content is empty
+                    if (!expectedContent && !actualContent) {{
+                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from both expected and actual output files.</p>";
+                    }} else if (!expectedContent) {{
+                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from expected output file.</p>";
+                    }} else {{
+                        document.getElementById("diff-output").innerHTML = "<p>Error: Could not extract content from actual output file.</p>";
+                    }}
                 }}
             }})
             .catch(error => {{
                 document.getElementById("diff-output").innerHTML = `<p>Error loading diff: ${{error.message}}</p>`;
+                console.error("Error in diff generation:", error);
             }});
             
             // Format the diff with syntax highlighting
@@ -2118,6 +2204,31 @@ tr.success:hover, tr.failure:hover {
     border-radius: 4px;
     padding: 15px;
     overflow-x: auto;
+}
+
+/* Success and error messages in diff section */
+.success-message {
+    background-color: #e6ffec;
+    color: #22863a;
+    padding: 15px;
+    border: 1px solid #22863a;
+    border-radius: 4px;
+    text-align: center;
+}
+
+.success-message p:first-child {
+    font-size: 18px;
+    font-weight: bold;
+    margin-bottom: 5px;
+}
+
+.no-diff-message {
+    background-color: #fffbdd;
+    color: #735c0f;
+    padding: 15px;
+    border: 1px solid #d9d0a5;
+    border-radius: 4px;
+    text-align: center;
 }
 
 /* Diff formatting */
