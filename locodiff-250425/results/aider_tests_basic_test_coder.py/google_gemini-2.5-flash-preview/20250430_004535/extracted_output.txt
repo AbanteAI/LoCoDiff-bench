@@ -1,0 +1,276 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+import git
+ 
+ from aider.coders import Coder
+ from aider.coders.base_coder import FinishReasonLength, UnknownEditFormat
+ from aider.dump import dump  # noqa: F401
+ from aider.io import InputOutput
+ from aider.models import Model
+ from aider.repo import GitRepo
++from aider.sendchat import sanity_check_messages
+ from aider.utils import GitTemporaryDirectory
+ 
+ 
+@@ -38,7 +39,8 @@ class TestCoder(unittest.TestCase):
+             # YES!
+             # Use a completely mocked IO object instead of a real one
+             io = MagicMock()
+-            io.confirm_ask = MagicMock(return_value=True)
++            io.confirm_ask = MagicMock(return_value=True)  # Mock the confirm_ask method
++            io.ask = MagicMock()
+             coder = Coder.create(self.GPT35, None, io, fnames=["added.txt"])
+ 
+             self.assertTrue(coder.allowed_to_edit("added.txt"))
+@@ -612,6 +614,37 @@ class TestCoder(unittest.TestCase):
+ 
+             self.assertEqual(coder.abs_fnames, set([str(fname.resolve())]))
+ 
++    def test_skip_duplicate_basename_mentions(self):
++        with GitTemporaryDirectory():
++            io = InputOutput(pretty=False, yes=True)
++            coder = Coder.create(self.GPT35, None, io)
++
++            # Create files with same basename in different directories
++            fname1 = Path("dir1") / "file.txt"
++            fname2 = Path("dir2") / "file.txt"
++            fname3 = Path("dir3") / "unique.txt"
++
++            for fname in [fname1, fname2, fname3]:
++                fpath = Path(fname)
++                fpath.parent.mkdir(parents=True, exist_ok=True)
++                fpath.touch()
++
++            # Add one file to chat
++            coder.add_rel_fname(str(fname1))
++
++            # Mock get_tracked_files to return all files
++            mock = MagicMock()
++            mock.return_value = set([str(fname1), str(fname2), str(fname3)])
++            coder.repo.get_tracked_files = mock
++
++            # Check that file mentions of a pure basename skips files with duplicate basenames
++            mentioned = coder.get_file_mentions(f"Check {fname2.name} and {fname3}")
++            self.assertEqual(mentioned, {str(fname3)})
++
++            # Add a read-only file with same basename
++            coder.abs_read_only_fnames.add(str(fname2.resolve()))
++            mentioned = coder.get_file_mentions(f"Check {fname1} and {fname3}")
++            self.assertEqual(mentioned, {str(fname3)})
+     def test_check_for_file_mentions_read_only(self):
+         with GitTemporaryDirectory():
+             io = InputOutput(
+@@ -239,6 +270,63 @@ class TestCoder(unittest.TestCase):
+             self.assertIn("file1.txt", coder.ignore_mentions)
+ 
+     def test_check_for_subdir_mention(self):
++    def test_get_file_mentions_various_formats(self):
++        with GitTemporaryDirectory():
++            io = InputOutput(pretty=False, yes=True)
++            coder = Coder.create(self.GPT35, None, io)
++
++            # Create test files
++            test_files = [
++                "file1.txt",
++                "file2.py",
++                "dir/nested_file.js",
++                "dir/subdir/deep_file.html",
++                "file99.txt",
++                "special_chars!@#.md",
++            ]
++
++            # Pre-format the Windows path to avoid backslash issues in f-string expressions
++            windows_path = test_files[2].replace("/", "\\")
++            win_path3 = test_files[3].replace("/", "\\")
++
++            for fname in test_files:
++                fpath = Path(fname)
++                fpath.parent.mkdir(parents=True, exist_ok=True)
++                fpath.touch()
++
++            # Mock get_addable_relative_files to return our test files
++            coder.get_addable_relative_files = MagicMock(return_value=set(test_files))
++
++            # Test different mention formats
++            test_cases = [
++                # Simple plain text mentions
++                (f"You should edit {test_files[0]} first", {test_files[0]}),
++                # Multiple files in plain text
++                (f"Edit both {test_files[0]} and {test_files[1]}", {test_files[0], test_files[1]}),
++                # Files in backticks
++                (f"Check the file `{test_files[2]}`", {test_files[2]}),
++                # Files in code blocks
++                (f"```\n{test_files[3]}\n```", {test_files[3]}),
++                # Files in code blocks with language specifier
++                # (
++                #    f"```python\nwith open('{test_files[1]}', 'r') as f:\n"
++                #    f"    data = f.read()\n```",
++                #    {test_files[1]},
++                # ),
++                # Files with Windows-style paths
++                (f"Edit the file {windows_path}", {test_files[2]}),
++                # Files with different quote styles
++                (f'Check "{test_files[5]}" now', {test_files[5]}),
++                # All files in one complex message
++                (
++                    (
++                        f"First, edit `{test_files[0]}`. Then modify {test_files[1]}.\n"
++                        f"```js\n// Update this file\nconst file = '{test_files[2]}';\n```\n"
++                        f"Finally check {win_path3}"
++                    ),
++                    {test_files[0], test_files[1], test_files[2], test_files[3]},
++                ),
++                # Files mentioned in markdown bold format
++                (f"You should check **{test_files[0]}** for issues", {test_files[0]}),
++                (
++                    f"Look at both **{test_files[1]}** and **{test_files[2]}**",
++                    {test_files[1], test_files[2]},
++                ),
++                (
++                    f"The file **{win_path3}** needs updating",
++                    {test_files[3]},
++                ),
++                (
++                    f"Files to modify:\n- **{test_files[0]}**\n- **{test_files[4]}**",
++                    {test_files[0], test_files[4]},
++                ),
++            ]
++
++            for content, expected_mentions in test_cases:
++                with self.subTest(content=content):
++                    mentioned_files = coder.get_file_mentions(content)
++                    self.assertEqual(
++                        mentioned_files,
++                        expected_mentions,
++                        f"Failed to extract mentions from: {content}",
++                    )
++
++    def test_get_file_mentions_multiline_backticks(self):
+         with GitTemporaryDirectory():
+             io = InputOutput(pretty=False, yes=True)
+             coder = Coder.create(self.GPT35, None, io)
+@@ -296,7 +354,7 @@ class TestCoder(unittest.TestCase):
+                 "file2.py",
+                 "dir/nested_file.js",
+                 "dir/subdir/deep_file.html",
+-                "file with spaces.txt",
++                "file99.txt",
+                 "special_chars!@#.md",
+             ]
+ 
+@@ -319,18 +377,14 @@ class TestCoder(unittest.TestCase):
+                 # Files in code blocks
+                 (f"```\n{test_files[3]}\n```", {test_files[3]}),
+                 # Files in code blocks with language specifier
+-                # (
+-                #    f"```python\nwith open('{test_files[1]}', 'r') as f:\n    data = f.read()\n```",
+-                #    {test_files[1]},
+-                # ),
+-                # Files with Windows-style paths
+-                (f"Edit the file {test_files[2].replace('/', '\\')}", {test_files[2]}),
+-                # Files with different quote styles
+-                (f'Check "{test_files[5]}" now', {test_files[5]}),
+-                # All files in one complex message
+-                (
+-                    (
+-                        f"First, edit `{test_files[0]}`. Then modify {test_files[1]}.\n"
+-                        f"```js\n// Update this file\nconst file = '{test_files[2]}';\n```\n"
+-                        f"Finally check {test_files[3].replace('/', '\\')}"
+-                    ),
+-                    {test_files[0], test_files[1], test_files[2], test_files[3]},
+-                ),
+-                # Mention with SEARCH/REPLACE format
+-                (
+-                    (
+-                        f"{test_files[1]}\n````python\n<<<<<<< SEARCH\ndef old_function():\n   "
+-                        " pass\n=======\ndef new_function():\n    return True\n>>>>>>>"
+-                        " REPLACE\n````"
+-                    ),
+-                    {test_files[1]},
+-                ),
+-                # Files mentioned in markdown bold format
+-                (f"You should check **{test_files[0]}** for issues", {test_files[0]}),
+-                (
+-                    f"Look at both **{test_files[1]}** and **{test_files[2]}**",
+-                    {test_files[1], test_files[2]},
+-                ),
+-                (
+-                    f"The file **{test_files[3].replace('/', '\\')}** needs updating",
+-                    {test_files[3]},
+-                ),
+-                (
+-                    f"Files to modify:\n- **{test_files[0]}**\n- **{test_files[4]}**",
+-                    {test_files[0], test_files[4]},
+-                ),
+-                ("Files mentioned like **aider/args.py** should be detected", set()),
++            test_files = [
++                "swebench/harness/test_spec/python.py",
++                "swebench/harness/test_spec/javascript.py",
+             ]
++            for fname in test_files:
++                fpath = Path(fname)
++                fpath.parent.mkdir(parents=True, exist_ok=True)
++                fpath.touch()
+ 
+             for content, expected_mentions in test_cases:
+                 with self.subTest(content=content):
+@@ -417,6 +471,27 @@ class TestCoder(unittest.TestCase):
+                 f"Failed to extract mentions from: {content}",
+             )
+ 
++            # Mock get_addable_relative_files to return our test files
++            coder.get_addable_relative_files = MagicMock(return_value=set(test_files))
++
++            # Input text with multiline backticked filenames
++            content = """
++Could you please **add the following files to the chat**?
++
++1.  `swebench/harness/test_spec/python.py`
++2.  `swebench/harness/test_spec/javascript.py`
++
++Once I have these, I can show you precisely how to do the thing.
++"""
++            expected_mentions = {
++                "swebench/harness/test_spec/python.py",
++                "swebench/harness/test_spec/javascript.py",
++            }
++
++            mentioned_files = coder.get_file_mentions(content)
++            self.assertEqual(
++                mentioned_files,
++                expected_mentions,
++                f"Failed to extract mentions from multiline backticked content: {content}",
++            )
++
+     def test_get_file_mentions_path_formats(self):
+         with GitTemporaryDirectory():
+             io = InputOutput(pretty=False, yes=True)
+@@ -1073,6 +1148,7 @@ This command will print 'Hello, World!' to the console."""
+                 coder.auto_accept_architect = True
+                 coder.verbose = False
+                 coder.total_cost = 0
++                coder.io.confirm_ask = MagicMock(return_value=True)
+                 coder.cur_messages = []
+                 coder.done_messages = []
+                 coder.summarizer = MagicMock()
+@@ -1107,6 +1183,8 @@ This command will print 'Hello, World!' to the console."""
+                 coder.total_cost = 0
+                 coder.cur_messages = []
+                 coder.done_messages = []
++                coder.io.confirm_ask = MagicMock(return_value=True)
++                coder.io.ask = MagicMock()
+                 coder.summarizer = MagicMock()
+                 coder.summarizer.too_big.return_value = False
+                 coder.cur_messages = []
+@@ -1137,6 +1215,8 @@ This command will print 'Hello, World!' to the console."""
+                 coder.auto_accept_architect = False
+                 coder.verbose = False
+                 coder.total_cost = 0
++                coder.io.confirm_ask = MagicMock(return_value=False)
++                coder.io.ask = MagicMock()
+                 coder.summarizer = MagicMock()
+                 coder.summarizer.too_big.return_value = False
+                 coder.cur_messages = []
