@@ -1,0 +1,3877 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- lib/segment/src/index/field_index/full_text_index/text_index.rs
+
+commit b9eee55a9fb6d53572622f62756a80e62484009e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Sep 1 12:50:12 2022 +0200
+
+    Full text search (#963)
+    
+    * allow additional params for payload field index
+    
+    * fmt
+    
+    * wip: full text index building
+    
+    * fmt
+    
+    * text search request
+    
+    * text search request
+    
+    * full text index persitance and loading
+    
+    * fmt
+    
+    * enable fts index in mapping
+    
+    * clippy
+    
+    * fix tests + add integration test
+    
+    * review fixes: extend payload index test
+    
+    * revert incedental change
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+new file mode 100644
+index 000000000..380a0b20d
+--- /dev/null
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -0,0 +1,323 @@
++use std::collections::HashSet;
++use std::sync::Arc;
++
++use parking_lot::RwLock;
++use rocksdb::DB;
++use serde_json::Value;
++
++use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
++use crate::common::Flusher;
++use crate::data_types::text_index::TextIndexParams;
++use crate::entry::entry_point::{OperationError, OperationResult};
++use crate::index::field_index::full_text_index::inverted_index::{
++    Document, InvertedIndex, ParsedQuery,
++};
++use crate::index::field_index::full_text_index::tokenizers::Tokenizer;
++use crate::index::field_index::{
++    CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndex, ValueIndexer,
++};
++use crate::telemetry::PayloadIndexTelemetry;
++use crate::types::{FieldCondition, Match, PayloadKeyType, PointOffsetType};
++
++pub struct FullTextIndex {
++    inverted_index: InvertedIndex,
++    db_wrapper: DatabaseColumnWrapper,
++    config: TextIndexParams,
++}
++
++impl FullTextIndex {
++    fn store_key(id: &PointOffsetType) -> Vec<u8> {
++        bincode::serialize(&id).unwrap()
++    }
++
++    fn restore_key(data: &[u8]) -> PointOffsetType {
++        bincode::deserialize(data).unwrap()
++    }
++
++    fn serialize_document(document: &Document) -> OperationResult<Vec<u8>> {
++        serde_cbor::to_vec(document).map_err(|e| {
++            OperationError::service_error(&format!("Failed to serialize document: {}", e))
++        })
++    }
++
++    fn deserialize_document(data: &[u8]) -> OperationResult<Document> {
++        serde_cbor::from_slice(data).map_err(|e| {
++            OperationError::service_error(&format!("Failed to deserialize document: {}", e))
++        })
++    }
++
++    fn storage_cf_name(field: &str) -> String {
++        format!("{field}_fts")
++    }
++
++    pub fn new(db: Arc<RwLock<DB>>, config: TextIndexParams, field: &str) -> Self {
++        let store_cf_name = Self::storage_cf_name(field);
++        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
++        FullTextIndex {
++            inverted_index: InvertedIndex::new(),
++            db_wrapper,
++            config,
++        }
++    }
++
++    pub fn get_doc(&self, idx: PointOffsetType) -> Option<&Document> {
++        match self.inverted_index.point_to_docs.get(idx as usize) {
++            Some(Some(doc)) => Some(doc),
++            _ => None,
++        }
++    }
++
++    pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
++        PayloadIndexTelemetry {
++            points_values_count: self.inverted_index.points_count,
++            points_count: self.inverted_index.points_count,
++            histogram_bucket_size: None,
++        }
++    }
++
++    pub fn recreate(&self) -> OperationResult<()> {
++        self.db_wrapper.recreate_column_family()
++    }
++
++    pub fn parse_query(&self, text: &str) -> ParsedQuery {
++        let mut tokens = vec![];
++        Tokenizer::tokenize_query(text, &self.config, |token| {
++            tokens.push(token.to_owned());
++        });
++        ParsedQuery {
++            tokens: tokens.into_iter().collect(),
++        }
++    }
++}
++
++impl ValueIndexer<String> for FullTextIndex {
++    fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
++        if self.get_doc(idx).is_some() {
++            self.remove_point(idx)?;
++        }
++
++        if values.is_empty() {
++            return Ok(());
++        }
++
++        let mut tokens: HashSet<String> = HashSet::new();
++
++        for value in values {
++            Tokenizer::tokenize_doc(&value, &self.config, |token| {
++                tokens.insert(token.to_owned());
++            });
++        }
++
++        let document = Document {
++            tokens: tokens.into_iter().collect(),
++        };
++
++        self.inverted_index.index_document(idx, document);
++
++        let db_idx = Self::store_key(&idx);
++        let db_document = Self::serialize_document(
++            self.inverted_index.point_to_docs[idx as usize]
++                .as_ref()
++                .unwrap(),
++        )?;
++
++        self.db_wrapper.put(&db_idx, &db_document)?;
++
++        Ok(())
++    }
++
++    fn get_value(&self, value: &Value) -> Option<String> {
++        if let Value::String(keyword) = value {
++            return Some(keyword.to_owned());
++        }
++        None
++    }
++
++    fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
++        let removed_doc = self.inverted_index.remove_document(id);
++
++        if removed_doc.is_none() {
++            return Ok(());
++        }
++
++        let db_doc_id = Self::store_key(&id);
++        self.db_wrapper.remove(&db_doc_id)?;
++
++        Ok(())
++    }
++}
++
++impl PayloadFieldIndex for FullTextIndex {
++    fn indexed_points(&self) -> usize {
++        self.inverted_index.points_count
++    }
++
++    fn load(&mut self) -> OperationResult<bool> {
++        if !self.db_wrapper.has_column_family()? {
++            return Ok(false);
++        };
++
++        for (key, value) in self.db_wrapper.lock_db().iter()? {
++            let idx = Self::restore_key(&key);
++            let document = Self::deserialize_document(&value)?;
++            self.inverted_index.index_document(idx, document);
++        }
++        Ok(true)
++    }
++
++    fn clear(self) -> OperationResult<()> {
++        self.db_wrapper.remove_column_family()
++    }
++
++    fn flusher(&self) -> Flusher {
++        self.db_wrapper.flusher()
++    }
++
++    fn filter(
++        &self,
++        condition: &FieldCondition,
++    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
++        if let Some(Match::Text(text_match)) = &condition.r#match {
++            let parsed_query = self.parse_query(&text_match.text);
++            return Some(self.inverted_index.filter(&parsed_query));
++        }
++        None
++    }
++
++    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
++        if let Some(Match::Text(text_match)) = &condition.r#match {
++            let parsed_query = self.parse_query(&text_match.text);
++            return Some(
++                self.inverted_index
++                    .estimate_cardinality(&parsed_query, condition),
++            );
++        }
++        None
++    }
++
++    fn payload_blocks(
++        &self,
++        threshold: usize,
++        key: PayloadKeyType,
++    ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
++        self.inverted_index.payload_blocks(threshold, key)
++    }
++
++    fn count_indexed_points(&self) -> usize {
++        self.inverted_index.points_count
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use tempfile::Builder;
++
++    use super::*;
++    use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
++    use crate::data_types::text_index::TokenizerType;
++    use crate::types::MatchText;
++
++    fn filter_request(text: &str) -> FieldCondition {
++        FieldCondition {
++            key: "text".to_owned(),
++            r#match: Some(Match::Text(MatchText {
++                text: text.to_owned(),
++            })),
++            range: None,
++            geo_bounding_box: None,
++            geo_radius: None,
++            values_count: None,
++        }
++    }
++
++    #[test]
++    fn test_full_text_indexing() {
++        let payloads: Vec<_> = vec![
++            serde_json::json!("The celebration had a long way to go and even in the silent depths of Multivac's underground chambers, it hung in the air."),
++            serde_json::json!("If nothing else, there was the mere fact of isolation and silence."),
++            serde_json::json!([
++                "For the first time in a decade, technicians were not scurrying about the vitals of the giant computer, ",
++                "the soft lights did not wink out their erratic patterns, the flow of information in and out had halted."
++            ]),
++            serde_json::json!("It would not be halted long, of course, for the needs of peace would be pressing."),
++            serde_json::json!("Yet now, for a day, perhaps for a week, even Multivac might celebrate the great time, and rest."),
++        ];
++
++        let tmp_dir = Builder::new().prefix("test_dir").tempdir().unwrap();
++        let config = TextIndexParams {
++            tokenizer: TokenizerType::Word,
++            min_token_len: None,
++            max_token_len: None,
++            lowercase: None,
++        };
++
++        {
++            let db = open_db_with_existing_cf(&tmp_dir.path().join("test_db")).unwrap();
++
++            let mut index = FullTextIndex::new(db, config.clone(), "text");
++
++            index.recreate().unwrap();
++
++            for (idx, payload) in payloads.iter().enumerate() {
++                index.add_point(idx as PointOffsetType, payload).unwrap();
++            }
++
++            assert_eq!(index.count_indexed_points(), payloads.len());
++
++            let filter_condition = filter_request("multivac");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert_eq!(search_res, vec![0, 4]);
++
++            let filter_condition = filter_request("giant computer");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert_eq!(search_res, vec![2]);
++
++            let filter_condition = filter_request("the great time");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert_eq!(search_res, vec![4]);
++
++            index.remove_point(2).unwrap();
++            index.remove_point(3).unwrap();
++
++            let filter_condition = filter_request("giant computer");
++            assert!(index.filter(&filter_condition).unwrap().next().is_none());
++
++            assert_eq!(index.count_indexed_points(), payloads.len() - 2);
++
++            index
++                .add_point(
++                    3,
++                    &serde_json::json!([
++                "The last question was asked for the first time, half in jest, on May 21, 2061,",
++                "at a time when humanity first stepped into the light."
++            ]),
++                )
++                .unwrap();
++
++            index.add_point(4, &serde_json::json!(
++                "The question came about as a result of a five dollar bet over highballs, and it happened this way: "
++            )).unwrap();
++
++            assert_eq!(index.count_indexed_points(), payloads.len() - 1);
++
++            index.flusher()().unwrap();
++        }
++
++        {
++            let db = open_db_with_existing_cf(&tmp_dir.path().join("test_db")).unwrap();
++            let mut index = FullTextIndex::new(db, config, "text");
++            let loaded = index.load().unwrap();
++            assert!(loaded);
++
++            assert_eq!(index.count_indexed_points(), 4);
++
++            let filter_condition = filter_request("multivac");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert_eq!(search_res, vec![0]);
++
++            let filter_condition = filter_request("the");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert_eq!(search_res, vec![0, 1, 3, 4]);
++        }
++    }
++}
+
+commit 03d08236a80e00784884ebace95efe0f8d3ea4ae
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Fri Sep 16 14:07:50 2022 +0200
+
+    better struct for fts (#1026)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 380a0b20d..7317512bf 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -214,7 +214,7 @@ mod tests {
+ 
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+-    use crate::data_types::text_index::TokenizerType;
++    use crate::data_types::text_index::{TextIndexType, TokenizerType};
+     use crate::types::MatchText;
+ 
+     fn filter_request(text: &str) -> FieldCondition {
+@@ -245,6 +245,7 @@ mod tests {
+ 
+         let tmp_dir = Builder::new().prefix("test_dir").tempdir().unwrap();
+         let config = TextIndexParams {
++            r#type: TextIndexType::Text,
+             tokenizer: TokenizerType::Word,
+             min_token_len: None,
+             max_token_len: None,
+
+commit bf480661458cb01af0291adb8992c76b71e2d553
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Oct 20 10:26:33 2022 +0200
+
+    Full reassign payload on upsert (#1148)
+    
+    * set_full_payload on upsert
+    
+    * fmt
+    
+    * fix clippy
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 7317512bf..3a9628e32 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -92,10 +92,6 @@ impl FullTextIndex {
+ 
+ impl ValueIndexer<String> for FullTextIndex {
+     fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
+-        if self.get_doc(idx).is_some() {
+-            self.remove_point(idx)?;
+-        }
+-
+         if values.is_empty() {
+             return Ok(());
+         }
+
+commit 516dcd7020e2f54d91ecdda87e08333b17d85574
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Sun Oct 23 02:48:55 2022 +0400
+
+    Telemetry level of detail (#1049)
+    
+    * telemetry level of detail
+    
+    * rename duration aggregator
+    
+    * are you happy fmt
+    
+    * move total searches sum
+    
+    * separate levels
+    
+    * optional bucket size
+    
+    * search telemetry improvements
+    
+    * separate web telemetry into methods
+    
+    * tonic telemetry methods
+    
+    * merge optimizations
+    
+    * are you happy fmt
+    
+    * better rounding
+    
+    * qdrant configs on level 1
+    
+    * provide collection params
+    
+    * add peers count
+    
+    * collection points count
+    
+    * update openapi
+    
+    * use pattern in actix telemetry
+    
+    * are you happy fmt
+    
+    * merge dev
+    
+    * are you happy fmt
+    
+    * fix merge conflicts
+    
+    * update openapi
+    
+    * fix build
+    
+    * are you happy fmt
+    
+    * add exact searches statistics
+    
+    * process replica set
+    
+    * update openapi
+    
+    * fix wrong name
+    
+    * fix naming
+    
+    * fix unwrap
+    
+    * review
+    
+    * fmt
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 3a9628e32..516ca8eea 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -69,6 +69,7 @@ impl FullTextIndex {
+ 
+     pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
+         PayloadIndexTelemetry {
++            field_name: None,
+             points_values_count: self.inverted_index.points_count,
+             points_count: self.inverted_index.points_count,
+             histogram_bucket_size: None,
+
+commit 9702054127430851aa927b59bdc2926adbe203d0
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Fri Dec 16 10:53:51 2022 +0100
+
+    Clippy for Rust 1.66 (#1284)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 516ca8eea..681ad5504 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -118,7 +118,7 @@ impl ValueIndexer<String> for FullTextIndex {
+                 .unwrap(),
+         )?;
+ 
+-        self.db_wrapper.put(&db_idx, &db_document)?;
++        self.db_wrapper.put(db_idx, db_document)?;
+ 
+         Ok(())
+     }
+@@ -138,7 +138,7 @@ impl ValueIndexer<String> for FullTextIndex {
+         }
+ 
+         let db_doc_id = Self::store_key(&id);
+-        self.db_wrapper.remove(&db_doc_id)?;
++        self.db_wrapper.remove(db_doc_id)?;
+ 
+         Ok(())
+     }
+
+commit 6eca194f71bc20ca3e945560d47414eb10c14874
+Author: Roman Titov <ffuugoo@users.noreply.github.com>
+Date:   Fri Jan 13 11:44:42 2023 +0100
+
+    Fix segment snapshotting (#1321) (#1334)
+    
+    * WIP: Fix `Segment::take_snapshot`
+    
+    TODO:
+    - This commit, probably, breaks snapshotting of segments with memmapped vector storage
+    - `ProxySegment::take_snapshot` seems to potentially similar bug
+    
+    * WIP: Fix `Segment::take_snapshot`
+    
+    - Fix snapshotting of `StructPayloadIndex`
+    - Fix snapshotting of segments with memmapped vector storage
+    - Temporarily break `ProxySegment::take_snapshot`
+    
+    * Fix `ProxySegment::take_snapshot`
+    
+    * Remove `copy_segment_directory` test
+    
+    * nitpicking
+    
+    * clippy fixes
+    
+    * use OperationError::service_error
+    
+    * Cleanup `TinyMap` trait bounds and derive `Debug`
+    
+    * Fix `test_snapshot` test
+    
+    - Derive `Debug` for `NamedVectors`
+    
+    * Move utility functions from `segment.rs` to `utils` module
+    
+    * Contextualize `segment::utils::fs::move_all` a bit more carefully
+    
+    * Fix a typo
+    
+    * add backward compatibility with old snapshot formats
+    
+    * fmt
+    
+    * add snapshot for compatibility test
+    
+    * git lfs is a piece of shit
+    
+    * Nitpicking
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 681ad5504..16fdbb8b1 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -36,13 +36,13 @@ impl FullTextIndex {
+ 
+     fn serialize_document(document: &Document) -> OperationResult<Vec<u8>> {
+         serde_cbor::to_vec(document).map_err(|e| {
+-            OperationError::service_error(&format!("Failed to serialize document: {}", e))
++            OperationError::service_error(format!("Failed to serialize document: {}", e))
+         })
+     }
+ 
+     fn deserialize_document(data: &[u8]) -> OperationResult<Document> {
+         serde_cbor::from_slice(data).map_err(|e| {
+-            OperationError::service_error(&format!("Failed to deserialize document: {}", e))
++            OperationError::service_error(format!("Failed to deserialize document: {}", e))
+         })
+     }
+ 
+
+commit 66aa2c99cedbdc31648feb0b28cb469d7021bef4
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Thu Jan 26 17:48:52 2023 +0100
+
+    Clippy rust 1.67 (#1406)
+    
+    * inline format! args
+    
+    * inline format! args
+    
+    * explicit lifetime could be elided
+    
+    * fmt
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 16fdbb8b1..a4909ed76 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -36,13 +36,13 @@ impl FullTextIndex {
+ 
+     fn serialize_document(document: &Document) -> OperationResult<Vec<u8>> {
+         serde_cbor::to_vec(document).map_err(|e| {
+-            OperationError::service_error(format!("Failed to serialize document: {}", e))
++            OperationError::service_error(format!("Failed to serialize document: {e}"))
+         })
+     }
+ 
+     fn deserialize_document(data: &[u8]) -> OperationResult<Document> {
+         serde_cbor::from_slice(data).map_err(|e| {
+-            OperationError::service_error(format!("Failed to deserialize document: {}", e))
++            OperationError::service_error(format!("Failed to deserialize document: {e}"))
+         })
+     }
+ 
+
+commit 3d8b5131bd54079a534f840eaf0f69e570a68517
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Thu Feb 23 15:57:12 2023 +0100
+
+    Nested payload filters (#1487)
+    
+    * Nested payload filters
+    
+    * close ToDo + add parsing of multuiple array values
+    
+    * fmt
+    
+    * improve testing nested arrays
+    
+    * fix NumericIndex to accumulate points_to_values mapping
+    
+    * revert numberic index + strict array field access
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index a4909ed76..6cfe7af5f 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -211,6 +211,7 @@ mod tests {
+ 
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
++    use crate::common::utils::MultiValue;
+     use crate::data_types::text_index::{TextIndexType, TokenizerType};
+     use crate::types::MatchText;
+ 
+@@ -257,7 +258,9 @@ mod tests {
+             index.recreate().unwrap();
+ 
+             for (idx, payload) in payloads.iter().enumerate() {
+-                index.add_point(idx as PointOffsetType, payload).unwrap();
++                index
++                    .add_point(idx as PointOffsetType, &MultiValue::one(payload))
++                    .unwrap();
+             }
+ 
+             assert_eq!(index.count_indexed_points(), payloads.len());
+@@ -282,19 +285,16 @@ mod tests {
+ 
+             assert_eq!(index.count_indexed_points(), payloads.len() - 2);
+ 
+-            index
+-                .add_point(
+-                    3,
+-                    &serde_json::json!([
++            let payload = serde_json::json!([
+                 "The last question was asked for the first time, half in jest, on May 21, 2061,",
+                 "at a time when humanity first stepped into the light."
+-            ]),
+-                )
+-                .unwrap();
++            ]);
++            index.add_point(3, &MultiValue::one(&payload)).unwrap();
+ 
+-            index.add_point(4, &serde_json::json!(
++            let payload = serde_json::json!([
+                 "The question came about as a result of a five dollar bet over highballs, and it happened this way: "
+-            )).unwrap();
++            ]);
++            index.add_point(4, &MultiValue::one(&payload)).unwrap();
+ 
+             assert_eq!(index.count_indexed_points(), payloads.len() - 1);
+ 
+
+commit a13206d0924b05be75c91b8b63d032ca512dd1d9
+Author: Ibrahim M. Akrab <ibrahim.m.akrab@gmail.com>
+Date:   Tue Apr 18 18:46:06 2023 +0200
+
+    Inverted index optimization (#1677)
+    
+    * Change BTreeSet/BTreeMap to HashSet/HashMap
+    Use Vec in Document
+    Use Vec in Postinglist
+    
+    * fix document removal index out of range
+    
+    * add common vocabulary dictionary to inverted index
+    
+    * use radix-trie to store vocabulary
+    
+    * add documentation for seemingly dangerous unwraps
+    
+    * Implement BitVec representation of PostingList
+    Add dynamic switching between Vec and BitVec representation
+    Split PostingList into its own module
+    
+    * use same persistent storage for documents
+    
+    * clean up
+    
+    * remove unused comments
+    
+    * keep stored document format the same
+    
+    * add reverse dictionary for faster document building
+    
+    * get rid of reverse vocabulary
+    
+    * review + fix tests
+    
+    * review + fix clippy
+    
+    * fix typo
+    
+    * use u32 as token id
+    
+    * fmt
+    
+    * remove patricia_tree
+    
+    * fmt
+    
+    * only use vec for posting
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 6cfe7af5f..5f7f9a74b 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -1,8 +1,9 @@
+-use std::collections::HashSet;
++use std::collections::{BTreeSet, HashSet};
+ use std::sync::Arc;
+ 
+ use parking_lot::RwLock;
+ use rocksdb::DB;
++use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ 
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+@@ -34,16 +35,27 @@ impl FullTextIndex {
+         bincode::deserialize(data).unwrap()
+     }
+ 
+-    fn serialize_document(document: &Document) -> OperationResult<Vec<u8>> {
+-        serde_cbor::to_vec(document).map_err(|e| {
++    fn serialize_document_tokens(&self, tokens: BTreeSet<String>) -> OperationResult<Vec<u8>> {
++        #[derive(Serialize)]
++        struct StoredDocument {
++            tokens: BTreeSet<String>,
++        }
++        let doc = StoredDocument { tokens };
++        serde_cbor::to_vec(&doc).map_err(|e| {
+             OperationError::service_error(format!("Failed to serialize document: {e}"))
+         })
+     }
+ 
+-    fn deserialize_document(data: &[u8]) -> OperationResult<Document> {
+-        serde_cbor::from_slice(data).map_err(|e| {
+-            OperationError::service_error(format!("Failed to deserialize document: {e}"))
+-        })
++    fn deserialize_document(data: &[u8], index: &mut InvertedIndex) -> OperationResult<Document> {
++        #[derive(Deserialize)]
++        struct StoredDocument {
++            tokens: BTreeSet<String>,
++        }
++        serde_cbor::from_slice::<StoredDocument>(data)
++            .map_err(|e| {
++                OperationError::service_error(format!("Failed to deserialize document: {e}"))
++            })
++            .map(|doc| index.document_from_tokens(&doc.tokens))
+     }
+ 
+     fn storage_cf_name(field: &str) -> String {
+@@ -81,14 +93,20 @@ impl FullTextIndex {
+     }
+ 
+     pub fn parse_query(&self, text: &str) -> ParsedQuery {
+-        let mut tokens = vec![];
++        let mut tokens = HashSet::new();
+         Tokenizer::tokenize_query(text, &self.config, |token| {
+-            tokens.push(token.to_owned());
++            tokens.insert(self.inverted_index.vocab.get(token).copied());
+         });
+         ParsedQuery {
+             tokens: tokens.into_iter().collect(),
+         }
+     }
++
++    #[cfg(test)]
++    pub fn query(&self, query: &str) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++        let parsed_query = self.parse_query(query);
++        self.inverted_index.filter(&parsed_query)
++    }
+ }
+ 
+ impl ValueIndexer<String> for FullTextIndex {
+@@ -97,7 +115,7 @@ impl ValueIndexer<String> for FullTextIndex {
+             return Ok(());
+         }
+ 
+-        let mut tokens: HashSet<String> = HashSet::new();
++        let mut tokens: BTreeSet<String> = BTreeSet::new();
+ 
+         for value in values {
+             Tokenizer::tokenize_doc(&value, &self.config, |token| {
+@@ -105,18 +123,11 @@ impl ValueIndexer<String> for FullTextIndex {
+             });
+         }
+ 
+-        let document = Document {
+-            tokens: tokens.into_iter().collect(),
+-        };
+-
++        let document = self.inverted_index.document_from_tokens(&tokens);
+         self.inverted_index.index_document(idx, document);
+ 
+         let db_idx = Self::store_key(&idx);
+-        let db_document = Self::serialize_document(
+-            self.inverted_index.point_to_docs[idx as usize]
+-                .as_ref()
+-                .unwrap(),
+-        )?;
++        let db_document = self.serialize_document_tokens(tokens)?;
+ 
+         self.db_wrapper.put(db_idx, db_document)?;
+ 
+@@ -156,7 +167,7 @@ impl PayloadFieldIndex for FullTextIndex {
+ 
+         for (key, value) in self.db_wrapper.lock_db().iter()? {
+             let idx = Self::restore_key(&key);
+-            let document = Self::deserialize_document(&value)?;
++            let document = Self::deserialize_document(&value, &mut self.inverted_index)?;
+             self.inverted_index.index_document(idx, document);
+         }
+         Ok(true)
+
+commit 0f0c213c2a94ee387a40e5309c3ae15e0e2c7c96
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Wed May 10 14:20:12 2023 +0200
+
+    Nested object filter (#1602)
+    
+    * nested object filter
+    
+    * code review
+    
+    * add support for must_not in nested
+    
+    * extract functions
+    
+    * support and test must_not in SimpleConditionChecker
+    
+    * add index matching unit test (to be continued)
+    
+    * remove extra clone
+    
+    * test with should
+    
+    * WIP: Nested object filter suggestions (#1855)
+    
+    * switch to bitvec
+    
+    * fix clippy
+    
+    * more tests
+    
+    * fmt
+    
+    * fix some tests
+    
+    * add test with text
+    
+    * support for nested should
+    
+    * do not rely on indexes for nested queries & fix test
+    
+    * use index to make index-aware checks in nested payload
+    
+    * fix value-count tests
+    
+    * re-fa-cto-ring
+    
+    * fmt
+    
+    ---------
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 5f7f9a74b..6fb0a887d 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -102,6 +102,16 @@ impl FullTextIndex {
+         }
+     }
+ 
++    pub fn parse_document(&self, text: &str) -> Document {
++        let mut document_tokens = vec![];
++        Tokenizer::tokenize_doc(text, &self.config, |token| {
++            if let Some(token_id) = self.inverted_index.vocab.get(token) {
++                document_tokens.push(*token_id);
++            }
++        });
++        Document::new(document_tokens)
++    }
++
+     #[cfg(test)]
+     pub fn query(&self, query: &str) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+         let parsed_query = self.parse_query(query);
+
+commit f5dfeeff4c4baf35045bc6904d88076f2e58d094
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon May 22 20:32:35 2023 +0200
+
+    Fixes for group-by (#1938)
+    
+    * fix payload seletor
+    
+    * clippy
+    
+    * except cardinality estimation
+    
+    * implement match except iterator and api
+    
+    * use except instead of must-not + test
+    
+    * Fix doc error
+    
+    * Update lib/collection/src/grouping/group_by.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/query_optimization/condition_converter.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/query_optimization/condition_converter.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/query_optimization/condition_converter.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/vector_storage/mod.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/collection/src/grouping/group_by.rs
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs [skip ci]
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    
+    * fix: `except_on` and `match_on` now produce `Vec<Condition>`s
+    
+    * Apply suggestions from code review (lib/segment/src/index/field_index/map_index.rs)
+    
+    * fix: reset review suggestion
+    
+    * Remove unnecessary move
+    
+    * Use Rust idiomatic map_else rather than match-none-false
+    
+    * is-null -> is-empty
+    
+    * de-comment drop_collection
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 6fb0a887d..d276b4f53 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -117,6 +117,11 @@ impl FullTextIndex {
+         let parsed_query = self.parse_query(query);
+         self.inverted_index.filter(&parsed_query)
+     }
++
++    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
++        // Maybe we want number of documents in the future?
++        self.get_doc(point_id).map(|x| x.len()).unwrap_or(0)
++    }
+ }
+ 
+ impl ValueIndexer<String> for FullTextIndex {
+
+commit 4016aa6af5186c679649967d58df1eef1e43d104
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Wed Jun 14 13:56:16 2023 -0400
+
+    Optimize `is_empty` (#2073)
+    
+    * optimize is_empty condition for hitting index
+    
+    * Optimize is_null too, simplify checker
+    
+    * refactor: introduce values_is_empty() for indexes
+    - use `.then()` instead of `&&`
+    
+    * cargo fmt
+    
+    * improve comments
+    
+    * Revert "Optimize is_null too, simplify checker"
+    
+    This reverts commit b9ebfe5ff28319090194cd5eb88a399b8f607fbf.
+    
+    * changes from review
+    
+    * update `test_is_empty_conditions` test for comparing indexed vs not indexed results
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index d276b4f53..1e83b99a5 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -122,6 +122,10 @@ impl FullTextIndex {
+         // Maybe we want number of documents in the future?
+         self.get_doc(point_id).map(|x| x.len()).unwrap_or(0)
+     }
++
++    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
++        self.get_doc(point_id).map(|x| x.is_empty()).unwrap_or(true)
++    }
+ }
+ 
+ impl ValueIndexer<String> for FullTextIndex {
+
+commit eae93b27767a784e1b07179ccdc9948e2caf9c80
+Author: Damien Castelltort <dcastelltort@gmail.com>
+Date:   Wed Jun 21 22:53:19 2023 +0200
+
+    Configurable location of temporary snapshot files (#1960)
+    
+    * Issue 1905: Configurable location for the tmp snapshot files
+    
+    * Apply suggestions from code review
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * fix code review suggestions
+    
+    * clippy fix
+    
+    * Propagate temp path, use configured dir for snapshot creation
+    
+    * Use real temp dir in snapshot tests
+    
+    * Mention default temporary snapshot file path in configuration
+    
+    * Use temp everywhere rather than a mix of temp and tmp
+    
+    * Use consistent naming for temporary snapshot directories
+    
+    * Extract logic for temporary storage path into toc method
+    
+    * Resolve clippy warnings
+    
+    * Apply suggestions from code review
+    
+    Co-authored-by: Roman Titov <ffuugoo@users.noreply.github.com>
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Roman Titov <ffuugoo@users.noreply.github.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 1e83b99a5..cd04c2832 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -271,7 +271,7 @@ mod tests {
+             serde_json::json!("Yet now, for a day, perhaps for a week, even Multivac might celebrate the great time, and rest."),
+         ];
+ 
+-        let tmp_dir = Builder::new().prefix("test_dir").tempdir().unwrap();
++        let temp_dir = Builder::new().prefix("test_dir").tempdir().unwrap();
+         let config = TextIndexParams {
+             r#type: TextIndexType::Text,
+             tokenizer: TokenizerType::Word,
+@@ -281,7 +281,7 @@ mod tests {
+         };
+ 
+         {
+-            let db = open_db_with_existing_cf(&tmp_dir.path().join("test_db")).unwrap();
++            let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+ 
+             let mut index = FullTextIndex::new(db, config.clone(), "text");
+ 
+@@ -332,7 +332,7 @@ mod tests {
+         }
+ 
+         {
+-            let db = open_db_with_existing_cf(&tmp_dir.path().join("test_db")).unwrap();
++            let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+             let mut index = FullTextIndex::new(db, config, "text");
+             let loaded = index.load().unwrap();
+             assert!(loaded);
+
+commit 0d9542b7114c68094cb1c5f4eb25e795e44f1ef9
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Mon Jul 3 13:25:54 2023 -0400
+
+    Small refactor: remove duplicated `indexed_points()` function (#2103)
+    
+    * remove duplicated `indexed_points()` function
+    
+    * update for binary index
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index cd04c2832..b5b882a4e 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -175,7 +175,7 @@ impl ValueIndexer<String> for FullTextIndex {
+ }
+ 
+ impl PayloadFieldIndex for FullTextIndex {
+-    fn indexed_points(&self) -> usize {
++    fn count_indexed_points(&self) -> usize {
+         self.inverted_index.points_count
+     }
+ 
+@@ -229,10 +229,6 @@ impl PayloadFieldIndex for FullTextIndex {
+     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
+         self.inverted_index.payload_blocks(threshold, key)
+     }
+-
+-    fn count_indexed_points(&self) -> usize {
+-        self.inverted_index.points_count
+-    }
+ }
+ 
+ #[cfg(test)]
+
+commit bd40a58e65e58ba5cfea79be5603faf88dc62248
+Author: Zein Wen <85084498+zzzz-vincent@users.noreply.github.com>
+Date:   Mon Jul 17 03:36:50 2023 -0700
+
+    Add geo_polygon filter to proto interface, complete conversion fn, and add an integration test (#2188)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index b5b882a4e..a77e83630 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -251,6 +251,7 @@ mod tests {
+             geo_bounding_box: None,
+             geo_radius: None,
+             values_count: None,
++            geo_polygon: None,
+         }
+     }
+ 
+
+commit 1611deaf034a8ec219b4aab80abe31200bb8fc15
+Author: Eugene Tolbakov <ev.tolbakov@gmail.com>
+Date:   Mon Sep 25 14:10:45 2023 +0100
+
+    Refactor: replace expect with ServiceError, remove repetive code (#2701)
+    
+    * Refactor: replace expect with ServiceError, remove repetive code
+    
+    * chore: remove unnecessary code
+    
+    * chore: apply cr suggestions
+    
+    * chore: apply clippy recommendations
+    
+    * Improve constructing errors
+    
+    * Improve test assertions
+    
+    * fix: replace max_regions assertion with operation error
+    
+    * fix: adjust according to CR
+    
+    * chore: replace Option with OperationResult for estimate_cardinality
+    
+    * chore: replace Option with OperationResult for filter
+    
+    * Better handling of transforming none into an error
+    
+    * Replace for loop with simple iterator, simply other iterator
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index a77e83630..2bc7655ac 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -203,23 +203,27 @@ impl PayloadFieldIndex for FullTextIndex {
+     fn filter(
+         &self,
+         condition: &FieldCondition,
+-    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
++    ) -> OperationResult<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+-            return Some(self.inverted_index.filter(&parsed_query));
++            return Ok(self.inverted_index.filter(&parsed_query));
+         }
+-        None
++        Err(OperationError::service_error("failed to filter"))
+     }
+ 
+-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
++    fn estimate_cardinality(
++        &self,
++        condition: &FieldCondition,
++    ) -> OperationResult<CardinalityEstimation> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+-            return Some(
+-                self.inverted_index
+-                    .estimate_cardinality(&parsed_query, condition),
+-            );
++            return Ok(self
++                .inverted_index
++                .estimate_cardinality(&parsed_query, condition));
+         }
+-        None
++        Err(OperationError::service_error(
++            "failed to estimate cardinality",
++        ))
+     }
+ 
+     fn payload_blocks(
+
+commit 0d4a3736590dc33b39db2aeea0a799c05ec632f3
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Thu Sep 28 12:11:29 2023 +0200
+
+    Move ScoredPointOffset into common (#2734)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 2bc7655ac..5b33126eb 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -1,6 +1,7 @@
+ use std::collections::{BTreeSet, HashSet};
+ use std::sync::Arc;
+ 
++use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ use serde::{Deserialize, Serialize};
+@@ -18,7 +19,7 @@ use crate::index::field_index::{
+     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndex, ValueIndexer,
+ };
+ use crate::telemetry::PayloadIndexTelemetry;
+-use crate::types::{FieldCondition, Match, PayloadKeyType, PointOffsetType};
++use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+ pub struct FullTextIndex {
+     inverted_index: InvertedIndex,
+
+commit 4f983e495db72336b2311dc2abe95a11eab8c620
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Fri Sep 29 16:23:24 2023 +0200
+
+    Promote operation error to dedicated file (#2736)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 5b33126eb..0a9c82efc 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -7,10 +7,10 @@ use rocksdb::DB;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ 
++use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::common::Flusher;
+ use crate::data_types::text_index::TextIndexParams;
+-use crate::entry::entry_point::{OperationError, OperationResult};
+ use crate::index::field_index::full_text_index::inverted_index::{
+     Document, InvertedIndex, ParsedQuery,
+ };
+
+commit 2f76603ddfbe5f995443c1e5e85c2d9345a55db0
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Wed Jan 31 10:14:31 2024 +0000
+
+    DateTime payload index (#3395)
+    
+    * Datetime payload index
+    
+    * Introduce IndexMapItem
+    
+    * Drop FieldIndex::DatetimeIndex
+    
+    * Rename OpenAPI struct names
+    
+    * Switch to microseconds
+    
+    * Validate and serialize grpc timestamps
+    
+    * Add tests with different timezones
+    
+    * minor review fixes
+    
+    * Revert "Drop FieldIndex::DatetimeIndex"
+    
+    This reverts commit d55f251afdbb418ef732a3e6799b92f924fc3035.
+    
+    * Revert "Introduce IndexMapItem"
+    
+    This reverts commit c5255f6b1aafa2b9552bac5d1811f9e826eb8d61.
+    
+    * fix: back to microseconds after reverts
+    
+    * extract range conversion from boxed checker fn
+    
+    * add log to deps
+    
+    * don't run macro doctest
+    
+    * no_run -> ignore
+    
+    * remove prost-types in favor of prost-wkt-types
+    
+    * better assertion on test_payload_indexing.py
+    
+    * propagate unparsable datetime
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 0a9c82efc..d461f1f57 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -244,20 +244,9 @@ mod tests {
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+     use crate::common::utils::MultiValue;
+     use crate::data_types::text_index::{TextIndexType, TokenizerType};
+-    use crate::types::MatchText;
+ 
+     fn filter_request(text: &str) -> FieldCondition {
+-        FieldCondition {
+-            key: "text".to_owned(),
+-            r#match: Some(Match::Text(MatchText {
+-                text: text.to_owned(),
+-            })),
+-            range: None,
+-            geo_bounding_box: None,
+-            geo_radius: None,
+-            values_count: None,
+-            geo_polygon: None,
+-        }
++        FieldCondition::new_match("text", Match::new_text(text))
+     }
+ 
+     #[test]
+
+commit 97e0ae1716ec34d372775bb1de999241a387815b
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Wed Feb 14 12:09:05 2024 +0100
+
+    text index immutable state without documents (#3497)
+    
+    color ci into green
+    
+    immutable index tests
+    
+    deletion test
+    
+    separate filter function
+    
+    are you happy fmt
+    
+    add shrink_to_fit
+    
+    refactor estimate_cardinality
+    
+    check is points_count is zero
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index d461f1f57..2668e1d51 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -47,7 +47,7 @@ impl FullTextIndex {
+         })
+     }
+ 
+-    fn deserialize_document(data: &[u8], index: &mut InvertedIndex) -> OperationResult<Document> {
++    fn deserialize_document(data: &[u8]) -> OperationResult<BTreeSet<String>> {
+         #[derive(Deserialize)]
+         struct StoredDocument {
+             tokens: BTreeSet<String>,
+@@ -56,35 +56,33 @@ impl FullTextIndex {
+             .map_err(|e| {
+                 OperationError::service_error(format!("Failed to deserialize document: {e}"))
+             })
+-            .map(|doc| index.document_from_tokens(&doc.tokens))
++            .map(|doc| doc.tokens)
+     }
+ 
+     fn storage_cf_name(field: &str) -> String {
+         format!("{field}_fts")
+     }
+ 
+-    pub fn new(db: Arc<RwLock<DB>>, config: TextIndexParams, field: &str) -> Self {
++    pub fn new(
++        db: Arc<RwLock<DB>>,
++        config: TextIndexParams,
++        field: &str,
++        is_appendable: bool,
++    ) -> Self {
+         let store_cf_name = Self::storage_cf_name(field);
+         let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
+         FullTextIndex {
+-            inverted_index: InvertedIndex::new(),
++            inverted_index: InvertedIndex::new(is_appendable),
+             db_wrapper,
+             config,
+         }
+     }
+ 
+-    pub fn get_doc(&self, idx: PointOffsetType) -> Option<&Document> {
+-        match self.inverted_index.point_to_docs.get(idx as usize) {
+-            Some(Some(doc)) => Some(doc),
+-            _ => None,
+-        }
+-    }
+-
+     pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
+         PayloadIndexTelemetry {
+             field_name: None,
+-            points_values_count: self.inverted_index.points_count,
+-            points_count: self.inverted_index.points_count,
++            points_values_count: self.inverted_index.points_count(),
++            points_count: self.inverted_index.points_count(),
+             histogram_bucket_size: None,
+         }
+     }
+@@ -96,7 +94,7 @@ impl FullTextIndex {
+     pub fn parse_query(&self, text: &str) -> ParsedQuery {
+         let mut tokens = HashSet::new();
+         Tokenizer::tokenize_query(text, &self.config, |token| {
+-            tokens.insert(self.inverted_index.vocab.get(token).copied());
++            tokens.insert(self.inverted_index.get_token(token));
+         });
+         ParsedQuery {
+             tokens: tokens.into_iter().collect(),
+@@ -106,8 +104,8 @@ impl FullTextIndex {
+     pub fn parse_document(&self, text: &str) -> Document {
+         let mut document_tokens = vec![];
+         Tokenizer::tokenize_doc(text, &self.config, |token| {
+-            if let Some(token_id) = self.inverted_index.vocab.get(token) {
+-                document_tokens.push(*token_id);
++            if let Some(token_id) = self.inverted_index.get_token(token) {
++                document_tokens.push(token_id);
+             }
+         });
+         Document::new(document_tokens)
+@@ -120,12 +118,15 @@ impl FullTextIndex {
+     }
+ 
+     pub fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        // Maybe we want number of documents in the future?
+-        self.get_doc(point_id).map(|x| x.len()).unwrap_or(0)
++        self.inverted_index.values_count(point_id)
+     }
+ 
+     pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        self.get_doc(point_id).map(|x| x.is_empty()).unwrap_or(true)
++        self.inverted_index.values_is_empty(point_id)
++    }
++
++    pub fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
++        self.inverted_index.check_match(parsed_query, point_id)
+     }
+ }
+ 
+@@ -144,7 +145,7 @@ impl ValueIndexer<String> for FullTextIndex {
+         }
+ 
+         let document = self.inverted_index.document_from_tokens(&tokens);
+-        self.inverted_index.index_document(idx, document);
++        self.inverted_index.index_document(idx, document)?;
+ 
+         let db_idx = Self::store_key(&idx);
+         let db_document = self.serialize_document_tokens(tokens)?;
+@@ -162,22 +163,17 @@ impl ValueIndexer<String> for FullTextIndex {
+     }
+ 
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+-        let removed_doc = self.inverted_index.remove_document(id);
+-
+-        if removed_doc.is_none() {
+-            return Ok(());
++        if self.inverted_index.remove_document(id) {
++            let db_doc_id = Self::store_key(&id);
++            self.db_wrapper.remove(db_doc_id)?;
+         }
+-
+-        let db_doc_id = Self::store_key(&id);
+-        self.db_wrapper.remove(db_doc_id)?;
+-
+         Ok(())
+     }
+ }
+ 
+ impl PayloadFieldIndex for FullTextIndex {
+     fn count_indexed_points(&self) -> usize {
+-        self.inverted_index.points_count
++        self.inverted_index.points_count()
+     }
+ 
+     fn load(&mut self) -> OperationResult<bool> {
+@@ -185,11 +181,14 @@ impl PayloadFieldIndex for FullTextIndex {
+             return Ok(false);
+         };
+ 
+-        for (key, value) in self.db_wrapper.lock_db().iter()? {
++        let db = self.db_wrapper.lock_db();
++        let i = db.iter()?.map(|(key, value)| {
+             let idx = Self::restore_key(&key);
+-            let document = Self::deserialize_document(&value, &mut self.inverted_index)?;
+-            self.inverted_index.index_document(idx, document);
+-        }
++            let tokens = Self::deserialize_document(&value)?;
++            Ok((idx, tokens))
++        });
++        self.inverted_index.build_index(i)?;
++
+         Ok(true)
+     }
+ 
+@@ -238,6 +237,7 @@ impl PayloadFieldIndex for FullTextIndex {
+ 
+ #[cfg(test)]
+ mod tests {
++    use rstest::rstest;
+     use tempfile::Builder;
+ 
+     use super::*;
+@@ -249,8 +249,10 @@ mod tests {
+         FieldCondition::new_match("text", Match::new_text(text))
+     }
+ 
+-    #[test]
+-    fn test_full_text_indexing() {
++    #[rstest]
++    #[case(true)]
++    #[case(false)]
++    fn test_full_text_indexing(#[case] immutable: bool) {
+         let payloads: Vec<_> = vec![
+             serde_json::json!("The celebration had a long way to go and even in the silent depths of Multivac's underground chambers, it hung in the air."),
+             serde_json::json!("If nothing else, there was the mere fact of isolation and silence."),
+@@ -274,7 +276,7 @@ mod tests {
+         {
+             let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+ 
+-            let mut index = FullTextIndex::new(db, config.clone(), "text");
++            let mut index = FullTextIndex::new(db, config.clone(), "text", true);
+ 
+             index.recreate().unwrap();
+ 
+@@ -324,7 +326,7 @@ mod tests {
+ 
+         {
+             let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+-            let mut index = FullTextIndex::new(db, config, "text");
++            let mut index = FullTextIndex::new(db, config, "text", immutable);
+             let loaded = index.load().unwrap();
+             assert!(loaded);
+ 
+@@ -337,6 +339,23 @@ mod tests {
+             let filter_condition = filter_request("the");
+             let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+             assert_eq!(search_res, vec![0, 1, 3, 4]);
++
++            // check deletion
++            index.remove_point(0).unwrap();
++            let filter_condition = filter_request("multivac");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert!(search_res.is_empty());
++            assert_eq!(index.count_indexed_points(), 3);
++
++            index.remove_point(3).unwrap();
++            let filter_condition = filter_request("the");
++            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
++            assert_eq!(search_res, vec![1, 4]);
++            assert_eq!(index.count_indexed_points(), 2);
++
++            // check deletion of non-existing point
++            index.remove_point(3).unwrap();
++            assert_eq!(index.count_indexed_points(), 2);
+         }
+     }
+ }
+
+commit 395a19f2c1fc0266406f23bda3c6f77434188c7a
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Tue Feb 20 23:07:15 2024 +0000
+
+    Use SmallVec instead of MultiValue (#3639)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 2668e1d51..75bf988d5 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -242,7 +242,6 @@ mod tests {
+ 
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+-    use crate::common::utils::MultiValue;
+     use crate::data_types::text_index::{TextIndexType, TokenizerType};
+ 
+     fn filter_request(text: &str) -> FieldCondition {
+@@ -281,9 +280,7 @@ mod tests {
+             index.recreate().unwrap();
+ 
+             for (idx, payload) in payloads.iter().enumerate() {
+-                index
+-                    .add_point(idx as PointOffsetType, &MultiValue::one(payload))
+-                    .unwrap();
++                index.add_point(idx as PointOffsetType, &[payload]).unwrap();
+             }
+ 
+             assert_eq!(index.count_indexed_points(), payloads.len());
+@@ -312,12 +309,12 @@ mod tests {
+                 "The last question was asked for the first time, half in jest, on May 21, 2061,",
+                 "at a time when humanity first stepped into the light."
+             ]);
+-            index.add_point(3, &MultiValue::one(&payload)).unwrap();
++            index.add_point(3, &[&payload]).unwrap();
+ 
+             let payload = serde_json::json!([
+                 "The question came about as a result of a five dollar bet over highballs, and it happened this way: "
+             ]);
+-            index.add_point(4, &MultiValue::one(&payload)).unwrap();
++            index.add_point(4, &[&payload]).unwrap();
+ 
+             assert_eq!(index.count_indexed_points(), payloads.len() - 1);
+ 
+
+commit 3beb4e3b4ff4b3f9585337f4e5b0826a14e247b6
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Fri Feb 23 14:38:40 2024 +0000
+
+    Introduce JsonPathString (#3674)
+    
+    * Introduce JsonPathString
+    
+    * Fix fomatting
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 75bf988d5..003ff6397 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -243,9 +243,10 @@ mod tests {
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+     use crate::data_types::text_index::{TextIndexType, TokenizerType};
++    use crate::json_path::path;
+ 
+     fn filter_request(text: &str) -> FieldCondition {
+-        FieldCondition::new_match("text", Match::new_text(text))
++        FieldCondition::new_match(path("text"), Match::new_text(text))
+     }
+ 
+     #[rstest]
+
+commit a74bf30f8da3b03c9c78208006c9ddccd5823bc8
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Fri Jul 5 12:09:31 2024 +0000
+
+    Extend PayloadSchemaParams to every PayloadSchemaType (#4613)
+    
+    * Move IntegerIndexType and TextIndexType into a common file
+    
+    * Formatting
+    
+    * Extend PayloadSchemaParams to every PayloadSchemaType
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 003ff6397..08ce3c73b 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -10,7 +10,7 @@ use serde_json::Value;
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::common::Flusher;
+-use crate::data_types::text_index::TextIndexParams;
++use crate::data_types::index::TextIndexParams;
+ use crate::index::field_index::full_text_index::inverted_index::{
+     Document, InvertedIndex, ParsedQuery,
+ };
+@@ -242,7 +242,7 @@ mod tests {
+ 
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+-    use crate::data_types::text_index::{TextIndexType, TokenizerType};
++    use crate::data_types::index::{TextIndexType, TokenizerType};
+     use crate::json_path::path;
+ 
+     fn filter_request(text: &str) -> FieldCondition {
+
+commit 4fdf7152f0977adc07bdf9258109ed8600c13f9f
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Thu Jul 11 04:06:40 2024 +0000
+
+    Drop JsonPathString (#4621)
+    
+    * drop some code
+    
+    * Drop JsonPathString
+    
+    * Fix test_remove_key
+    
+    Drop failing tests:
+    - Deleting array indices is not idempotent, so we don't support it.
+    - Empty JSONPath is not supported.
+    
+    * Make json_path::path() non-generic
+    
+    * Remove references to JsonPathV2
+    
+    * Drop JsonPathInterface
+    
+    * Move json_path::v2 code into json_path
+    
+    * Drop validate_not_empty
+    
+    * Drop JsonPath::head() as being unused
+    
+    * Replace path() with JsonPath::new()
+    
+    * Restore comments
+    
+    * Move tests to json_path
+    
+    * Use json() consistently in tests
+    
+    * Replace many into calls with Into trait
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 08ce3c73b..207ba0d4c 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -243,10 +243,10 @@ mod tests {
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+     use crate::data_types::index::{TextIndexType, TokenizerType};
+-    use crate::json_path::path;
++    use crate::json_path::JsonPath;
+ 
+     fn filter_request(text: &str) -> FieldCondition {
+-        FieldCondition::new_match(path("text"), Match::new_text(text))
++        FieldCondition::new_match(JsonPath::new("text"), Match::new_text(text))
+     }
+ 
+     #[rstest]
+
+commit d0a5349f788494d9c88e1f6b33cd740ef6103ec4
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Jul 11 14:48:11 2024 +0200
+
+    Ensure payload is deleted on flush only (#4653)
+    
+    * Use DatabaseColumnScheduledDeleteWrapper to make sure we only delete payload and indexed payload when flushed at the right time
+    
+    * Remove double clone
+    
+    * In on disk payload storage, don't return payload if delete is pending
+    
+    * hide deleted_pending_persistence inside the abstraction
+    
+    * Add RocksDB column operator filtering pending deletes
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 207ba0d4c..540aa15a7 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ 
+ use crate::common::operation_error::{OperationError, OperationResult};
++use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::common::Flusher;
+ use crate::data_types::index::TextIndexParams;
+@@ -23,7 +24,7 @@ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+ pub struct FullTextIndex {
+     inverted_index: InvertedIndex,
+-    db_wrapper: DatabaseColumnWrapper,
++    db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+     config: TextIndexParams,
+ }
+ 
+@@ -70,7 +71,10 @@ impl FullTextIndex {
+         is_appendable: bool,
+     ) -> Self {
+         let store_cf_name = Self::storage_cf_name(field);
+-        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
++        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
++            db,
++            &store_cf_name,
++        ));
+         FullTextIndex {
+             inverted_index: InvertedIndex::new(is_appendable),
+             db_wrapper,
+
+commit 38a8a01b244c26c18e3efe0eeb449f6e37566d83
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Fri Jul 19 12:57:25 2024 +0000
+
+    Make ValueIndexer trait non-generic (#4690)
+    
+    * Introduce NumericIndexInner
+    
+    * Make ValueIndexer trait non-generic
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 540aa15a7..0ace9958f 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -134,7 +134,9 @@ impl FullTextIndex {
+     }
+ }
+ 
+-impl ValueIndexer<String> for FullTextIndex {
++impl ValueIndexer for FullTextIndex {
++    type ValueType = String;
++
+     fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
+         if values.is_empty() {
+             return Ok(());
+
+commit 07c278ad51084c98adf9a7093619ffc5a73f87c9
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Mon Jul 22 08:19:19 2024 +0000
+
+    Enable some of the pedantic clippy lints (#4715)
+    
+    * Use workspace lints
+    
+    * Enable lint: manual_let_else
+    
+    * Enable lint: enum_glob_use
+    
+    * Enable lint: filter_map_next
+    
+    * Enable lint: ref_as_ptr
+    
+    * Enable lint: ref_option_ref
+    
+    * Enable lint: manual_is_variant_and
+    
+    * Enable lint: flat_map_option
+    
+    * Enable lint: inefficient_to_string
+    
+    * Enable lint: implicit_clone
+    
+    * Enable lint: inconsistent_struct_constructor
+    
+    * Enable lint: unnecessary_wraps
+    
+    * Enable lint: needless_continue
+    
+    * Enable lint: unused_self
+    
+    * Enable lint: from_iter_instead_of_collect
+    
+    * Enable lint: uninlined_format_args
+    
+    * Enable lint: doc_link_with_quotes
+    
+    * Enable lint: needless_raw_string_hashes
+    
+    * Enable lint: used_underscore_binding
+    
+    * Enable lint: ptr_as_ptr
+    
+    * Enable lint: explicit_into_iter_loop
+    
+    * Enable lint: cast_lossless
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 0ace9958f..179194c1c 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -37,7 +37,7 @@ impl FullTextIndex {
+         bincode::deserialize(data).unwrap()
+     }
+ 
+-    fn serialize_document_tokens(&self, tokens: BTreeSet<String>) -> OperationResult<Vec<u8>> {
++    fn serialize_document_tokens(tokens: BTreeSet<String>) -> OperationResult<Vec<u8>> {
+         #[derive(Serialize)]
+         struct StoredDocument {
+             tokens: BTreeSet<String>,
+@@ -154,7 +154,7 @@ impl ValueIndexer for FullTextIndex {
+         self.inverted_index.index_document(idx, document)?;
+ 
+         let db_idx = Self::store_key(&idx);
+-        let db_document = self.serialize_document_tokens(tokens)?;
++        let db_document = Self::serialize_document_tokens(tokens)?;
+ 
+         self.db_wrapper.put(db_idx, db_document)?;
+ 
+
+commit f35f512605437d671bb81eec83a24a6d3509bc13
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Mon Jul 22 10:19:23 2024 +0000
+
+    Introduce FieldIndexBuilder (#4717)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 179194c1c..17a5c8004 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -17,7 +17,8 @@ use crate::index::field_index::full_text_index::inverted_index::{
+ };
+ use crate::index::field_index::full_text_index::tokenizers::Tokenizer;
+ use crate::index::field_index::{
+-    CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndex, ValueIndexer,
++    CardinalityEstimation, FieldIndexBuilderTrait, PayloadBlockCondition, PayloadFieldIndex,
++    ValueIndexer,
+ };
+ use crate::telemetry::PayloadIndexTelemetry;
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+@@ -82,6 +83,14 @@ impl FullTextIndex {
+         }
+     }
+ 
++    pub fn builder(
++        db: Arc<RwLock<DB>>,
++        config: TextIndexParams,
++        field: &str,
++    ) -> FullTextIndexBuilder {
++        FullTextIndexBuilder(Self::new(db, config, field, true))
++    }
++
+     pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
+         PayloadIndexTelemetry {
+             field_name: None,
+@@ -134,6 +143,24 @@ impl FullTextIndex {
+     }
+ }
+ 
++pub struct FullTextIndexBuilder(FullTextIndex);
++
++impl FieldIndexBuilderTrait for FullTextIndexBuilder {
++    type FieldIndexType = FullTextIndex;
++
++    fn init(&mut self) -> OperationResult<()> {
++        self.0.recreate()
++    }
++
++    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
++        self.0.add_point(id, payload)
++    }
++
++    fn finalize(self) -> OperationResult<Self::FieldIndexType> {
++        Ok(self.0)
++    }
++}
++
+ impl ValueIndexer for FullTextIndex {
+     type ValueType = String;
+ 
+
+commit f77c98899a2771f4f6b178da46b2442f403dea61
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Tue Jul 23 13:53:08 2024 +0000
+
+    Drop FieldIndex::recreate() method (#4735)
+    
+    * Drop FieldIndex::recreate() method
+    
+    * Make `make_empty()` return `Result`
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 17a5c8004..97cb1e7b6 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -100,10 +100,6 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    pub fn recreate(&self) -> OperationResult<()> {
+-        self.db_wrapper.recreate_column_family()
+-    }
+-
+     pub fn parse_query(&self, text: &str) -> ParsedQuery {
+         let mut tokens = HashSet::new();
+         Tokenizer::tokenize_query(text, &self.config, |token| {
+@@ -149,7 +145,7 @@ impl FieldIndexBuilderTrait for FullTextIndexBuilder {
+     type FieldIndexType = FullTextIndex;
+ 
+     fn init(&mut self) -> OperationResult<()> {
+-        self.0.recreate()
++        self.0.db_wrapper.recreate_column_family()
+     }
+ 
+     fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
+@@ -309,9 +305,9 @@ mod tests {
+         {
+             let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+ 
+-            let mut index = FullTextIndex::new(db, config.clone(), "text", true);
+-
+-            index.recreate().unwrap();
++            let mut index = FullTextIndex::builder(db, config.clone(), "text")
++                .make_empty()
++                .unwrap();
+ 
+             for (idx, payload) in payloads.iter().enumerate() {
+                 index.add_point(idx as PointOffsetType, &[payload]).unwrap();
+
+commit 5df4231e2d7ab63c2e3e1931624fb039c1087375
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Wed Jul 24 08:43:00 2024 +0200
+
+    ValueIndexer get_value without self (#4740)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 97cb1e7b6..0e8f792f4 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -184,7 +184,7 @@ impl ValueIndexer for FullTextIndex {
+         Ok(())
+     }
+ 
+-    fn get_value(&self, value: &Value) -> Option<String> {
++    fn get_value(value: &Value) -> Option<String> {
+         if let Value::String(keyword) = value {
+             return Some(keyword.to_owned());
+         }
+
+commit ab714cdfecc3f70f330ecdc0d262b39fe6440be7
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Thu Jul 25 16:05:12 2024 -0400
+
+    Use option in `filter` and `estimate_cardinality` (#4747)
+    
+    * chore: filter returns option
+    
+    * chore: make estimate_cardinality return Option
+    
+    * better comment
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 0e8f792f4..a3d2cc121 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -232,27 +232,23 @@ impl PayloadFieldIndex for FullTextIndex {
+     fn filter(
+         &self,
+         condition: &FieldCondition,
+-    ) -> OperationResult<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
++    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+-            return Ok(self.inverted_index.filter(&parsed_query));
++            return Some(self.inverted_index.filter(&parsed_query));
+         }
+-        Err(OperationError::service_error("failed to filter"))
++        None
+     }
+ 
+-    fn estimate_cardinality(
+-        &self,
+-        condition: &FieldCondition,
+-    ) -> OperationResult<CardinalityEstimation> {
++    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+-            return Ok(self
+-                .inverted_index
+-                .estimate_cardinality(&parsed_query, condition));
++            return Some(
++                self.inverted_index
++                    .estimate_cardinality(&parsed_query, condition),
++            );
+         }
+-        Err(OperationError::service_error(
+-            "failed to estimate cardinality",
+-        ))
++        None
+     }
+ 
+     fn payload_blocks(
+
+commit 7ea8e1ec7d378739ae8a6bf524daf31df2bb5b87
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Sat Aug 3 19:45:14 2024 +0000
+
+    Integrate map/numeric mmap indices (#4809)
+    
+    * Extend FieldIndexBuilder with mmap indices
+    
+    * Introduce PayloadFieldIndex::files()
+    
+    * Create and delete index dirs
+    
+    * Update index_selector and index_builder_selector
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index a3d2cc121..b5f69a547 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -1,4 +1,5 @@
+ use std::collections::{BTreeSet, HashSet};
++use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+ use common::types::PointOffsetType;
+@@ -229,6 +230,10 @@ impl PayloadFieldIndex for FullTextIndex {
+         self.db_wrapper.flusher()
+     }
+ 
++    fn files(&self) -> Vec<PathBuf> {
++        vec![]
++    }
++
+     fn filter(
+         &self,
+         condition: &FieldCondition,
+
+commit 2d456df948f91bb770100f63f42a9ca5349e2113
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Fri Sep 13 16:40:20 2024 -0300
+
+    Refactor `FullTextIndex` as enum (#5067)
+    
+    * refactor inverted index into trait
+    
+    * create immutable and mutable versions of text index
+    
+    * migrate to full text index enum
+    
+    * fix clippy
+    
+    * review remarks
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index b5f69a547..4b9fde4ad 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -8,15 +8,15 @@ use rocksdb::DB;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ 
++use super::immutable_text_index::ImmutableFullTextIndex;
++use super::inverted_index::{Document, InvertedIndex, ParsedQuery, TokenId};
++use super::mutable_text_index::MutableFullTextIndex;
++use super::tokenizers::Tokenizer;
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::common::Flusher;
+ use crate::data_types::index::TextIndexParams;
+-use crate::index::field_index::full_text_index::inverted_index::{
+-    Document, InvertedIndex, ParsedQuery,
+-};
+-use crate::index::field_index::full_text_index::tokenizers::Tokenizer;
+ use crate::index::field_index::{
+     CardinalityEstimation, FieldIndexBuilderTrait, PayloadBlockCondition, PayloadFieldIndex,
+     ValueIndexer,
+@@ -24,18 +24,157 @@ use crate::index::field_index::{
+ use crate::telemetry::PayloadIndexTelemetry;
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+-pub struct FullTextIndex {
+-    inverted_index: InvertedIndex,
+-    db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+-    config: TextIndexParams,
++pub enum FullTextIndex {
++    Mutable(MutableFullTextIndex),
++    Immutable(ImmutableFullTextIndex),
+ }
+ 
+ impl FullTextIndex {
++    pub fn new(
++        db: Arc<RwLock<DB>>,
++        config: TextIndexParams,
++        field: &str,
++        is_appendable: bool,
++    ) -> Self {
++        let store_cf_name = Self::storage_cf_name(field);
++        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
++            db,
++            &store_cf_name,
++        ));
++        if is_appendable {
++            Self::Mutable(MutableFullTextIndex::new(db_wrapper, config))
++        } else {
++            Self::Immutable(ImmutableFullTextIndex::new(db_wrapper, config))
++        }
++    }
++
++    pub fn init(&mut self) -> OperationResult<()> {
++        match self {
++            Self::Mutable(index) => index.init(),
++            Self::Immutable(index) => index.init(),
++        }
++    }
++
++    pub fn builder(
++        db: Arc<RwLock<DB>>,
++        config: TextIndexParams,
++        field: &str,
++    ) -> FullTextIndexBuilder {
++        FullTextIndexBuilder(Self::new(db, config, field, true))
++    }
++
++    fn storage_cf_name(field: &str) -> String {
++        format!("{field}_fts")
++    }
++
++    fn points_count(&self) -> usize {
++        match self {
++            Self::Mutable(index) => index.inverted_index.points_count(),
++            Self::Immutable(index) => index.inverted_index.points_count(),
++        }
++    }
++
++    fn get_token(&self, token: &str) -> Option<TokenId> {
++        match self {
++            Self::Mutable(index) => index.inverted_index.get_token_id(token),
++            Self::Immutable(index) => index.inverted_index.get_token_id(token),
++        }
++    }
++
++    fn document_from_tokens(&mut self, tokens: &BTreeSet<String>) -> Document {
++        match self {
++            Self::Mutable(index) => index.inverted_index.document_from_tokens(tokens),
++            Self::Immutable(index) => index.inverted_index.document_from_tokens(tokens),
++        }
++    }
++
++    fn index_document(
++        &mut self,
++        point_id: PointOffsetType,
++        document: Document,
++    ) -> OperationResult<()> {
++        match self {
++            Self::Mutable(index) => index.inverted_index.index_document(point_id, document),
++            Self::Immutable(index) => index.inverted_index.index_document(point_id, document),
++        }
++    }
++
++    fn remove_document(&mut self, point_id: PointOffsetType) -> bool {
++        match self {
++            Self::Mutable(index) => index.inverted_index.remove_document(point_id),
++            Self::Immutable(index) => index.inverted_index.remove_document(point_id),
++        }
++    }
++
++    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++        match self {
++            Self::Mutable(index) => index.inverted_index.filter(query),
++            Self::Immutable(index) => index.inverted_index.filter(query),
++        }
++    }
++
++    fn payload_blocks(
++        &self,
++        threshold: usize,
++        key: PayloadKeyType,
++    ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
++        match self {
++            Self::Mutable(index) => Box::new(index.inverted_index.payload_blocks(threshold, key)),
++            Self::Immutable(index) => Box::new(index.inverted_index.payload_blocks(threshold, key)),
++        }
++    }
++
++    fn estimate_cardinality(
++        &self,
++        query: &ParsedQuery,
++        condition: &FieldCondition,
++    ) -> CardinalityEstimation {
++        match self {
++            Self::Mutable(index) => index.inverted_index.estimate_cardinality(query, condition),
++            Self::Immutable(index) => index.inverted_index.estimate_cardinality(query, condition),
++        }
++    }
++
++    pub fn check_match(&self, query: &ParsedQuery, point_id: PointOffsetType) -> bool {
++        match self {
++            Self::Mutable(index) => index.inverted_index.check_match(query, point_id),
++            Self::Immutable(index) => index.inverted_index.check_match(query, point_id),
++        }
++    }
++
++    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
++        match self {
++            Self::Mutable(index) => index.inverted_index.values_count(point_id),
++            Self::Immutable(index) => index.inverted_index.values_count(point_id),
++        }
++    }
++
++    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
++        match self {
++            Self::Mutable(index) => index.inverted_index.values_is_empty(point_id),
++            Self::Immutable(index) => index.inverted_index.values_is_empty(point_id),
++        }
++    }
++
++    fn config(&self) -> &TextIndexParams {
++        match self {
++            Self::Mutable(index) => &index.config,
++            Self::Immutable(index) => &index.config,
++        }
++    }
++
++    fn db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
++        match self {
++            Self::Mutable(index) => &index.db_wrapper,
++            Self::Immutable(index) => &index.db_wrapper,
++        }
++    }
++
+     fn store_key(id: &PointOffsetType) -> Vec<u8> {
+         bincode::serialize(&id).unwrap()
+     }
+ 
+-    fn restore_key(data: &[u8]) -> PointOffsetType {
++    pub(super) fn restore_key(data: &[u8]) -> PointOffsetType {
+         bincode::deserialize(data).unwrap()
+     }
+ 
+@@ -50,7 +189,7 @@ impl FullTextIndex {
+         })
+     }
+ 
+-    fn deserialize_document(data: &[u8]) -> OperationResult<BTreeSet<String>> {
++    pub(super) fn deserialize_document(data: &[u8]) -> OperationResult<BTreeSet<String>> {
+         #[derive(Deserialize)]
+         struct StoredDocument {
+             tokens: BTreeSet<String>,
+@@ -62,49 +201,19 @@ impl FullTextIndex {
+             .map(|doc| doc.tokens)
+     }
+ 
+-    fn storage_cf_name(field: &str) -> String {
+-        format!("{field}_fts")
+-    }
+-
+-    pub fn new(
+-        db: Arc<RwLock<DB>>,
+-        config: TextIndexParams,
+-        field: &str,
+-        is_appendable: bool,
+-    ) -> Self {
+-        let store_cf_name = Self::storage_cf_name(field);
+-        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+-            db,
+-            &store_cf_name,
+-        ));
+-        FullTextIndex {
+-            inverted_index: InvertedIndex::new(is_appendable),
+-            db_wrapper,
+-            config,
+-        }
+-    }
+-
+-    pub fn builder(
+-        db: Arc<RwLock<DB>>,
+-        config: TextIndexParams,
+-        field: &str,
+-    ) -> FullTextIndexBuilder {
+-        FullTextIndexBuilder(Self::new(db, config, field, true))
+-    }
+-
+     pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
+         PayloadIndexTelemetry {
+             field_name: None,
+-            points_values_count: self.inverted_index.points_count(),
+-            points_count: self.inverted_index.points_count(),
++            points_values_count: self.points_count(),
++            points_count: self.points_count(),
+             histogram_bucket_size: None,
+         }
+     }
+ 
+     pub fn parse_query(&self, text: &str) -> ParsedQuery {
+         let mut tokens = HashSet::new();
+-        Tokenizer::tokenize_query(text, &self.config, |token| {
+-            tokens.insert(self.inverted_index.get_token(token));
++        Tokenizer::tokenize_query(text, self.config(), |token| {
++            tokens.insert(self.get_token(token));
+         });
+         ParsedQuery {
+             tokens: tokens.into_iter().collect(),
+@@ -113,8 +222,8 @@ impl FullTextIndex {
+ 
+     pub fn parse_document(&self, text: &str) -> Document {
+         let mut document_tokens = vec![];
+-        Tokenizer::tokenize_doc(text, &self.config, |token| {
+-            if let Some(token_id) = self.inverted_index.get_token(token) {
++        Tokenizer::tokenize_doc(text, self.config(), |token| {
++            if let Some(token_id) = self.get_token(token) {
+                 document_tokens.push(token_id);
+             }
+         });
+@@ -124,19 +233,7 @@ impl FullTextIndex {
+     #[cfg(test)]
+     pub fn query(&self, query: &str) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+         let parsed_query = self.parse_query(query);
+-        self.inverted_index.filter(&parsed_query)
+-    }
+-
+-    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        self.inverted_index.values_count(point_id)
+-    }
+-
+-    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        self.inverted_index.values_is_empty(point_id)
+-    }
+-
+-    pub fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+-        self.inverted_index.check_match(parsed_query, point_id)
++        self.filter(&parsed_query)
+     }
+ }
+ 
+@@ -146,7 +243,7 @@ impl FieldIndexBuilderTrait for FullTextIndexBuilder {
+     type FieldIndexType = FullTextIndex;
+ 
+     fn init(&mut self) -> OperationResult<()> {
+-        self.0.db_wrapper.recreate_column_family()
++        self.0.init()
+     }
+ 
+     fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
+@@ -169,18 +266,18 @@ impl ValueIndexer for FullTextIndex {
+         let mut tokens: BTreeSet<String> = BTreeSet::new();
+ 
+         for value in values {
+-            Tokenizer::tokenize_doc(&value, &self.config, |token| {
++            Tokenizer::tokenize_doc(&value, self.config(), |token| {
+                 tokens.insert(token.to_owned());
+             });
+         }
+ 
+-        let document = self.inverted_index.document_from_tokens(&tokens);
+-        self.inverted_index.index_document(idx, document)?;
++        let document = self.document_from_tokens(&tokens);
++        self.index_document(idx, document)?;
+ 
+         let db_idx = Self::store_key(&idx);
+         let db_document = Self::serialize_document_tokens(tokens)?;
+ 
+-        self.db_wrapper.put(db_idx, db_document)?;
++        self.db_wrapper().put(db_idx, db_document)?;
+ 
+         Ok(())
+     }
+@@ -193,9 +290,9 @@ impl ValueIndexer for FullTextIndex {
+     }
+ 
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+-        if self.inverted_index.remove_document(id) {
++        if self.remove_document(id) {
+             let db_doc_id = Self::store_key(&id);
+-            self.db_wrapper.remove(db_doc_id)?;
++            self.db_wrapper().remove(db_doc_id)?;
+         }
+         Ok(())
+     }
+@@ -203,31 +300,22 @@ impl ValueIndexer for FullTextIndex {
+ 
+ impl PayloadFieldIndex for FullTextIndex {
+     fn count_indexed_points(&self) -> usize {
+-        self.inverted_index.points_count()
++        self.points_count()
+     }
+ 
+     fn load(&mut self) -> OperationResult<bool> {
+-        if !self.db_wrapper.has_column_family()? {
+-            return Ok(false);
+-        };
+-
+-        let db = self.db_wrapper.lock_db();
+-        let i = db.iter()?.map(|(key, value)| {
+-            let idx = Self::restore_key(&key);
+-            let tokens = Self::deserialize_document(&value)?;
+-            Ok((idx, tokens))
+-        });
+-        self.inverted_index.build_index(i)?;
+-
+-        Ok(true)
++        match self {
++            Self::Mutable(index) => index.load_from_db(),
++            Self::Immutable(index) => index.load_from_db(),
++        }
+     }
+ 
+     fn clear(self) -> OperationResult<()> {
+-        self.db_wrapper.remove_column_family()
++        self.db_wrapper().remove_column_family()
+     }
+ 
+     fn flusher(&self) -> Flusher {
+-        self.db_wrapper.flusher()
++        self.db_wrapper().flusher()
+     }
+ 
+     fn files(&self) -> Vec<PathBuf> {
+@@ -240,7 +328,7 @@ impl PayloadFieldIndex for FullTextIndex {
+     ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+-            return Some(self.inverted_index.filter(&parsed_query));
++            return Some(self.filter(&parsed_query));
+         }
+         None
+     }
+@@ -248,10 +336,7 @@ impl PayloadFieldIndex for FullTextIndex {
+     fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+-            return Some(
+-                self.inverted_index
+-                    .estimate_cardinality(&parsed_query, condition),
+-            );
++            return Some(self.estimate_cardinality(&parsed_query, condition));
+         }
+         None
+     }
+@@ -261,129 +346,6 @@ impl PayloadFieldIndex for FullTextIndex {
+         threshold: usize,
+         key: PayloadKeyType,
+     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
+-        self.inverted_index.payload_blocks(threshold, key)
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use rstest::rstest;
+-    use tempfile::Builder;
+-
+-    use super::*;
+-    use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+-    use crate::data_types::index::{TextIndexType, TokenizerType};
+-    use crate::json_path::JsonPath;
+-
+-    fn filter_request(text: &str) -> FieldCondition {
+-        FieldCondition::new_match(JsonPath::new("text"), Match::new_text(text))
+-    }
+-
+-    #[rstest]
+-    #[case(true)]
+-    #[case(false)]
+-    fn test_full_text_indexing(#[case] immutable: bool) {
+-        let payloads: Vec<_> = vec![
+-            serde_json::json!("The celebration had a long way to go and even in the silent depths of Multivac's underground chambers, it hung in the air."),
+-            serde_json::json!("If nothing else, there was the mere fact of isolation and silence."),
+-            serde_json::json!([
+-                "For the first time in a decade, technicians were not scurrying about the vitals of the giant computer, ",
+-                "the soft lights did not wink out their erratic patterns, the flow of information in and out had halted."
+-            ]),
+-            serde_json::json!("It would not be halted long, of course, for the needs of peace would be pressing."),
+-            serde_json::json!("Yet now, for a day, perhaps for a week, even Multivac might celebrate the great time, and rest."),
+-        ];
+-
+-        let temp_dir = Builder::new().prefix("test_dir").tempdir().unwrap();
+-        let config = TextIndexParams {
+-            r#type: TextIndexType::Text,
+-            tokenizer: TokenizerType::Word,
+-            min_token_len: None,
+-            max_token_len: None,
+-            lowercase: None,
+-        };
+-
+-        {
+-            let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+-
+-            let mut index = FullTextIndex::builder(db, config.clone(), "text")
+-                .make_empty()
+-                .unwrap();
+-
+-            for (idx, payload) in payloads.iter().enumerate() {
+-                index.add_point(idx as PointOffsetType, &[payload]).unwrap();
+-            }
+-
+-            assert_eq!(index.count_indexed_points(), payloads.len());
+-
+-            let filter_condition = filter_request("multivac");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert_eq!(search_res, vec![0, 4]);
+-
+-            let filter_condition = filter_request("giant computer");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert_eq!(search_res, vec![2]);
+-
+-            let filter_condition = filter_request("the great time");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert_eq!(search_res, vec![4]);
+-
+-            index.remove_point(2).unwrap();
+-            index.remove_point(3).unwrap();
+-
+-            let filter_condition = filter_request("giant computer");
+-            assert!(index.filter(&filter_condition).unwrap().next().is_none());
+-
+-            assert_eq!(index.count_indexed_points(), payloads.len() - 2);
+-
+-            let payload = serde_json::json!([
+-                "The last question was asked for the first time, half in jest, on May 21, 2061,",
+-                "at a time when humanity first stepped into the light."
+-            ]);
+-            index.add_point(3, &[&payload]).unwrap();
+-
+-            let payload = serde_json::json!([
+-                "The question came about as a result of a five dollar bet over highballs, and it happened this way: "
+-            ]);
+-            index.add_point(4, &[&payload]).unwrap();
+-
+-            assert_eq!(index.count_indexed_points(), payloads.len() - 1);
+-
+-            index.flusher()().unwrap();
+-        }
+-
+-        {
+-            let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
+-            let mut index = FullTextIndex::new(db, config, "text", immutable);
+-            let loaded = index.load().unwrap();
+-            assert!(loaded);
+-
+-            assert_eq!(index.count_indexed_points(), 4);
+-
+-            let filter_condition = filter_request("multivac");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert_eq!(search_res, vec![0]);
+-
+-            let filter_condition = filter_request("the");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert_eq!(search_res, vec![0, 1, 3, 4]);
+-
+-            // check deletion
+-            index.remove_point(0).unwrap();
+-            let filter_condition = filter_request("multivac");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert!(search_res.is_empty());
+-            assert_eq!(index.count_indexed_points(), 3);
+-
+-            index.remove_point(3).unwrap();
+-            let filter_condition = filter_request("the");
+-            let search_res: Vec<_> = index.filter(&filter_condition).unwrap().collect();
+-            assert_eq!(search_res, vec![1, 4]);
+-            assert_eq!(index.count_indexed_points(), 2);
+-
+-            // check deletion of non-existing point
+-            index.remove_point(3).unwrap();
+-            assert_eq!(index.count_indexed_points(), 2);
+-        }
++        self.payload_blocks(threshold, key)
+     }
+ }
+
+commit cf8971503637f3d089670d74df81e31fb76f4fcf
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Mon Sep 16 16:27:30 2024 -0300
+
+    Expose `on_disk` text index (#5074)
+    
+    * map index: fix reachable code marked as unreachable
+    
+    * plumber work to get mmap text index to interfaces
+    
+    * test: add fixture for mmap text index, always create mmap segment
+    
+    * various fixes
+    
+    - ensure dir is created for mmap
+    - implement is_on_disk() for text index
+    - invert deleted condition for filter in mmap inverted index
+    
+    * update grpc docs and openapi
+    
+    * implement return of files
+    
+    * review nit
+    
+    * fix after rebase
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 4b9fde4ad..d9712213d 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -10,6 +10,7 @@ use serde_json::Value;
+ 
+ use super::immutable_text_index::ImmutableFullTextIndex;
+ use super::inverted_index::{Document, InvertedIndex, ParsedQuery, TokenId};
++use super::mmap_text_index::{FullTextMmapIndexBuilder, MmapFullTextIndex};
+ use super::mutable_text_index::MutableFullTextIndex;
+ use super::tokenizers::Tokenizer;
+ use crate::common::operation_error::{OperationError, OperationResult};
+@@ -24,9 +25,11 @@ use crate::index::field_index::{
+ use crate::telemetry::PayloadIndexTelemetry;
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
++#[allow(clippy::large_enum_variant)]
+ pub enum FullTextIndex {
+     Mutable(MutableFullTextIndex),
+     Immutable(ImmutableFullTextIndex),
++    Mmap(MmapFullTextIndex),
+ }
+ 
+ impl FullTextIndex {
+@@ -48,10 +51,15 @@ impl FullTextIndex {
+         }
+     }
+ 
++    pub fn new_mmap(path: PathBuf, config: TextIndexParams) -> OperationResult<Self> {
++        Ok(Self::Mmap(MmapFullTextIndex::open(path, config)?))
++    }
++
+     pub fn init(&mut self) -> OperationResult<()> {
+         match self {
+             Self::Mutable(index) => index.init(),
+             Self::Immutable(index) => index.init(),
++            Self::Mmap(_) => unreachable!("not applicable for mmap immutable index"),
+         }
+     }
+ 
+@@ -63,14 +71,27 @@ impl FullTextIndex {
+         FullTextIndexBuilder(Self::new(db, config, field, true))
+     }
+ 
++    pub fn builder_mmap(path: PathBuf, config: TextIndexParams) -> FullTextMmapIndexBuilder {
++        FullTextMmapIndexBuilder::new(path, config)
++    }
++
+     fn storage_cf_name(field: &str) -> String {
+         format!("{field}_fts")
+     }
+ 
++    fn config(&self) -> &TextIndexParams {
++        match self {
++            Self::Mutable(index) => &index.config,
++            Self::Immutable(index) => &index.config,
++            Self::Mmap(index) => &index.config,
++        }
++    }
++
+     fn points_count(&self) -> usize {
+         match self {
+             Self::Mutable(index) => index.inverted_index.points_count(),
+             Self::Immutable(index) => index.inverted_index.points_count(),
++            Self::Mmap(index) => index.inverted_index.points_count(),
+         }
+     }
+ 
+@@ -78,31 +99,7 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.inverted_index.get_token_id(token),
+             Self::Immutable(index) => index.inverted_index.get_token_id(token),
+-        }
+-    }
+-
+-    fn document_from_tokens(&mut self, tokens: &BTreeSet<String>) -> Document {
+-        match self {
+-            Self::Mutable(index) => index.inverted_index.document_from_tokens(tokens),
+-            Self::Immutable(index) => index.inverted_index.document_from_tokens(tokens),
+-        }
+-    }
+-
+-    fn index_document(
+-        &mut self,
+-        point_id: PointOffsetType,
+-        document: Document,
+-    ) -> OperationResult<()> {
+-        match self {
+-            Self::Mutable(index) => index.inverted_index.index_document(point_id, document),
+-            Self::Immutable(index) => index.inverted_index.index_document(point_id, document),
+-        }
+-    }
+-
+-    fn remove_document(&mut self, point_id: PointOffsetType) -> bool {
+-        match self {
+-            Self::Mutable(index) => index.inverted_index.remove_document(point_id),
+-            Self::Immutable(index) => index.inverted_index.remove_document(point_id),
++            Self::Mmap(index) => index.inverted_index.get_token_id(token),
+         }
+     }
+ 
+@@ -110,6 +107,7 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.inverted_index.filter(query),
+             Self::Immutable(index) => index.inverted_index.filter(query),
++            Self::Mmap(index) => index.inverted_index.filter(query),
+         }
+     }
+ 
+@@ -121,6 +119,7 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => Box::new(index.inverted_index.payload_blocks(threshold, key)),
+             Self::Immutable(index) => Box::new(index.inverted_index.payload_blocks(threshold, key)),
++            Self::Mmap(index) => Box::new(index.inverted_index.payload_blocks(threshold, key)),
+         }
+     }
+ 
+@@ -132,6 +131,7 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.inverted_index.estimate_cardinality(query, condition),
+             Self::Immutable(index) => index.inverted_index.estimate_cardinality(query, condition),
++            Self::Mmap(index) => index.inverted_index.estimate_cardinality(query, condition),
+         }
+     }
+ 
+@@ -139,6 +139,7 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.inverted_index.check_match(query, point_id),
+             Self::Immutable(index) => index.inverted_index.check_match(query, point_id),
++            Self::Mmap(index) => index.inverted_index.check_match(query, point_id),
+         }
+     }
+ 
+@@ -146,6 +147,7 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.inverted_index.values_count(point_id),
+             Self::Immutable(index) => index.inverted_index.values_count(point_id),
++            Self::Mmap(index) => index.inverted_index.values_count(point_id),
+         }
+     }
+ 
+@@ -153,24 +155,11 @@ impl FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.inverted_index.values_is_empty(point_id),
+             Self::Immutable(index) => index.inverted_index.values_is_empty(point_id),
++            Self::Mmap(index) => index.inverted_index.values_is_empty(point_id),
+         }
+     }
+ 
+-    fn config(&self) -> &TextIndexParams {
+-        match self {
+-            Self::Mutable(index) => &index.config,
+-            Self::Immutable(index) => &index.config,
+-        }
+-    }
+-
+-    fn db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
+-        match self {
+-            Self::Mutable(index) => &index.db_wrapper,
+-            Self::Immutable(index) => &index.db_wrapper,
+-        }
+-    }
+-
+-    fn store_key(id: &PointOffsetType) -> Vec<u8> {
++    pub(super) fn store_key(id: &PointOffsetType) -> Vec<u8> {
+         bincode::serialize(&id).unwrap()
+     }
+ 
+@@ -178,7 +167,7 @@ impl FullTextIndex {
+         bincode::deserialize(data).unwrap()
+     }
+ 
+-    fn serialize_document_tokens(tokens: BTreeSet<String>) -> OperationResult<Vec<u8>> {
++    pub(super) fn serialize_document_tokens(tokens: BTreeSet<String>) -> OperationResult<Vec<u8>> {
+         #[derive(Serialize)]
+         struct StoredDocument {
+             tokens: BTreeSet<String>,
+@@ -259,27 +248,15 @@ impl ValueIndexer for FullTextIndex {
+     type ValueType = String;
+ 
+     fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
+-        if values.is_empty() {
+-            return Ok(());
+-        }
+-
+-        let mut tokens: BTreeSet<String> = BTreeSet::new();
+-
+-        for value in values {
+-            Tokenizer::tokenize_doc(&value, self.config(), |token| {
+-                tokens.insert(token.to_owned());
+-            });
++        match self {
++            Self::Mutable(index) => index.add_many(idx, values),
++            Self::Immutable(_) => Err(OperationError::service_error(
++                "Cannot add values to immutable text index",
++            )),
++            Self::Mmap(_) => Err(OperationError::service_error(
++                "Cannot add values to mmap text index",
++            )),
+         }
+-
+-        let document = self.document_from_tokens(&tokens);
+-        self.index_document(idx, document)?;
+-
+-        let db_idx = Self::store_key(&idx);
+-        let db_document = Self::serialize_document_tokens(tokens)?;
+-
+-        self.db_wrapper().put(db_idx, db_document)?;
+-
+-        Ok(())
+     }
+ 
+     fn get_value(value: &Value) -> Option<String> {
+@@ -290,11 +267,11 @@ impl ValueIndexer for FullTextIndex {
+     }
+ 
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+-        if self.remove_document(id) {
+-            let db_doc_id = Self::store_key(&id);
+-            self.db_wrapper().remove(db_doc_id)?;
++        match self {
++            FullTextIndex::Mutable(index) => index.remove_point(id),
++            FullTextIndex::Immutable(index) => index.remove_point(id),
++            FullTextIndex::Mmap(index) => index.remove_point(id),
+         }
+-        Ok(())
+     }
+ }
+ 
+@@ -307,19 +284,32 @@ impl PayloadFieldIndex for FullTextIndex {
+         match self {
+             Self::Mutable(index) => index.load_from_db(),
+             Self::Immutable(index) => index.load_from_db(),
++            Self::Mmap(_index) => Ok(true), // mmap index is always loaded
+         }
+     }
+ 
+     fn clear(self) -> OperationResult<()> {
+-        self.db_wrapper().remove_column_family()
++        match self {
++            Self::Mutable(index) => index.clear(),
++            Self::Immutable(index) => index.clear(),
++            Self::Mmap(index) => index.clear(),
++        }
+     }
+ 
+     fn flusher(&self) -> Flusher {
+-        self.db_wrapper().flusher()
++        match self {
++            Self::Mutable(index) => index.db_wrapper.flusher(),
++            Self::Immutable(index) => index.db_wrapper.flusher(),
++            Self::Mmap(index) => index.flusher(),
++        }
+     }
+ 
+     fn files(&self) -> Vec<PathBuf> {
+-        vec![]
++        match self {
++            Self::Mutable(_) => vec![],
++            Self::Immutable(_) => vec![],
++            Self::Mmap(index) => index.files(),
++        }
+     }
+ 
+     fn filter(
+
+commit a73d0bfcc731785eecd2781e01d1841d0c42e626
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Mon Oct 7 12:08:58 2024 +0200
+
+    Mmap geo index (#4841)
+    
+    * define mmap geo index
+    
+    fix compilation
+    
+    deleted flags
+    
+    load new mmap
+    
+    geo index tests
+    
+    fix tests
+    
+    fix build after rebase
+    
+    add files list
+    
+    * are you happy fmt
+    
+    * refactor get_stored_sub_regions output type
+    
+    * repr(C) for geohash
+    
+    * Replace manual flattening with flat map iterator
+    
+    * review remanings
+    
+    * remove panics
+    
+    * add files for snapshot
+    
+    * rename Dynamic into InMemory
+    
+    * are you happy fmt
+    
+    * review renames
+    
+    * Use copied rather than cloned
+    
+    * minor review refactoring + comments
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index d9712213d..a9b2249ea 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -33,7 +33,7 @@ pub enum FullTextIndex {
+ }
+ 
+ impl FullTextIndex {
+-    pub fn new(
++    pub fn new_memory(
+         db: Arc<RwLock<DB>>,
+         config: TextIndexParams,
+         field: &str,
+@@ -68,7 +68,7 @@ impl FullTextIndex {
+         config: TextIndexParams,
+         field: &str,
+     ) -> FullTextIndexBuilder {
+-        FullTextIndexBuilder(Self::new(db, config, field, true))
++        FullTextIndexBuilder(Self::new_memory(db, config, field, true))
+     }
+ 
+     pub fn builder_mmap(path: PathBuf, config: TextIndexParams) -> FullTextMmapIndexBuilder {
+
+commit 103b86841b5dafa8515c917086a3e0ecc60e4768
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Fri Nov 8 16:54:52 2024 +0100
+
+    Do not pass PointOffsetType by reference (#5406)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index a9b2249ea..6dd11aee8 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -159,7 +159,7 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    pub(super) fn store_key(id: &PointOffsetType) -> Vec<u8> {
++    pub(super) fn store_key(id: PointOffsetType) -> Vec<u8> {
+         bincode::serialize(&id).unwrap()
+     }
+ 
+
+commit 1a54ff000faf24896d578d5fd12f865546db420f
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Mon Nov 18 12:42:55 2024 +0100
+
+    Fix large variant for fulltext index (#5458)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 6dd11aee8..566a068a0 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -25,11 +25,10 @@ use crate::index::field_index::{
+ use crate::telemetry::PayloadIndexTelemetry;
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+-#[allow(clippy::large_enum_variant)]
+ pub enum FullTextIndex {
+     Mutable(MutableFullTextIndex),
+     Immutable(ImmutableFullTextIndex),
+-    Mmap(MmapFullTextIndex),
++    Mmap(Box<MmapFullTextIndex>),
+ }
+ 
+ impl FullTextIndex {
+@@ -52,7 +51,7 @@ impl FullTextIndex {
+     }
+ 
+     pub fn new_mmap(path: PathBuf, config: TextIndexParams) -> OperationResult<Self> {
+-        Ok(Self::Mmap(MmapFullTextIndex::open(path, config)?))
++        Ok(Self::Mmap(Box::new(MmapFullTextIndex::open(path, config)?)))
+     }
+ 
+     pub fn init(&mut self) -> OperationResult<()> {
+
+commit c573f2f0a23e86cd1be27d67d17fa486a3ff9adf
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Fri Dec 6 17:29:19 2024 -0600
+
+    Mmap bool index (#5526)
+    
+    * add `MmapBitSlice::extend` helper
+    
+    * mmap bool index implementation
+    
+    * unit test both implementations
+    
+    * switch to `DynamicMmapFlags`
+    
+    * tidy up
+    
+    * recalculate `indexed_count` on load
+    
+    * grow bitslice aligned to the mmap page size
+    
+    * ergonomic get_slice_for
+    
+    * fix for growing mmap
+    
+    * use more `get_slice_for()`
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 566a068a0..b088d2751 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -287,7 +287,7 @@ impl PayloadFieldIndex for FullTextIndex {
+         }
+     }
+ 
+-    fn clear(self) -> OperationResult<()> {
++    fn cleanup(self) -> OperationResult<()> {
+         match self {
+             Self::Mutable(index) => index.clear(),
+             Self::Immutable(index) => index.clear(),
+
+commit 8ad2b34265448ec01b89d4093de5fbb1a86dcd4d
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Feb 25 11:21:25 2025 +0100
+
+    Bump Rust edition to 2024 (#6042)
+    
+    * Bump Rust edition to 2024
+    
+    * gen is a reserved keyword now
+    
+    * Remove ref mut on references
+    
+    * Mark extern C as unsafe
+    
+    * Wrap unsafe function bodies in unsafe block
+    
+    * Geo hash implements Copy, don't reference but pass by value instead
+    
+    * Replace secluded self import with parent
+    
+    * Update execute_cluster_read_operation with new match semantics
+    
+    * Fix lifetime issue
+    
+    * Replace map_or with is_none_or
+    
+    * set_var is unsafe now
+    
+    * Reformat
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index b088d2751..073c08081 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -13,10 +13,10 @@ use super::inverted_index::{Document, InvertedIndex, ParsedQuery, TokenId};
+ use super::mmap_text_index::{FullTextMmapIndexBuilder, MmapFullTextIndex};
+ use super::mutable_text_index::MutableFullTextIndex;
+ use super::tokenizers::Tokenizer;
++use crate::common::Flusher;
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+-use crate::common::Flusher;
+ use crate::data_types::index::TextIndexParams;
+ use crate::index::field_index::{
+     CardinalityEstimation, FieldIndexBuilderTrait, PayloadBlockCondition, PayloadFieldIndex,
+
+commit 6d53bd91845ee56bb252c08716fdf46d883c48aa
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Wed Mar 12 14:31:48 2025 +0100
+
+    IO read measurements for most Payload indices (#5951)
+    
+    * Add payload index filtering IO measurements for some indices
+    
+    * Add payload index metric to api and telemetry
+    
+    * Also account for index access overhead
+    
+    * Review remarks
+    
+    * Anonymize new HardwareUsage field
+    
+    * Fix tests
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 073c08081..2e157be77 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashSet};
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
++use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+@@ -314,6 +315,7 @@ impl PayloadFieldIndex for FullTextIndex {
+     fn filter(
+         &self,
+         condition: &FieldCondition,
++        _hw_acc: HwMeasurementAcc, // TODO(io_measurement): Implement measurements
+     ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+             let parsed_query = self.parse_query(&text_match.text);
+
+commit 9554383a1e455dffa21d713b8622d0c991e24582
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Mar 13 09:32:24 2025 +0100
+
+    Payload fulltext index IO read measurements (#5954)
+    
+    * FullTextIndex filter measurements
+    
+    * Clippy
+    
+    * Add test for `new_accumulator`
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 2e157be77..b8695d6ba 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -3,6 +3,7 @@ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
++use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+@@ -95,19 +96,23 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    fn get_token(&self, token: &str) -> Option<TokenId> {
++    fn get_token(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId> {
+         match self {
+-            Self::Mutable(index) => index.inverted_index.get_token_id(token),
+-            Self::Immutable(index) => index.inverted_index.get_token_id(token),
+-            Self::Mmap(index) => index.inverted_index.get_token_id(token),
++            Self::Mutable(index) => index.inverted_index.get_token_id(token, hw_counter),
++            Self::Immutable(index) => index.inverted_index.get_token_id(token, hw_counter),
++            Self::Mmap(index) => index.inverted_index.get_token_id(token, hw_counter),
+         }
+     }
+ 
+-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++    fn filter(
++        &self,
++        query: &ParsedQuery,
++        hw_counter: &HardwareCounterCell,
++    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+         match self {
+-            Self::Mutable(index) => index.inverted_index.filter(query),
+-            Self::Immutable(index) => index.inverted_index.filter(query),
+-            Self::Mmap(index) => index.inverted_index.filter(query),
++            Self::Mutable(index) => index.inverted_index.filter(query, hw_counter),
++            Self::Immutable(index) => index.inverted_index.filter(query, hw_counter),
++            Self::Mmap(index) => index.inverted_index.filter(query, hw_counter),
+         }
+     }
+ 
+@@ -135,11 +140,22 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    pub fn check_match(&self, query: &ParsedQuery, point_id: PointOffsetType) -> bool {
++    pub fn check_match(
++        &self,
++        query: &ParsedQuery,
++        point_id: PointOffsetType,
++        hw_counter: &HardwareCounterCell,
++    ) -> bool {
+         match self {
+-            Self::Mutable(index) => index.inverted_index.check_match(query, point_id),
+-            Self::Immutable(index) => index.inverted_index.check_match(query, point_id),
+-            Self::Mmap(index) => index.inverted_index.check_match(query, point_id),
++            Self::Mutable(index) => index
++                .inverted_index
++                .check_match(query, point_id, hw_counter),
++            Self::Immutable(index) => index
++                .inverted_index
++                .check_match(query, point_id, hw_counter),
++            Self::Mmap(index) => index
++                .inverted_index
++                .check_match(query, point_id, hw_counter),
+         }
+     }
+ 
+@@ -199,20 +215,20 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    pub fn parse_query(&self, text: &str) -> ParsedQuery {
++    pub fn parse_query(&self, text: &str, hw_counter: &HardwareCounterCell) -> ParsedQuery {
+         let mut tokens = HashSet::new();
+         Tokenizer::tokenize_query(text, self.config(), |token| {
+-            tokens.insert(self.get_token(token));
++            tokens.insert(self.get_token(token, hw_counter));
+         });
+         ParsedQuery {
+             tokens: tokens.into_iter().collect(),
+         }
+     }
+ 
+-    pub fn parse_document(&self, text: &str) -> Document {
++    pub fn parse_document(&self, text: &str, hw_counter: &HardwareCounterCell) -> Document {
+         let mut document_tokens = vec![];
+         Tokenizer::tokenize_doc(text, self.config(), |token| {
+-            if let Some(token_id) = self.get_token(token) {
++            if let Some(token_id) = self.get_token(token, hw_counter) {
+                 document_tokens.push(token_id);
+             }
+         });
+@@ -220,9 +236,13 @@ impl FullTextIndex {
+     }
+ 
+     #[cfg(test)]
+-    pub fn query(&self, query: &str) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+-        let parsed_query = self.parse_query(query);
+-        self.filter(&parsed_query)
++    pub fn query(
++        &self,
++        query: &str,
++        hw_counter: &HardwareCounterCell,
++    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++        let parsed_query = self.parse_query(query, hw_counter);
++        self.filter(&parsed_query, hw_counter)
+     }
+ }
+ 
+@@ -315,18 +335,20 @@ impl PayloadFieldIndex for FullTextIndex {
+     fn filter(
+         &self,
+         condition: &FieldCondition,
+-        _hw_acc: HwMeasurementAcc, // TODO(io_measurement): Implement measurements
++        hw_acc: HwMeasurementAcc,
+     ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
++        let hw_counter = hw_acc.get_counter_cell();
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+-            let parsed_query = self.parse_query(&text_match.text);
+-            return Some(self.filter(&parsed_query));
++            let parsed_query = self.parse_query(&text_match.text, &hw_counter);
++            return Some(self.filter(&parsed_query, &hw_counter));
+         }
+         None
+     }
+ 
+     fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
++        let hw_counter = HardwareCounterCell::disposable(); // TODO(io_measurements): maybe needs propagation?
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+-            let parsed_query = self.parse_query(&text_match.text);
++            let parsed_query = self.parse_query(&text_match.text, &hw_counter);
+             return Some(self.estimate_cardinality(&parsed_query, condition));
+         }
+         None
+
+commit 56a7cfdb205f90df28d2816d9e8ef6251fc517a2
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Mar 14 11:05:38 2025 +0100
+
+    Cardinality estimation IO measurements (#6117)
+    
+    * Cardinality estimation measurements
+    
+    * Apply hw measurements to latest changes from dev
+    
+    * Clippy
+    
+    * Also measure cardinality estimation for geo index
+    
+    * Make measured units 'bytes'
+    
+    * Use PointOffsetType instead of u32 for size calculation
+    
+    * fix memory cost for check_values_any in mmap index
+    
+    * fix double counting for value reading in mmap, remove hw_counter from mmap hashmap
+    
+    * fmt
+    
+    * fix hw measurement for text index
+    
+    * Remove non necessary lifetime annotations
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index b8695d6ba..939c40bb4 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -2,7 +2,6 @@ use std::collections::{BTreeSet, HashSet};
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+-use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+@@ -104,11 +103,11 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    fn filter(
+-        &self,
+-        query: &ParsedQuery,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++    fn filter<'a>(
++        &'a self,
++        query: ParsedQuery,
++        hw_counter: &'a HardwareCounterCell,
++    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
+         match self {
+             Self::Mutable(index) => index.inverted_index.filter(query, hw_counter),
+             Self::Immutable(index) => index.inverted_index.filter(query, hw_counter),
+@@ -132,11 +131,18 @@ impl FullTextIndex {
+         &self,
+         query: &ParsedQuery,
+         condition: &FieldCondition,
++        hw_counter: &HardwareCounterCell,
+     ) -> CardinalityEstimation {
+         match self {
+-            Self::Mutable(index) => index.inverted_index.estimate_cardinality(query, condition),
+-            Self::Immutable(index) => index.inverted_index.estimate_cardinality(query, condition),
+-            Self::Mmap(index) => index.inverted_index.estimate_cardinality(query, condition),
++            Self::Mutable(index) => index
++                .inverted_index
++                .estimate_cardinality(query, condition, hw_counter),
++            Self::Immutable(index) => index
++                .inverted_index
++                .estimate_cardinality(query, condition, hw_counter),
++            Self::Mmap(index) => index
++                .inverted_index
++                .estimate_cardinality(query, condition, hw_counter),
+         }
+     }
+ 
+@@ -236,13 +242,13 @@ impl FullTextIndex {
+     }
+ 
+     #[cfg(test)]
+-    pub fn query(
+-        &self,
+-        query: &str,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++    pub fn query<'a>(
++        &'a self,
++        query: &'a str,
++        hw_counter: &'a HardwareCounterCell,
++    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
+         let parsed_query = self.parse_query(query, hw_counter);
+-        self.filter(&parsed_query, hw_counter)
++        self.filter(parsed_query, hw_counter)
+     }
+ }
+ 
+@@ -332,24 +338,26 @@ impl PayloadFieldIndex for FullTextIndex {
+         }
+     }
+ 
+-    fn filter(
+-        &self,
+-        condition: &FieldCondition,
+-        hw_acc: HwMeasurementAcc,
+-    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+-        let hw_counter = hw_acc.get_counter_cell();
++    fn filter<'a>(
++        &'a self,
++        condition: &'a FieldCondition,
++        hw_counter: &'a HardwareCounterCell,
++    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+-            let parsed_query = self.parse_query(&text_match.text, &hw_counter);
+-            return Some(self.filter(&parsed_query, &hw_counter));
++            let parsed_query = self.parse_query(&text_match.text, hw_counter);
++            return Some(self.filter(parsed_query, hw_counter));
+         }
+         None
+     }
+ 
+-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+-        let hw_counter = HardwareCounterCell::disposable(); // TODO(io_measurements): maybe needs propagation?
++    fn estimate_cardinality(
++        &self,
++        condition: &FieldCondition,
++        hw_counter: &HardwareCounterCell,
++    ) -> Option<CardinalityEstimation> {
+         if let Some(Match::Text(text_match)) = &condition.r#match {
+-            let parsed_query = self.parse_query(&text_match.text, &hw_counter);
+-            return Some(self.estimate_cardinality(&parsed_query, condition));
++            let parsed_query = self.parse_query(&text_match.text, hw_counter);
++            return Some(self.estimate_cardinality(&parsed_query, condition, hw_counter));
+         }
+         None
+     }
+
+commit 13f0a87c80cd25a85bac907c7eee53f8c55f048e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon Mar 17 20:38:54 2025 +0100
+
+    Mmap in-ram payload indexes without RocksDB (#6148)
+    
+    * refactor IndexSelector to support mmap with populate
+    
+    * specify populate flag DynamicMmapFlags
+    
+    * replace db+flag with enum StorageType
+    
+    * fix flag
+    
+    * disable by default
+    
+    * clippy
+    
+    * remove outdated comment
+    
+    * remove comment
+    
+    * Update lib/segment/src/index/field_index/bool_index/mmap_bool_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 939c40bb4..6ad815342 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -51,8 +51,14 @@ impl FullTextIndex {
+         }
+     }
+ 
+-    pub fn new_mmap(path: PathBuf, config: TextIndexParams) -> OperationResult<Self> {
+-        Ok(Self::Mmap(Box::new(MmapFullTextIndex::open(path, config)?)))
++    pub fn new_mmap(
++        path: PathBuf,
++        config: TextIndexParams,
++        is_on_disk: bool,
++    ) -> OperationResult<Self> {
++        Ok(Self::Mmap(Box::new(MmapFullTextIndex::open(
++            path, config, is_on_disk,
++        )?)))
+     }
+ 
+     pub fn init(&mut self) -> OperationResult<()> {
+@@ -71,8 +77,12 @@ impl FullTextIndex {
+         FullTextIndexBuilder(Self::new_memory(db, config, field, true))
+     }
+ 
+-    pub fn builder_mmap(path: PathBuf, config: TextIndexParams) -> FullTextMmapIndexBuilder {
+-        FullTextMmapIndexBuilder::new(path, config)
++    pub fn builder_mmap(
++        path: PathBuf,
++        config: TextIndexParams,
++        is_on_disk: bool,
++    ) -> FullTextMmapIndexBuilder {
++        FullTextMmapIndexBuilder::new(path, config, is_on_disk)
+     }
+ 
+     fn storage_cf_name(field: &str) -> String {
+
+commit 5cd7239b61d1a6944984132283f762850275670f
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Mon Mar 24 19:39:17 2025 +0100
+
+    Measure Payload Index IO Writes (#6137)
+    
+    * Prepare measurement of index creation + Remove vector deletion
+    measurement
+    
+    * add hw_counter to add_point functions
+    
+    * Adjust add_point(..) function signatures
+    
+    * Add new measurement type: payload index IO write
+    
+    * Measure payload index IO writes
+    
+    * Some Hw measurement performance improvements
+    
+    * Review remarks
+    
+    * Fix measurements in distributed setups
+    
+    * review fixes
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 6ad815342..55aad7363 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -271,8 +271,13 @@ impl FieldIndexBuilderTrait for FullTextIndexBuilder {
+         self.0.init()
+     }
+ 
+-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
+-        self.0.add_point(id, payload)
++    fn add_point(
++        &mut self,
++        id: PointOffsetType,
++        payload: &[&Value],
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
++        self.0.add_point(id, payload, hw_counter)
+     }
+ 
+     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
+@@ -283,9 +288,14 @@ impl FieldIndexBuilderTrait for FullTextIndexBuilder {
+ impl ValueIndexer for FullTextIndex {
+     type ValueType = String;
+ 
+-    fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
++    fn add_many(
++        &mut self,
++        idx: PointOffsetType,
++        values: Vec<String>,
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
+         match self {
+-            Self::Mutable(index) => index.add_many(idx, values),
++            Self::Mutable(index) => index.add_many(idx, values, hw_counter),
+             Self::Immutable(_) => Err(OperationError::service_error(
+                 "Cannot add values to immutable text index",
+             )),
+
+commit 6e0ddbafa950250daff35ebe44fb3ec6afad944f
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Wed Apr 9 10:54:30 2025 +0200
+
+    disk cache hygiene (#6323)
+    
+    * wip: implement explicit populate and clear_cache functions for all components
+    
+    * fmt
+    
+    * implement clear and populate for vector storages
+    
+    * fmt
+    
+    * implement clear and populate for payload storage
+    
+    * wip: implement explicit populate and clear_cache functions payload indexes
+    
+    * implement explicit populate and clear_cache functions payload indexes
+    
+    * fix clippy on CI
+    
+    * only compile posix_fadvise on linux
+    
+    * only compile posix_fadvise on linux
+    
+    * implement explicit populate and clear_cache functions for quantized vectors
+    
+    * fmt
+    
+    * remove post-load prefault
+    
+    * fix typo
+    
+    * implement is-on-disk for payload indexes, implement clear on drop for segment, implement clear after segment build
+    
+    * fmt
+    
+    * also evict quantized vectors after optimization
+    
+    * re-use and replace advise_dontneed
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 55aad7363..05322e2c7 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -260,6 +260,35 @@ impl FullTextIndex {
+         let parsed_query = self.parse_query(query, hw_counter);
+         self.filter(parsed_query, hw_counter)
+     }
++
++    pub fn is_on_disk(&self) -> bool {
++        match self {
++            FullTextIndex::Mutable(_) => false,
++            FullTextIndex::Immutable(_) => false,
++            FullTextIndex::Mmap(index) => index.is_on_disk(),
++        }
++    }
++
++    /// Populate all pages in the mmap.
++    /// Block until all pages are populated.
++    pub fn populate(&self) -> OperationResult<()> {
++        match self {
++            FullTextIndex::Mutable(_) => {}   // Not a mmap
++            FullTextIndex::Immutable(_) => {} // Not a mmap
++            FullTextIndex::Mmap(index) => index.populate()?,
++        }
++        Ok(())
++    }
++
++    /// Drop disk cache.
++    pub fn clear_cache(&self) -> OperationResult<()> {
++        match self {
++            FullTextIndex::Mutable(_) => {}   // Not a mmap
++            FullTextIndex::Immutable(_) => {} // Not a mmap
++            FullTextIndex::Mmap(index) => index.clear_cache()?,
++        }
++        Ok(())
++    }
+ }
+ 
+ pub struct FullTextIndexBuilder(FullTextIndex);
+
+commit a9795f7ce495c5d19aa2078dc957625f6c9b8d51
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Apr 15 16:58:38 2025 +0200
+
+    faster mmap numeric index (#6381)
+    
+    * wip: attempt to investigate slow mmap numeric index
+    
+    * fmt
+    
+    * Improve performance of ConditionedCounter (#6384)
+    
+    * Improve Performance of ConditionedCounter
+    
+    * Remove unneeded hw_counter from signatures
+    
+    * Clippy
+    
+    * Fix Clippy II
+    
+    * Fix Clippy III
+    
+    * Fix Clippy IV
+    
+    * Use static string, don't allocate string
+    
+    * Remove allow dead code attribute
+    
+    ---------
+    
+    Co-authored-by: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/text_index.rs b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+index 05322e2c7..78a26b5a8 100644
+--- a/lib/segment/src/index/field_index/full_text_index/text_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/text_index.rs
+@@ -225,6 +225,11 @@ impl FullTextIndex {
+     pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
+         PayloadIndexTelemetry {
+             field_name: None,
++            index_type: match self {
++                FullTextIndex::Mutable(_) => "mutable_full_text",
++                FullTextIndex::Immutable(_) => "immutable_full_text",
++                FullTextIndex::Mmap(_) => "mmap_full_text",
++            },
+             points_values_count: self.points_count(),
+             points_count: self.points_count(),
+             histogram_bucket_size: None,
+

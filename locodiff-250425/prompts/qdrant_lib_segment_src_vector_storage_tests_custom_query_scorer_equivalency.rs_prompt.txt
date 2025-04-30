@@ -1,0 +1,1979 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+
+commit ebe0a01685253fbb3ea5f817c79f5e0f917a816d
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Sun Oct 15 18:52:02 2023 -0300
+
+    Add `QueryVector::Discovery` (#2809)
+    
+    * - add DiscoveryQuery to QueryVector
+    - merge reco_query_scorer and discovery_query_scorer into custom_query_scorer
+    - reuse reco_query_scorer equivalency tests for discovery scorer
+    
+    * self review
+    
+    * empty commit
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+new file mode 100644
+index 000000000..e3a7e1ef5
+--- /dev/null
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -0,0 +1,315 @@
++use std::collections::HashSet;
++use std::path::Path;
++use std::sync::atomic::AtomicBool;
++use std::sync::Arc;
++use std::{error, result};
++
++use atomic_refcell::AtomicRefCell;
++use itertools::Itertools;
++use rand::rngs::StdRng;
++use rand::seq::IteratorRandom;
++use rand::{thread_rng, Rng, SeedableRng};
++use rstest::rstest;
++
++use super::utils::sampler;
++use crate::common::rocksdb_wrapper;
++use crate::data_types::vectors::{QueryVector, VectorElementType};
++use crate::fixtures::payload_context_fixture::FixtureIdTracker;
++use crate::id_tracker::id_tracker_base::IdTracker;
++use crate::types::{
++    BinaryQuantizationConfig, Distance, ProductQuantizationConfig, QuantizationConfig,
++    ScalarQuantizationConfig,
++};
++#[cfg(target_os = "linux")]
++use crate::vector_storage::memmap_vector_storage::open_memmap_vector_storage_with_async_io;
++use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
++use crate::vector_storage::query::discovery_query::{DiscoveryPair, DiscoveryQuery};
++use crate::vector_storage::query::reco_query::RecoQuery;
++use crate::vector_storage::simple_vector_storage::open_simple_vector_storage;
++use crate::vector_storage::tests::utils::score;
++use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
++
++const DIMS: usize = 128;
++const NUM_POINTS: usize = 600;
++const DISTANCE: Distance = Distance::Dot;
++const MAX_EXAMPLES: usize = 10;
++const SAMPLE_SIZE: usize = 100;
++const SEED: u64 = 42;
++
++type Result<T, E = Error> = result::Result<T, E>;
++type Error = Box<dyn error::Error>;
++
++type WithQuantization = (
++    QuantizationConfig,
++    Box<dyn Iterator<Item = VectorElementType>>,
++);
++
++fn random_query<R: Rng + ?Sized>(
++    query_variant: &QueryVariant,
++    rnd: &mut R,
++    sampler: &mut impl Iterator<Item = f32>,
++) -> QueryVector {
++    match query_variant {
++        QueryVariant::Recommend => random_reco_query(rnd, sampler),
++        QueryVariant::Discovery => random_discovery_query(rnd, sampler),
++    }
++}
++
++fn random_reco_query<R: Rng + ?Sized>(
++    rnd: &mut R,
++    sampler: &mut impl Iterator<Item = f32>,
++) -> QueryVector {
++    let num_positives: usize = rnd.gen_range(0..MAX_EXAMPLES);
++    let num_negatives: usize = rnd.gen_range(0..MAX_EXAMPLES);
++
++    let positives = (0..num_positives)
++        .map(|_| sampler.take(DIMS).collect())
++        .collect_vec();
++
++    let negatives = (0..num_negatives)
++        .map(|_| sampler.take(DIMS).collect())
++        .collect_vec();
++
++    RecoQuery::new(positives, negatives).into()
++}
++
++fn random_discovery_query<R: Rng + ?Sized>(
++    rnd: &mut R,
++    sampler: &mut impl Iterator<Item = f32>,
++) -> QueryVector {
++    let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
++
++    let target = sampler.take(DIMS).collect();
++
++    let pairs = (0..num_pairs)
++        .map(|_| {
++            let positive = sampler.take(DIMS).collect();
++            let negative = sampler.take(DIMS).collect();
++            DiscoveryPair { positive, negative }
++        })
++        .collect_vec();
++
++    DiscoveryQuery::new(target, pairs).into()
++}
++
++fn ram_storage(dir: &Path) -> AtomicRefCell<VectorStorageEnum> {
++    let storage = open_simple_vector_storage(
++        rocksdb_wrapper::open_db(dir, &[rocksdb_wrapper::DB_VECTOR_CF]).unwrap(),
++        rocksdb_wrapper::DB_VECTOR_CF,
++        DIMS,
++        DISTANCE,
++    )
++    .unwrap();
++
++    Arc::into_inner(storage).unwrap()
++}
++
++#[cfg(target_os = "linux")]
++fn async_memmap_storage(dir: &std::path::Path) -> AtomicRefCell<VectorStorageEnum> {
++    let storage = open_memmap_vector_storage_with_async_io(dir, DIMS, DISTANCE, true).unwrap();
++    Arc::into_inner(storage).unwrap()
++}
++
++fn scalar_u8() -> Option<WithQuantization> {
++    let config = ScalarQuantizationConfig {
++        r#type: crate::types::ScalarType::Int8,
++        quantile: Some(0.5),
++        always_ram: Some(true),
++    }
++    .into();
++
++    let sampler = {
++        let rng = StdRng::seed_from_u64(SEED);
++        Box::new(rng.sample_iter(rand_distr::Normal::new(0.0, 8.0).unwrap()))
++    };
++
++    Some((config, sampler))
++}
++
++fn product_x4() -> Option<WithQuantization> {
++    let config = ProductQuantizationConfig {
++        compression: crate::types::CompressionRatio::X4,
++        always_ram: Some(true),
++    }
++    .into();
++
++    let sampler = {
++        let rng = thread_rng();
++        Box::new(rng.sample_iter(rand::distributions::Standard))
++    };
++
++    Some((config, sampler))
++}
++
++fn binary() -> Option<WithQuantization> {
++    let config = BinaryQuantizationConfig {
++        always_ram: Some(true),
++    }
++    .into();
++
++    let sampler = {
++        let rng = StdRng::seed_from_u64(SEED);
++        Box::new(
++            rng.sample_iter(rand::distributions::Uniform::new_inclusive(-1.0, 1.0))
++                .map(|x| x as u8 as f32),
++        )
++    };
++
++    Some((config, sampler))
++}
++
++enum QueryVariant {
++    Recommend,
++    Discovery,
++}
++
++fn scoring_equivalency(
++    query_variant: QueryVariant,
++    other_storage: impl FnOnce(&std::path::Path) -> AtomicRefCell<VectorStorageEnum>,
++    with_quantization: Option<WithQuantization>,
++) -> Result<()> {
++    let (quant_config, quant_sampler) = with_quantization
++        .map(|v| (Some(v.0), Some(v.1)))
++        .unwrap_or_default();
++
++    let raw_dir = tempfile::Builder::new().prefix("raw-storage").tempdir()?;
++
++    let db = rocksdb_wrapper::open_db(raw_dir.path(), &[rocksdb_wrapper::DB_VECTOR_CF])?;
++
++    let raw_storage =
++        open_simple_vector_storage(db, rocksdb_wrapper::DB_VECTOR_CF, DIMS, DISTANCE)?;
++
++    let mut raw_storage = raw_storage.borrow_mut();
++
++    let mut rng = StdRng::seed_from_u64(SEED);
++    let mut sampler = quant_sampler.unwrap_or(Box::new(sampler(rng.clone())));
++
++    super::utils::insert_distributed_vectors(&mut *raw_storage, NUM_POINTS, &mut sampler)?;
++
++    let mut id_tracker = FixtureIdTracker::new(NUM_POINTS);
++    super::utils::delete_random_vectors(
++        &mut rng,
++        &mut *raw_storage,
++        &mut id_tracker,
++        NUM_POINTS / 10,
++    )?;
++
++    let other_dir = tempfile::Builder::new().prefix("other-storage").tempdir()?;
++
++    let other_storage = other_storage(other_dir.path());
++    let mut other_storage = other_storage.borrow_mut();
++
++    other_storage.update_from(&raw_storage, &mut (0..NUM_POINTS as _), &Default::default())?;
++
++    let quant_dir = tempfile::Builder::new().prefix("quant-storage").tempdir()?;
++    let quantized_vectors = if let Some(config) = &quant_config {
++        Some(QuantizedVectors::create(
++            &other_storage,
++            config,
++            quant_dir.path(),
++            4,
++            &AtomicBool::new(false),
++        )?)
++    } else {
++        None
++    };
++    let quantized_vectors = quantized_vectors.as_ref().map(|q| q.borrow());
++
++    let attempts = 50;
++    for _i in 0..attempts {
++        let query = random_query(&query_variant, &mut rng, &mut sampler);
++
++        let raw_scorer = new_raw_scorer(
++            query.clone(),
++            &raw_storage,
++            id_tracker.deleted_point_bitslice(),
++        );
++
++        let is_stopped = AtomicBool::new(false);
++
++        let other_scorer = match &quantized_vectors {
++            Some(quantized_storage) => quantized_storage.raw_scorer(
++                query,
++                id_tracker.deleted_point_bitslice(),
++                other_storage.deleted_vector_bitslice(),
++                &is_stopped,
++            ),
++            None => new_raw_scorer(query, &other_storage, id_tracker.deleted_point_bitslice()),
++        };
++
++        let points =
++            (0..other_storage.total_vector_count() as _).choose_multiple(&mut rng, SAMPLE_SIZE);
++
++        let raw_scores = score(&*raw_scorer, &points);
++        let other_scores = score(&*other_scorer, &points);
++
++        // Compare scores
++        if quantized_vectors.is_none() {
++            // both calculations are done on raw vectors, so score should be exactly the same
++            assert_eq!(
++                raw_scores, other_scores,
++                "Scorer results are not equal, attempt: {}",
++                _i
++            );
++        } else {
++            // Quantization is used for the other storage, so score should be similar
++            // but not necessarily the exact same. Recommend query has a step function,
++            // so small differences in similarities can lead to very different scores
++
++            let top = SAMPLE_SIZE / 10;
++
++            let raw_top: HashSet<_> = raw_scores
++                .iter()
++                .sorted()
++                .rev()
++                .take(top)
++                .map(|p| p.idx)
++                .collect();
++            let other_top: HashSet<_> = other_scores
++                .iter()
++                .sorted()
++                .rev()
++                .take(top)
++                .map(|p| p.idx)
++                .collect();
++
++            let intersection = raw_top.intersection(&other_top).count();
++
++            assert!(
++                (intersection as f32 / top as f32) >= 0.7, // at least 70% of top 10% results should be shared
++                "Top results from scorers are not similar, attempt {_i}:
++                top raw: {raw_top:?},
++                top other: {other_top:?}
++                only {intersection} of {top} top results are shared",
++            );
++        }
++    }
++
++    Ok(())
++}
++
++#[rstest]
++fn compare_scoring_equivalency(
++    #[values(QueryVariant::Recommend, QueryVariant::Discovery)] query_variant: QueryVariant,
++    #[values(ram_storage)] other_storage: impl FnOnce(
++        &std::path::Path,
++    ) -> AtomicRefCell<VectorStorageEnum>,
++
++    #[values(None, product_x4(), scalar_u8(), binary())] quantization_config: Option<
++        WithQuantization,
++    >,
++) -> Result<()> {
++    scoring_equivalency(query_variant, other_storage, quantization_config)
++}
++
++#[cfg(target_os = "linux")]
++#[rstest]
++fn async_compare_scoring_equivalency(
++    #[values(QueryVariant::Recommend, QueryVariant::Discovery)] query_variant: QueryVariant,
++
++    #[values(async_memmap_storage)] other_storage: impl FnOnce(
++        &std::path::Path,
++    ) -> AtomicRefCell<VectorStorageEnum>,
++) -> Result<()> {
++    scoring_equivalency(query_variant, other_storage, None)
++}
+
+commit 7801661d79665281643a81a72f468afc383be9e7
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Thu Oct 19 15:29:37 2023 -0300
+
+    Add discovery context scorer (#2820)
+    
+    * add discovery context query
+    
+    * add tests
+    
+    * small optimization for loss_by
+    
+    * fix async raw scorer
+    
+    * ditch micro-optimization
+    
+    * remove sigmoid,  rename `iter_all` -> `flat_iter`
+    
+    * fix tests, add more cases
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index e3a7e1ef5..72405808d 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -23,6 +23,7 @@ use crate::types::{
+ #[cfg(target_os = "linux")]
+ use crate::vector_storage::memmap_vector_storage::open_memmap_vector_storage_with_async_io;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
++use crate::vector_storage::query::context_query::ContextQuery;
+ use crate::vector_storage::query::discovery_query::{DiscoveryPair, DiscoveryQuery};
+ use crate::vector_storage::query::reco_query::RecoQuery;
+ use crate::vector_storage::simple_vector_storage::open_simple_vector_storage;
+@@ -52,6 +53,7 @@ fn random_query<R: Rng + ?Sized>(
+     match query_variant {
+         QueryVariant::Recommend => random_reco_query(rnd, sampler),
+         QueryVariant::Discovery => random_discovery_query(rnd, sampler),
++        QueryVariant::Context => random_context_query(rnd, sampler),
+     }
+ }
+ 
+@@ -92,6 +94,23 @@ fn random_discovery_query<R: Rng + ?Sized>(
+     DiscoveryQuery::new(target, pairs).into()
+ }
+ 
++fn random_context_query<R: Rng + ?Sized>(
++    rnd: &mut R,
++    sampler: &mut impl Iterator<Item = f32>,
++) -> QueryVector {
++    let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
++
++    let pairs = (0..num_pairs)
++        .map(|_| {
++            let positive = sampler.take(DIMS).collect();
++            let negative = sampler.take(DIMS).collect();
++            DiscoveryPair { positive, negative }
++        })
++        .collect_vec();
++
++    ContextQuery::new(pairs).into()
++}
++
+ fn ram_storage(dir: &Path) -> AtomicRefCell<VectorStorageEnum> {
+     let storage = open_simple_vector_storage(
+         rocksdb_wrapper::open_db(dir, &[rocksdb_wrapper::DB_VECTOR_CF]).unwrap(),
+@@ -161,6 +180,7 @@ fn binary() -> Option<WithQuantization> {
+ enum QueryVariant {
+     Recommend,
+     Discovery,
++    Context,
+ }
+ 
+ fn scoring_equivalency(
+@@ -290,7 +310,12 @@ fn scoring_equivalency(
+ 
+ #[rstest]
+ fn compare_scoring_equivalency(
+-    #[values(QueryVariant::Recommend, QueryVariant::Discovery)] query_variant: QueryVariant,
++    #[values(
++        QueryVariant::Recommend,
++        QueryVariant::Discovery,
++        QueryVariant::Context
++    )]
++    query_variant: QueryVariant,
+     #[values(ram_storage)] other_storage: impl FnOnce(
+         &std::path::Path,
+     ) -> AtomicRefCell<VectorStorageEnum>,
+@@ -305,7 +330,12 @@ fn compare_scoring_equivalency(
+ #[cfg(target_os = "linux")]
+ #[rstest]
+ fn async_compare_scoring_equivalency(
+-    #[values(QueryVariant::Recommend, QueryVariant::Discovery)] query_variant: QueryVariant,
++    #[values(
++        QueryVariant::Recommend,
++        QueryVariant::Discovery,
++        QueryVariant::Context
++    )]
++    query_variant: QueryVariant,
+ 
+     #[values(async_memmap_storage)] other_storage: impl FnOnce(
+         &std::path::Path,
+
+commit 847422fdb166f438715ef64b6199c480e4563771
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Thu Oct 26 15:40:28 2023 +0200
+
+    propagate vector type into QueryVector (#2878)
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 72405808d..215f4984d 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -65,11 +65,11 @@ fn random_reco_query<R: Rng + ?Sized>(
+     let num_negatives: usize = rnd.gen_range(0..MAX_EXAMPLES);
+ 
+     let positives = (0..num_positives)
+-        .map(|_| sampler.take(DIMS).collect())
++        .map(|_| sampler.take(DIMS).collect_vec().into())
+         .collect_vec();
+ 
+     let negatives = (0..num_negatives)
+-        .map(|_| sampler.take(DIMS).collect())
++        .map(|_| sampler.take(DIMS).collect_vec().into())
+         .collect_vec();
+ 
+     RecoQuery::new(positives, negatives).into()
+@@ -81,12 +81,12 @@ fn random_discovery_query<R: Rng + ?Sized>(
+ ) -> QueryVector {
+     let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
+ 
+-    let target = sampler.take(DIMS).collect();
++    let target = sampler.take(DIMS).collect_vec().into();
+ 
+     let pairs = (0..num_pairs)
+         .map(|_| {
+-            let positive = sampler.take(DIMS).collect();
+-            let negative = sampler.take(DIMS).collect();
++            let positive = sampler.take(DIMS).collect_vec().into();
++            let negative = sampler.take(DIMS).collect_vec().into();
+             DiscoveryPair { positive, negative }
+         })
+         .collect_vec();
+@@ -102,8 +102,8 @@ fn random_context_query<R: Rng + ?Sized>(
+ 
+     let pairs = (0..num_pairs)
+         .map(|_| {
+-            let positive = sampler.take(DIMS).collect();
+-            let negative = sampler.take(DIMS).collect();
++            let positive = sampler.take(DIMS).collect_vec().into();
++            let negative = sampler.take(DIMS).collect_vec().into();
+             DiscoveryPair { positive, negative }
+         })
+         .collect_vec();
+
+commit 5de2b2d84e601b7156b29b204f1aa82d5fb88f41
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Thu Oct 26 19:36:15 2023 -0400
+
+    Discovery search handler at hnsw level (#2836)
+    
+    * add discovery_search_with_graph handler
+    
+    * add precision test
+    
+    * rename `DiscoveryPair` -> `ContextPair`
+    
+    * review fixes
+    
+    * renames + comments
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 215f4984d..406a2efea 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -23,8 +23,8 @@ use crate::types::{
+ #[cfg(target_os = "linux")]
+ use crate::vector_storage::memmap_vector_storage::open_memmap_vector_storage_with_async_io;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+-use crate::vector_storage::query::context_query::ContextQuery;
+-use crate::vector_storage::query::discovery_query::{DiscoveryPair, DiscoveryQuery};
++use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
++use crate::vector_storage::query::discovery_query::DiscoveryQuery;
+ use crate::vector_storage::query::reco_query::RecoQuery;
+ use crate::vector_storage::simple_vector_storage::open_simple_vector_storage;
+ use crate::vector_storage::tests::utils::score;
+@@ -87,7 +87,7 @@ fn random_discovery_query<R: Rng + ?Sized>(
+         .map(|_| {
+             let positive = sampler.take(DIMS).collect_vec().into();
+             let negative = sampler.take(DIMS).collect_vec().into();
+-            DiscoveryPair { positive, negative }
++            ContextPair { positive, negative }
+         })
+         .collect_vec();
+ 
+@@ -104,7 +104,7 @@ fn random_context_query<R: Rng + ?Sized>(
+         .map(|_| {
+             let positive = sampler.take(DIMS).collect_vec().into();
+             let negative = sampler.take(DIMS).collect_vec().into();
+-            DiscoveryPair { positive, negative }
++            ContextPair { positive, negative }
+         })
+         .collect_vec();
+ 
+
+commit 7134ba7dc25ad7a2dccbbf9c3bd4f3072e46f6c5
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Tue Oct 31 23:44:20 2023 +0100
+
+    raw scorer with operation result (#2897)
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 406a2efea..4eacd6cd6 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -243,18 +243,23 @@ fn scoring_equivalency(
+             query.clone(),
+             &raw_storage,
+             id_tracker.deleted_point_bitslice(),
+-        );
++        )
++        .unwrap();
+ 
+         let is_stopped = AtomicBool::new(false);
+ 
+         let other_scorer = match &quantized_vectors {
+-            Some(quantized_storage) => quantized_storage.raw_scorer(
+-                query,
+-                id_tracker.deleted_point_bitslice(),
+-                other_storage.deleted_vector_bitslice(),
+-                &is_stopped,
+-            ),
+-            None => new_raw_scorer(query, &other_storage, id_tracker.deleted_point_bitslice()),
++            Some(quantized_storage) => quantized_storage
++                .raw_scorer(
++                    query,
++                    id_tracker.deleted_point_bitslice(),
++                    other_storage.deleted_vector_bitslice(),
++                    &is_stopped,
++                )
++                .unwrap(),
++            None => {
++                new_raw_scorer(query, &other_storage, id_tracker.deleted_point_bitslice()).unwrap()
++            }
+         };
+ 
+         let points =
+
+commit d8241a3fe5b7127ceae8fed3a77c7a9c2827cc09
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Thu Nov 2 13:30:44 2023 -0400
+
+    Fix recommend `best_score` formula (#2904)
+    
+    * fix recommend best score formula
+    
+    * fix integration test
+    
+    * review fixes
+    
+    * rebase and fix conflicts
+    
+    * correct proptest comment
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 4eacd6cd6..c7b3659d3 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -62,7 +62,7 @@ fn random_reco_query<R: Rng + ?Sized>(
+     sampler: &mut impl Iterator<Item = f32>,
+ ) -> QueryVector {
+     let num_positives: usize = rnd.gen_range(0..MAX_EXAMPLES);
+-    let num_negatives: usize = rnd.gen_range(0..MAX_EXAMPLES);
++    let num_negatives: usize = rnd.gen_range(1..MAX_EXAMPLES);
+ 
+     let positives = (0..num_positives)
+         .map(|_| sampler.take(DIMS).collect_vec().into())
+@@ -236,7 +236,7 @@ fn scoring_equivalency(
+     let quantized_vectors = quantized_vectors.as_ref().map(|q| q.borrow());
+ 
+     let attempts = 50;
+-    for _i in 0..attempts {
++    for i in 0..attempts {
+         let query = random_query(&query_variant, &mut rng, &mut sampler);
+ 
+         let raw_scorer = new_raw_scorer(
+@@ -251,15 +251,18 @@ fn scoring_equivalency(
+         let other_scorer = match &quantized_vectors {
+             Some(quantized_storage) => quantized_storage
+                 .raw_scorer(
+-                    query,
++                    query.clone(),
+                     id_tracker.deleted_point_bitslice(),
+                     other_storage.deleted_vector_bitslice(),
+                     &is_stopped,
+                 )
+                 .unwrap(),
+-            None => {
+-                new_raw_scorer(query, &other_storage, id_tracker.deleted_point_bitslice()).unwrap()
+-            }
++            None => new_raw_scorer(
++                query.clone(),
++                &other_storage,
++                id_tracker.deleted_point_bitslice(),
++            )
++            .unwrap(),
+         };
+ 
+         let points =
+@@ -273,8 +276,8 @@ fn scoring_equivalency(
+             // both calculations are done on raw vectors, so score should be exactly the same
+             assert_eq!(
+                 raw_scores, other_scores,
+-                "Scorer results are not equal, attempt: {}",
+-                _i
++                "Scorer results are not equal, attempt: {}, query: {:?}",
++                i, query
+             );
+         } else {
+             // Quantization is used for the other storage, so score should be similar
+@@ -302,7 +305,7 @@ fn scoring_equivalency(
+ 
+             assert!(
+                 (intersection as f32 / top as f32) >= 0.7, // at least 70% of top 10% results should be shared
+-                "Top results from scorers are not similar, attempt {_i}:
++                "Top results from scorers are not similar, attempt {i}:
+                 top raw: {raw_top:?},
+                 top other: {other_top:?}
+                 only {intersection} of {top} top results are shared",
+
+commit 8c93500998e7fb1fa8d6435d6561dd4316ab7b2d
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Wed Dec 13 17:08:37 2023 +0000
+
+    Rename SimpleDenseVectorStorage (#3223)
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index c7b3659d3..fc24cec50 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -26,7 +26,7 @@ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
+ use crate::vector_storage::query::discovery_query::DiscoveryQuery;
+ use crate::vector_storage::query::reco_query::RecoQuery;
+-use crate::vector_storage::simple_vector_storage::open_simple_vector_storage;
++use crate::vector_storage::simple_dense_vector_storage::open_simple_vector_storage;
+ use crate::vector_storage::tests::utils::score;
+ use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+ 
+
+commit b1aed910f23688aead01b484d3ddc9f2d5429e05
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Fri Dec 15 13:00:28 2023 +0000
+
+    Remove quantization update from hnsw index (#3221)
+    
+    * remove quantization update from hnsw index
+    
+    * test that hnsw was builded with presented quantization
+    
+    * are you happy codespell
+    
+    * prefer method over public field
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index fc24cec50..6f76644c0 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -233,7 +233,6 @@ fn scoring_equivalency(
+     } else {
+         None
+     };
+-    let quantized_vectors = quantized_vectors.as_ref().map(|q| q.borrow());
+ 
+     let attempts = 50;
+     for i in 0..attempts {
+
+commit 8ae92d47161cbb90b6c211400cc307069858ffc6
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Feb 8 12:52:03 2024 +0100
+
+    allow stopping segment loading (#3498)
+    
+    * allow stopping segment loading
+    
+    * fix benches
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 6f76644c0..fbdb5dabd 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -117,6 +117,7 @@ fn ram_storage(dir: &Path) -> AtomicRefCell<VectorStorageEnum> {
+         rocksdb_wrapper::DB_VECTOR_CF,
+         DIMS,
+         DISTANCE,
++        &AtomicBool::new(false),
+     )
+     .unwrap();
+ 
+@@ -196,8 +197,13 @@ fn scoring_equivalency(
+ 
+     let db = rocksdb_wrapper::open_db(raw_dir.path(), &[rocksdb_wrapper::DB_VECTOR_CF])?;
+ 
+-    let raw_storage =
+-        open_simple_vector_storage(db, rocksdb_wrapper::DB_VECTOR_CF, DIMS, DISTANCE)?;
++    let raw_storage = open_simple_vector_storage(
++        db,
++        rocksdb_wrapper::DB_VECTOR_CF,
++        DIMS,
++        DISTANCE,
++        &AtomicBool::default(),
++    )?;
+ 
+     let mut raw_storage = raw_storage.borrow_mut();
+ 
+@@ -326,7 +332,6 @@ fn compare_scoring_equivalency(
+     #[values(ram_storage)] other_storage: impl FnOnce(
+         &std::path::Path,
+     ) -> AtomicRefCell<VectorStorageEnum>,
+-
+     #[values(None, product_x4(), scalar_u8(), binary())] quantization_config: Option<
+         WithQuantization,
+     >,
+@@ -343,7 +348,6 @@ fn async_compare_scoring_equivalency(
+         QueryVariant::Context
+     )]
+     query_variant: QueryVariant,
+-
+     #[values(async_memmap_storage)] other_storage: impl FnOnce(
+         &std::path::Path,
+     ) -> AtomicRefCell<VectorStorageEnum>,
+
+commit d1d69d12e6d9b8c0f8d2302c494bc7c1e2601e40
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Wed Feb 28 12:30:44 2024 +0100
+
+    Clearer names for dense storage implementations (#3712)
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index fbdb5dabd..4a1e8ff76 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -21,7 +21,7 @@ use crate::types::{
+     ScalarQuantizationConfig,
+ };
+ #[cfg(target_os = "linux")]
+-use crate::vector_storage::memmap_vector_storage::open_memmap_vector_storage_with_async_io;
++use crate::vector_storage::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
+ use crate::vector_storage::query::discovery_query::DiscoveryQuery;
+
+commit 6b3629e2fc77aee1aa63b361ed827916497289b3
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon Mar 25 13:21:21 2024 +0100
+
+    Refactor vector storage infra to be generic over vector element type (#3900)
+    
+    * make SimpleDenseVectorStorage generic against VectorElementType
+    
+    * make generic loading of the simple dense storage
+    
+    * move memmap_dense_vector_storage
+    
+    * move mmap_dense_vectors
+    
+    * move appendable_mmap_dense_vector_storage
+    
+    * fmt
+    
+    * move dynamic_mmap_flags
+    
+    * move simple_dense_vector_storage
+    
+    * move PrimitiveVectorElement
+    
+    * fmt
+    
+    * make MmapDenseVectors generic
+    
+    * make MemmapDenseVectorStorage generic to data type
+    
+    * fix UringReader on non-linux platform
+    
+    * make ChunkedMmapVectors generic of the vector element type
+    
+    * make AppendableMmapDenseVectorStorage generic of the vector element type
+    
+    * make PrimitiveVectorElement trait even more global
+    
+    * make Metric generic over vector element type and refactor it into GenericMetric
+    
+    * make DenseVectorStorage generic over vector element
+    
+    * remove temorary trait for migrating Metric
+    
+    * make CustomQueryScorer generic against vector element type
+    
+    * refactor PrimitiveVectorElement to use Cow and allow owned conversions
+    
+    * Move score post-processing out of metric object
+    
+    * naive implementation of metrics for byte vectors
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 4a1e8ff76..4636ef7f1 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -21,12 +21,12 @@ use crate::types::{
+     ScalarQuantizationConfig,
+ };
+ #[cfg(target_os = "linux")]
+-use crate::vector_storage::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
++use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
++use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_vector_storage;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
+ use crate::vector_storage::query::discovery_query::DiscoveryQuery;
+ use crate::vector_storage::query::reco_query::RecoQuery;
+-use crate::vector_storage::simple_dense_vector_storage::open_simple_vector_storage;
+ use crate::vector_storage::tests::utils::score;
+ use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+ 
+@@ -210,12 +210,12 @@ fn scoring_equivalency(
+     let mut rng = StdRng::seed_from_u64(SEED);
+     let mut sampler = quant_sampler.unwrap_or(Box::new(sampler(rng.clone())));
+ 
+-    super::utils::insert_distributed_vectors(&mut *raw_storage, NUM_POINTS, &mut sampler)?;
++    super::utils::insert_distributed_vectors(&mut raw_storage, NUM_POINTS, &mut sampler)?;
+ 
+     let mut id_tracker = FixtureIdTracker::new(NUM_POINTS);
+     super::utils::delete_random_vectors(
+         &mut rng,
+-        &mut *raw_storage,
++        &mut raw_storage,
+         &mut id_tracker,
+         NUM_POINTS / 10,
+     )?;
+
+commit a330542c8ac3b3228e0f06d1b9fd1c2ce36230f0
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Mon Apr 8 12:22:24 2024 +0200
+
+    Integrate Multivector at segment level (#3973)
+    
+    * Integrate Multivector at segment level
+    
+    * more tests - green with lower accuracy
+    
+    * decrease expected accuracy to fix test
+    
+    * cleanup test
+    
+    * multivector can not be empty
+    
+    * vary number of vector per multivec point
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 4636ef7f1..dda5827dd 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -22,7 +22,7 @@ use crate::types::{
+ };
+ #[cfg(target_os = "linux")]
+ use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
+-use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_vector_storage;
++use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
+ use crate::vector_storage::query::discovery_query::DiscoveryQuery;
+@@ -112,7 +112,7 @@ fn random_context_query<R: Rng + ?Sized>(
+ }
+ 
+ fn ram_storage(dir: &Path) -> AtomicRefCell<VectorStorageEnum> {
+-    let storage = open_simple_vector_storage(
++    let storage = open_simple_dense_vector_storage(
+         rocksdb_wrapper::open_db(dir, &[rocksdb_wrapper::DB_VECTOR_CF]).unwrap(),
+         rocksdb_wrapper::DB_VECTOR_CF,
+         DIMS,
+@@ -197,7 +197,7 @@ fn scoring_equivalency(
+ 
+     let db = rocksdb_wrapper::open_db(raw_dir.path(), &[rocksdb_wrapper::DB_VECTOR_CF])?;
+ 
+-    let raw_storage = open_simple_vector_storage(
++    let raw_storage = open_simple_dense_vector_storage(
+         db,
+         rocksdb_wrapper::DB_VECTOR_CF,
+         DIMS,
+
+commit bd16dfa0173c727019d61feb0579d8bcdbc28354
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Wed May 15 09:36:46 2024 -0400
+
+    universal-query: Add `query()` to `ShardOperation` trait (#4210)
+    
+    * add `query` to shard trait
+    
+    * add missing conversions for query
+    
+    * update grpc docs
+    
+    * Query response has intermediate results
+    
+    * add ShardQueryResponse description
+    
+    * move pub use to the top, keep only one way of reaching reexports
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index dda5827dd..753d7cc8b 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -24,9 +24,7 @@ use crate::types::{
+ use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
+ use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+-use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
+-use crate::vector_storage::query::discovery_query::DiscoveryQuery;
+-use crate::vector_storage::query::reco_query::RecoQuery;
++use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+ use crate::vector_storage::tests::utils::score;
+ use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+ 
+
+commit 21a3fb5f38a796f37883017adc993d0322bbca8f
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Tue May 28 16:38:56 2024 +0200
+
+    Use correct vector storage size (#4312)
+    
+    * use correct vector storage size
+    
+    * remove dim from segment entry
+    
+    * are you happy fmt
+    
+    * codespell and proportions
+    
+    * remove obsolete comment
+    
+    * remove `try_vector_dim`
+    
+    * are you happy fmt
+    
+    * remove todo
+    
+    * revert code of conduct
+    
+    * check div 0
+    
+    * Simplify a bit with max iterator
+    
+    * Update lib/segment/src/index/hnsw_index/hnsw.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * are you happy fmt
+    
+    * Update lib/segment/src/index/plain_payload_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * review fix
+    
+    * set full scan threshold 0 for test
+    
+    * use u128 also for multivector storages
+    
+    * fix sparse vector size calculation
+    
+    * Move size calculation into if-branch
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 753d7cc8b..1a4629ab1 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -208,7 +208,7 @@ fn scoring_equivalency(
+     let mut rng = StdRng::seed_from_u64(SEED);
+     let mut sampler = quant_sampler.unwrap_or(Box::new(sampler(rng.clone())));
+ 
+-    super::utils::insert_distributed_vectors(&mut raw_storage, NUM_POINTS, &mut sampler)?;
++    super::utils::insert_distributed_vectors(DIMS, &mut raw_storage, NUM_POINTS, &mut sampler)?;
+ 
+     let mut id_tracker = FixtureIdTracker::new(NUM_POINTS);
+     super::utils::delete_random_vectors(
+
+commit 96ecd2cca8ba311282b5d72c9e41ed71ddca036d
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Tue Jun 4 11:16:11 2024 +0200
+
+    Fix hnsw full scan threshold (#4369)
+    
+    * fix hnsw full scan threshold
+    
+    * add test
+    
+    * are you happy clippy
+    
+    * separate open_vector_storage
+    
+    * remove public fields from builder
+    
+    * wip: do not create segment in builder before build
+    
+    * avoid arc in storage test and low-level loading functions
+    
+    * WIP: remove internal segment from SegmentBuilder
+    
+    * fmt
+    
+    * finalize segment builder fixes
+    
+    * Revert "are you happy clippy"
+    
+    This reverts commit c04afa698995f75f8b589737c2a794aee03824d8.
+    
+    * Revert "add test"
+    
+    This reverts commit 8e7ad6207ed042f25dcd07a16fac7c109b9c5a9e.
+    
+    * Revert "fix hnsw full scan threshold"
+    
+    This reverts commit 8904443fcb849cca30885b0b6980b0113ed25c16.
+    
+    * remove _daatabse from builder
+    
+    * fix optimizer test
+    
+    * fix id tracker versions persistence
+    
+    * do flush for segment components on build
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 1a4629ab1..f8040b01b 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -1,10 +1,8 @@
+ use std::collections::HashSet;
+ use std::path::Path;
+ use std::sync::atomic::AtomicBool;
+-use std::sync::Arc;
+ use std::{error, result};
+ 
+-use atomic_refcell::AtomicRefCell;
+ use itertools::Itertools;
+ use rand::rngs::StdRng;
+ use rand::seq::IteratorRandom;
+@@ -26,7 +24,8 @@ use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+ use crate::vector_storage::tests::utils::score;
+-use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
++use crate::vector_storage::vector_storage_base::VectorStorage;
++use crate::vector_storage::{new_raw_scorer, VectorStorageEnum};
+ 
+ const DIMS: usize = 128;
+ const NUM_POINTS: usize = 600;
+@@ -109,23 +108,20 @@ fn random_context_query<R: Rng + ?Sized>(
+     ContextQuery::new(pairs).into()
+ }
+ 
+-fn ram_storage(dir: &Path) -> AtomicRefCell<VectorStorageEnum> {
+-    let storage = open_simple_dense_vector_storage(
++fn ram_storage(dir: &Path) -> VectorStorageEnum {
++    open_simple_dense_vector_storage(
+         rocksdb_wrapper::open_db(dir, &[rocksdb_wrapper::DB_VECTOR_CF]).unwrap(),
+         rocksdb_wrapper::DB_VECTOR_CF,
+         DIMS,
+         DISTANCE,
+         &AtomicBool::new(false),
+     )
+-    .unwrap();
+-
+-    Arc::into_inner(storage).unwrap()
++    .unwrap()
+ }
+ 
+ #[cfg(target_os = "linux")]
+-fn async_memmap_storage(dir: &std::path::Path) -> AtomicRefCell<VectorStorageEnum> {
+-    let storage = open_memmap_vector_storage_with_async_io(dir, DIMS, DISTANCE, true).unwrap();
+-    Arc::into_inner(storage).unwrap()
++fn async_memmap_storage(dir: &std::path::Path) -> VectorStorageEnum {
++    open_memmap_vector_storage_with_async_io(dir, DIMS, DISTANCE, true).unwrap()
+ }
+ 
+ fn scalar_u8() -> Option<WithQuantization> {
+@@ -184,7 +180,7 @@ enum QueryVariant {
+ 
+ fn scoring_equivalency(
+     query_variant: QueryVariant,
+-    other_storage: impl FnOnce(&std::path::Path) -> AtomicRefCell<VectorStorageEnum>,
++    other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
+     with_quantization: Option<WithQuantization>,
+ ) -> Result<()> {
+     let (quant_config, quant_sampler) = with_quantization
+@@ -195,7 +191,7 @@ fn scoring_equivalency(
+ 
+     let db = rocksdb_wrapper::open_db(raw_dir.path(), &[rocksdb_wrapper::DB_VECTOR_CF])?;
+ 
+-    let raw_storage = open_simple_dense_vector_storage(
++    let mut raw_storage = open_simple_dense_vector_storage(
+         db,
+         rocksdb_wrapper::DB_VECTOR_CF,
+         DIMS,
+@@ -203,8 +199,6 @@ fn scoring_equivalency(
+         &AtomicBool::default(),
+     )?;
+ 
+-    let mut raw_storage = raw_storage.borrow_mut();
+-
+     let mut rng = StdRng::seed_from_u64(SEED);
+     let mut sampler = quant_sampler.unwrap_or(Box::new(sampler(rng.clone())));
+ 
+@@ -220,8 +214,7 @@ fn scoring_equivalency(
+ 
+     let other_dir = tempfile::Builder::new().prefix("other-storage").tempdir()?;
+ 
+-    let other_storage = other_storage(other_dir.path());
+-    let mut other_storage = other_storage.borrow_mut();
++    let mut other_storage = other_storage(other_dir.path());
+ 
+     other_storage.update_from(&raw_storage, &mut (0..NUM_POINTS as _), &Default::default())?;
+ 
+@@ -327,9 +320,7 @@ fn compare_scoring_equivalency(
+         QueryVariant::Context
+     )]
+     query_variant: QueryVariant,
+-    #[values(ram_storage)] other_storage: impl FnOnce(
+-        &std::path::Path,
+-    ) -> AtomicRefCell<VectorStorageEnum>,
++    #[values(ram_storage)] other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
+     #[values(None, product_x4(), scalar_u8(), binary())] quantization_config: Option<
+         WithQuantization,
+     >,
+@@ -346,9 +337,7 @@ fn async_compare_scoring_equivalency(
+         QueryVariant::Context
+     )]
+     query_variant: QueryVariant,
+-    #[values(async_memmap_storage)] other_storage: impl FnOnce(
+-        &std::path::Path,
+-    ) -> AtomicRefCell<VectorStorageEnum>,
++    #[values(async_memmap_storage)] other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
+ ) -> Result<()> {
+     scoring_equivalency(query_variant, other_storage, None)
+ }
+
+commit 38522784b76c5e27dce2e71e8b22defcac68da75
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Jul 18 11:43:56 2024 +0200
+
+    Basic defragmentation (#4610)
+    
+    * sorting
+    
+    * migrate tests and move logic into SegmentBuilder
+    
+    * add test and improve implementation
+    
+    * improve code
+    
+    * review
+    
+    * code review improvements
+    
+    * add index building to test
+    
+    * Do not clone ranges
+    
+    * Resolve clippy warnings due to recent PR on dev
+    
+    * review suggestions
+    
+    * Defragmentation in api (#4684)
+    
+    * add tenant config to api
+    
+    * deduplicate used defragmentation keys
+    
+    * rename is_tenant to is_primary
+    
+    * use all values to defrag key
+    
+    * rename is_primary -> is_tenant
+    
+    * update schema
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index f8040b01b..509bf3a20 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -3,6 +3,7 @@ use std::path::Path;
+ use std::sync::atomic::AtomicBool;
+ use std::{error, result};
+ 
++use common::types::PointOffsetType;
+ use itertools::Itertools;
+ use rand::rngs::StdRng;
+ use rand::seq::IteratorRandom;
+@@ -216,7 +217,13 @@ fn scoring_equivalency(
+ 
+     let mut other_storage = other_storage(other_dir.path());
+ 
+-    other_storage.update_from(&raw_storage, &mut (0..NUM_POINTS as _), &Default::default())?;
++    let mut iter = (0..NUM_POINTS).map(|i| {
++        let i = i as PointOffsetType;
++        let vec = raw_storage.get_vector(i);
++        let deleted = raw_storage.is_deleted_vector(i);
++        (i, vec, deleted)
++    });
++    other_storage.update_from(&mut iter, &Default::default())?;
+ 
+     let quant_dir = tempfile::Builder::new().prefix("quant-storage").tempdir()?;
+     let quantized_vectors = if let Some(config) = &quant_config {
+
+commit 07c278ad51084c98adf9a7093619ffc5a73f87c9
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Mon Jul 22 08:19:19 2024 +0000
+
+    Enable some of the pedantic clippy lints (#4715)
+    
+    * Use workspace lints
+    
+    * Enable lint: manual_let_else
+    
+    * Enable lint: enum_glob_use
+    
+    * Enable lint: filter_map_next
+    
+    * Enable lint: ref_as_ptr
+    
+    * Enable lint: ref_option_ref
+    
+    * Enable lint: manual_is_variant_and
+    
+    * Enable lint: flat_map_option
+    
+    * Enable lint: inefficient_to_string
+    
+    * Enable lint: implicit_clone
+    
+    * Enable lint: inconsistent_struct_constructor
+    
+    * Enable lint: unnecessary_wraps
+    
+    * Enable lint: needless_continue
+    
+    * Enable lint: unused_self
+    
+    * Enable lint: from_iter_instead_of_collect
+    
+    * Enable lint: uninlined_format_args
+    
+    * Enable lint: doc_link_with_quotes
+    
+    * Enable lint: needless_raw_string_hashes
+    
+    * Enable lint: used_underscore_binding
+    
+    * Enable lint: ptr_as_ptr
+    
+    * Enable lint: explicit_into_iter_loop
+    
+    * Enable lint: cast_lossless
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 509bf3a20..2a605cb09 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -125,7 +125,7 @@ fn async_memmap_storage(dir: &std::path::Path) -> VectorStorageEnum {
+     open_memmap_vector_storage_with_async_io(dir, DIMS, DISTANCE, true).unwrap()
+ }
+ 
+-fn scalar_u8() -> Option<WithQuantization> {
++fn scalar_u8() -> WithQuantization {
+     let config = ScalarQuantizationConfig {
+         r#type: crate::types::ScalarType::Int8,
+         quantile: Some(0.5),
+@@ -138,10 +138,10 @@ fn scalar_u8() -> Option<WithQuantization> {
+         Box::new(rng.sample_iter(rand_distr::Normal::new(0.0, 8.0).unwrap()))
+     };
+ 
+-    Some((config, sampler))
++    (config, sampler)
+ }
+ 
+-fn product_x4() -> Option<WithQuantization> {
++fn product_x4() -> WithQuantization {
+     let config = ProductQuantizationConfig {
+         compression: crate::types::CompressionRatio::X4,
+         always_ram: Some(true),
+@@ -153,10 +153,10 @@ fn product_x4() -> Option<WithQuantization> {
+         Box::new(rng.sample_iter(rand::distributions::Standard))
+     };
+ 
+-    Some((config, sampler))
++    (config, sampler)
+ }
+ 
+-fn binary() -> Option<WithQuantization> {
++fn binary() -> WithQuantization {
+     let config = BinaryQuantizationConfig {
+         always_ram: Some(true),
+     }
+@@ -166,11 +166,11 @@ fn binary() -> Option<WithQuantization> {
+         let rng = StdRng::seed_from_u64(SEED);
+         Box::new(
+             rng.sample_iter(rand::distributions::Uniform::new_inclusive(-1.0, 1.0))
+-                .map(|x| x as u8 as f32),
++                .map(|x| f32::from(x as u8)),
+         )
+     };
+ 
+-    Some((config, sampler))
++    (config, sampler)
+ }
+ 
+ enum QueryVariant {
+@@ -279,8 +279,7 @@ fn scoring_equivalency(
+             // both calculations are done on raw vectors, so score should be exactly the same
+             assert_eq!(
+                 raw_scores, other_scores,
+-                "Scorer results are not equal, attempt: {}, query: {:?}",
+-                i, query
++                "Scorer results are not equal, attempt: {i}, query: {query:?}"
+             );
+         } else {
+             // Quantization is used for the other storage, so score should be similar
+@@ -328,9 +327,8 @@ fn compare_scoring_equivalency(
+     )]
+     query_variant: QueryVariant,
+     #[values(ram_storage)] other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
+-    #[values(None, product_x4(), scalar_u8(), binary())] quantization_config: Option<
+-        WithQuantization,
+-    >,
++    #[values(None, Some(product_x4()), Some(scalar_u8()), Some(binary()))]
++    quantization_config: Option<WithQuantization>,
+ ) -> Result<()> {
+     scoring_equivalency(query_variant, other_storage, quantization_config)
+ }
+
+commit 6e48f588a1de3090b2959e1589fc08984634ebe6
+Author: Tim Visée <tim+github@visee.me>
+Date:   Mon Aug 26 20:02:08 2024 +0200
+
+    Fix point deletions on mmap segment optimization (#4952)
+    
+    * Don't use ID but current point offset when optimizing dense mmap storage
+    
+    This change now matches the implementation in all other storage types.
+    
+    * Remove now obsolete point offsets in update_from point iterator
+    
+    * Fix test
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 2a605cb09..f694a1608 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -221,7 +221,7 @@ fn scoring_equivalency(
+         let i = i as PointOffsetType;
+         let vec = raw_storage.get_vector(i);
+         let deleted = raw_storage.is_deleted_vector(i);
+-        (i, vec, deleted)
++        (vec, deleted)
+     });
+     other_storage.update_from(&mut iter, &Default::default())?;
+ 
+
+commit cd8efa8f17a6d6b45e6e8b54638ab6976d740aa5
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Oct 25 09:52:18 2024 +0200
+
+    Hw counter utilization checks (#5288)
+    
+    * Enforce usage of hardware counter values
+    
+    * improve comments
+    
+    * log a warning in release mode
+    
+    * some minor improvements
+    
+    * avoid cloning for hardware counter
+    
+    * fmt
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index f694a1608..dbae8d33a 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -313,6 +313,9 @@ fn scoring_equivalency(
+                 only {intersection} of {top} top results are shared",
+             );
+         }
++
++        raw_scorer.take_hardware_counter().discard_results();
++        other_scorer.take_hardware_counter().discard_results();
+     }
+ 
+     Ok(())
+
+commit 5aee24cc089b0ddedacb80c508e33d40fcea1950
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Tue Dec 10 12:12:36 2024 +0100
+
+    Timeout aware hardware counter (#5555)
+    
+    * Make hardware counting timeout aware
+    
+    * improve test
+    
+    * rebuild everything
+    
+    * fmt
+    
+    * post-rebase fixes
+    
+    * upd tests
+    
+    * fix tests
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index dbae8d33a..9748210ec 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -3,6 +3,7 @@ use std::path::Path;
+ use std::sync::atomic::AtomicBool;
+ use std::{error, result};
+ 
++use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ use itertools::Itertools;
+ use rand::rngs::StdRng;
+@@ -26,7 +27,7 @@ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+ use crate::vector_storage::tests::utils::score;
+ use crate::vector_storage::vector_storage_base::VectorStorage;
+-use crate::vector_storage::{new_raw_scorer, VectorStorageEnum};
++use crate::vector_storage::{new_raw_scorer_for_test, VectorStorageEnum};
+ 
+ const DIMS: usize = 128;
+ const NUM_POINTS: usize = 600;
+@@ -242,7 +243,7 @@ fn scoring_equivalency(
+     for i in 0..attempts {
+         let query = random_query(&query_variant, &mut rng, &mut sampler);
+ 
+-        let raw_scorer = new_raw_scorer(
++        let raw_scorer = new_raw_scorer_for_test(
+             query.clone(),
+             &raw_storage,
+             id_tracker.deleted_point_bitslice(),
+@@ -258,9 +259,10 @@ fn scoring_equivalency(
+                     id_tracker.deleted_point_bitslice(),
+                     other_storage.deleted_vector_bitslice(),
+                     &is_stopped,
++                    HardwareCounterCell::new(),
+                 )
+                 .unwrap(),
+-            None => new_raw_scorer(
++            None => new_raw_scorer_for_test(
+                 query.clone(),
+                 &other_storage,
+                 id_tracker.deleted_point_bitslice(),
+@@ -313,9 +315,6 @@ fn scoring_equivalency(
+                 only {intersection} of {top} top results are shared",
+             );
+         }
+-
+-        raw_scorer.take_hardware_counter().discard_results();
+-        other_scorer.take_hardware_counter().discard_results();
+     }
+ 
+     Ok(())
+
+commit f11032829662bbf68fd2bf3cbd8483152fa92b44
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Tue Jan 28 12:19:11 2025 -0300
+
+    bump and migrate to `rand` 0.9.0 (#5892)
+    
+    * bump and migrate to rand 0.9.0
+    
+    also bump rand_distr to 0.5.0 to match it
+    
+    * Migrate AVX2 and SSE implementations
+    
+    * Remove unused thread_rng placeholders
+    
+    * More random migrations
+    
+    * Migrate GPU tests
+    
+    * bump seed
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 9748210ec..625a2d4bb 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -8,7 +8,7 @@ use common::types::PointOffsetType;
+ use itertools::Itertools;
+ use rand::rngs::StdRng;
+ use rand::seq::IteratorRandom;
+-use rand::{thread_rng, Rng, SeedableRng};
++use rand::{rng, Rng, SeedableRng};
+ use rstest::rstest;
+ 
+ use super::utils::sampler;
+@@ -60,8 +60,8 @@ fn random_reco_query<R: Rng + ?Sized>(
+     rnd: &mut R,
+     sampler: &mut impl Iterator<Item = f32>,
+ ) -> QueryVector {
+-    let num_positives: usize = rnd.gen_range(0..MAX_EXAMPLES);
+-    let num_negatives: usize = rnd.gen_range(1..MAX_EXAMPLES);
++    let num_positives: usize = rnd.random_range(0..MAX_EXAMPLES);
++    let num_negatives: usize = rnd.random_range(1..MAX_EXAMPLES);
+ 
+     let positives = (0..num_positives)
+         .map(|_| sampler.take(DIMS).collect_vec().into())
+@@ -78,7 +78,7 @@ fn random_discovery_query<R: Rng + ?Sized>(
+     rnd: &mut R,
+     sampler: &mut impl Iterator<Item = f32>,
+ ) -> QueryVector {
+-    let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
++    let num_pairs: usize = rnd.random_range(0..MAX_EXAMPLES);
+ 
+     let target = sampler.take(DIMS).collect_vec().into();
+ 
+@@ -97,7 +97,7 @@ fn random_context_query<R: Rng + ?Sized>(
+     rnd: &mut R,
+     sampler: &mut impl Iterator<Item = f32>,
+ ) -> QueryVector {
+-    let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
++    let num_pairs: usize = rnd.random_range(0..MAX_EXAMPLES);
+ 
+     let pairs = (0..num_pairs)
+         .map(|_| {
+@@ -150,8 +150,8 @@ fn product_x4() -> WithQuantization {
+     .into();
+ 
+     let sampler = {
+-        let rng = thread_rng();
+-        Box::new(rng.sample_iter(rand::distributions::Standard))
++        let rng = rng();
++        Box::new(rng.sample_iter(rand::distr::StandardUniform))
+     };
+ 
+     (config, sampler)
+@@ -166,7 +166,7 @@ fn binary() -> WithQuantization {
+     let sampler = {
+         let rng = StdRng::seed_from_u64(SEED);
+         Box::new(
+-            rng.sample_iter(rand::distributions::Uniform::new_inclusive(-1.0, 1.0))
++            rng.sample_iter(rand::distr::Uniform::new_inclusive(-1.0, 1.0).unwrap())
+                 .map(|x| f32::from(x as u8)),
+         )
+     };
+
+commit 8ad2b34265448ec01b89d4093de5fbb1a86dcd4d
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Feb 25 11:21:25 2025 +0100
+
+    Bump Rust edition to 2024 (#6042)
+    
+    * Bump Rust edition to 2024
+    
+    * gen is a reserved keyword now
+    
+    * Remove ref mut on references
+    
+    * Mark extern C as unsafe
+    
+    * Wrap unsafe function bodies in unsafe block
+    
+    * Geo hash implements Copy, don't reference but pass by value instead
+    
+    * Replace secluded self import with parent
+    
+    * Update execute_cluster_read_operation with new match semantics
+    
+    * Fix lifetime issue
+    
+    * Replace map_or with is_none_or
+    
+    * set_var is unsafe now
+    
+    * Reformat
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 625a2d4bb..6dd95ee02 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -8,7 +8,7 @@ use common::types::PointOffsetType;
+ use itertools::Itertools;
+ use rand::rngs::StdRng;
+ use rand::seq::IteratorRandom;
+-use rand::{rng, Rng, SeedableRng};
++use rand::{Rng, SeedableRng, rng};
+ use rstest::rstest;
+ 
+ use super::utils::sampler;
+@@ -27,7 +27,7 @@ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+ use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+ use crate::vector_storage::tests::utils::score;
+ use crate::vector_storage::vector_storage_base::VectorStorage;
+-use crate::vector_storage::{new_raw_scorer_for_test, VectorStorageEnum};
++use crate::vector_storage::{VectorStorageEnum, new_raw_scorer_for_test};
+ 
+ const DIMS: usize = 128;
+ const NUM_POINTS: usize = 600;
+
+commit e114801ebfde19c080a39aa4fada7b50bafd1248
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Thu Apr 3 04:01:39 2025 -0300
+
+    `sum_scores` recommendation strategy (#6256)
+    
+    * Add in rest and grpc
+    
+    * add to QueryEnum
+    
+    * implement Query trait
+    
+    * connect to scorer creation
+    
+    * upd tests
+    
+    * additional changes
+    
+    * fmt
+    
+    * gen openapi and grpc docs
+    
+    * coderabbit fix
+    
+    * add changes in async scorer
+    
+    * test sum_scores in more places, refactor to remove repetition
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index 6dd95ee02..f1d3aa206 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -8,13 +8,14 @@ use common::types::PointOffsetType;
+ use itertools::Itertools;
+ use rand::rngs::StdRng;
+ use rand::seq::IteratorRandom;
+-use rand::{Rng, SeedableRng, rng};
++use rand::{Rng, SeedableRng};
+ use rstest::rstest;
+ 
+ use super::utils::sampler;
+ use crate::common::rocksdb_wrapper;
+ use crate::data_types::vectors::{QueryVector, VectorElementType};
+ use crate::fixtures::payload_context_fixture::FixtureIdTracker;
++use crate::fixtures::query_fixtures::QueryVariant;
+ use crate::id_tracker::id_tracker_base::IdTracker;
+ use crate::types::{
+     BinaryQuantizationConfig, Distance, ProductQuantizationConfig, QuantizationConfig,
+@@ -24,7 +25,6 @@ use crate::types::{
+ use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
+ use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
+ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+-use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+ use crate::vector_storage::tests::utils::score;
+ use crate::vector_storage::vector_storage_base::VectorStorage;
+ use crate::vector_storage::{VectorStorageEnum, new_raw_scorer_for_test};
+@@ -32,82 +32,26 @@ use crate::vector_storage::{VectorStorageEnum, new_raw_scorer_for_test};
+ const DIMS: usize = 128;
+ const NUM_POINTS: usize = 600;
+ const DISTANCE: Distance = Distance::Dot;
+-const MAX_EXAMPLES: usize = 10;
+ const SAMPLE_SIZE: usize = 100;
+ const SEED: u64 = 42;
+ 
+ type Result<T, E = Error> = result::Result<T, E>;
+ type Error = Box<dyn error::Error>;
+ 
+-type WithQuantization = (
+-    QuantizationConfig,
+-    Box<dyn Iterator<Item = VectorElementType>>,
+-);
++type Sampler<'a> = Box<dyn Iterator<Item = VectorElementType> + 'a>;
+ 
+-fn random_query<R: Rng + ?Sized>(
+-    query_variant: &QueryVariant,
+-    rnd: &mut R,
+-    sampler: &mut impl Iterator<Item = f32>,
+-) -> QueryVector {
+-    match query_variant {
+-        QueryVariant::Recommend => random_reco_query(rnd, sampler),
+-        QueryVariant::Discovery => random_discovery_query(rnd, sampler),
+-        QueryVariant::Context => random_context_query(rnd, sampler),
+-    }
+-}
+-
+-fn random_reco_query<R: Rng + ?Sized>(
+-    rnd: &mut R,
+-    sampler: &mut impl Iterator<Item = f32>,
+-) -> QueryVector {
+-    let num_positives: usize = rnd.random_range(0..MAX_EXAMPLES);
+-    let num_negatives: usize = rnd.random_range(1..MAX_EXAMPLES);
+-
+-    let positives = (0..num_positives)
+-        .map(|_| sampler.take(DIMS).collect_vec().into())
+-        .collect_vec();
+-
+-    let negatives = (0..num_negatives)
+-        .map(|_| sampler.take(DIMS).collect_vec().into())
+-        .collect_vec();
+-
+-    RecoQuery::new(positives, negatives).into()
+-}
+-
+-fn random_discovery_query<R: Rng + ?Sized>(
+-    rnd: &mut R,
+-    sampler: &mut impl Iterator<Item = f32>,
+-) -> QueryVector {
+-    let num_pairs: usize = rnd.random_range(0..MAX_EXAMPLES);
+-
+-    let target = sampler.take(DIMS).collect_vec().into();
+-
+-    let pairs = (0..num_pairs)
+-        .map(|_| {
+-            let positive = sampler.take(DIMS).collect_vec().into();
+-            let negative = sampler.take(DIMS).collect_vec().into();
+-            ContextPair { positive, negative }
+-        })
+-        .collect_vec();
++type SamplerGenerator = Box<dyn for<'a> Fn(&'a mut StdRng) -> Sampler<'a>>;
+ 
+-    DiscoveryQuery::new(target, pairs).into()
+-}
++type WithQuantization = (QuantizationConfig, SamplerGenerator);
+ 
+-fn random_context_query<R: Rng + ?Sized>(
+-    rnd: &mut R,
+-    sampler: &mut impl Iterator<Item = f32>,
++fn random_query<R: Rng + ?Sized>(
++    query_variant: &QueryVariant,
++    rng: &mut R,
++    gen_sampler: &dyn Fn(&mut R) -> Sampler,
+ ) -> QueryVector {
+-    let num_pairs: usize = rnd.random_range(0..MAX_EXAMPLES);
+-
+-    let pairs = (0..num_pairs)
+-        .map(|_| {
+-            let positive = sampler.take(DIMS).collect_vec().into();
+-            let negative = sampler.take(DIMS).collect_vec().into();
+-            ContextPair { positive, negative }
+-        })
+-        .collect_vec();
+-
+-    ContextQuery::new(pairs).into()
++    crate::fixtures::query_fixtures::random_query(query_variant, rng, |rng| {
++        gen_sampler(rng).take(DIMS).collect_vec().into()
++    })
+ }
+ 
+ fn ram_storage(dir: &Path) -> VectorStorageEnum {
+@@ -134,10 +78,9 @@ fn scalar_u8() -> WithQuantization {
+     }
+     .into();
+ 
+-    let sampler = {
+-        let rng = StdRng::seed_from_u64(SEED);
+-        Box::new(rng.sample_iter(rand_distr::Normal::new(0.0, 8.0).unwrap()))
+-    };
++    let sampler: SamplerGenerator = Box::new(|rng: &mut StdRng| {
++        Box::new(rng.sample_iter(rand_distr::Normal::new(0.0f32, 8.0).unwrap()))
++    });
+ 
+     (config, sampler)
+ }
+@@ -149,10 +92,8 @@ fn product_x4() -> WithQuantization {
+     }
+     .into();
+ 
+-    let sampler = {
+-        let rng = rng();
+-        Box::new(rng.sample_iter(rand::distr::StandardUniform))
+-    };
++    let sampler: SamplerGenerator =
++        Box::new(|rng: &mut StdRng| Box::new(rng.sample_iter(rand::distr::StandardUniform)));
+ 
+     (config, sampler)
+ }
+@@ -163,23 +104,16 @@ fn binary() -> WithQuantization {
+     }
+     .into();
+ 
+-    let sampler = {
+-        let rng = StdRng::seed_from_u64(SEED);
++    let sampler: SamplerGenerator = Box::new(|rng: &mut StdRng| {
+         Box::new(
+             rng.sample_iter(rand::distr::Uniform::new_inclusive(-1.0, 1.0).unwrap())
+                 .map(|x| f32::from(x as u8)),
+         )
+-    };
++    });
+ 
+     (config, sampler)
+ }
+ 
+-enum QueryVariant {
+-    Recommend,
+-    Discovery,
+-    Context,
+-}
+-
+ fn scoring_equivalency(
+     query_variant: QueryVariant,
+     other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
+@@ -202,9 +136,14 @@ fn scoring_equivalency(
+     )?;
+ 
+     let mut rng = StdRng::seed_from_u64(SEED);
+-    let mut sampler = quant_sampler.unwrap_or(Box::new(sampler(rng.clone())));
++    let gen_sampler = quant_sampler.unwrap_or_else(|| Box::new(|rng| Box::new(sampler(rng))));
+ 
+-    super::utils::insert_distributed_vectors(DIMS, &mut raw_storage, NUM_POINTS, &mut sampler)?;
++    super::utils::insert_distributed_vectors(
++        DIMS,
++        &mut raw_storage,
++        NUM_POINTS,
++        &mut gen_sampler(&mut rng.clone()),
++    )?;
+ 
+     let mut id_tracker = FixtureIdTracker::new(NUM_POINTS);
+     super::utils::delete_random_vectors(
+@@ -241,7 +180,7 @@ fn scoring_equivalency(
+ 
+     let attempts = 50;
+     for i in 0..attempts {
+-        let query = random_query(&query_variant, &mut rng, &mut sampler);
++        let query = random_query(&query_variant, &mut rng, &gen_sampler);
+ 
+         let raw_scorer = new_raw_scorer_for_test(
+             query.clone(),
+@@ -323,7 +262,8 @@ fn scoring_equivalency(
+ #[rstest]
+ fn compare_scoring_equivalency(
+     #[values(
+-        QueryVariant::Recommend,
++        QueryVariant::RecoBestScore,
++        QueryVariant::RecoSumScores,
+         QueryVariant::Discovery,
+         QueryVariant::Context
+     )]
+@@ -339,7 +279,8 @@ fn compare_scoring_equivalency(
+ #[rstest]
+ fn async_compare_scoring_equivalency(
+     #[values(
+-        QueryVariant::Recommend,
++        QueryVariant::RecoBestScore,
++        QueryVariant::RecoSumScores,
+         QueryVariant::Discovery,
+         QueryVariant::Context
+     )]
+
+commit 3d988e66c49c5edf7d3daceea801f30b01303afe
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Wed Apr 9 08:54:42 2025 +0000
+
+    Remove is_stopped from RawScorer  (#6305)
+    
+    * Introduce CancelledError
+    
+    * Remove is_stopped from RawScorer
+
+diff --git a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+index f1d3aa206..987836353 100644
+--- a/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
++++ b/lib/segment/src/vector_storage/tests/custom_query_scorer_equivalency.rs
+@@ -189,15 +189,12 @@ fn scoring_equivalency(
+         )
+         .unwrap();
+ 
+-        let is_stopped = AtomicBool::new(false);
+-
+         let other_scorer = match &quantized_vectors {
+             Some(quantized_storage) => quantized_storage
+                 .raw_scorer(
+                     query.clone(),
+                     id_tracker.deleted_point_bitslice(),
+                     other_storage.deleted_vector_bitslice(),
+-                    &is_stopped,
+                     HardwareCounterCell::new(),
+                 )
+                 .unwrap(),
+

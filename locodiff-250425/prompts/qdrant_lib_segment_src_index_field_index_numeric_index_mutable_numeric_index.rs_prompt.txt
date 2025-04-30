@@ -1,0 +1,2218 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+
+commit a0b156b7cbf39d8de56656250292a872c28163e1
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Tue Oct 3 11:48:42 2023 +0200
+
+    Mutable numeric index (#2653)
+    
+    * mutable numeric index
+    
+    * mutable numeric index
+    
+    * apply changes from dev
+    
+    * fix build
+    
+    * remove obsolete allow
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+new file mode 100644
+index 000000000..8c7dbfc9d
+--- /dev/null
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -0,0 +1,133 @@
++use std::collections::BTreeMap;
++use std::ops::Bound;
++use std::sync::Arc;
++
++use common::types::PointOffsetType;
++use parking_lot::RwLock;
++use rocksdb::DB;
++
++use super::{Encodable, NumericIndex, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
++use crate::common::operation_error::{OperationError, OperationResult};
++use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
++use crate::index::field_index::histogram::{Histogram, Numericable};
++
++pub struct MutableNumericIndex<T: Encodable + Numericable> {
++    pub(super) map: BTreeMap<Vec<u8>, u32>,
++    pub(super) db_wrapper: DatabaseColumnWrapper,
++    pub(super) histogram: Histogram<T>,
++    pub(super) points_count: usize,
++    pub(super) max_values_per_point: usize,
++    pub(super) point_to_values: Vec<Vec<T>>,
++}
++
++impl<T: Encodable + Numericable> MutableNumericIndex<T> {
++    pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
++        let store_cf_name = NumericIndex::<T>::storage_cf_name(field);
++        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
++        Self {
++            map: BTreeMap::new(),
++            db_wrapper,
++            histogram: Histogram::new(HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION),
++            points_count: 0,
++            max_values_per_point: 1,
++            point_to_values: Default::default(),
++        }
++    }
++
++    pub fn get_db_wrapper(&self) -> &DatabaseColumnWrapper {
++        &self.db_wrapper
++    }
++
++    pub fn get_values(&self, idx: PointOffsetType) -> Option<&Vec<T>> {
++        self.point_to_values.get(idx as usize)
++    }
++
++    pub fn get_values_count(&self) -> usize {
++        self.map.len()
++    }
++
++    pub fn values_range(
++        &self,
++        start_bound: Bound<Vec<u8>>,
++        end_bound: Bound<Vec<u8>>,
++    ) -> impl Iterator<Item = PointOffsetType> + '_ {
++        self.map.range((start_bound, end_bound)).map(|(_, v)| *v)
++    }
++
++    fn add_value(&mut self, id: PointOffsetType, value: T) -> OperationResult<()> {
++        let key = value.encode_key(id);
++        self.db_wrapper.put(&key, id.to_be_bytes())?;
++        NumericIndex::<T>::add_to_map(&mut self.map, &mut self.histogram, key, id);
++        Ok(())
++    }
++
++    pub fn add_many_to_list(
++        &mut self,
++        idx: PointOffsetType,
++        values: impl IntoIterator<Item = T>,
++    ) -> OperationResult<()> {
++        if self.point_to_values.len() <= idx as usize {
++            self.point_to_values.resize(idx as usize + 1, Vec::new())
++        }
++        let values: Vec<T> = values.into_iter().collect();
++        for value in &values {
++            self.add_value(idx, *value)?;
++        }
++        if !values.is_empty() {
++            self.points_count += 1;
++            self.max_values_per_point = self.max_values_per_point.max(values.len());
++        }
++        self.point_to_values[idx as usize] = values;
++        Ok(())
++    }
++
++    pub fn load(&mut self) -> OperationResult<bool> {
++        if !self.db_wrapper.has_column_family()? {
++            return Ok(false);
++        };
++
++        for (key, value) in self.db_wrapper.lock_db().iter()? {
++            let value_idx = u32::from_be_bytes(value.as_ref().try_into().unwrap());
++            let (idx, value) = T::decode_key(&key);
++
++            if idx != value_idx {
++                return Err(OperationError::service_error("incorrect key value"));
++            }
++
++            if self.point_to_values.len() <= idx as usize {
++                self.point_to_values.resize(idx as usize + 1, Vec::new())
++            }
++
++            self.point_to_values[idx as usize].push(value);
++
++            NumericIndex::<T>::add_to_map(&mut self.map, &mut self.histogram, key.to_vec(), idx);
++        }
++        for values in &self.point_to_values {
++            if !values.is_empty() {
++                self.points_count += 1;
++                self.max_values_per_point = self.max_values_per_point.max(values.len());
++            }
++        }
++        Ok(true)
++    }
++
++    pub fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
++        if self.point_to_values.len() <= idx as usize {
++            return Ok(());
++        }
++
++        let removed_values = std::mem::take(&mut self.point_to_values[idx as usize]);
++
++        for value in &removed_values {
++            let key = value.encode_key(idx);
++            self.db_wrapper.remove(&key)?;
++            NumericIndex::<T>::remove_from_map(&mut self.map, &mut self.histogram, key);
++        }
++
++        if !removed_values.is_empty() {
++            self.points_count -= 1;
++        }
++
++        Ok(())
++    }
++}
+
+commit b8cba0fc5bb743eddeea4a10072e79e305255fa6
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Thu Oct 5 14:12:23 2023 +0200
+
+    Immutable numeric index (#2666)
+    
+    * immutable numeric index
+    
+    * avoid Vec<u8> encoding
+    
+    * test inf float
+    
+    * rename test
+    
+    * fix nan case for float payload index
+    
+    * are you happy fmt
+    
+    * set of numeric pair as separate struct
+    
+    * fix build
+    
+    * are you happy clippy
+    
+    * more tests
+    
+    * remove from histogram
+    
+    * review fixes
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 8c7dbfc9d..881f1c465 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -1,5 +1,6 @@
+ use std::collections::BTreeMap;
+ use std::ops::Bound;
++use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+ 
+ use common::types::PointOffsetType;
+@@ -9,10 +10,10 @@ use rocksdb::DB;
+ use super::{Encodable, NumericIndex, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+-use crate::index::field_index::histogram::{Histogram, Numericable};
++use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+ 
+ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+-    pub(super) map: BTreeMap<Vec<u8>, u32>,
++    pub(super) map: BTreeMap<Vec<u8>, PointOffsetType>,
+     pub(super) db_wrapper: DatabaseColumnWrapper,
+     pub(super) histogram: Histogram<T>,
+     pub(super) points_count: usize,
+@@ -38,8 +39,8 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+         &self.db_wrapper
+     }
+ 
+-    pub fn get_values(&self, idx: PointOffsetType) -> Option<&Vec<T>> {
+-        self.point_to_values.get(idx as usize)
++    pub fn get_values(&self, idx: PointOffsetType) -> Option<&[T]> {
++        self.point_to_values.get(idx as usize).map(|v| v.as_slice())
+     }
+ 
+     pub fn get_values_count(&self) -> usize {
+@@ -57,7 +58,7 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+     fn add_value(&mut self, id: PointOffsetType, value: T) -> OperationResult<()> {
+         let key = value.encode_key(id);
+         self.db_wrapper.put(&key, id.to_be_bytes())?;
+-        NumericIndex::<T>::add_to_map(&mut self.map, &mut self.histogram, key, id);
++        Self::add_to_map(&mut self.map, &mut self.histogram, key, id);
+         Ok(())
+     }
+ 
+@@ -100,7 +101,7 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+ 
+             self.point_to_values[idx as usize].push(value);
+ 
+-            NumericIndex::<T>::add_to_map(&mut self.map, &mut self.histogram, key.to_vec(), idx);
++            Self::add_to_map(&mut self.map, &mut self.histogram, key.to_vec(), idx);
+         }
+         for values in &self.point_to_values {
+             if !values.is_empty() {
+@@ -121,7 +122,7 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+         for value in &removed_values {
+             let key = value.encode_key(idx);
+             self.db_wrapper.remove(&key)?;
+-            NumericIndex::<T>::remove_from_map(&mut self.map, &mut self.histogram, key);
++            Self::remove_from_map(&mut self.map, &mut self.histogram, key);
+         }
+ 
+         if !removed_values.is_empty() {
+@@ -130,4 +131,66 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+ 
+         Ok(())
+     }
++
++    fn add_to_map(
++        map: &mut BTreeMap<Vec<u8>, PointOffsetType>,
++        histogram: &mut Histogram<T>,
++        key: Vec<u8>,
++        id: PointOffsetType,
++    ) {
++        let existed_value = map.insert(key.clone(), id);
++        // Histogram works with unique values (idx + value) only, so we need to
++        // make sure that we don't add the same value twice.
++        // key is a combination of value + idx, so we can use it to ensure than the pair is unique
++        if existed_value.is_none() {
++            histogram.insert(
++                Self::key_to_histogram_point(&key),
++                |x| Self::get_histogram_left_neighbor(map, x),
++                |x| Self::get_histogram_right_neighbor(map, x),
++            );
++        }
++    }
++
++    fn remove_from_map(
++        map: &mut BTreeMap<Vec<u8>, PointOffsetType>,
++        histogram: &mut Histogram<T>,
++        key: Vec<u8>,
++    ) {
++        let existed_val = map.remove(&key);
++        if existed_val.is_some() {
++            histogram.remove(
++                &Self::key_to_histogram_point(&key),
++                |x| Self::get_histogram_left_neighbor(map, x),
++                |x| Self::get_histogram_right_neighbor(map, x),
++            );
++        }
++    }
++
++    fn key_to_histogram_point(key: &[u8]) -> Point<T> {
++        let (decoded_idx, decoded_val) = T::decode_key(key);
++        Point {
++            val: decoded_val,
++            idx: decoded_idx as usize,
++        }
++    }
++
++    fn get_histogram_left_neighbor(
++        map: &BTreeMap<Vec<u8>, PointOffsetType>,
++        point: &Point<T>,
++    ) -> Option<Point<T>> {
++        let key = point.val.encode_key(point.idx as PointOffsetType);
++        map.range((Unbounded, Excluded(key)))
++            .next_back()
++            .map(|(key, _)| Self::key_to_histogram_point(key))
++    }
++
++    fn get_histogram_right_neighbor(
++        map: &BTreeMap<Vec<u8>, PointOffsetType>,
++        point: &Point<T>,
++    ) -> Option<Point<T>> {
++        let key = point.val.encode_key(point.idx as PointOffsetType);
++        map.range((Excluded(key), Unbounded))
++            .next()
++            .map(|(key, _)| Self::key_to_histogram_point(key))
++    }
+ }
+
+commit 0d0f8459d77913fcde705307a75314d045419d06
+Author: Tim Visée <tim+github@visee.me>
+Date:   Fri Nov 10 09:42:14 2023 +0100
+
+    Some micro optimizations in reserve/resize usage (#2967)
+    
+    * In HNSW graph layer building, infer right capacity on collect
+    
+    * Resize with empty vector, use constant function rather than clone
+    
+    * Use resize_with in other places as well
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 881f1c465..d4bb9aaca 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -68,7 +68,7 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+         values: impl IntoIterator<Item = T>,
+     ) -> OperationResult<()> {
+         if self.point_to_values.len() <= idx as usize {
+-            self.point_to_values.resize(idx as usize + 1, Vec::new())
++            self.point_to_values.resize_with(idx as usize + 1, Vec::new)
+         }
+         let values: Vec<T> = values.into_iter().collect();
+         for value in &values {
+@@ -96,7 +96,7 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+             }
+ 
+             if self.point_to_values.len() <= idx as usize {
+-                self.point_to_values.resize(idx as usize + 1, Vec::new())
++                self.point_to_values.resize_with(idx as usize + 1, Vec::new)
+             }
+ 
+             self.point_to_values[idx as usize].push(value);
+
+commit 5ebfdb05b35c1441e5f743b754f513daf7acda6b
+Author: Tim Visée <tim+github@visee.me>
+Date:   Fri Nov 24 16:18:34 2023 +0100
+
+    Default `max_values_per_point` to zero, add tests (#3039)
+    
+    * Prevent another division by zero in geo index
+    
+    * Set default `max_values_per_point` to zero
+    
+    * Extend empty cardinality test
+    
+    * Add unit tests for empty index types with cardinality
+    
+    * Shortcut cardinality estimation, zero if no values per point
+    
+    * Use const functions for cardinality type
+    
+    * Remove redundant checked division, we do a rhs zero check above
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index d4bb9aaca..b4f67f297 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -30,7 +30,7 @@ impl<T: Encodable + Numericable> MutableNumericIndex<T> {
+             db_wrapper,
+             histogram: Histogram::new(HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION),
+             points_count: 0,
+-            max_values_per_point: 1,
++            max_values_per_point: 0,
+             point_to_values: Default::default(),
+         }
+     }
+
+commit f6b081d96774f52bfa94788cf97dff6a297d1caf
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Thu Jan 25 17:56:16 2024 +0100
+
+    Filed index point-to-values as separate struct (#3296)
+    
+    * filed index point to values as separate struct
+    
+    * numeric index
+    
+    * return removed values
+    
+    * add comments
+    
+    * codespell
+    
+    * add unit test
+    
+    * fix counters
+    
+    * review remarks
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index b4f67f297..20550d9b5 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -21,7 +21,7 @@ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+     pub(super) point_to_values: Vec<Vec<T>>,
+ }
+ 
+-impl<T: Encodable + Numericable> MutableNumericIndex<T> {
++impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
+         let store_cf_name = NumericIndex::<T>::storage_cf_name(field);
+         let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
+
+commit 320b7f2621f08d08fa6fbd1e8f82a277610af81c
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Sun Feb 4 14:46:22 2024 -0300
+
+    `order_by` in scroll (#3493)
+    
+    * first PR implementation (#2865)
+    
+    - fetch offset id
+    - restructure tests
+    - only let order_by with numeric
+    - introduce order_by interface
+    
+    cargo fmt
+    
+    update openapi
+    
+    calculate range to fetch using offset + limit, do some cleanup
+    
+    enable index validation, fix test
+    
+    Fix pagination
+    
+    add e2e tests
+    
+    make test a little more strict
+    
+    select numeric index on read_ordered_filtered
+    
+    add filtering test 🫨
+    
+    fix filtering on order-by
+    
+    fix pip requirements
+    
+    add grpc interface, make read_ordered_filtered fallible
+    
+    fmt
+    
+    small optimization of `with_payload` and `with_vector`
+    
+    refactor common logic of point_ops and local_shard_operations
+    
+    Make filtering test harder and fix limit for worst case
+    
+    update openapi
+    
+    small clarity refactor
+    
+    avoid extra allocation when sorting with offset
+    
+    stream from numeric index btree instead of calculating range
+    
+    use payload to store order-by value, instead of modifying Record interface
+    
+    various fixes:
+    - fix ordering at collection level, when merging shard results
+    - fix offset at segment level, to take into account also value offset
+    - make rust tests pass
+    
+    remove unused histogram changes
+    
+    fix error messages and make has_range_index exhaustive
+    
+    remove unused From impl
+    
+    Move OrderBy and Direction to segment::data_types::order_by
+    
+    Refactor normal scroll_by in local_shard_operations.rs
+    
+    More cleanup + rename OrderableRead to StreamWithValue
+    
+    empty commit
+    
+    optimization for merging results from shards and segments
+    
+    fix case of multi-valued fields
+    
+    fix IntegerIndexParams name after rebase
+    
+    precompute offset key
+    
+    use extracted `read_by_id_stream`
+    
+    Expose value_offset to user
+    - rename offset -> value_offset
+    - extract offset value fetching logic
+    
+    * remove offset functionality when using order_by
+    
+    * include order_by in ForwardProxyShard
+    
+    * extra nits
+    
+    * remove histogram changes
+    
+    * more nits
+    
+    * self review
+    
+    * resolve conflicts after rebase, not enable order-by with datetime index schema
+    
+    * make grpc start_from value extendable
+    
+    * gen grpc docs
+    
+    ---------
+    
+    Co-authored-by: kwkr <kawka.maciej.93@gmail.com>
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 20550d9b5..368700859 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -55,6 +55,19 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         self.map.range((start_bound, end_bound)).map(|(_, v)| *v)
+     }
+ 
++    pub fn orderable_values_range(
++        &self,
++        start_bound: Bound<Vec<u8>>,
++        end_bound: Bound<Vec<u8>>,
++    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
++        self.map
++            .range((start_bound, end_bound))
++            .map(|(encoded, idx)| {
++                let (_idx, value) = T::decode_key(encoded);
++                (value, *idx)
++            })
++    }
++
+     fn add_value(&mut self, id: PointOffsetType, value: T) -> OperationResult<()> {
+         let key = value.encode_key(id);
+         self.db_wrapper.put(&key, id.to_be_bytes())?;
+
+commit d0a5349f788494d9c88e1f6b33cd740ef6103ec4
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Jul 11 14:48:11 2024 +0200
+
+    Ensure payload is deleted on flush only (#4653)
+    
+    * Use DatabaseColumnScheduledDeleteWrapper to make sure we only delete payload and indexed payload when flushed at the right time
+    
+    * Remove double clone
+    
+    * In on disk payload storage, don't return payload if delete is pending
+    
+    * hide deleted_pending_persistence inside the abstraction
+    
+    * Add RocksDB column operator filtering pending deletes
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 368700859..cc74e6cc7 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -9,12 +9,13 @@ use rocksdb::DB;
+ 
+ use super::{Encodable, NumericIndex, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
+ use crate::common::operation_error::{OperationError, OperationResult};
++use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+ 
+ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+     pub(super) map: BTreeMap<Vec<u8>, PointOffsetType>,
+-    pub(super) db_wrapper: DatabaseColumnWrapper,
++    pub(super) db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+     pub(super) histogram: Histogram<T>,
+     pub(super) points_count: usize,
+     pub(super) max_values_per_point: usize,
+@@ -24,7 +25,10 @@ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
+         let store_cf_name = NumericIndex::<T>::storage_cf_name(field);
+-        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
++        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
++            db,
++            &store_cf_name,
++        ));
+         Self {
+             map: BTreeMap::new(),
+             db_wrapper,
+@@ -35,7 +39,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         }
+     }
+ 
+-    pub fn get_db_wrapper(&self) -> &DatabaseColumnWrapper {
++    pub fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
+         &self.db_wrapper
+     }
+ 
+@@ -100,7 +104,10 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             return Ok(false);
+         };
+ 
+-        for (key, value) in self.db_wrapper.lock_db().iter()? {
++        let db_lock = self.db_wrapper.lock_db();
++        let pending_deletes = self.db_wrapper.pending_deletes();
++
++        for (key, value) in db_lock.iter_pending_deletes(pending_deletes)? {
+             let value_idx = u32::from_be_bytes(value.as_ref().try_into().unwrap());
+             let (idx, value) = T::decode_key(&key);
+ 
+
+commit c7d25b2096ae9c51d38ecd4476fe7581fbc1eb8d
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Fri Jul 12 11:37:20 2024 +0200
+
+    Field index values as iterator instead of slice (#4644)
+    
+    * field index values as iterator instead of slice
+    
+    * Use consistent assertions
+    
+    * fix wrong values_count update
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index cc74e6cc7..3a1e8a153 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -43,11 +43,19 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         &self.db_wrapper
+     }
+ 
+-    pub fn get_values(&self, idx: PointOffsetType) -> Option<&[T]> {
+-        self.point_to_values.get(idx as usize).map(|v| v.as_slice())
++    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
++        Some(Box::new(
++            self.point_to_values
++                .get(idx as usize)
++                .map(|v| v.iter().cloned())?,
++        ))
+     }
+ 
+-    pub fn get_values_count(&self) -> usize {
++    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
++        self.point_to_values.get(idx as usize).map(Vec::len)
++    }
++
++    pub fn total_unique_values_count(&self) -> usize {
+         self.map.len()
+     }
+ 
+
+commit b50521c4aff51a6b59f7d672412cd4900983d26e
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Fri Jul 12 11:11:51 2024 +0000
+
+    Introduce iterator for DatabaseColumnScheduledDeleteWrapper (#4662)
+    
+    * Revert "Add RocksDB column operator filtering pending deletes"
+    
+    This reverts commit dc074ee7ffbf2285807cf70ecbe9290fa24c6c99.
+    
+    * Restore Arc after reverting
+    
+    * Introduce iterator for DatabaseColumnScheduledDeleteWrapper
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 3a1e8a153..c6c70f0b5 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -112,10 +112,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             return Ok(false);
+         };
+ 
+-        let db_lock = self.db_wrapper.lock_db();
+-        let pending_deletes = self.db_wrapper.pending_deletes();
+-
+-        for (key, value) in db_lock.iter_pending_deletes(pending_deletes)? {
++        for (key, value) in self.db_wrapper.lock_db().iter()? {
+             let value_idx = u32::from_be_bytes(value.as_ref().try_into().unwrap());
+             let (idx, value) = T::decode_key(&key);
+ 
+
+commit a0f9cafb56f778a9981474380f9c8a158ea183bd
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Mon Jul 15 17:08:16 2024 +0200
+
+    Remove dyn iterator from field condition checker (#4665)
+    
+    * remove dyn iterator from field condition checker
+    
+    * are you happy clippy
+    
+    * review remarks
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index c6c70f0b5..5d2ecc555 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -43,6 +43,13 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         &self.db_wrapper
+     }
+ 
++    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
++        self.point_to_values
++            .get(idx as usize)
++            .map(|values| values.iter().any(check_fn))
++            .unwrap_or(false)
++    }
++
+     pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
+         Some(Box::new(
+             self.point_to_values
+
+commit 38a8a01b244c26c18e3efe0eeb449f6e37566d83
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Fri Jul 19 12:57:25 2024 +0000
+
+    Make ValueIndexer trait non-generic (#4690)
+    
+    * Introduce NumericIndexInner
+    
+    * Make ValueIndexer trait non-generic
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 5d2ecc555..10b4b2b3a 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -7,7 +7,7 @@ use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ 
+-use super::{Encodable, NumericIndex, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
++use super::{Encodable, NumericIndexInner, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+@@ -24,7 +24,7 @@ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+ 
+ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
+-        let store_cf_name = NumericIndex::<T>::storage_cf_name(field);
++        let store_cf_name = NumericIndexInner::<T>::storage_cf_name(field);
+         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+             db,
+             &store_cf_name,
+
+commit 80aee3cceac7254964cf644521bc47d55ea49d6d
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Wed Jul 24 14:09:39 2024 +0200
+
+    Remove NumericIndexKey and use histogram point (#4743)
+    
+    * Remove NumericIndexKey and use histogram point
+    
+    * use old ordering
+    
+    * fix ci
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 10b4b2b3a..2f6bba664 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -202,7 +202,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         let (decoded_idx, decoded_val) = T::decode_key(key);
+         Point {
+             val: decoded_val,
+-            idx: decoded_idx as usize,
++            idx: decoded_idx,
+         }
+     }
+ 
+
+commit 84f3df4f654dd7deea94ef245a5a63ddd2c4e55b
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Wed Jul 24 15:53:14 2024 +0200
+
+    remove vec u8 from mutable numeric index (#4744)
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 2f6bba664..d8b3e470f 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -1,4 +1,4 @@
+-use std::collections::BTreeMap;
++use std::collections::BTreeSet;
+ use std::ops::Bound;
+ use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+@@ -14,7 +14,7 @@ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+ 
+ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+-    pub(super) map: BTreeMap<Vec<u8>, PointOffsetType>,
++    pub(super) map: BTreeSet<Point<T>>,
+     pub(super) db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+     pub(super) histogram: Histogram<T>,
+     pub(super) points_count: usize,
+@@ -30,7 +30,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             &store_cf_name,
+         ));
+         Self {
+-            map: BTreeMap::new(),
++            map: BTreeSet::new(),
+             db_wrapper,
+             histogram: Histogram::new(HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION),
+             points_count: 0,
+@@ -68,29 +68,28 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+ 
+     pub fn values_range(
+         &self,
+-        start_bound: Bound<Vec<u8>>,
+-        end_bound: Bound<Vec<u8>>,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
+     ) -> impl Iterator<Item = PointOffsetType> + '_ {
+-        self.map.range((start_bound, end_bound)).map(|(_, v)| *v)
++        self.map
++            .range((start_bound, end_bound))
++            .map(|point| point.idx)
+     }
+ 
+     pub fn orderable_values_range(
+         &self,
+-        start_bound: Bound<Vec<u8>>,
+-        end_bound: Bound<Vec<u8>>,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
+     ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
+         self.map
+             .range((start_bound, end_bound))
+-            .map(|(encoded, idx)| {
+-                let (_idx, value) = T::decode_key(encoded);
+-                (value, *idx)
+-            })
++            .map(|point| (point.val, point.idx))
+     }
+ 
+     fn add_value(&mut self, id: PointOffsetType, value: T) -> OperationResult<()> {
+         let key = value.encode_key(id);
+-        self.db_wrapper.put(&key, id.to_be_bytes())?;
+-        Self::add_to_map(&mut self.map, &mut self.histogram, key, id);
++        self.db_wrapper.put(key, id.to_be_bytes())?;
++        Self::add_to_map(&mut self.map, &mut self.histogram, Point::new(value, id));
+         Ok(())
+     }
+ 
+@@ -133,7 +132,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+ 
+             self.point_to_values[idx as usize].push(value);
+ 
+-            Self::add_to_map(&mut self.map, &mut self.histogram, key.to_vec(), idx);
++            Self::add_to_map(&mut self.map, &mut self.histogram, Point::new(value, idx));
+         }
+         for values in &self.point_to_values {
+             if !values.is_empty() {
+@@ -154,7 +153,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         for value in &removed_values {
+             let key = value.encode_key(idx);
+             self.db_wrapper.remove(&key)?;
+-            Self::remove_from_map(&mut self.map, &mut self.histogram, key);
++            Self::remove_from_map(&mut self.map, &mut self.histogram, Point::new(*value, idx));
+         }
+ 
+         if !removed_values.is_empty() {
+@@ -164,65 +163,36 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         Ok(())
+     }
+ 
+-    fn add_to_map(
+-        map: &mut BTreeMap<Vec<u8>, PointOffsetType>,
+-        histogram: &mut Histogram<T>,
+-        key: Vec<u8>,
+-        id: PointOffsetType,
+-    ) {
+-        let existed_value = map.insert(key.clone(), id);
++    fn add_to_map(map: &mut BTreeSet<Point<T>>, histogram: &mut Histogram<T>, key: Point<T>) {
++        let was_added = map.insert(key.clone());
+         // Histogram works with unique values (idx + value) only, so we need to
+         // make sure that we don't add the same value twice.
+         // key is a combination of value + idx, so we can use it to ensure than the pair is unique
+-        if existed_value.is_none() {
++        if was_added {
+             histogram.insert(
+-                Self::key_to_histogram_point(&key),
+-                |x| Self::get_histogram_left_neighbor(map, x),
+-                |x| Self::get_histogram_right_neighbor(map, x),
++                key,
++                |x| Self::get_histogram_left_neighbor(map, x.clone()),
++                |x| Self::get_histogram_right_neighbor(map, x.clone()),
+             );
+         }
+     }
+ 
+-    fn remove_from_map(
+-        map: &mut BTreeMap<Vec<u8>, PointOffsetType>,
+-        histogram: &mut Histogram<T>,
+-        key: Vec<u8>,
+-    ) {
+-        let existed_val = map.remove(&key);
+-        if existed_val.is_some() {
++    fn remove_from_map(map: &mut BTreeSet<Point<T>>, histogram: &mut Histogram<T>, key: Point<T>) {
++        let was_removed = map.remove(&key);
++        if was_removed {
+             histogram.remove(
+-                &Self::key_to_histogram_point(&key),
+-                |x| Self::get_histogram_left_neighbor(map, x),
+-                |x| Self::get_histogram_right_neighbor(map, x),
++                &key,
++                |x| Self::get_histogram_left_neighbor(map, x.clone()),
++                |x| Self::get_histogram_right_neighbor(map, x.clone()),
+             );
+         }
+     }
+ 
+-    fn key_to_histogram_point(key: &[u8]) -> Point<T> {
+-        let (decoded_idx, decoded_val) = T::decode_key(key);
+-        Point {
+-            val: decoded_val,
+-            idx: decoded_idx,
+-        }
++    fn get_histogram_left_neighbor(map: &BTreeSet<Point<T>>, key: Point<T>) -> Option<Point<T>> {
++        map.range((Unbounded, Excluded(key))).next_back().cloned()
+     }
+ 
+-    fn get_histogram_left_neighbor(
+-        map: &BTreeMap<Vec<u8>, PointOffsetType>,
+-        point: &Point<T>,
+-    ) -> Option<Point<T>> {
+-        let key = point.val.encode_key(point.idx as PointOffsetType);
+-        map.range((Unbounded, Excluded(key)))
+-            .next_back()
+-            .map(|(key, _)| Self::key_to_histogram_point(key))
+-    }
+-
+-    fn get_histogram_right_neighbor(
+-        map: &BTreeMap<Vec<u8>, PointOffsetType>,
+-        point: &Point<T>,
+-    ) -> Option<Point<T>> {
+-        let key = point.val.encode_key(point.idx as PointOffsetType);
+-        map.range((Excluded(key), Unbounded))
+-            .next()
+-            .map(|(key, _)| Self::key_to_histogram_point(key))
++    fn get_histogram_right_neighbor(map: &BTreeSet<Point<T>>, key: Point<T>) -> Option<Point<T>> {
++        map.range((Excluded(key), Unbounded)).next().cloned()
+     }
+ }
+
+commit 22a072474587f9d340d700b0e178a45f9310d092
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Thu Jul 25 00:04:58 2024 +0200
+
+    Dynamic numeric index without persistence (#4745)
+    
+    * dynamic numeric index without persistence
+    
+    * review remarks
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index d8b3e470f..53b15f976 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -4,6 +4,7 @@ use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+ 
+ use common::types::PointOffsetType;
++use delegate::delegate;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ 
+@@ -14,33 +15,57 @@ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+ use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+ 
+ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+-    pub(super) map: BTreeSet<Point<T>>,
+-    pub(super) db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+-    pub(super) histogram: Histogram<T>,
+-    pub(super) points_count: usize,
+-    pub(super) max_values_per_point: usize,
+-    pub(super) point_to_values: Vec<Vec<T>>,
++    db_wrapper: DatabaseColumnScheduledDeleteWrapper,
++    dynamic_index: DynamicNumericIndex<T>,
+ }
+ 
+-impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+-    pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
+-        let store_cf_name = NumericIndexInner::<T>::storage_cf_name(field);
+-        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+-            db,
+-            &store_cf_name,
+-        ));
++// Numeric Index with insertions and deletions without persistence
++pub struct DynamicNumericIndex<T: Encodable + Numericable> {
++    pub map: BTreeSet<Point<T>>,
++    pub histogram: Histogram<T>,
++    pub points_count: usize,
++    pub max_values_per_point: usize,
++    pub point_to_values: Vec<Vec<T>>,
++}
++
++impl<T: Encodable + Numericable> Default for DynamicNumericIndex<T> {
++    fn default() -> Self {
+         Self {
+             map: BTreeSet::new(),
+-            db_wrapper,
+             histogram: Histogram::new(HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION),
+             points_count: 0,
+             max_values_per_point: 0,
+             point_to_values: Default::default(),
+         }
+     }
++}
+ 
+-    pub fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
+-        &self.db_wrapper
++impl<T: Encodable + Numericable + Default> DynamicNumericIndex<T> {
++    pub fn from_iter(
++        iter: impl Iterator<Item = OperationResult<(PointOffsetType, T)>>,
++    ) -> OperationResult<Self> {
++        let mut index = DynamicNumericIndex::default();
++        for pair in iter {
++            let (idx, value) = pair?;
++
++            if index.point_to_values.len() <= idx as usize {
++                index
++                    .point_to_values
++                    .resize_with(idx as usize + 1, Vec::new)
++            }
++
++            index.point_to_values[idx as usize].push(value);
++
++            let key = Point::new(value, idx);
++            DynamicNumericIndex::add_to_map(&mut index.map, &mut index.histogram, key);
++        }
++        for values in &index.point_to_values {
++            if !values.is_empty() {
++                index.points_count += 1;
++                index.max_values_per_point = index.max_values_per_point.max(values.len());
++            }
++        }
++        Ok(index)
+     }
+ 
+     pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+@@ -86,81 +111,32 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             .map(|point| (point.val, point.idx))
+     }
+ 
+-    fn add_value(&mut self, id: PointOffsetType, value: T) -> OperationResult<()> {
+-        let key = value.encode_key(id);
+-        self.db_wrapper.put(key, id.to_be_bytes())?;
+-        Self::add_to_map(&mut self.map, &mut self.histogram, Point::new(value, id));
+-        Ok(())
+-    }
+-
+-    pub fn add_many_to_list(
+-        &mut self,
+-        idx: PointOffsetType,
+-        values: impl IntoIterator<Item = T>,
+-    ) -> OperationResult<()> {
++    pub fn add_many_to_list(&mut self, idx: PointOffsetType, values: Vec<T>) {
+         if self.point_to_values.len() <= idx as usize {
+             self.point_to_values.resize_with(idx as usize + 1, Vec::new)
+         }
+-        let values: Vec<T> = values.into_iter().collect();
+         for value in &values {
+-            self.add_value(idx, *value)?;
++            let key = Point::new(*value, idx);
++            Self::add_to_map(&mut self.map, &mut self.histogram, key);
+         }
+         if !values.is_empty() {
+             self.points_count += 1;
+             self.max_values_per_point = self.max_values_per_point.max(values.len());
+         }
+         self.point_to_values[idx as usize] = values;
+-        Ok(())
+     }
+ 
+-    pub fn load(&mut self) -> OperationResult<bool> {
+-        if !self.db_wrapper.has_column_family()? {
+-            return Ok(false);
+-        };
+-
+-        for (key, value) in self.db_wrapper.lock_db().iter()? {
+-            let value_idx = u32::from_be_bytes(value.as_ref().try_into().unwrap());
+-            let (idx, value) = T::decode_key(&key);
+-
+-            if idx != value_idx {
+-                return Err(OperationError::service_error("incorrect key value"));
+-            }
+-
+-            if self.point_to_values.len() <= idx as usize {
+-                self.point_to_values.resize_with(idx as usize + 1, Vec::new)
+-            }
+-
+-            self.point_to_values[idx as usize].push(value);
+-
+-            Self::add_to_map(&mut self.map, &mut self.histogram, Point::new(value, idx));
+-        }
+-        for values in &self.point_to_values {
++    pub fn remove_point(&mut self, idx: PointOffsetType) {
++        if let Some(values) = self.point_to_values.get_mut(idx as usize) {
+             if !values.is_empty() {
+-                self.points_count += 1;
+-                self.max_values_per_point = self.max_values_per_point.max(values.len());
++                self.points_count = self.points_count.checked_sub(1).unwrap_or_default();
+             }
++            for value in values.iter() {
++                let key = Point::new(*value, idx);
++                Self::remove_from_map(&mut self.map, &mut self.histogram, key);
++            }
++            *values = Default::default();
+         }
+-        Ok(true)
+-    }
+-
+-    pub fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
+-        if self.point_to_values.len() <= idx as usize {
+-            return Ok(());
+-        }
+-
+-        let removed_values = std::mem::take(&mut self.point_to_values[idx as usize]);
+-
+-        for value in &removed_values {
+-            let key = value.encode_key(idx);
+-            self.db_wrapper.remove(&key)?;
+-            Self::remove_from_map(&mut self.map, &mut self.histogram, Point::new(*value, idx));
+-        }
+-
+-        if !removed_values.is_empty() {
+-            self.points_count -= 1;
+-        }
+-
+-        Ok(())
+     }
+ 
+     fn add_to_map(map: &mut BTreeSet<Point<T>>, histogram: &mut Histogram<T>, key: Point<T>) {
+@@ -195,4 +171,118 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     fn get_histogram_right_neighbor(map: &BTreeSet<Point<T>>, key: Point<T>) -> Option<Point<T>> {
+         map.range((Excluded(key), Unbounded)).next().cloned()
+     }
++
++    pub fn get_histogram(&self) -> &Histogram<T> {
++        &self.histogram
++    }
++
++    pub fn get_points_count(&self) -> usize {
++        self.points_count
++    }
++
++    pub fn get_max_values_per_point(&self) -> usize {
++        self.max_values_per_point
++    }
++}
++
++impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
++    pub fn new_from_db_wrapper(db_wrapper: DatabaseColumnScheduledDeleteWrapper) -> Self {
++        Self {
++            db_wrapper,
++            dynamic_index: DynamicNumericIndex::default(),
++        }
++    }
++
++    pub fn into_dynamic_index(self) -> DynamicNumericIndex<T> {
++        self.dynamic_index
++    }
++
++    pub fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
++        &self.db_wrapper
++    }
++
++    pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
++        let store_cf_name = NumericIndexInner::<T>::storage_cf_name(field);
++        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
++            db,
++            &store_cf_name,
++        ));
++        Self {
++            db_wrapper,
++            dynamic_index: DynamicNumericIndex::default(),
++        }
++    }
++
++    pub fn load(&mut self) -> OperationResult<bool> {
++        if !self.db_wrapper.has_column_family()? {
++            return Ok(false);
++        };
++
++        self.dynamic_index = DynamicNumericIndex::from_iter(
++            self.db_wrapper.lock_db().iter()?.map(|(key, value)| {
++                let value_idx =
++                    u32::from_be_bytes(value.as_ref().try_into().map_err(|_| {
++                        OperationError::service_error("incorrect numeric index value")
++                    })?);
++                let (idx, value) = T::decode_key(&key);
++                if idx != value_idx {
++                    return Err(OperationError::service_error(
++                        "incorrect numeric index key-value pair",
++                    ));
++                }
++                Ok((idx, value))
++            }),
++        )?;
++
++        Ok(true)
++    }
++
++    pub fn add_many_to_list(
++        &mut self,
++        idx: PointOffsetType,
++        values: Vec<T>,
++    ) -> OperationResult<()> {
++        for value in &values {
++            let key = value.encode_key(idx);
++            self.db_wrapper.put(&key, idx.to_be_bytes())?;
++        }
++        self.dynamic_index.add_many_to_list(idx, values);
++        Ok(())
++    }
++
++    pub fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
++        self.dynamic_index
++            .get_values(idx)
++            .map(|mut values| {
++                values.try_for_each(|value| {
++                    let key = value.encode_key(idx);
++                    self.db_wrapper.remove(key)
++                })
++            })
++            .transpose()?;
++        self.dynamic_index.remove_point(idx);
++        Ok(())
++    }
++
++    delegate! {
++        to self.dynamic_index {
++            pub fn total_unique_values_count(&self) -> usize;
++            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
++            pub fn get_points_count(&self) -> usize;
++            pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
++            pub fn values_count(&self, idx: PointOffsetType) -> Option<usize>;
++            pub fn values_range(
++                &self,
++                start_bound: Bound<Point<T>>,
++                end_bound: Bound<Point<T>>,
++            ) -> impl Iterator<Item = PointOffsetType> + '_;
++            pub fn orderable_values_range(
++                &self,
++                start_bound: Bound<Point<T>>,
++                end_bound: Bound<Point<T>>,
++            ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ ;
++            pub fn get_histogram(&self) -> &Histogram<T>;
++            pub fn get_max_values_per_point(&self) -> usize;
++        }
++    }
+ }
+
+commit 6a6d75656b43dd3868f70d9b5fdf7fab58b6c8b9
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Fri Jul 26 12:33:40 2024 +0200
+
+    numeric index remove direct db usage (#4757)
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 53b15f976..9c293c258 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -8,7 +8,9 @@ use delegate::delegate;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ 
+-use super::{Encodable, NumericIndexInner, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
++use super::{
++    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
++};
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+@@ -202,7 +204,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     }
+ 
+     pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
+-        let store_cf_name = NumericIndexInner::<T>::storage_cf_name(field);
++        let store_cf_name = numeric_index_storage_cf_name(field);
+         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+             db,
+             &store_cf_name,
+
+commit 745b1621dffbbf13c23a6ba6514c65502f983ad2
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Jul 26 16:59:34 2024 +0200
+
+    UUID payload index (#4738)
+    
+    * add UuidIndex
+    
+    * fix clippy
+    
+    * rebase to dev
+    
+    * update api docs
+    
+    * don't use wrapper type for Uuid index
+    
+    * rebase to `dev`
+    
+    * remove existence checking
+    
+    * rename UuidPayloadKeyType => UuidIntType
+    
+    * apply review changes
+    
+    * rebase to dev
+    
+    * post-rebase fixes
+    
+    * Improve estimation
+    
+    * Improve naming
+    
+    * Apply suggestions from code review
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+    
+    * use u128 in histogram and improve uuid sorting
+    
+    * Also allow defragmentation for completely random Uuids
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 9c293c258..c05b1e88b 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -266,6 +266,10 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         Ok(())
+     }
+ 
++    pub fn map(&self) -> &BTreeSet<Point<T>> {
++        &self.dynamic_index.map
++    }
++
+     delegate! {
+         to self.dynamic_index {
+             pub fn total_unique_values_count(&self) -> usize;
+
+commit a73d0bfcc731785eecd2781e01d1841d0c42e626
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Mon Oct 7 12:08:58 2024 +0200
+
+    Mmap geo index (#4841)
+    
+    * define mmap geo index
+    
+    fix compilation
+    
+    deleted flags
+    
+    load new mmap
+    
+    geo index tests
+    
+    fix tests
+    
+    fix build after rebase
+    
+    add files list
+    
+    * are you happy fmt
+    
+    * refactor get_stored_sub_regions output type
+    
+    * repr(C) for geohash
+    
+    * Replace manual flattening with flat map iterator
+    
+    * review remanings
+    
+    * remove panics
+    
+    * add files for snapshot
+    
+    * rename Dynamic into InMemory
+    
+    * are you happy fmt
+    
+    * review renames
+    
+    * Use copied rather than cloned
+    
+    * minor review refactoring + comments
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index c05b1e88b..a772ac673 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -18,11 +18,11 @@ use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+ 
+ pub struct MutableNumericIndex<T: Encodable + Numericable> {
+     db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+-    dynamic_index: DynamicNumericIndex<T>,
++    in_memory_index: InMemoryNumericIndex<T>,
+ }
+ 
+ // Numeric Index with insertions and deletions without persistence
+-pub struct DynamicNumericIndex<T: Encodable + Numericable> {
++pub struct InMemoryNumericIndex<T: Encodable + Numericable> {
+     pub map: BTreeSet<Point<T>>,
+     pub histogram: Histogram<T>,
+     pub points_count: usize,
+@@ -30,7 +30,7 @@ pub struct DynamicNumericIndex<T: Encodable + Numericable> {
+     pub point_to_values: Vec<Vec<T>>,
+ }
+ 
+-impl<T: Encodable + Numericable> Default for DynamicNumericIndex<T> {
++impl<T: Encodable + Numericable> Default for InMemoryNumericIndex<T> {
+     fn default() -> Self {
+         Self {
+             map: BTreeSet::new(),
+@@ -42,11 +42,11 @@ impl<T: Encodable + Numericable> Default for DynamicNumericIndex<T> {
+     }
+ }
+ 
+-impl<T: Encodable + Numericable + Default> DynamicNumericIndex<T> {
++impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+     pub fn from_iter(
+         iter: impl Iterator<Item = OperationResult<(PointOffsetType, T)>>,
+     ) -> OperationResult<Self> {
+-        let mut index = DynamicNumericIndex::default();
++        let mut index = InMemoryNumericIndex::default();
+         for pair in iter {
+             let (idx, value) = pair?;
+ 
+@@ -59,7 +59,7 @@ impl<T: Encodable + Numericable + Default> DynamicNumericIndex<T> {
+             index.point_to_values[idx as usize].push(value);
+ 
+             let key = Point::new(value, idx);
+-            DynamicNumericIndex::add_to_map(&mut index.map, &mut index.histogram, key);
++            InMemoryNumericIndex::add_to_map(&mut index.map, &mut index.histogram, key);
+         }
+         for values in &index.point_to_values {
+             if !values.is_empty() {
+@@ -191,12 +191,12 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     pub fn new_from_db_wrapper(db_wrapper: DatabaseColumnScheduledDeleteWrapper) -> Self {
+         Self {
+             db_wrapper,
+-            dynamic_index: DynamicNumericIndex::default(),
++            in_memory_index: InMemoryNumericIndex::default(),
+         }
+     }
+ 
+-    pub fn into_dynamic_index(self) -> DynamicNumericIndex<T> {
+-        self.dynamic_index
++    pub fn into_in_memory_index(self) -> InMemoryNumericIndex<T> {
++        self.in_memory_index
+     }
+ 
+     pub fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
+@@ -211,7 +211,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         ));
+         Self {
+             db_wrapper,
+-            dynamic_index: DynamicNumericIndex::default(),
++            in_memory_index: InMemoryNumericIndex::default(),
+         }
+     }
+ 
+@@ -220,7 +220,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             return Ok(false);
+         };
+ 
+-        self.dynamic_index = DynamicNumericIndex::from_iter(
++        self.in_memory_index = InMemoryNumericIndex::from_iter(
+             self.db_wrapper.lock_db().iter()?.map(|(key, value)| {
+                 let value_idx =
+                     u32::from_be_bytes(value.as_ref().try_into().map_err(|_| {
+@@ -248,12 +248,12 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             let key = value.encode_key(idx);
+             self.db_wrapper.put(&key, idx.to_be_bytes())?;
+         }
+-        self.dynamic_index.add_many_to_list(idx, values);
++        self.in_memory_index.add_many_to_list(idx, values);
+         Ok(())
+     }
+ 
+     pub fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
+-        self.dynamic_index
++        self.in_memory_index
+             .get_values(idx)
+             .map(|mut values| {
+                 values.try_for_each(|value| {
+@@ -262,16 +262,16 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+                 })
+             })
+             .transpose()?;
+-        self.dynamic_index.remove_point(idx);
++        self.in_memory_index.remove_point(idx);
+         Ok(())
+     }
+ 
+     pub fn map(&self) -> &BTreeSet<Point<T>> {
+-        &self.dynamic_index.map
++        &self.in_memory_index.map
+     }
+ 
+     delegate! {
+-        to self.dynamic_index {
++        to self.in_memory_index {
+             pub fn total_unique_values_count(&self) -> usize;
+             pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
+             pub fn get_points_count(&self) -> usize;
+
+commit 8ad2b34265448ec01b89d4093de5fbb1a86dcd4d
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Feb 25 11:21:25 2025 +0100
+
+    Bump Rust edition to 2024 (#6042)
+    
+    * Bump Rust edition to 2024
+    
+    * gen is a reserved keyword now
+    
+    * Remove ref mut on references
+    
+    * Mark extern C as unsafe
+    
+    * Wrap unsafe function bodies in unsafe block
+    
+    * Geo hash implements Copy, don't reference but pass by value instead
+    
+    * Replace secluded self import with parent
+    
+    * Update execute_cluster_read_operation with new match semantics
+    
+    * Fix lifetime issue
+    
+    * Replace map_or with is_none_or
+    
+    * set_var is unsafe now
+    
+    * Reformat
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index a772ac673..12f732722 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -9,7 +9,7 @@ use parking_lot::RwLock;
+ use rocksdb::DB;
+ 
+ use super::{
+-    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
++    Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION, numeric_index_storage_cf_name,
+ };
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+
+commit 6d53bd91845ee56bb252c08716fdf46d883c48aa
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Wed Mar 12 14:31:48 2025 +0100
+
+    IO read measurements for most Payload indices (#5951)
+    
+    * Add payload index filtering IO measurements for some indices
+    
+    * Add payload index metric to api and telemetry
+    
+    * Also account for index access overhead
+    
+    * Review remarks
+    
+    * Anonymize new HardwareUsage field
+    
+    * Fix tests
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 12f732722..4d8b8f89d 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -3,6 +3,8 @@ use std::ops::Bound;
+ use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+ 
++use common::counter::hardware_accumulator::HwMeasurementAcc;
++use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ use delegate::delegate;
+ use parking_lot::RwLock;
+@@ -70,10 +72,22 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         Ok(index)
+     }
+ 
+-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
++    pub fn check_values_any(
++        &self,
++        idx: PointOffsetType,
++        check_fn: impl Fn(&T) -> bool,
++        hw_counter: &HardwareCounterCell,
++    ) -> bool {
+         self.point_to_values
+             .get(idx as usize)
+-            .map(|values| values.iter().any(check_fn))
++            .map(|values| {
++                values.iter().any(|v| {
++                    hw_counter
++                        .payload_index_io_read_counter()
++                        .incr_delta(size_of_val(v));
++                    check_fn(v)
++                })
++            })
+             .unwrap_or(false)
+     }
+ 
+@@ -97,9 +111,16 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         &self,
+         start_bound: Bound<Point<T>>,
+         end_bound: Bound<Point<T>>,
++        hw_acc: HwMeasurementAcc,
+     ) -> impl Iterator<Item = PointOffsetType> + '_ {
++        let counter = hw_acc.get_counter_cell();
+         self.map
+             .range((start_bound, end_bound))
++            .inspect(move |i| {
++                counter
++                    .payload_index_io_read_counter()
++                    .incr_delta(size_of_val(&i.val));
++            })
+             .map(|point| point.idx)
+     }
+ 
+@@ -273,7 +294,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+     delegate! {
+         to self.in_memory_index {
+             pub fn total_unique_values_count(&self) -> usize;
+-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
++            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool, hw_counter: &HardwareCounterCell) -> bool;
+             pub fn get_points_count(&self) -> usize;
+             pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
+             pub fn values_count(&self, idx: PointOffsetType) -> Option<usize>;
+@@ -281,6 +302,7 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+                 &self,
+                 start_bound: Bound<Point<T>>,
+                 end_bound: Bound<Point<T>>,
++                hw_counter: HwMeasurementAcc,
+             ) -> impl Iterator<Item = PointOffsetType> + '_;
+             pub fn orderable_values_range(
+                 &self,
+
+commit 56a7cfdb205f90df28d2816d9e8ef6251fc517a2
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Mar 14 11:05:38 2025 +0100
+
+    Cardinality estimation IO measurements (#6117)
+    
+    * Cardinality estimation measurements
+    
+    * Apply hw measurements to latest changes from dev
+    
+    * Clippy
+    
+    * Also measure cardinality estimation for geo index
+    
+    * Make measured units 'bytes'
+    
+    * Use PointOffsetType instead of u32 for size calculation
+    
+    * fix memory cost for check_values_any in mmap index
+    
+    * fix double counting for value reading in mmap, remove hw_counter from mmap hashmap
+    
+    * fmt
+    
+    * fix hw measurement for text index
+    
+    * Remove non necessary lifetime annotations
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 4d8b8f89d..ade41d8b4 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -3,10 +3,8 @@ use std::ops::Bound;
+ use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+ 
+-use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+-use delegate::delegate;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ 
+@@ -107,17 +105,16 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         self.map.len()
+     }
+ 
+-    pub fn values_range(
+-        &self,
++    pub fn values_range<'a>(
++        &'a self,
+         start_bound: Bound<Point<T>>,
+         end_bound: Bound<Point<T>>,
+-        hw_acc: HwMeasurementAcc,
+-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+-        let counter = hw_acc.get_counter_cell();
++        hw_counter: &'a HardwareCounterCell,
++    ) -> impl Iterator<Item = PointOffsetType> + 'a {
+         self.map
+             .range((start_bound, end_bound))
+             .inspect(move |i| {
+-                counter
++                hw_counter
+                     .payload_index_io_read_counter()
+                     .incr_delta(size_of_val(&i.val));
+             })
+@@ -291,26 +288,57 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         &self.in_memory_index.map
+     }
+ 
+-    delegate! {
+-        to self.in_memory_index {
+-            pub fn total_unique_values_count(&self) -> usize;
+-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool, hw_counter: &HardwareCounterCell) -> bool;
+-            pub fn get_points_count(&self) -> usize;
+-            pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
+-            pub fn values_count(&self, idx: PointOffsetType) -> Option<usize>;
+-            pub fn values_range(
+-                &self,
+-                start_bound: Bound<Point<T>>,
+-                end_bound: Bound<Point<T>>,
+-                hw_counter: HwMeasurementAcc,
+-            ) -> impl Iterator<Item = PointOffsetType> + '_;
+-            pub fn orderable_values_range(
+-                &self,
+-                start_bound: Bound<Point<T>>,
+-                end_bound: Bound<Point<T>>,
+-            ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ ;
+-            pub fn get_histogram(&self) -> &Histogram<T>;
+-            pub fn get_max_values_per_point(&self) -> usize;
+-        }
++    #[inline]
++    pub fn total_unique_values_count(&self) -> usize {
++        self.in_memory_index.total_unique_values_count()
++    }
++    #[inline]
++    pub fn check_values_any(
++        &self,
++        idx: PointOffsetType,
++        check_fn: impl Fn(&T) -> bool,
++        hw_counter: &HardwareCounterCell,
++    ) -> bool {
++        self.in_memory_index
++            .check_values_any(idx, check_fn, hw_counter)
++    }
++    #[inline]
++    pub fn get_points_count(&self) -> usize {
++        self.in_memory_index.get_points_count()
++    }
++    #[inline]
++    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
++        self.in_memory_index.get_values(idx)
++    }
++    #[inline]
++    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
++        self.in_memory_index.values_count(idx)
++    }
++    #[inline]
++    pub fn values_range<'a>(
++        &'a self,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
++        hw_counter: &'a HardwareCounterCell,
++    ) -> impl Iterator<Item = PointOffsetType> + 'a {
++        self.in_memory_index
++            .values_range(start_bound, end_bound, hw_counter)
++    }
++    #[inline]
++    pub fn orderable_values_range(
++        &self,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
++    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
++        self.in_memory_index
++            .orderable_values_range(start_bound, end_bound)
++    }
++    #[inline]
++    pub fn get_histogram(&self) -> &Histogram<T> {
++        self.in_memory_index.get_histogram()
++    }
++    #[inline]
++    pub fn get_max_values_per_point(&self) -> usize {
++        self.in_memory_index.get_max_values_per_point()
+     }
+ }
+
+commit 5f49aa746f254d1f6afda7ed701a8c64585f75ec
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Wed Mar 19 10:37:32 2025 +0100
+
+    Payload Index Io measurements with Iterator (#6132)
+    
+    * IteratorExt helper functions for Hw Measurements + Some impls
+    
+    * More index impls; Performance improvements; Use new iterator
+    
+    * Add missing measurement in hnsw search. Use disposable flag in HwCounterCell too
+    
+    * use precomputed counts more
+    
+    * Review nits
+    
+    * Fix measurement of map_index iter_values_map
+    
+    * Review remarks
+    
+    * fix OnFinalCount
+    
+    * remove comment
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index ade41d8b4..57d9c3028 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -4,6 +4,7 @@ use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+ 
+ use common::counter::hardware_counter::HardwareCounterCell;
++use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+ use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+@@ -79,12 +80,12 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         self.point_to_values
+             .get(idx as usize)
+             .map(|values| {
+-                values.iter().any(|v| {
+-                    hw_counter
+-                        .payload_index_io_read_counter()
+-                        .incr_delta(size_of_val(v));
+-                    check_fn(v)
+-                })
++                values
++                    .iter()
++                    .measure_hw_with_cell(hw_counter, size_of::<T>(), |i| {
++                        i.payload_index_io_read_counter()
++                    })
++                    .any(check_fn)
+             })
+             .unwrap_or(false)
+     }
+@@ -113,12 +114,10 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+     ) -> impl Iterator<Item = PointOffsetType> + 'a {
+         self.map
+             .range((start_bound, end_bound))
+-            .inspect(move |i| {
+-                hw_counter
+-                    .payload_index_io_read_counter()
+-                    .incr_delta(size_of_val(&i.val));
+-            })
+             .map(|point| point.idx)
++            .measure_hw_with_cell(hw_counter, size_of::<T>(), |i| {
++                i.payload_index_io_read_counter()
++            })
+     }
+ 
+     pub fn orderable_values_range(
+
+commit 5cd7239b61d1a6944984132283f762850275670f
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Mon Mar 24 19:39:17 2025 +0100
+
+    Measure Payload Index IO Writes (#6137)
+    
+    * Prepare measurement of index creation + Remove vector deletion
+    measurement
+    
+    * add hw_counter to add_point functions
+    
+    * Adjust add_point(..) function signatures
+    
+    * Add new measurement type: payload index IO write
+    
+    * Measure payload index IO writes
+    
+    * Some Hw measurement performance improvements
+    
+    * Review remarks
+    
+    * Fix measurements in distributed setups
+    
+    * review fixes
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 57d9c3028..cbabb887f 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -260,11 +260,17 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         &mut self,
+         idx: PointOffsetType,
+         values: Vec<T>,
++        hw_counter: &HardwareCounterCell,
+     ) -> OperationResult<()> {
++        let mut counter = 0;
+         for value in &values {
+             let key = value.encode_key(idx);
+             self.db_wrapper.put(&key, idx.to_be_bytes())?;
++            counter += size_of_val(&key) + size_of_val(&idx);
+         }
++        hw_counter
++            .payload_index_io_write_counter()
++            .incr_delta(counter);
+         self.in_memory_index.add_many_to_list(idx, values);
+         Ok(())
+     }
+
+commit dcd5674ebb5b096b882189599bfb5eea13d241dd
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Apr 3 20:09:29 2025 +0200
+
+    Writeback counter cell (#6190)
+    
+    * Add WritebackCounterCell
+    
+    * Replace custom counting with WritebackCounterCell
+    
+    * Update lib/common/common/src/counter/counter_cell.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index cbabb887f..4a402dacb 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -262,15 +262,16 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         values: Vec<T>,
+         hw_counter: &HardwareCounterCell,
+     ) -> OperationResult<()> {
+-        let mut counter = 0;
++        let mut hw_cell_wb = hw_counter
++            .payload_index_io_write_counter()
++            .write_back_counter();
++
+         for value in &values {
+             let key = value.encode_key(idx);
+             self.db_wrapper.put(&key, idx.to_be_bytes())?;
+-            counter += size_of_val(&key) + size_of_val(&idx);
++            hw_cell_wb.incr_delta(size_of_val(&key) + size_of_val(&idx));
+         }
+-        hw_counter
+-            .payload_index_io_write_counter()
+-            .incr_delta(counter);
++
+         self.in_memory_index.add_many_to_list(idx, values);
+         Ok(())
+     }
+
+commit 231d579f708c59a2ceeb5a75136ef2de10641b22
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Apr 3 20:57:03 2025 +0200
+
+    Don't measure in memory geo, map and numeric indices (#6311)
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index 4a402dacb..f0026e92d 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -4,7 +4,6 @@ use std::ops::Bound::{Excluded, Unbounded};
+ use std::sync::Arc;
+ 
+ use common::counter::hardware_counter::HardwareCounterCell;
+-use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+ use common::types::PointOffsetType;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+@@ -71,22 +70,10 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         Ok(index)
+     }
+ 
+-    pub fn check_values_any(
+-        &self,
+-        idx: PointOffsetType,
+-        check_fn: impl Fn(&T) -> bool,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> bool {
++    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+         self.point_to_values
+             .get(idx as usize)
+-            .map(|values| {
+-                values
+-                    .iter()
+-                    .measure_hw_with_cell(hw_counter, size_of::<T>(), |i| {
+-                        i.payload_index_io_read_counter()
+-                    })
+-                    .any(check_fn)
+-            })
++            .map(|values| values.iter().any(check_fn))
+             .unwrap_or(false)
+     }
+ 
+@@ -106,18 +93,14 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         self.map.len()
+     }
+ 
+-    pub fn values_range<'a>(
+-        &'a self,
++    pub fn values_range(
++        &self,
+         start_bound: Bound<Point<T>>,
+         end_bound: Bound<Point<T>>,
+-        hw_counter: &'a HardwareCounterCell,
+-    ) -> impl Iterator<Item = PointOffsetType> + 'a {
++    ) -> impl Iterator<Item = PointOffsetType> {
+         self.map
+             .range((start_bound, end_bound))
+             .map(|point| point.idx)
+-            .measure_hw_with_cell(hw_counter, size_of::<T>(), |i| {
+-                i.payload_index_io_read_counter()
+-            })
+     }
+ 
+     pub fn orderable_values_range(
+@@ -299,14 +282,8 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         self.in_memory_index.total_unique_values_count()
+     }
+     #[inline]
+-    pub fn check_values_any(
+-        &self,
+-        idx: PointOffsetType,
+-        check_fn: impl Fn(&T) -> bool,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> bool {
+-        self.in_memory_index
+-            .check_values_any(idx, check_fn, hw_counter)
++    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
++        self.in_memory_index.check_values_any(idx, check_fn)
+     }
+     #[inline]
+     pub fn get_points_count(&self) -> usize {
+@@ -321,14 +298,12 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         self.in_memory_index.values_count(idx)
+     }
+     #[inline]
+-    pub fn values_range<'a>(
+-        &'a self,
++    pub fn values_range(
++        &self,
+         start_bound: Bound<Point<T>>,
+         end_bound: Bound<Point<T>>,
+-        hw_counter: &'a HardwareCounterCell,
+-    ) -> impl Iterator<Item = PointOffsetType> + 'a {
+-        self.in_memory_index
+-            .values_range(start_bound, end_bound, hw_counter)
++    ) -> impl Iterator<Item = PointOffsetType> {
++        self.in_memory_index.values_range(start_bound, end_bound)
+     }
+     #[inline]
+     pub fn orderable_values_range(
+
+commit a9795f7ce495c5d19aa2078dc957625f6c9b8d51
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Apr 15 16:58:38 2025 +0200
+
+    faster mmap numeric index (#6381)
+    
+    * wip: attempt to investigate slow mmap numeric index
+    
+    * fmt
+    
+    * Improve performance of ConditionedCounter (#6384)
+    
+    * Improve Performance of ConditionedCounter
+    
+    * Remove unneeded hw_counter from signatures
+    
+    * Clippy
+    
+    * Fix Clippy II
+    
+    * Fix Clippy III
+    
+    * Fix Clippy IV
+    
+    * Use static string, don't allocate string
+    
+    * Remove allow dead code attribute
+    
+    ---------
+    
+    Co-authored-by: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+index f0026e92d..932d247f5 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs
+@@ -42,13 +42,13 @@ impl<T: Encodable + Numericable> Default for InMemoryNumericIndex<T> {
+     }
+ }
+ 
+-impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+-    pub fn from_iter(
+-        iter: impl Iterator<Item = OperationResult<(PointOffsetType, T)>>,
+-    ) -> OperationResult<Self> {
++impl<T: Encodable + Numericable + Default> FromIterator<(PointOffsetType, T)>
++    for InMemoryNumericIndex<T>
++{
++    fn from_iter<I: IntoIterator<Item = (PointOffsetType, T)>>(iter: I) -> Self {
+         let mut index = InMemoryNumericIndex::default();
+         for pair in iter {
+-            let (idx, value) = pair?;
++            let (idx, value) = pair;
+ 
+             if index.point_to_values.len() <= idx as usize {
+                 index
+@@ -67,9 +67,11 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+                 index.max_values_per_point = index.max_values_per_point.max(values.len());
+             }
+         }
+-        Ok(index)
++        index
+     }
++}
+ 
++impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+     pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+         self.point_to_values
+             .get(idx as usize)
+@@ -220,8 +222,11 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+             return Ok(false);
+         };
+ 
+-        self.in_memory_index = InMemoryNumericIndex::from_iter(
+-            self.db_wrapper.lock_db().iter()?.map(|(key, value)| {
++        self.in_memory_index = self
++            .db_wrapper
++            .lock_db()
++            .iter()?
++            .map(|(key, value)| {
+                 let value_idx =
+                     u32::from_be_bytes(value.as_ref().try_into().map_err(|_| {
+                         OperationError::service_error("incorrect numeric index value")
+@@ -233,8 +238,8 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+                     ));
+                 }
+                 Ok((idx, value))
+-            }),
+-        )?;
++            })
++            .collect::<Result<InMemoryNumericIndex<_>, OperationError>>()?;
+ 
+         Ok(true)
+     }
+

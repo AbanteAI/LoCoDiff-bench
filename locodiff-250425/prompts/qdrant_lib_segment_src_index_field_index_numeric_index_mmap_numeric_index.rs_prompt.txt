@@ -1,0 +1,1286 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+
+commit 78afe797b767c9ff1649ad5a579115ba9f8800b3
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Tue Jul 30 12:04:14 2024 +0200
+
+    Mmap numeric index (#4721)
+    
+    * mmap numeric index
+    
+    dynamic numeric index
+    
+    remove pub from fields
+    
+    add mmap enum
+    
+    remove vec<u8> as number
+    
+    get_value without self
+    
+    mmap save load
+    
+    trait for conversion from P into T
+    
+    save-load points-to-values
+    
+    fix unit tests
+    
+    are you happy clippy
+    
+    fix ci
+    
+    apply changes from #4743
+    
+    NumericIndex: add new_mmap() method
+    
+    remove mmapvalue trait from immutable
+    
+    small refactor
+    
+    implement from_referenced for str
+    
+    are you happy clippy
+    
+    deleted flags by idx instead of pairs
+    
+    * fix build after rebase
+    
+    * review remarks
+    
+    * tests macos
+    
+    * increase deleted count while deletion
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+new file mode 100644
+index 000000000..2555eae0b
+--- /dev/null
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -0,0 +1,318 @@
++use std::ops::Bound;
++use std::path::{Path, PathBuf};
++
++use common::types::PointOffsetType;
++use io::file_operations::{atomic_save_json, read_json};
++use memmap2::MmapMut;
++use memory::mmap_ops::{self, create_and_ensure_length};
++use serde::{Deserialize, Serialize};
++
++use super::mutable_numeric_index::DynamicNumericIndex;
++use super::Encodable;
++use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
++use crate::common::mmap_type::{MmapBitSlice, MmapSlice};
++use crate::common::operation_error::OperationResult;
++use crate::common::Flusher;
++use crate::index::field_index::histogram::{Histogram, Numericable, Point};
++use crate::index::field_index::mmap_point_to_values::{MmapPointToValues, MmapValue};
++
++const PAIRS_PATH: &str = "data.bin";
++const DELETED_PATH: &str = "deleted.bin";
++const CONFIG_PATH: &str = "mmap_field_index_config.json";
++
++pub struct MmapNumericIndex<T: Encodable + Numericable + Default + MmapValue + 'static> {
++    path: PathBuf,
++    deleted: MmapBitSliceBufferedUpdateWrapper,
++    // sorted pairs (id + value), sorted by value (by id if values are equal)
++    pairs: MmapSlice<Point<T>>,
++    histogram: Histogram<T>,
++    deleted_count: usize,
++    max_values_per_point: usize,
++    point_to_values: MmapPointToValues<T>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct MmapNumericIndexConfig {
++    max_values_per_point: usize,
++}
++
++pub(super) struct NumericIndexPairsIterator<'a, T: Encodable + Numericable> {
++    pairs: &'a [Point<T>],
++    deleted: &'a MmapBitSliceBufferedUpdateWrapper,
++    start_index: usize,
++    end_index: usize,
++}
++
++impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, T> {
++    type Item = Point<T>;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        while self.start_index < self.end_index {
++            let key = self.pairs[self.start_index].clone();
++            let deleted = self.deleted.get(key.idx as usize).unwrap_or(true);
++            self.start_index += 1;
++            if deleted {
++                continue;
++            }
++            return Some(key);
++        }
++        None
++    }
++}
++
++impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'a, T> {
++    fn next_back(&mut self) -> Option<Self::Item> {
++        while self.start_index < self.end_index {
++            let key = self.pairs[self.end_index - 1].clone();
++            let deleted = self.deleted.get(key.idx as usize).unwrap_or(true);
++            self.end_index -= 1;
++            if deleted {
++                continue;
++            }
++            return Some(key);
++        }
++        None
++    }
++}
++
++impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
++    pub fn build(dynamic_index: DynamicNumericIndex<T>, path: &Path) -> OperationResult<Self> {
++        let pairs_path = path.join(PAIRS_PATH);
++        let deleted_path = path.join(DELETED_PATH);
++        let config_path = path.join(CONFIG_PATH);
++
++        atomic_save_json(
++            &config_path,
++            &MmapNumericIndexConfig {
++                max_values_per_point: dynamic_index.max_values_per_point,
++            },
++        )?;
++
++        dynamic_index.histogram.save(path)?;
++
++        MmapPointToValues::<T>::from_iter(
++            path,
++            dynamic_index
++                .point_to_values
++                .iter()
++                .enumerate()
++                .map(|(idx, values)| {
++                    (
++                        idx as PointOffsetType,
++                        values.iter().map(|v| T::into_referenced(v)),
++                    )
++                }),
++        )?;
++
++        {
++            let pairs_file = create_and_ensure_length(
++                &pairs_path,
++                dynamic_index.map.len() * std::mem::size_of::<Point<T>>(),
++            )?;
++            let pairs_mmap = unsafe { MmapMut::map_mut(&pairs_file)? };
++            let mut pairs = unsafe { MmapSlice::<Point<T>>::try_from(pairs_mmap)? };
++            for (src, dst) in dynamic_index.map.iter().zip(pairs.iter_mut()) {
++                *dst = src.clone();
++            }
++        }
++
++        {
++            const BITS_IN_BYTE: usize = 8;
++            let deleted_flags_count = dynamic_index.point_to_values.len();
++            let deleted_file = create_and_ensure_length(
++                &deleted_path,
++                BITS_IN_BYTE
++                    * BITS_IN_BYTE
++                    * deleted_flags_count.div_ceil(BITS_IN_BYTE * BITS_IN_BYTE),
++            )?;
++            let mut deleted_mmap = unsafe { MmapMut::map_mut(&deleted_file)? };
++            deleted_mmap.fill(0);
++            let mut deleted_bitflags = MmapBitSlice::from(deleted_mmap, 0);
++            for (idx, values) in dynamic_index.point_to_values.iter().enumerate() {
++                if values.is_empty() {
++                    deleted_bitflags.set(idx, true);
++                }
++            }
++        }
++
++        Self::load(path)
++    }
++
++    pub fn load(path: &Path) -> OperationResult<Self> {
++        let pairs_path = path.join(PAIRS_PATH);
++        let deleted_path = path.join(DELETED_PATH);
++        let config_path = path.join(CONFIG_PATH);
++
++        let histogram = Histogram::<T>::load(path)?;
++        let config: MmapNumericIndexConfig = read_json(&config_path)?;
++        let deleted = mmap_ops::open_write_mmap(&deleted_path)?;
++        let deleted = MmapBitSlice::from(deleted, 0);
++        let deleted_count = deleted.count_ones();
++        let map = unsafe { MmapSlice::try_from(mmap_ops::open_write_mmap(&pairs_path)?)? };
++        let point_to_values = MmapPointToValues::open(path)?;
++
++        Ok(Self {
++            pairs: map,
++            deleted: MmapBitSliceBufferedUpdateWrapper::new(deleted),
++            path: path.to_path_buf(),
++            histogram,
++            deleted_count,
++            max_values_per_point: config.max_values_per_point,
++            point_to_values,
++        })
++    }
++
++    pub fn clear(self) -> OperationResult<()> {
++        let files = self.files();
++        drop(self);
++        for file in files {
++            std::fs::remove_file(file)?;
++        }
++        Ok(())
++    }
++
++    pub fn files(&self) -> Vec<PathBuf> {
++        let mut files = vec![
++            self.path.join(PAIRS_PATH),
++            self.path.join(DELETED_PATH),
++            self.path.join(CONFIG_PATH),
++        ];
++        files.extend(self.point_to_values.files());
++        files.extend(Histogram::<T>::files(&self.path));
++        files
++    }
++
++    pub fn flusher(&self) -> Flusher {
++        self.deleted.flusher()
++    }
++
++    pub(super) fn check_values_any(
++        &self,
++        idx: PointOffsetType,
++        check_fn: impl Fn(&T) -> bool,
++    ) -> bool {
++        if self.deleted.get(idx as usize) == Some(false) {
++            self.point_to_values
++                .check_values_any(idx, |v| check_fn(T::from_referenced(&v)))
++        } else {
++            false
++        }
++    }
++
++    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
++        if self.deleted.get(idx as usize) == Some(false) {
++            Some(Box::new(
++                self.point_to_values
++                    .get_values(idx)?
++                    .map(|v| *T::from_referenced(&v)),
++            ))
++        } else {
++            None
++        }
++    }
++
++    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
++        if self.deleted.get(idx as usize) == Some(false) {
++            self.point_to_values.get_values_count(idx)
++        } else {
++            None
++        }
++    }
++
++    /// Returns the number of key-value pairs in the index.
++    /// Note that is doesn't count deleted pairs.
++    pub(super) fn total_unique_values_count(&self) -> usize {
++        self.pairs.len()
++    }
++
++    pub(super) fn values_range(
++        &self,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
++    ) -> impl Iterator<Item = PointOffsetType> + '_ {
++        self.values_range_iterator(start_bound, end_bound)
++            .map(|Point { idx, .. }| idx)
++    }
++
++    pub(super) fn orderable_values_range(
++        &self,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
++    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
++        self.values_range_iterator(start_bound, end_bound)
++            .map(|Point { val, idx }| (val, idx))
++    }
++
++    pub fn remove_point(&mut self, idx: PointOffsetType) {
++        let idx = idx as usize;
++        if idx < self.deleted.len() && !self.deleted.get(idx).unwrap_or(true) {
++            self.deleted.set(idx, true);
++            self.deleted_count += 1;
++        }
++    }
++
++    pub(super) fn get_histogram(&self) -> &Histogram<T> {
++        &self.histogram
++    }
++
++    pub(super) fn get_points_count(&self) -> usize {
++        self.point_to_values.len() - self.deleted_count
++    }
++
++    pub(super) fn get_max_values_per_point(&self) -> usize {
++        self.max_values_per_point
++    }
++
++    pub(super) fn values_range_size(
++        &self,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
++    ) -> usize {
++        let iterator = self.values_range_iterator(start_bound, end_bound);
++        iterator.end_index - iterator.start_index
++    }
++
++    // get iterator
++    fn values_range_iterator(
++        &self,
++        start_bound: Bound<Point<T>>,
++        end_bound: Bound<Point<T>>,
++    ) -> NumericIndexPairsIterator<'_, T> {
++        let start_index = match start_bound {
++            Bound::Included(bound) => self.pairs.binary_search(&bound).unwrap_or_else(|idx| idx),
++            Bound::Excluded(bound) => match self.pairs.binary_search(&bound) {
++                Ok(idx) => idx + 1,
++                Err(idx) => idx,
++            },
++            Bound::Unbounded => 0,
++        };
++
++        if start_index >= self.pairs.len() {
++            return NumericIndexPairsIterator {
++                pairs: &self.pairs,
++                deleted: &self.deleted,
++                start_index: self.pairs.len(),
++                end_index: self.pairs.len(),
++            };
++        }
++
++        let end_index = match end_bound {
++            Bound::Included(bound) => match self.pairs[start_index..].binary_search(&bound) {
++                Ok(idx) => idx + 1 + start_index,
++                Err(idx) => idx + start_index,
++            },
++            Bound::Excluded(bound) => {
++                let end_bound = self.pairs[start_index..].binary_search(&bound);
++                end_bound.unwrap_or_else(|idx| idx) + start_index
++            }
++            Bound::Unbounded => self.pairs.len(),
++        };
++
++        NumericIndexPairsIterator {
++            pairs: &self.pairs,
++            deleted: &self.deleted,
++            start_index,
++            end_index,
++        }
++    }
++}
+
+commit 7ea8e1ec7d378739ae8a6bf524daf31df2bb5b87
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Sat Aug 3 19:45:14 2024 +0000
+
+    Integrate map/numeric mmap indices (#4809)
+    
+    * Extend FieldIndexBuilder with mmap indices
+    
+    * Introduce PayloadFieldIndex::files()
+    
+    * Create and delete index dirs
+    
+    * Update index_selector and index_builder_selector
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 2555eae0b..ca91893ac 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -1,3 +1,4 @@
++use std::fs::{create_dir_all, remove_dir};
+ use std::ops::Bound;
+ use std::path::{Path, PathBuf};
+ 
+@@ -77,6 +78,8 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIt
+ 
+ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+     pub fn build(dynamic_index: DynamicNumericIndex<T>, path: &Path) -> OperationResult<Self> {
++        create_dir_all(path)?;
++
+         let pairs_path = path.join(PAIRS_PATH);
+         let deleted_path = path.join(DELETED_PATH);
+         let config_path = path.join(CONFIG_PATH);
+@@ -164,10 +167,11 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+ 
+     pub fn clear(self) -> OperationResult<()> {
+         let files = self.files();
+-        drop(self);
++        let Self { path, .. } = self;
+         for file in files {
+             std::fs::remove_file(file)?;
+         }
++        let _ = remove_dir(path);
+         Ok(())
+     }
+ 
+
+commit 3be87b11ebd82b8ad65918babf54ebc3f253a13d
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Wed Aug 14 11:04:56 2024 +0200
+
+    Mmap subcrate refactoring (#4886)
+    
+    * make mmap_type independent from segment structures
+    
+    * make bitvec and thiserror workspace dependencies
+    
+    * move mmap_type into common/memory subcrate
+    
+    * fmt
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index ca91893ac..0a9a286b1 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -6,12 +6,12 @@ use common::types::PointOffsetType;
+ use io::file_operations::{atomic_save_json, read_json};
+ use memmap2::MmapMut;
+ use memory::mmap_ops::{self, create_and_ensure_length};
++use memory::mmap_type::{MmapBitSlice, MmapSlice};
+ use serde::{Deserialize, Serialize};
+ 
+ use super::mutable_numeric_index::DynamicNumericIndex;
+ use super::Encodable;
+ use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
+-use crate::common::mmap_type::{MmapBitSlice, MmapSlice};
+ use crate::common::operation_error::OperationResult;
+ use crate::common::Flusher;
+ use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+
+commit 59a372b13132ec485b313e36ce26a94bfb855d74
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Wed Aug 14 13:41:37 2024 +0000
+
+    InRamChunkedMmap: optimize using madvise (#4881)
+    
+    * refactor: introduce AdviceSetting for open_read_mmap/open_write_mmap
+    
+    * perf: use Advice::Normal in a few places
+    
+    * perf: use MADV_DONTNEED after reading
+    
+    * perf: use POSIX_FADV_DONTNEED after reading
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 0a9a286b1..6615feddb 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
+ use common::types::PointOffsetType;
+ use io::file_operations::{atomic_save_json, read_json};
+ use memmap2::MmapMut;
++use memory::madvise::AdviceSetting;
+ use memory::mmap_ops::{self, create_and_ensure_length};
+ use memory::mmap_type::{MmapBitSlice, MmapSlice};
+ use serde::{Deserialize, Serialize};
+@@ -148,10 +149,15 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+ 
+         let histogram = Histogram::<T>::load(path)?;
+         let config: MmapNumericIndexConfig = read_json(&config_path)?;
+-        let deleted = mmap_ops::open_write_mmap(&deleted_path)?;
++        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global)?;
+         let deleted = MmapBitSlice::from(deleted, 0);
+         let deleted_count = deleted.count_ones();
+-        let map = unsafe { MmapSlice::try_from(mmap_ops::open_write_mmap(&pairs_path)?)? };
++        let map = unsafe {
++            MmapSlice::try_from(mmap_ops::open_write_mmap(
++                &pairs_path,
++                AdviceSetting::Global,
++            )?)?
++        };
+         let point_to_values = MmapPointToValues::open(path)?;
+ 
+         Ok(Self {
+
+commit 4b429214cc3feeede5d5ab2912fad76523219c4e
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Tue Aug 27 11:30:57 2024 -0400
+
+    Integer and UUID facets (#4946)
+    
+    * move FacetIndex into facet_index.rs
+    
+    * add support for integer facets
+    
+    * add support for uuid facets
+    
+    * use separate internal structure
+    
+    * rename FacetValue::Keyword into FacetValue::String in REST
+    
+    * fix after rebase
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 6615feddb..e1d2acef8 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -103,7 +103,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+                 .map(|(idx, values)| {
+                     (
+                         idx as PointOffsetType,
+-                        values.iter().map(|v| T::into_referenced(v)),
++                        values.iter().map(|v| T::as_referenced(v)),
+                     )
+                 }),
+         )?;
+
+commit b3b22793769d2a18b5be99beb96b29fbf275521e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Sat Sep 14 20:53:07 2024 +0200
+
+    Allow explicit populate of mmap (#4923)
+    
+    * expose mmap populate
+    
+    * expose mmap populate in open_read_mmap
+    
+    * FOR TEST, REVERSE IT: make InRamChunkedMmap default
+    
+    * enable populate advise on unix
+    
+    * fix clippy
+    
+    * unix -> linux
+    
+    * Update lib/collection/src/config.rs
+    
+    * clippy fixes
+    
+    * resolve conflicts
+    
+    * fmt
+    
+    * Runtime check for PopulateRead
+    
+    ---------
+    
+    Co-authored-by: xzfc <xzfcpw@gmail.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index e1d2acef8..0a55c3af2 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -149,13 +149,14 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+ 
+         let histogram = Histogram::<T>::load(path)?;
+         let config: MmapNumericIndexConfig = read_json(&config_path)?;
+-        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global)?;
++        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
+         let deleted = MmapBitSlice::from(deleted, 0);
+         let deleted_count = deleted.count_ones();
+         let map = unsafe {
+             MmapSlice::try_from(mmap_ops::open_write_mmap(
+                 &pairs_path,
+                 AdviceSetting::Global,
++                false,
+             )?)?
+         };
+         let point_to_values = MmapPointToValues::open(path)?;
+
+commit a73d0bfcc731785eecd2781e01d1841d0c42e626
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Mon Oct 7 12:08:58 2024 +0200
+
+    Mmap geo index (#4841)
+    
+    * define mmap geo index
+    
+    fix compilation
+    
+    deleted flags
+    
+    load new mmap
+    
+    geo index tests
+    
+    fix tests
+    
+    fix build after rebase
+    
+    add files list
+    
+    * are you happy fmt
+    
+    * refactor get_stored_sub_regions output type
+    
+    * repr(C) for geohash
+    
+    * Replace manual flattening with flat map iterator
+    
+    * review remanings
+    
+    * remove panics
+    
+    * add files for snapshot
+    
+    * rename Dynamic into InMemory
+    
+    * are you happy fmt
+    
+    * review renames
+    
+    * Use copied rather than cloned
+    
+    * minor review refactoring + comments
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 0a55c3af2..b079cedbb 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -10,7 +10,7 @@ use memory::mmap_ops::{self, create_and_ensure_length};
+ use memory::mmap_type::{MmapBitSlice, MmapSlice};
+ use serde::{Deserialize, Serialize};
+ 
+-use super::mutable_numeric_index::DynamicNumericIndex;
++use super::mutable_numeric_index::InMemoryNumericIndex;
+ use super::Encodable;
+ use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
+ use crate::common::operation_error::OperationResult;
+@@ -78,7 +78,7 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIt
+ }
+ 
+ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+-    pub fn build(dynamic_index: DynamicNumericIndex<T>, path: &Path) -> OperationResult<Self> {
++    pub fn build(in_memory_index: InMemoryNumericIndex<T>, path: &Path) -> OperationResult<Self> {
+         create_dir_all(path)?;
+ 
+         let pairs_path = path.join(PAIRS_PATH);
+@@ -88,15 +88,15 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         atomic_save_json(
+             &config_path,
+             &MmapNumericIndexConfig {
+-                max_values_per_point: dynamic_index.max_values_per_point,
++                max_values_per_point: in_memory_index.max_values_per_point,
+             },
+         )?;
+ 
+-        dynamic_index.histogram.save(path)?;
++        in_memory_index.histogram.save(path)?;
+ 
+         MmapPointToValues::<T>::from_iter(
+             path,
+-            dynamic_index
++            in_memory_index
+                 .point_to_values
+                 .iter()
+                 .enumerate()
+@@ -111,18 +111,18 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         {
+             let pairs_file = create_and_ensure_length(
+                 &pairs_path,
+-                dynamic_index.map.len() * std::mem::size_of::<Point<T>>(),
++                in_memory_index.map.len() * std::mem::size_of::<Point<T>>(),
+             )?;
+             let pairs_mmap = unsafe { MmapMut::map_mut(&pairs_file)? };
+             let mut pairs = unsafe { MmapSlice::<Point<T>>::try_from(pairs_mmap)? };
+-            for (src, dst) in dynamic_index.map.iter().zip(pairs.iter_mut()) {
++            for (src, dst) in in_memory_index.map.iter().zip(pairs.iter_mut()) {
+                 *dst = src.clone();
+             }
+         }
+ 
+         {
+             const BITS_IN_BYTE: usize = 8;
+-            let deleted_flags_count = dynamic_index.point_to_values.len();
++            let deleted_flags_count = in_memory_index.point_to_values.len();
+             let deleted_file = create_and_ensure_length(
+                 &deleted_path,
+                 BITS_IN_BYTE
+@@ -132,7 +132,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+             let mut deleted_mmap = unsafe { MmapMut::map_mut(&deleted_file)? };
+             deleted_mmap.fill(0);
+             let mut deleted_bitflags = MmapBitSlice::from(deleted_mmap, 0);
+-            for (idx, values) in dynamic_index.point_to_values.iter().enumerate() {
++            for (idx, values) in in_memory_index.point_to_values.iter().enumerate() {
+                 if values.is_empty() {
+                     deleted_bitflags.set(idx, true);
+                 }
+
+commit f416f2b98f08fc7749814b0725f9035459b5c057
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Wed Nov 27 11:24:58 2024 +0100
+
+    Clippy 1.83 (#5513)
+    
+    * Clippy 1.83
+    
+    * there is more
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index b079cedbb..722baf90a 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -45,7 +45,7 @@ pub(super) struct NumericIndexPairsIterator<'a, T: Encodable + Numericable> {
+     end_index: usize,
+ }
+ 
+-impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, T> {
++impl<T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'_, T> {
+     type Item = Point<T>;
+ 
+     fn next(&mut self) -> Option<Self::Item> {
+@@ -62,7 +62,7 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a,
+     }
+ }
+ 
+-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'a, T> {
++impl<T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'_, T> {
+     fn next_back(&mut self) -> Option<Self::Item> {
+         while self.start_index < self.end_index {
+             let key = self.pairs[self.end_index - 1].clone();
+
+commit 8ad2b34265448ec01b89d4093de5fbb1a86dcd4d
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Feb 25 11:21:25 2025 +0100
+
+    Bump Rust edition to 2024 (#6042)
+    
+    * Bump Rust edition to 2024
+    
+    * gen is a reserved keyword now
+    
+    * Remove ref mut on references
+    
+    * Mark extern C as unsafe
+    
+    * Wrap unsafe function bodies in unsafe block
+    
+    * Geo hash implements Copy, don't reference but pass by value instead
+    
+    * Replace secluded self import with parent
+    
+    * Update execute_cluster_read_operation with new match semantics
+    
+    * Fix lifetime issue
+    
+    * Replace map_or with is_none_or
+    
+    * set_var is unsafe now
+    
+    * Reformat
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 722baf90a..78d0f4b07 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -10,11 +10,11 @@ use memory::mmap_ops::{self, create_and_ensure_length};
+ use memory::mmap_type::{MmapBitSlice, MmapSlice};
+ use serde::{Deserialize, Serialize};
+ 
+-use super::mutable_numeric_index::InMemoryNumericIndex;
+ use super::Encodable;
++use super::mutable_numeric_index::InMemoryNumericIndex;
++use crate::common::Flusher;
+ use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
+ use crate::common::operation_error::OperationResult;
+-use crate::common::Flusher;
+ use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+ use crate::index::field_index::mmap_point_to_values::{MmapPointToValues, MmapValue};
+ 
+
+commit 6d53bd91845ee56bb252c08716fdf46d883c48aa
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Wed Mar 12 14:31:48 2025 +0100
+
+    IO read measurements for most Payload indices (#5951)
+    
+    * Add payload index filtering IO measurements for some indices
+    
+    * Add payload index metric to api and telemetry
+    
+    * Also account for index access overhead
+    
+    * Review remarks
+    
+    * Anonymize new HardwareUsage field
+    
+    * Fix tests
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 78d0f4b07..bf1bb815b 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -2,6 +2,7 @@ use std::fs::{create_dir_all, remove_dir};
+ use std::ops::Bound;
+ use std::path::{Path, PathBuf};
+ 
++use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ use io::file_operations::{atomic_save_json, read_json};
+ use memmap2::MmapMut;
+@@ -201,10 +202,14 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         &self,
+         idx: PointOffsetType,
+         check_fn: impl Fn(&T) -> bool,
++        hw_counter: &HardwareCounterCell,
+     ) -> bool {
+         if self.deleted.get(idx as usize) == Some(false) {
+-            self.point_to_values
+-                .check_values_any(idx, |v| check_fn(T::from_referenced(&v)))
++            self.point_to_values.check_values_any(
++                idx,
++                |v| check_fn(T::from_referenced(&v)),
++                hw_counter,
++            )
+         } else {
+             false
+         }
+
+commit 56a7cfdb205f90df28d2816d9e8ef6251fc517a2
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Mar 14 11:05:38 2025 +0100
+
+    Cardinality estimation IO measurements (#6117)
+    
+    * Cardinality estimation measurements
+    
+    * Apply hw measurements to latest changes from dev
+    
+    * Clippy
+    
+    * Also measure cardinality estimation for geo index
+    
+    * Make measured units 'bytes'
+    
+    * Use PointOffsetType instead of u32 for size calculation
+    
+    * fix memory cost for check_values_any in mmap index
+    
+    * fix double counting for value reading in mmap, remove hw_counter from mmap hashmap
+    
+    * fmt
+    
+    * fix hw measurement for text index
+    
+    * Remove non necessary lifetime annotations
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index bf1bb815b..ffe9538b2 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -241,12 +241,18 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         self.pairs.len()
+     }
+ 
+-    pub(super) fn values_range(
+-        &self,
++    pub(super) fn values_range<'a>(
++        &'a self,
+         start_bound: Bound<Point<T>>,
+         end_bound: Bound<Point<T>>,
+-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
++        hw_counter: &'a HardwareCounterCell,
++    ) -> impl Iterator<Item = PointOffsetType> + 'a {
+         self.values_range_iterator(start_bound, end_bound)
++            .inspect(move |_| {
++                hw_counter
++                    .payload_index_io_read_counter()
++                    .incr_delta(size_of::<Point<T>>())
++            })
+             .map(|Point { idx, .. }| idx)
+     }
+ 
+
+commit 13f0a87c80cd25a85bac907c7eee53f8c55f048e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon Mar 17 20:38:54 2025 +0100
+
+    Mmap in-ram payload indexes without RocksDB (#6148)
+    
+    * refactor IndexSelector to support mmap with populate
+    
+    * specify populate flag DynamicMmapFlags
+    
+    * replace db+flag with enum StorageType
+    
+    * fix flag
+    
+    * disable by default
+    
+    * clippy
+    
+    * remove outdated comment
+    
+    * remove comment
+    
+    * Update lib/segment/src/index/field_index/bool_index/mmap_bool_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index ffe9538b2..cdb4d2a6b 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -79,7 +79,11 @@ impl<T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterat
+ }
+ 
+ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+-    pub fn build(in_memory_index: InMemoryNumericIndex<T>, path: &Path) -> OperationResult<Self> {
++    pub fn build(
++        in_memory_index: InMemoryNumericIndex<T>,
++        path: &Path,
++        is_on_disk: bool,
++    ) -> OperationResult<Self> {
+         create_dir_all(path)?;
+ 
+         let pairs_path = path.join(PAIRS_PATH);
+@@ -140,10 +144,10 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+             }
+         }
+ 
+-        Self::load(path)
++        Self::load(path, is_on_disk)
+     }
+ 
+-    pub fn load(path: &Path) -> OperationResult<Self> {
++    pub fn load(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
+         let pairs_path = path.join(PAIRS_PATH);
+         let deleted_path = path.join(DELETED_PATH);
+         let config_path = path.join(CONFIG_PATH);
+@@ -153,11 +157,12 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
+         let deleted = MmapBitSlice::from(deleted, 0);
+         let deleted_count = deleted.count_ones();
++        let do_populate = !is_on_disk;
+         let map = unsafe {
+             MmapSlice::try_from(mmap_ops::open_write_mmap(
+                 &pairs_path,
+                 AdviceSetting::Global,
+-                false,
++                do_populate,
+             )?)?
+         };
+         let point_to_values = MmapPointToValues::open(path)?;
+
+commit dcd5674ebb5b096b882189599bfb5eea13d241dd
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Apr 3 20:09:29 2025 +0200
+
+    Writeback counter cell (#6190)
+    
+    * Add WritebackCounterCell
+    
+    * Replace custom counting with WritebackCounterCell
+    
+    * Update lib/common/common/src/counter/counter_cell.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index cdb4d2a6b..e7b243cb5 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -3,6 +3,7 @@ use std::ops::Bound;
+ use std::path::{Path, PathBuf};
+ 
+ use common::counter::hardware_counter::HardwareCounterCell;
++use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+ use common::types::PointOffsetType;
+ use io::file_operations::{atomic_save_json, read_json};
+ use memmap2::MmapMut;
+@@ -253,12 +254,10 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         hw_counter: &'a HardwareCounterCell,
+     ) -> impl Iterator<Item = PointOffsetType> + 'a {
+         self.values_range_iterator(start_bound, end_bound)
+-            .inspect(move |_| {
+-                hw_counter
+-                    .payload_index_io_read_counter()
+-                    .incr_delta(size_of::<Point<T>>())
+-            })
+             .map(|Point { idx, .. }| idx)
++            .measure_hw_with_cell(hw_counter, size_of::<Point<T>>(), |i| {
++                i.payload_index_io_read_counter()
++            })
+     }
+ 
+     pub(super) fn orderable_values_range(
+
+commit 231d579f708c59a2ceeb5a75136ef2de10641b22
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Apr 3 20:57:03 2025 +0200
+
+    Don't measure in memory geo, map and numeric indices (#6311)
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index e7b243cb5..6e56975bd 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -2,6 +2,7 @@ use std::fs::{create_dir_all, remove_dir};
+ use std::ops::Bound;
+ use std::path::{Path, PathBuf};
+ 
++use common::counter::conditioned_counter::ConditionedCounter;
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+ use common::types::PointOffsetType;
+@@ -33,6 +34,7 @@ pub struct MmapNumericIndex<T: Encodable + Numericable + Default + MmapValue + '
+     deleted_count: usize,
+     max_values_per_point: usize,
+     point_to_values: MmapPointToValues<T>,
++    is_on_disk: bool,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -176,6 +178,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+             deleted_count,
+             max_values_per_point: config.max_values_per_point,
+             point_to_values,
++            is_on_disk,
+         })
+     }
+ 
+@@ -210,11 +213,13 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         check_fn: impl Fn(&T) -> bool,
+         hw_counter: &HardwareCounterCell,
+     ) -> bool {
++        let hw_counter = self.make_conditioned_counter(hw_counter);
++
+         if self.deleted.get(idx as usize) == Some(false) {
+             self.point_to_values.check_values_any(
+                 idx,
+                 |v| check_fn(T::from_referenced(&v)),
+-                hw_counter,
++                &hw_counter,
+             )
+         } else {
+             false
+@@ -253,9 +258,11 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         end_bound: Bound<Point<T>>,
+         hw_counter: &'a HardwareCounterCell,
+     ) -> impl Iterator<Item = PointOffsetType> + 'a {
++        let hw_counter = self.make_conditioned_counter(hw_counter);
++
+         self.values_range_iterator(start_bound, end_bound)
+             .map(|Point { idx, .. }| idx)
+-            .measure_hw_with_cell(hw_counter, size_of::<Point<T>>(), |i| {
++            .measure_hw_with_condition_cell(hw_counter, size_of::<Point<T>>(), |i| {
+                 i.payload_index_io_read_counter()
+             })
+     }
+@@ -341,4 +348,11 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+             end_index,
+         }
+     }
++
++    fn make_conditioned_counter<'a>(
++        &self,
++        hw_counter: &'a HardwareCounterCell,
++    ) -> ConditionedCounter<'a> {
++        ConditionedCounter::new(self.is_on_disk, hw_counter)
++    }
+ }
+
+commit 6e0ddbafa950250daff35ebe44fb3ec6afad944f
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Wed Apr 9 10:54:30 2025 +0200
+
+    disk cache hygiene (#6323)
+    
+    * wip: implement explicit populate and clear_cache functions for all components
+    
+    * fmt
+    
+    * implement clear and populate for vector storages
+    
+    * fmt
+    
+    * implement clear and populate for payload storage
+    
+    * wip: implement explicit populate and clear_cache functions payload indexes
+    
+    * implement explicit populate and clear_cache functions payload indexes
+    
+    * fix clippy on CI
+    
+    * only compile posix_fadvise on linux
+    
+    * only compile posix_fadvise on linux
+    
+    * implement explicit populate and clear_cache functions for quantized vectors
+    
+    * fmt
+    
+    * remove post-load prefault
+    
+    * fix typo
+    
+    * implement is-on-disk for payload indexes, implement clear on drop for segment, implement clear after segment build
+    
+    * fmt
+    
+    * also evict quantized vectors after optimization
+    
+    * re-use and replace advise_dontneed
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 6e56975bd..68844eb33 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -8,7 +8,7 @@ use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+ use common::types::PointOffsetType;
+ use io::file_operations::{atomic_save_json, read_json};
+ use memmap2::MmapMut;
+-use memory::madvise::AdviceSetting;
++use memory::madvise::{AdviceSetting, clear_disk_cache};
+ use memory::mmap_ops::{self, create_and_ensure_length};
+ use memory::mmap_type::{MmapBitSlice, MmapSlice};
+ use serde::{Deserialize, Serialize};
+@@ -168,7 +168,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+                 do_populate,
+             )?)?
+         };
+-        let point_to_values = MmapPointToValues::open(path)?;
++        let point_to_values = MmapPointToValues::open(path, do_populate)?;
+ 
+         Ok(Self {
+             pairs: map,
+@@ -355,4 +355,29 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+     ) -> ConditionedCounter<'a> {
+         ConditionedCounter::new(self.is_on_disk, hw_counter)
+     }
++
++    pub fn is_on_disk(&self) -> bool {
++        self.is_on_disk
++    }
++
++    /// Populate all pages in the mmap.
++    /// Block until all pages are populated.
++    pub fn populate(&self) -> OperationResult<()> {
++        self.pairs.populate()?;
++        self.point_to_values.populate();
++        Ok(())
++    }
++
++    /// Drop disk cache.
++    pub fn clear_cache(&self) -> OperationResult<()> {
++        let pairs_path = self.path.join(PAIRS_PATH);
++        let deleted_path = self.path.join(DELETED_PATH);
++
++        clear_disk_cache(&pairs_path)?;
++        clear_disk_cache(&deleted_path)?;
++
++        self.point_to_values.clear_cache()?;
++
++        Ok(())
++    }
+ }
+
+commit a9795f7ce495c5d19aa2078dc957625f6c9b8d51
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Apr 15 16:58:38 2025 +0200
+
+    faster mmap numeric index (#6381)
+    
+    * wip: attempt to investigate slow mmap numeric index
+    
+    * fmt
+    
+    * Improve performance of ConditionedCounter (#6384)
+    
+    * Improve Performance of ConditionedCounter
+    
+    * Remove unneeded hw_counter from signatures
+    
+    * Clippy
+    
+    * Fix Clippy II
+    
+    * Fix Clippy III
+    
+    * Fix Clippy IV
+    
+    * Use static string, don't allocate string
+    
+    * Remove allow dead code attribute
+    
+    ---------
+    
+    Co-authored-by: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 68844eb33..92f0ad2ab 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -207,7 +207,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+         self.deleted.flusher()
+     }
+ 
+-    pub(super) fn check_values_any(
++    pub fn check_values_any(
+         &self,
+         idx: PointOffsetType,
+         check_fn: impl Fn(&T) -> bool,
+
+commit 1f805b618ee62b3e8f934abee4e7c05a26174611
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Thu Apr 17 08:57:47 2025 +0000
+
+    Clear disk cache after read (#6396)
+    
+    * Move clear_disk_cache to memory::fadvise
+    
+    * Add memory::fadvise::OneshotFile
+    
+    * Use OneshotFile
+
+diff --git a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+index 92f0ad2ab..5dbfd01e2 100644
+--- a/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
++++ b/lib/segment/src/index/field_index/numeric_index/mmap_numeric_index.rs
+@@ -8,7 +8,8 @@ use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+ use common::types::PointOffsetType;
+ use io::file_operations::{atomic_save_json, read_json};
+ use memmap2::MmapMut;
+-use memory::madvise::{AdviceSetting, clear_disk_cache};
++use memory::fadvise::clear_disk_cache;
++use memory::madvise::AdviceSetting;
+ use memory::mmap_ops::{self, create_and_ensure_length};
+ use memory::mmap_type::{MmapBitSlice, MmapSlice};
+ use serde::{Deserialize, Serialize};
+

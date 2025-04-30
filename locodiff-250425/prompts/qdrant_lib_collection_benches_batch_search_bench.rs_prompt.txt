@@ -1,0 +1,3078 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- lib/collection/benches/batch_search_bench.rs
+
+commit a2acca0345057dfb7fd8f218801a1c84cd77616b
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Aug 18 14:48:17 2022 +0200
+
+    Segment batch search (#813)
+    
+    * batch search benchmark
+    
+    * collect filter iterator in indexed search
+    
+    * fmt
+    
+    * fix
+    
+    * fix
+    
+    * fmt
+    
+    * use new tempfile create
+    
+    * auto batching
+    
+    * Clippy fixes
+    
+    * REST, gRPC and internal APIs
+    
+    * fix bugs & less duplication
+    
+    * two steps payload retrieval mechanism & fix duplication
+    
+    * add proxy_segment implementation & tests
+    
+    * add gRPC docs
+    
+    * remove unused code (#950)
+    
+    * only filter ids within a batch
+    
+    * add more equivalence tests
+    
+    * add integration test search vs batch
+    
+    * assert more search options in tests
+    
+    * cleanup assertions
+    
+    * fix offset panic
+    
+    * rename search batch API
+    
+    * openapi spec
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+new file mode 100644
+index 000000000..b1801e5bc
+--- /dev/null
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -0,0 +1,188 @@
++mod prof;
++
++use std::num::{NonZeroU32, NonZeroU64};
++use std::sync::Arc;
++
++use collection::config::{CollectionConfig, CollectionParams, WalConfig};
++use collection::operations::point_ops::{PointInsertOperations, PointOperations, PointStruct};
++use collection::operations::types::{SearchRequest, SearchRequestBatch};
++use collection::operations::CollectionUpdateOperations;
++use collection::optimizers_builder::OptimizersConfig;
++use collection::shard::local_shard::LocalShard;
++use collection::shard::ShardOperation;
++use criterion::{criterion_group, criterion_main, Criterion};
++use rand::thread_rng;
++use segment::fixtures::payload_fixtures::random_vector;
++use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
++use serde_json::Map;
++use tempfile::Builder;
++use tokio::runtime::Runtime;
++use tokio::sync::RwLock;
++
++fn create_rnd_batch() -> CollectionUpdateOperations {
++    let mut rng = thread_rng();
++    let num_points = 2000;
++    let dim = 100;
++    let mut points = Vec::new();
++    for i in 0..num_points {
++        let mut payload_map = Map::new();
++        payload_map.insert("a".to_string(), (i % 5).into());
++        let vector = random_vector(&mut rng, dim);
++        let point = PointStruct {
++            id: i.into(),
++            vector,
++            payload: Some(Payload(payload_map)),
++        };
++        points.push(point);
++    }
++    CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
++        PointInsertOperations::PointsList(points),
++    ))
++}
++
++fn batch_search_bench(c: &mut Criterion) {
++    let storage_dir = Builder::new().prefix("storage").tempdir().unwrap();
++
++    let runtime = Runtime::new().unwrap();
++    let search_runtime = Runtime::new().unwrap();
++    let search_runtime_handle = search_runtime.handle();
++    let handle = runtime.handle().clone();
++
++    let wal_config = WalConfig {
++        wal_capacity_mb: 1,
++        wal_segments_ahead: 0,
++    };
++
++    let collection_params = CollectionParams {
++        vector_size: NonZeroU64::new(100).unwrap(),
++        distance: Distance::Dot,
++        shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
++        on_disk_payload: false,
++    };
++
++    let collection_config = CollectionConfig {
++        params: collection_params,
++        optimizer_config: OptimizersConfig {
++            deleted_threshold: 0.9,
++            vacuum_min_vector_number: 1000,
++            default_segment_number: 2,
++            max_segment_size: Some(100_000),
++            memmap_threshold: Some(100_000),
++            indexing_threshold: 50_000,
++            flush_interval_sec: 30,
++            max_optimization_threads: 2,
++        },
++        wal_config,
++        hnsw_config: Default::default(),
++    };
++
++    let shared_config = Arc::new(RwLock::new(collection_config));
++
++    let shard = handle
++        .block_on(LocalShard::build(
++            0,
++            "test_collection".to_string(),
++            storage_dir.path(),
++            shared_config,
++        ))
++        .unwrap();
++
++    let rnd_batch = create_rnd_batch();
++
++    handle.block_on((&shard).update(rnd_batch, true)).unwrap();
++
++    let mut group = c.benchmark_group("batch-search-bench");
++
++    let filters = vec![
++        None,
++        Some(Filter::new_must(Condition::Field(
++            FieldCondition::new_match("a".to_string(), 3.into()),
++        ))),
++        Some(Filter::new_must(Condition::Field(
++            FieldCondition::new_range(
++                "a".to_string(),
++                Range {
++                    lt: None,
++                    gt: Some(-1.),
++                    gte: None,
++                    lte: Some(100.0),
++                },
++            ),
++        ))),
++    ];
++
++    let batch_size = 100;
++
++    for (fid, filter) in filters.into_iter().enumerate() {
++        group.bench_function(format!("search-{fid}"), |b| {
++            b.iter(|| {
++                runtime.block_on(async {
++                    let mut rng = thread_rng();
++                    for _i in 0..batch_size {
++                        let query = random_vector(&mut rng, 100);
++                        let search_query = SearchRequest {
++                            vector: query,
++                            filter: filter.clone(),
++                            params: None,
++                            limit: 10,
++                            offset: 0,
++                            with_payload: None,
++                            with_vector: false,
++                            score_threshold: None,
++                        };
++                        let result = (&shard)
++                            .search(
++                                Arc::new(SearchRequestBatch {
++                                    searches: vec![search_query],
++                                }),
++                                search_runtime_handle,
++                            )
++                            .await
++                            .unwrap();
++                        assert!(!result.is_empty());
++                    }
++                });
++            })
++        });
++
++        group.bench_function(format!("search-batch-{fid}"), |b| {
++            b.iter(|| {
++                runtime.block_on(async {
++                    let mut rng = thread_rng();
++                    let mut searches = Vec::new();
++                    for _i in 0..batch_size {
++                        let query = random_vector(&mut rng, 100);
++                        let search_query = SearchRequest {
++                            vector: query,
++                            filter: filter.clone(),
++                            params: None,
++                            limit: 10,
++                            offset: 0,
++                            with_payload: None,
++                            with_vector: false,
++                            score_threshold: None,
++                        };
++                        searches.push(search_query);
++                    }
++
++                    let search_query = SearchRequestBatch { searches };
++                    let result = (&shard)
++                        .search(Arc::new(search_query), search_runtime_handle)
++                        .await
++                        .unwrap();
++                    assert!(!result.is_empty());
++                });
++            })
++        });
++    }
++
++    group.finish();
++}
++
++criterion_group! {
++    name = benches;
++    config = Criterion::default();
++    targets = batch_search_bench,
++}
++
++criterion_main!(benches);
+
+commit dc0314201edc69c04930cd8e6b752515b59ee74e
+Author: Egor Ivkov <e.o.ivkov@gmail.com>
+Date:   Wed Aug 31 11:26:52 2022 +0300
+
+    Add replication factor (#966)
+    
+    * Add replication_factor config and ops to change it
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index b1801e5bc..533afc9d6 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -57,6 +57,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         vector_size: NonZeroU64::new(100).unwrap(),
+         distance: Distance::Dot,
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
++        replication_factor: NonZeroU32::new(1).unwrap(),
+         on_disk_payload: false,
+     };
+ 
+
+commit f6b21861939744e054a861d9771608b7e6b614e7
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Sun Sep 11 22:59:23 2022 +0400
+
+    [WIP] Many named vectors per point (#958)
+    
+    * many named vectors per point (segment-level)
+    
+    * operation result for dim function
+    
+    * beautifulized vector name
+    
+    * fix naming bug
+    
+    * segment version migration
+    
+    * fmt
+    
+    * add segment tests
+    
+    * are you happy clippy
+    
+    * fix build
+    
+    * [WIP] many named vectors per point (collection-level) (#975)
+    
+    * config and search
+    
+    * fix placeholders for proxy segment move
+    
+    * remove VectorType from collection
+    
+    * are you happy fmt
+    
+    * vectors in grps messages
+    
+    * create collections with vectors
+    
+    * segment holder fixes
+    
+    * are you happy fmt
+    
+    * remove default vector name placeholders
+    
+    * are you happy fmt
+    
+    * are you happy clippy
+    
+    * fix build
+    
+    * fix web api
+    
+    * are you happy clippy
+    
+    * are you happy fmt
+    
+    * record vector&vectors
+    
+    * openapi update
+    
+    * fix openapi integration tests
+    
+    * segment builder fix todo
+    
+    * vector names for update from segment
+    
+    * remove unwrap
+    
+    * backward compatibility
+    
+    * upd openapi
+    
+    * backward compatible PointStruct
+    
+    * upd openapi
+    
+    * fix record back-comp
+    
+    * fmt
+    
+    * vector configuration backward compatibility
+    
+    * fix vetor storage size estimation
+    
+    * fmt
+    
+    * multi-vec segment test + index test
+    
+    * fmt
+    
+    * api integration tests
+    
+    * [WIP] Named vectors struct (#1002)
+    
+    * move to separate file
+    
+    * named vectors as struct
+    
+    * use cow
+    
+    * fix build
+    
+    * keys iterator
+    
+    * avoid copy in PointStruct -> get_vectors
+    
+    * avoid another copy
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 533afc9d6..b0b49be1a 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,3 +1,5 @@
++#![allow(deprecated)]
++
+ mod prof;
+ 
+ use std::num::{NonZeroU32, NonZeroU64};
+@@ -12,6 +14,7 @@ use collection::shard::local_shard::LocalShard;
+ use collection::shard::ShardOperation;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::thread_rng;
++use segment::data_types::vectors::only_default_vector;
+ use segment::fixtures::payload_fixtures::random_vector;
+ use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
+ use serde_json::Map;
+@@ -28,9 +31,10 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
+         let mut payload_map = Map::new();
+         payload_map.insert("a".to_string(), (i % 5).into());
+         let vector = random_vector(&mut rng, dim);
++        let vectors = only_default_vector(&vector);
+         let point = PointStruct {
+             id: i.into(),
+-            vector,
++            vector: vectors.into(),
+             payload: Some(Payload(payload_map)),
+         };
+         points.push(point);
+@@ -54,8 +58,9 @@ fn batch_search_bench(c: &mut Criterion) {
+     };
+ 
+     let collection_params = CollectionParams {
+-        vector_size: NonZeroU64::new(100).unwrap(),
+-        distance: Distance::Dot,
++        vectors: None,
++        vector_size: Some(NonZeroU64::new(100).unwrap()),
++        distance: Some(Distance::Dot),
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+         replication_factor: NonZeroU32::new(1).unwrap(),
+         on_disk_payload: false,
+@@ -122,13 +127,13 @@ fn batch_search_bench(c: &mut Criterion) {
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+                         let search_query = SearchRequest {
+-                            vector: query,
++                            vector: query.into(),
+                             filter: filter.clone(),
+                             params: None,
+                             limit: 10,
+                             offset: 0,
+                             with_payload: None,
+-                            with_vector: false,
++                            with_vector: false.into(),
+                             score_threshold: None,
+                         };
+                         let result = (&shard)
+@@ -154,13 +159,13 @@ fn batch_search_bench(c: &mut Criterion) {
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+                         let search_query = SearchRequest {
+-                            vector: query,
++                            vector: query.into(),
+                             filter: filter.clone(),
+                             params: None,
+                             limit: 10,
+                             offset: 0,
+                             with_payload: None,
+-                            with_vector: false,
++                            with_vector: false.into(),
+                             score_threshold: None,
+                         };
+                         searches.push(search_query);
+
+commit 94883e7062c3eab7c65886daa524a0ff3cec3c37
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Fri Sep 16 01:37:04 2022 +0200
+
+    allow empty with_vector
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index b0b49be1a..7457de5b5 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -133,7 +133,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                             limit: 10,
+                             offset: 0,
+                             with_payload: None,
+-                            with_vector: false.into(),
++                            with_vector: None,
+                             score_threshold: None,
+                         };
+                         let result = (&shard)
+@@ -165,7 +165,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                             limit: 10,
+                             offset: 0,
+                             with_payload: None,
+-                            with_vector: false.into(),
++                            with_vector: None,
+                             score_threshold: None,
+                         };
+                         searches.push(search_query);
+
+commit dc07b01e1fea5cb9be3579b555be480e30aa3041
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon Sep 19 13:51:03 2022 +0200
+
+    remove deprecated fields from API (#1030)
+    
+    * remove depricated fields from API
+    
+    * fmt
+    
+    * upd openapi and integration tests
+    
+    * fix grpc test
+    
+    * regenerate storage reference data
+    
+    * improve docs
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 7457de5b5..a242cf4a3 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -5,7 +5,7 @@ mod prof;
+ use std::num::{NonZeroU32, NonZeroU64};
+ use std::sync::Arc;
+ 
+-use collection::config::{CollectionConfig, CollectionParams, WalConfig};
++use collection::config::{CollectionConfig, CollectionParams, VectorParams, WalConfig};
+ use collection::operations::point_ops::{PointInsertOperations, PointOperations, PointStruct};
+ use collection::operations::types::{SearchRequest, SearchRequestBatch};
+ use collection::operations::CollectionUpdateOperations;
+@@ -58,9 +58,11 @@ fn batch_search_bench(c: &mut Criterion) {
+     };
+ 
+     let collection_params = CollectionParams {
+-        vectors: None,
+-        vector_size: Some(NonZeroU64::new(100).unwrap()),
+-        distance: Some(Distance::Dot),
++        vectors: VectorParams {
++            size: NonZeroU64::new(100).unwrap(),
++            distance: Distance::Dot,
++        }
++        .into(),
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+         replication_factor: NonZeroU32::new(1).unwrap(),
+         on_disk_payload: false,
+
+commit 1becde4c8f9fe69e0bac1732319dd9469abbe316
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Thu Sep 22 18:59:36 2022 +0200
+
+    Fix Clippy following Rust update (#1046)
+    
+    * Fix Clippy following Rust update
+    
+    error: this expression can be written more simply using `.retain()`
+       --> lib/collection/src/collection_manager/holders/proxy_segment.rs:444:13
+        |
+    444 | /             read_points = read_points
+    445 | |                 .into_iter()
+    446 | |                 .filter(|idx| !deleted_points.contains(idx))
+    447 | |                 .collect();
+        | |__________________________^ help: consider calling `.retain()` instead: `read_points.retain(|idx| !deleted_points.contains(idx))`
+        |
+        = note: `-D clippy::manual-retain` implied by `-D warnings`
+        = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_retain
+    
+    * this expression borrows a value the compiler would automatically borrow
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index a242cf4a3..446a74626 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -97,7 +97,7 @@ fn batch_search_bench(c: &mut Criterion) {
+ 
+     let rnd_batch = create_rnd_batch();
+ 
+-    handle.block_on((&shard).update(rnd_batch, true)).unwrap();
++    handle.block_on(shard.update(rnd_batch, true)).unwrap();
+ 
+     let mut group = c.benchmark_group("batch-search-bench");
+ 
+@@ -138,7 +138,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                             with_vector: None,
+                             score_threshold: None,
+                         };
+-                        let result = (&shard)
++                        let result = shard
+                             .search(
+                                 Arc::new(SearchRequestBatch {
+                                     searches: vec![search_query],
+@@ -174,7 +174,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                     }
+ 
+                     let search_query = SearchRequestBatch { searches };
+-                    let result = (&shard)
++                    let result = shard
+                         .search(Arc::new(search_query), search_runtime_handle)
+                         .await
+                         .unwrap();
+
+commit 62cc0880b880de613801cf01df1cd6984a86ca01
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Wed Oct 12 12:19:08 2022 +0200
+
+    Replica set snapshot (#1118)
+    
+    * replication set loading + snapshoting
+    
+    * test + fixes
+    
+    * fix typo
+    
+    * fmt
+    
+    * remove duplicated
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 446a74626..c559fd84e 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -87,7 +87,7 @@ fn batch_search_bench(c: &mut Criterion) {
+     let shared_config = Arc::new(RwLock::new(collection_config));
+ 
+     let shard = handle
+-        .block_on(LocalShard::build(
++        .block_on(LocalShard::build_local(
+             0,
+             "test_collection".to_string(),
+             storage_dir.path(),
+
+commit 9324be1d6038b4ba66ca776eb7e753e69fe5d624
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Mon Oct 17 20:12:10 2022 +0200
+
+    [Replication] Add replicas (#1085)
+    
+    * Add replicas to ReplicaSet
+    
+    * unproxify shard & miscs
+    
+    * no exlusive write locking while adding replicas
+    
+    * on_optimizer_config_update on Shard with async. recursion
+    
+    * no exlusive write locking while removing replicas
+    
+    * shortcut replica set propagation #1101
+    
+    * remove unused field
+    
+    * make RequestShardTransfer callback sync.
+    
+    * promote local & remote to replica state
+    
+    * fixes for replica sync api (#1123)
+    
+    * code review
+    
+    * fix replica set update - fail only if all failed
+    
+    * Add replica redesign (#1131)
+    
+    * refactor shard/mod.rs
+    
+    * wip
+    
+    * fmt
+    
+    * it compiles
+    
+    * temporary disable replica placemeant change on replication factor
+    
+    * fmt
+    
+    * finish todos
+    
+    * small refactoring
+    
+    * remove change::add
+    
+    * replica-set -> shard-replica-set
+    
+    * fmt
+    
+    * upd openapi
+    
+    * fix finish transfer logic
+    
+    * fix existing integration tests
+    
+    * shard transfer validation
+    
+    * fmt
+    
+    * review fixes
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index c559fd84e..5d740c8c7 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -10,8 +10,8 @@ use collection::operations::point_ops::{PointInsertOperations, PointOperations,
+ use collection::operations::types::{SearchRequest, SearchRequestBatch};
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+-use collection::shard::local_shard::LocalShard;
+-use collection::shard::ShardOperation;
++use collection::shards::local_shard::LocalShard;
++use collection::shards::shard_trait::ShardOperation;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::thread_rng;
+ use segment::data_types::vectors::only_default_vector;
+
+commit 664d9bd93be71532061ffbc2ff9c2b4c11f3d20f
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Oct 25 17:37:15 2022 +0200
+
+    implement concern-factor, forbig disabling the last node, improve tes… (#1168)
+    
+    * implement concern-factor, forbig disabling the last node, improve test stability
+    
+    * upd docs
+    
+    * improve test_recover_dead_node
+    
+    * rename to write_consistency_factor
+    
+    * Fix bug: applied index higher than commit on restart (#1172)
+    
+    * create collection with default status = dead + await for activation on create_collecton_op_submit
+    
+    * fmt
+    
+    * fix unit tests
+    
+    Co-authored-by: Egor Ivkov <e.o.ivkov@gmail.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 5d740c8c7..4cb0c7b57 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -65,6 +65,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         .into(),
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+         replication_factor: NonZeroU32::new(1).unwrap(),
++        write_consistency_factor: NonZeroU32::new(1).unwrap(),
+         on_disk_payload: false,
+     };
+ 
+
+commit 63b59c1044b2da42e493b4592cfe56e7699e8a95
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Wed Nov 9 12:58:06 2022 +0100
+
+    fix colletion params update (#1208)
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 4cb0c7b57..ec2bef0fb 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -5,9 +5,9 @@ mod prof;
+ use std::num::{NonZeroU32, NonZeroU64};
+ use std::sync::Arc;
+ 
+-use collection::config::{CollectionConfig, CollectionParams, VectorParams, WalConfig};
++use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{PointInsertOperations, PointOperations, PointStruct};
+-use collection::operations::types::{SearchRequest, SearchRequestBatch};
++use collection::operations::types::{SearchRequest, SearchRequestBatch, VectorParams};
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+ use collection::shards::local_shard::LocalShard;
+
+commit 9638f2f915f4b96364b0f0b80f31399e5e4beb58
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Wed Jan 25 08:05:50 2023 +0100
+
+    Collections share a single optimizer runtime (#1396)
+    
+    * Collections share a single optimizer runtime
+    
+    * review fixes
+    
+    * rename: optimizer_runtime -> update_runtime
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index ec2bef0fb..a96182520 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -93,6 +93,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             "test_collection".to_string(),
+             storage_dir.path(),
+             shared_config,
++            handle.clone(),
+         ))
+         .unwrap();
+ 
+
+commit 2bcba1de7a818961a57c605fd18643fbd0f3193d
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon Feb 6 14:00:23 2023 +0100
+
+    Windows support (#1432)
+    
+    * windows-support
+    
+    * fmt
+    
+    * install protoc with action
+    
+    * upd WAL revision
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index a96182520..7a438a6f7 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,5 +1,6 @@
+ #![allow(deprecated)]
+ 
++#[cfg(not(target_os = "windows"))]
+ mod prof;
+ 
+ use std::num::{NonZeroU32, NonZeroU64};
+
+commit 128e49fcc3633e361df33818de6cca0aab95da10
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Fri Mar 3 20:46:17 2023 +0400
+
+    integrate quantized data to storages (#1311)
+    
+    * integrate quantized data to storages
+    
+    * revert gitignore
+    
+    * are you happy clippy
+    
+    * quantize in optimizer
+    
+    * provide flag
+    
+    * fix segfault
+    
+    * skip quantization flag, update scores
+    
+    * use quantization flag
+    
+    * are you happy fmt
+    
+    * use quantization flag
+    
+    * quantized search test
+    
+    * are you happy fmt
+    
+    * refactor test, refactor scorer choosing
+    
+    * are you happy fmt
+    
+    * run quantization on segment builder
+    
+    * decrease testing parameters
+    
+    * simplify segment
+    
+    * update version
+    
+    * remove use_quantization flag
+    
+    * provide quantization config
+    
+    * quantization version up
+    
+    * euclid dist
+    
+    * add euclid test
+    
+    * saveload
+    
+    * fix initialization bugs
+    
+    * quantization lib version up
+    
+    * fix arm build
+    
+    * refactor scorer selecting
+    
+    * quant lib version up
+    
+    * are you happy fmt
+    
+    * are you happy fmt
+    
+    * are you happy clippy
+    
+    * add save/load test for simple storage
+    
+    * add comments
+    
+    * quantiles
+    
+    * quantization mmap
+    
+    * remove f32
+    
+    * mmap test
+    
+    * fix mmap slice
+    
+    * fix mmap test
+    
+    * use chunks for quantization storage
+    
+    * fix build
+    
+    * are you happy fmt
+    
+    * update quantization library
+    
+    * update quantization lib
+    
+    * update quantization lib
+    
+    * integrate api changes
+    
+    * are you happy fmt
+    
+    * change quantization api
+    
+    * additional checks in tests
+    
+    * update quantization version
+    
+    * fix unit tests
+    
+    * add quantization to storage config
+    
+    * use quantization for all cardinality search cases
+    
+    * Integrate quantization suggestions 2 (#1520)
+    
+    * review api
+    
+    * wip: refactor quantization integrations
+    
+    * wip: refactor quantization integrations
+    
+    * wip: fmt
+    
+    * include quantization into snapshot
+    
+    * fmt
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 7a438a6f7..5bb83a22f 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -84,6 +84,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         },
+         wal_config,
+         hnsw_config: Default::default(),
++        quantization_config: Default::default(),
+     };
+ 
+     let shared_config = Arc::new(RwLock::new(collection_config));
+
+commit a9f800bdd694d885e506902e1a568c0235e49be1
+Author: Roman Titov <ffuugoo@users.noreply.github.com>
+Date:   Mon Mar 13 10:27:43 2023 +0100
+
+    Add `update_queue_size` field to the `StorageConfig` structure (#1543)
+    
+    * WIP: Add `update_queue_size` field to the `StorageConfig` structure
+    
+    * WIP: Add `collection::config::GlobalConfig`... [skip ci]
+    
+    ...to propagate "global" (i.e., non per-collection) parameters to `collection` crate types.
+    
+    TODO:
+    - fix tests/clippy/formatting (I'm on the move and laptop will die any minute now)
+    
+    * Fix tests, clippy and formatting
+    
+    * Remove unnecessary nesting in `collection/tests/alias_tests.rs`
+    
+    * review
+    
+    * fmt
+    
+    * fix review
+    
+    * fix review
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 5bb83a22f..02291edd2 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -95,6 +95,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             "test_collection".to_string(),
+             storage_dir.path(),
+             shared_config,
++            Default::default(),
+             handle.clone(),
+         ))
+         .unwrap();
+
+commit 66ba8f17af136554e5a5a707c31d8d1fd801b70c
+Author: Tim Visée <tim+github@visee.me>
+Date:   Mon Apr 10 17:16:56 2023 +0200
+
+    Add vector specific HNSW configuration (#1675)
+    
+    * Validate VectorConfig/VectorParams, remove obsolete validation
+    
+    * Add HNSW config diff to vector parameters
+    
+    * Validate params in collection config
+    
+    * Add HNSW config to segment vector data config
+    
+    * Add VectorsConfig params iterator for more elegant conversions
+    
+    * Prefer vector HNSW config over collection config for building HNSW index
+    
+    * Base segment vector param HNSW config on collection config
+    
+    * General improvements
+    
+    * Rewrite HNSW ef_construct extract function to also consider vector configs
+    
+    * Update OpenAPI specification
+    
+    * Add test to check if vector specific HNSW config is persisted
+    
+    * review changes
+    
+    * review changes
+    
+    * Regenerate gRPC docs
+    
+    * Fix test on Windows
+    
+    * Regenerate OpenAPI specification
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 02291edd2..deab9ef0a 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -62,6 +62,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         vectors: VectorParams {
+             size: NonZeroU64::new(100).unwrap(),
+             distance: Distance::Dot,
++            hnsw_config: None,
+         }
+         .into(),
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+
+commit 868626f409a7bcc4e2537dcf69b9b4bbe2c10208
+Author: Tim Visée <tim+github@visee.me>
+Date:   Mon Apr 10 21:39:43 2023 +0200
+
+    Add vector specific quantization configuration (#1680)
+    
+    * Add QuantizationConfigDiff type
+    
+    * Add quantization config diff to vector parameters
+    
+    * Prefer vector config over collection config for quantization
+    
+    * Update OpenAPI specification
+    
+    * Validate quantization configuration quantile in 0.5-1.0 range
+    
+    As per https://github.com/qdrant/qdrant/pull/1681
+    
+    * Add test if check if vector specific quantization config is persisted
+    
+    * Alias quantization to quantization_config in vector parameters
+    
+    * Remove quantization config diff, use full vector specific config instead
+    
+    * Regenerate OpenAPI specification and gRPC docs
+    
+    * Fix compilation error
+    
+    * Add error handling to quantization config conversions
+    
+    * Fix quantization integration test, make HNSW test stricter
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index deab9ef0a..f2d6a8b01 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -63,6 +63,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             size: NonZeroU64::new(100).unwrap(),
+             distance: Distance::Dot,
+             hnsw_config: None,
++            quantization_config: None,
+         }
+         .into(),
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+
+commit 0cff1564a598d4b9177dfb4a44401bfcd9ebdb9e
+Author: Luis Cossío <luis.cossio@outlook.com>
+Date:   Fri Apr 14 18:03:13 2023 -0400
+
+    Allow `indexing_threshold=null` to disable indexing (#1702)
+    
+    * feat: allow indexing_threshold=null to disable indexing
+    
+    * fix: continue refactor
+    
+    * amend: continue refactor
+    
+    * amend: restore docstring
+    
+    * update openapi.json
+    
+    * test: add sanity test
+    
+    * test: refactor test
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index f2d6a8b01..ae2b4947d 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -80,7 +80,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             default_segment_number: 2,
+             max_segment_size: Some(100_000),
+             memmap_threshold: Some(100_000),
+-            indexing_threshold: 50_000,
++            indexing_threshold: Some(50_000),
+             flush_interval_sec: 30,
+             max_optimization_threads: 2,
+         },
+
+commit 45ae3e048b15f10e71b5825a9fc00ee7b7676390
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue May 9 18:01:01 2023 +0200
+
+    Dynamic mmap vector storage (#1838)
+    
+    * wip: chunked mmap
+    
+    * Fix typo
+    
+    * insert and get methods
+    
+    * dynamic bitvec
+    
+    * clippy
+    
+    * wip: vector storage
+    
+    * wip: fmt
+    
+    * wip: mmap chunks
+    
+    * wip: mmap problems
+    
+    * Share transmuted mutable reference over mmap
+    
+    * option to enable appendable mmap vectors
+    
+    * fmt
+    
+    * rename storage status file
+    
+    * update tests
+    
+    * fix get deleted value range
+    
+    * add recovery to vector storage tests
+    
+    * add flush to tests
+    
+    * fix transmute from immutable to mutable
+    
+    * make transmuted pointer private
+    
+    * remove unused unsafe functions
+    
+    * force WAL flush if wait=true
+    
+    * move wal flush into updater thread
+    
+    * remove flush from update api
+    
+    * Minimize pub visibility for specialized/dangerous functions
+    
+    * Allocate vector with predefined capacity
+    
+    * Inline format parameters
+    
+    * Assert we have multiple chunks while testing, test is useless otherwise
+    
+    * Remove unnecessary scope
+    
+    * Remove unnecessary dereference
+    
+    * Random bool has 0.5 as standard distribution, use iter::repeat_with
+    
+    * Replace RemovableMmap::new with Default derive
+    
+    * Rename len to num_flags
+    
+    * Use Option replace as it is convention alongside take
+    
+    * Add FileId enum to replace error prone manual ID rotating
+    
+    * Use debug_assert_eq where applicable
+    
+    * Refactor drop and set to replace
+    
+    * Change default chunk size for chunked mmap vectors to 32MB
+    
+    This change is made as per GitHub review, because allocating a few
+    storages with 128MB would take a significant amount of time and storage.
+    
+    See: https://github.com/qdrant/qdrant/pull/1838#discussion_r1187215475
+    
+    * Replace for-loops with iterators
+    
+    * Draft: add typed mmap to improve code safety (#1860)
+    
+    * Add typed mmap
+    
+    * Replace some crude mmap usages with typed mmap
+    
+    * Use typed mmap for deleted flags
+    
+    * Simplify dynamic mmap flags a lot with new typed mmap, remove flags option
+    
+    * Reformat
+    
+    * Remove old mmap functions that are now unused
+    
+    * Reimplement mmap locking for mmap_vectors
+    
+    * Add MmapBitSlice tests
+    
+    * Replace MmapChunk with new typed mmap
+    
+    * Update docs
+    
+    * Clean-up
+    
+    * Disable alignment assertions on Windows for now
+    
+    * Rename mmap lock to mlock to prevent confusion with lockable types
+    
+    * one more small test
+    
+    * Some review fixes
+    
+    * Add aliasing note
+    
+    * Add basic error handling in typed mmap constructors
+    
+    * Use typed mmap error handling throughout project
+    
+    * Move mmap type module to common
+    
+    * Fix transmute functions being unsound
+    
+    See https://github.com/qdrant/qdrant/pull/1860#discussion_r1188593854
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index ae2b4947d..f03c48e15 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -64,6 +64,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             distance: Distance::Dot,
+             hnsw_config: None,
+             quantization_config: None,
++            on_disk: None,
+         }
+         .into(),
+         shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+
+commit df711b7c2e64ec4baf9c086fab2ba68dcdf0966e
+Author: Tim Visée <tim+github@visee.me>
+Date:   Wed May 17 09:49:55 2023 +0200
+
+    Refactor segment config (#1894)
+    
+    * Clone current segment config to deprecated type
+    
+    * Remove segment level quantization config from segment config
+    
+    * Also deprecate current VectorDataConfig
+    
+    * Update old segment migration to work with new refactoring
+    
+    * Move index into vector data config
+    
+    * Move vector data config migration logic into segment level
+    
+    * Remove hnsw_config from vector data config
+    
+    * Rename collection params to vector data conversions function
+    
+    * Move storage type into vector data config
+    
+    * Set appendable flag correctly
+    
+    * Clean up and reformat
+    
+    * Make segment on disk flag not optional
+    
+    * Add appendable flag to segment config to replace storage type
+    
+    * Remove storage type from segment config
+    
+    * Deprecate storage type enum
+    
+    * Use consistent variable naming
+    
+    * Cleanup
+    
+    * Add segment config migration for v0.5.0 to current
+    
+    * Bump segment to 0.6.0
+    
+    * Remove serde defaults for new storage and vector data config types
+    
+    These default value configurations are not needed anymore, because these
+    structs are not used to deserialize old data. All current fields should
+    always be available in these structs. When new fields are added in new
+    functions, the serde default annotation must be set again.
+    
+    * Cleanup
+    
+    * Update OpenAPI specification
+    
+    This updates the returned data structure on telemetry endpoints, as a
+    result of segment configuration refactoring.
+    
+    * Fix quantization configuration not falling back to collection config
+    
+    * Fix compiler warning when building in release mode
+    
+    * Move deprecated type structs into compat module
+    
+    * Update allow deprecated attributes
+    
+    * Assign quantization config only in segment optimizer
+    
+    * Remove unsued parameter
+    
+    * Add vector storage type enum to vector data config
+    
+    * Remove appendable and on_disk flags from segment and vector config
+    
+    * Update OpenAPI specification
+    
+    * add tests
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index f03c48e15..f2e35a3df 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,5 +1,3 @@
+-#![allow(deprecated)]
+-
+ #[cfg(not(target_os = "windows"))]
+ mod prof;
+ 
+
+commit 34ba4d244229e2fb855ca5b9109e5d76e6a1c9a6
+Author: Taras Tsugrii <taras.tsugriy@gmail.com>
+Date:   Tue Jul 11 02:18:38 2023 -0500
+
+    [bench] Reserve vector storage to avoid reallocs. (#2245)
+    
+    This is particularly useful for microbenchmarks since
+    1) this cost shouldn't affect benchmark results
+    2) memory allocations are the largest source of measurement noise
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index f2e35a3df..748c3b8f5 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -25,14 +25,14 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
+     let mut rng = thread_rng();
+     let num_points = 2000;
+     let dim = 100;
+-    let mut points = Vec::new();
++    let mut points = Vec::with_capacity(num_points);
+     for i in 0..num_points {
+         let mut payload_map = Map::new();
+         payload_map.insert("a".to_string(), (i % 5).into());
+         let vector = random_vector(&mut rng, dim);
+         let vectors = only_default_vector(&vector);
+         let point = PointStruct {
+-            id: i.into(),
++            id: (i as u64).into(),
+             vector: vectors.into(),
+             payload: Some(Payload(payload_map)),
+         };
+@@ -163,7 +163,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             b.iter(|| {
+                 runtime.block_on(async {
+                     let mut rng = thread_rng();
+-                    let mut searches = Vec::new();
++                    let mut searches = Vec::with_capacity(batch_size);
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+                         let search_query = SearchRequest {
+
+commit 0df5ef470a0443be270a9f6c349cf835d3d5ec7b
+Author: Roman Titov <ffuugoo@users.noreply.github.com>
+Date:   Fri Sep 22 21:56:10 2023 +0200
+
+    Fan out read operations if local shard is updated (#2642)
+    
+    * Fan-out read operations if local shard is being updated
+    
+    * Implement `is_update_in_progress` check for all shard types
+    
+    * fixup! Implement `is_update_in_progress` check for all shard types
+    
+    Reverse conditional 🤦‍♀️
+    
+    * WIP: Add `read_fan_out_factor` collection parameter...
+    
+    ...and refactor `execute_read_operation`/`execute_and_resolve_read_operation` to use it reasonably
+    
+    * WIP: Refactor `info` and `count` requests to utilize `read_fan_out_factor` properly
+    
+    * fixup! WIP: Refactor `info` and `count` requests to utilize `read_fan_out_factor` properly
+    
+    Fix typo
+    
+    * fixup! WIP: Add `read_fan_out_factor` collection parameter...
+    
+    Initialize `read_fan_out_factor` in tests
+    
+    * fixup! WIP: Add `read_fan_out_factor` collection parameter...
+    
+    Add `TODO` marker (:
+    
+    * fixup! WIP: Add `read_fan_out_factor` collection parameter...
+    
+    * fixup! fixup! WIP: Add `read_fan_out_factor` collection parameter...
+    
+    * fixup! fixup! fixup! WIP: Add `read_fan_out_factor` collection parameter...
+    
+    🤦‍♀️
+    
+    * Add `read_fan_out_factor` to required HTTP and gRPC APIs
+    
+    * WIP: Generate OpenAPI spec and gRPC docs
+    
+    * fixup! Add `read_fan_out_factor` to required HTTP and gRPC APIs
+    
+    * fixup! WIP: Add `read_fan_out_factor` collection parameter...
+    
+    Fix the comment
+    
+    * Add documentation
+    
+    * fixup! Add documentation
+    
+    Update OpenAPI spec and gRPC docs
+    
+    * optional param by default + comment
+    
+    * fmt
+    
+    * rollback test fixes
+    
+    * review changes
+    
+    * fmt
+    
+    * revert api changes
+    
+    * upd openapi
+    
+    * upd comment
+    
+    * fix info api
+    
+    * resolve merge conflicts
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 748c3b8f5..eb68575dd 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,7 +1,7 @@
+ #[cfg(not(target_os = "windows"))]
+ mod prof;
+ 
+-use std::num::{NonZeroU32, NonZeroU64};
++use std::num::NonZeroU64;
+ use std::sync::Arc;
+ 
+ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+@@ -65,10 +65,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             on_disk: None,
+         }
+         .into(),
+-        shard_number: NonZeroU32::new(1).expect("Shard number can not be zero"),
+-        replication_factor: NonZeroU32::new(1).unwrap(),
+-        write_consistency_factor: NonZeroU32::new(1).unwrap(),
+-        on_disk_payload: false,
++        ..CollectionParams::empty()
+     };
+ 
+     let collection_config = CollectionConfig {
+
+commit 87524275d4ff940145ff0110932f2b4d64f987b9
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Thu Nov 2 12:45:46 2023 -0400
+
+    Expose timeout query param for search requests (#2748)
+    
+    * add timeout query param for search requests
+    
+    * enable timeout for recommend requests
+    
+    * Add query timeout for group by requests
+    
+    * update openapi models
+    
+    * Don't decrease timeout after recommend preprocessing
+    
+    * Add openapi test
+    
+    * code review
+    
+    * add timeout to individual group by requests, non-decreasing
+    
+    * handle timeout for discover
+    
+    * Update timeout field tag in SearchBatchPoints
+    message
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index eb68575dd..8400edfb7 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -147,6 +147,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                                     searches: vec![search_query],
+                                 }),
+                                 search_runtime_handle,
++                                None,
+                             )
+                             .await
+                             .unwrap();
+@@ -178,7 +179,7 @@ fn batch_search_bench(c: &mut Criterion) {
+ 
+                     let search_query = SearchRequestBatch { searches };
+                     let result = shard
+-                        .search(Arc::new(search_query), search_runtime_handle)
++                        .search(Arc::new(search_query), search_runtime_handle, None)
+                         .await
+                         .unwrap();
+                     assert!(!result.is_empty());
+
+commit 816b5a7448c7f1e0d81c99e5a31219d00ece6fe5
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Nov 9 15:06:02 2023 +0100
+
+    Shard key routing for update requests (#2909)
+    
+    * add shard_key into output data structures for points
+    
+    * fmt
+    
+    * add shard selector for point update operations
+    
+    * fix creating index without sharding
+    
+    * Merge serde attributes
+    
+    * Code review changes
+    
+    * review fixes
+    
+    * upd openapi
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 8400edfb7..65417c509 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -5,7 +5,9 @@ use std::num::NonZeroU64;
+ use std::sync::Arc;
+ 
+ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+-use collection::operations::point_ops::{PointInsertOperations, PointOperations, PointStruct};
++use collection::operations::point_ops::{
++    PointInsertOperationsInternal, PointOperations, PointStruct,
++};
+ use collection::operations::types::{SearchRequest, SearchRequestBatch, VectorParams};
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+@@ -39,7 +41,7 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
+         points.push(point);
+     }
+     CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+-        PointInsertOperations::PointsList(points),
++        PointInsertOperationsInternal::PointsList(points),
+     ))
+ }
+ 
+
+commit cae3c45bf5d08ef6900cb88891b72f0b0bbf154e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Fri Nov 10 18:38:01 2023 +0100
+
+    Remove deprecated search methods (#2970)
+    
+    * remove duplicated search methods, introduced for compatibility in last version
+    
+    * Use `with_capacity` rather than a manual reserve
+    
+    * explicit Arc clones
+    
+    * get rid of batching by runs of same strategy
+    
+    * avoid refactor in group by
+    
+    * more explicit arc clones, remove one .expect()
+    
+    * little extra refactor on recommendations.rs
+    
+    * refactor grouping_test.rs too
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 65417c509..88a9d8788 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -8,7 +8,7 @@ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{
+     PointInsertOperationsInternal, PointOperations, PointStruct,
+ };
+-use collection::operations::types::{SearchRequest, SearchRequestBatch, VectorParams};
++use collection::operations::types::{CoreSearchRequestBatch, SearchRequest, VectorParams};
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+ use collection::shards::local_shard::LocalShard;
+@@ -144,9 +144,9 @@ fn batch_search_bench(c: &mut Criterion) {
+                             score_threshold: None,
+                         };
+                         let result = shard
+-                            .search(
+-                                Arc::new(SearchRequestBatch {
+-                                    searches: vec![search_query],
++                            .core_search(
++                                Arc::new(CoreSearchRequestBatch {
++                                    searches: vec![search_query.into()],
+                                 }),
+                                 search_runtime_handle,
+                                 None,
+@@ -176,12 +176,12 @@ fn batch_search_bench(c: &mut Criterion) {
+                             with_vector: None,
+                             score_threshold: None,
+                         };
+-                        searches.push(search_query);
++                        searches.push(search_query.into());
+                     }
+ 
+-                    let search_query = SearchRequestBatch { searches };
++                    let search_query = CoreSearchRequestBatch { searches };
+                     let result = shard
+-                        .search(Arc::new(search_query), search_runtime_handle, None)
++                        .core_search(Arc::new(search_query), search_runtime_handle, None)
+                         .await
+                         .unwrap();
+                     assert!(!result.is_empty());
+
+commit 2810672598fcba5aac80077daf469791475d1b5e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Nov 14 16:47:05 2023 +0100
+
+    Huge refactoring to make read requests aware of shard key selector (#3004)
+    
+    * huge refactoring to make read requests avare of shard key selector
+    
+    * fix integration test
+    
+    * review fixes
+    
+    * allow lookup_from specific shards
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 88a9d8788..b3c27527b 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -8,7 +8,7 @@ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{
+     PointInsertOperationsInternal, PointOperations, PointStruct,
+ };
+-use collection::operations::types::{CoreSearchRequestBatch, SearchRequest, VectorParams};
++use collection::operations::types::{CoreSearchRequestBatch, SearchRequestInternal, VectorParams};
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+ use collection::shards::local_shard::LocalShard;
+@@ -133,7 +133,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                     let mut rng = thread_rng();
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+-                        let search_query = SearchRequest {
++                        let search_query = SearchRequestInternal {
+                             vector: query.into(),
+                             filter: filter.clone(),
+                             params: None,
+@@ -166,7 +166,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                     let mut searches = Vec::with_capacity(batch_size);
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+-                        let search_query = SearchRequest {
++                        let search_query = SearchRequestInternal {
+                             vector: query.into(),
+                             filter: filter.clone(),
+                             params: None,
+
+commit 3fd3ff215aefede19b7f6ce566f7680b4b53dac3
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Wed Nov 22 15:05:54 2023 -0300
+
+    refactor: turn offset into an option (#3082)
+    
+    * refactor: make offset optional
+    
+    * update openapi
+    
+    * add simple test
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index b3c27527b..d79087eee 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -138,7 +138,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                             filter: filter.clone(),
+                             params: None,
+                             limit: 10,
+-                            offset: 0,
++                            offset: None,
+                             with_payload: None,
+                             with_vector: None,
+                             score_threshold: None,
+@@ -171,7 +171,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                             filter: filter.clone(),
+                             params: None,
+                             limit: 10,
+-                            offset: 0,
++                            offset: None,
+                             with_payload: None,
+                             with_vector: None,
+                             score_threshold: None,
+
+commit 19514265330ac9a1049b9439517deb104a5a19ed
+Author: Tim Visée <tim+github@visee.me>
+Date:   Wed Jan 31 11:56:34 2024 +0100
+
+    Dynamic CPU saturation internals (#3364)
+    
+    * Move CPU count function to common, fix wrong CPU count in visited list
+    
+    * Change default number of rayon threads to 8
+    
+    * Use CPU budget and CPU permits for optimizer tasks to limit utilization
+    
+    * Respect configured thread limits, use new sane defaults in config
+    
+    * Fix spelling issues
+    
+    * Fix test compilation error
+    
+    * Improve breaking if there is no CPU budget
+    
+    * Block optimizations until CPU budget, fix potentially getting stuck
+    
+    Our optimization worker now blocks until CPU budget is available to
+    perform the task.
+    
+    Fix potential issue where optimization worker could get stuck. This
+    would happen if no optimization task is started because there's no
+    available CPU budget. This ensures the worker is woken up again to
+    retry.
+    
+    * Utilize n-1 CPUs with optimization tasks
+    
+    * Better handle situations where CPU budget is drained
+    
+    * Dynamically scale rayon CPU count based on CPU size
+    
+    * Fix incorrect default for max_indexing_threads conversion
+    
+    * Respect max_indexing_threads for collection
+    
+    * Make max_indexing_threads optional, use none to set no limit
+    
+    * Update property documentation and comments
+    
+    * Property max_optimization_threads is per shard, not per collection
+    
+    * If we reached shard optimization limit, skip further checks
+    
+    * Add remaining TODOs
+    
+    * Fix spelling mistake
+    
+    * Align gRPC comment blocks
+    
+    * Fix compilation errors since last rebase
+    
+    * Make tests aware of CPU budget
+    
+    * Use new CPU budget calculation function everywhere
+    
+    * Make CPU budget configurable in settings, move static budget to common
+    
+    * Do not use static CPU budget, instance it and pass it through
+    
+    * Update CPU budget description
+    
+    * Move heuristic into defaults
+    
+    * Fix spelling issues
+    
+    * Move cpu_budget property to a better place
+    
+    * Move some things around
+    
+    * Minor review improvements
+    
+    * Use range match statement for CPU count heuristics
+    
+    * Systems with 1 or 2 CPUs do not keep cores unallocated by default
+    
+    * Fix compilation errors since last rebase
+    
+    * Update lib/segment/src/types.rs
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    
+    * Update lib/storage/src/content_manager/toc/transfer.rs
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    
+    * Rename cpu_budget to optimizer_cpu_budget
+    
+    * Update OpenAPI specification
+    
+    * Require at least half of the desired CPUs for optimizers
+    
+    This prevents running optimizations with just one CPU, which could be
+    very slow.
+    
+    * Don't use wildcard in CPU heuristic match statements
+    
+    * Rename cpu_budget setting to optimizer_cpu_budget
+    
+    * Update CPU budget comments
+    
+    * Spell acquire correctly
+    
+    * Change if-else into match
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    
+    * Rename max_rayon_threads to num_rayon_threads, add explanation
+    
+    * Explain limit in update handler
+    
+    * Remove numbers for automatic selection of indexing threads
+    
+    * Inline max_workers variable
+    
+    * Remove CPU budget from ShardTransferConsensus trait, it is in collection
+    
+    * small allow(dead_code) => cfg(test)
+    
+    * Remove now obsolete lazy_static
+    
+    * Fix incorrect CPU calculation in CPU saturation test
+    
+    * Make waiting for CPU budget async, don't block current thread
+    
+    * Prevent deadlock on optimizer signal channel
+    
+    Do not block the optimization worker task anymore to wait for CPU budget
+    to be available. That prevents our optimizer signal channel from being
+    drained, blocking incoming updates because the cannot send another
+    optimizer signal. Now, prevent blocking this task all together and
+    retrigger the optimizers separately when CPU budget is available again.
+    
+    * Fix incorrect CPU calculation in optimization cancel test
+    
+    * Rename CPU budget wait function to notify
+    
+    * Detach API changes from CPU saturation internals
+    
+    This allows us to merge into a patch version of Qdrant. We can
+    reintroduce the API changes in the upcoming minor release to make all of
+    it fully functional.
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index d79087eee..9c87da4c7 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -13,6 +13,7 @@ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+ use collection::shards::local_shard::LocalShard;
+ use collection::shards::shard_trait::ShardOperation;
++use common::cpu::CpuBudget;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::thread_rng;
+ use segment::data_types::vectors::only_default_vector;
+@@ -97,6 +98,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             shared_config,
+             Default::default(),
+             handle.clone(),
++            CpuBudget::default(),
+         ))
+         .unwrap();
+ 
+
+commit 99b750fcfa63444e07105947f7fd4fb241d7b050
+Author: Roman Titov <ffuugoo@users.noreply.github.com>
+Date:   Thu Feb 1 11:44:13 2024 +0100
+
+    Add `clock_tag` field to update operations (#3408)
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 9c87da4c7..0d7b43a95 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -104,7 +104,9 @@ fn batch_search_bench(c: &mut Criterion) {
+ 
+     let rnd_batch = create_rnd_batch();
+ 
+-    handle.block_on(shard.update(rnd_batch, true)).unwrap();
++    handle
++        .block_on(shard.update(rnd_batch.into(), true))
++        .unwrap();
+ 
+     let mut group = c.benchmark_group("batch-search-bench");
+ 
+
+commit c6407abbb365a64769b87dd41a550d821ebf7346
+Author: Tim Visée <tim+github@visee.me>
+Date:   Mon Feb 5 14:08:02 2024 +0100
+
+    Dynamic CPU saturation integration (#3115)
+    
+    * Integrate dynamic CPU saturation with public API changes
+    
+    This reverts commit 08930fefa940729064f649c1f7ec0bef53daad66.
+    
+    * Call num_cpus only once
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 0d7b43a95..11c5b7e87 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -81,7 +81,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             memmap_threshold: Some(100_000),
+             indexing_threshold: Some(50_000),
+             flush_interval_sec: 30,
+-            max_optimization_threads: 2,
++            max_optimization_threads: Some(2),
+         },
+         wal_config,
+         hnsw_config: Default::default(),
+
+commit 3beb4e3b4ff4b3f9585337f4e5b0826a14e247b6
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Fri Feb 23 14:38:40 2024 +0000
+
+    Introduce JsonPathString (#3674)
+    
+    * Introduce JsonPathString
+    
+    * Fix fomatting
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 11c5b7e87..dba851280 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -113,11 +113,11 @@ fn batch_search_bench(c: &mut Criterion) {
+     let filters = vec![
+         None,
+         Some(Filter::new_must(Condition::Field(
+-            FieldCondition::new_match("a".to_string(), 3.into()),
++            FieldCondition::new_match("a".parse().unwrap(), 3.into()),
+         ))),
+         Some(Filter::new_must(Condition::Field(
+             FieldCondition::new_range(
+-                "a".to_string(),
++                "a".parse().unwrap(),
+                 Range {
+                     lt: None,
+                     gt: Some(-1.),
+
+commit db5399f9e47cfe9d740645ec2f27e8751444882b
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Mon Mar 18 13:31:55 2024 +0100
+
+    Use rest vector type as non segment part (#3829)
+    
+    * use rest vector type as non-segment part
+    
+    * add todo
+    
+    * switch into -> from
+    
+    * review remarks
+    
+    * review remarks
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index dba851280..77478e340 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -16,7 +16,7 @@ use collection::shards::shard_trait::ShardOperation;
+ use common::cpu::CpuBudget;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::thread_rng;
+-use segment::data_types::vectors::only_default_vector;
++use segment::data_types::vectors::{only_default_vector, VectorStruct};
+ use segment::fixtures::payload_fixtures::random_vector;
+ use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
+ use serde_json::Map;
+@@ -36,7 +36,7 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
+         let vectors = only_default_vector(&vector);
+         let point = PointStruct {
+             id: (i as u64).into(),
+-            vector: vectors.into(),
++            vector: VectorStruct::from(vectors).into(),
+             payload: Some(Payload(payload_map)),
+         };
+         points.push(point);
+
+commit 632ec541e28ffc8450909e52102c6ade5715a357
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Apr 18 15:22:28 2024 +0200
+
+    Byte storage api support (#4065)
+    
+    * wip: include datatype in vector params API
+    
+    * generate api schemas
+    
+    * propagate datatype to segment creation
+    
+    * fix review
+    
+    * fmt
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 77478e340..4d799a353 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,14 +1,11 @@
+-#[cfg(not(target_os = "windows"))]
+-mod prof;
+-
+-use std::num::NonZeroU64;
+ use std::sync::Arc;
+ 
+ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{
+     PointInsertOperationsInternal, PointOperations, PointStruct,
+ };
+-use collection::operations::types::{CoreSearchRequestBatch, SearchRequestInternal, VectorParams};
++use collection::operations::types::{CoreSearchRequestBatch, SearchRequestInternal};
++use collection::operations::vector_params_builder::VectorParamsBuilder;
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+ use collection::shards::local_shard::LocalShard;
+@@ -24,6 +21,9 @@ use tempfile::Builder;
+ use tokio::runtime::Runtime;
+ use tokio::sync::RwLock;
+ 
++#[cfg(not(target_os = "windows"))]
++mod prof;
++
+ fn create_rnd_batch() -> CollectionUpdateOperations {
+     let mut rng = thread_rng();
+     let num_points = 2000;
+@@ -60,14 +60,7 @@ fn batch_search_bench(c: &mut Criterion) {
+     };
+ 
+     let collection_params = CollectionParams {
+-        vectors: VectorParams {
+-            size: NonZeroU64::new(100).unwrap(),
+-            distance: Distance::Dot,
+-            hnsw_config: None,
+-            quantization_config: None,
+-            on_disk: None,
+-        }
+-        .into(),
++        vectors: VectorParamsBuilder::new(100, Distance::Dot).build().into(),
+         ..CollectionParams::empty()
+     };
+ 
+
+commit f7a7e6ff128b7134e0cdf9804494981a7880ccee
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri May 31 09:02:44 2024 +0200
+
+    Add optimizer_overwrite config option (#4317)
+    
+    * add config option
+    
+    * add optimizers_config to optimizer calls
+    
+    * also add for tests
+    
+    * add to build_optimizers
+    
+    * rename function parameter
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 4d799a353..c7ac4651e 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -81,6 +81,8 @@ fn batch_search_bench(c: &mut Criterion) {
+         quantization_config: Default::default(),
+     };
+ 
++    let optimizers_config = collection_config.optimizer_config.clone();
++
+     let shared_config = Arc::new(RwLock::new(collection_config));
+ 
+     let shard = handle
+@@ -92,6 +94,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             Default::default(),
+             handle.clone(),
+             CpuBudget::default(),
++            optimizers_config,
+         ))
+         .unwrap();
+ 
+
+commit 020da0635696b60a53b0261a0ee111bfc71197c6
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Tue Jun 18 07:54:59 2024 +0200
+
+    universal-query: add lookups to query API definition (#4479)
+    
+    * universal-query: add with_lookup to query API definition
+    
+    * fix consistency doc check
+    
+    * lookup_from and not lookup_with
+    
+    * clean import
+    
+    * improve doc for lookup location wrt using
+    
+    * Suggestions for descriptions
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index c7ac4651e..2da46e13c 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,10 +1,11 @@
+ use std::sync::Arc;
+ 
++use api::rest::SearchRequestInternal;
+ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{
+     PointInsertOperationsInternal, PointOperations, PointStruct,
+ };
+-use collection::operations::types::{CoreSearchRequestBatch, SearchRequestInternal};
++use collection::operations::types::CoreSearchRequestBatch;
+ use collection::operations::vector_params_builder::VectorParamsBuilder;
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+
+commit 49a9d05e7c180c2a4828686a54b9a7a8fbc946f3
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Jun 18 20:38:24 2024 +0200
+
+    Fix multivector for unnamed vectors (#4482)
+    
+    * minor conversion improvement
+    
+    * use NamedVectors in update_vectors
+    
+    * remove merge from VectorStruct
+    
+    * rename Multi -> Named in vector struct
+    
+    * add multi-dense vectors option into VectorStruct
+    
+    * generate openapi
+    
+    * rename VectorStruct -> VectorStructInternal
+    
+    * add conversion for anonymous multivec in grpc
+    
+    * renames for BatchVectorStruct
+    
+    * implement multi-dense for batch
+    
+    * allow multi-dense in batch upserts
+    
+    * test and fixes
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 2da46e13c..0c61d4da0 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -14,7 +14,7 @@ use collection::shards::shard_trait::ShardOperation;
+ use common::cpu::CpuBudget;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::thread_rng;
+-use segment::data_types::vectors::{only_default_vector, VectorStruct};
++use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
+ use segment::fixtures::payload_fixtures::random_vector;
+ use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
+ use serde_json::Map;
+@@ -37,7 +37,7 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
+         let vectors = only_default_vector(&vector);
+         let point = PointStruct {
+             id: (i as u64).into(),
+-            vector: VectorStruct::from(vectors).into(),
++            vector: VectorStructInternal::from(vectors).into(),
+             payload: Some(Payload(payload_map)),
+         };
+         points.push(point);
+
+commit 63b2801e4fe25fea190e5a4069d6a1d3702a4661
+Author: Tim Visée <tim+github@visee.me>
+Date:   Fri Jun 21 20:01:05 2024 +0200
+
+    Fix new appendable segments not having payload indices (#4523)
+    
+    * Propagate payload index schema down to shard replica set + update handler
+    
+    * Configure payload indices when creating new appendable segment
+    
+    * When loading segments, make sure applied payload indices match config
+    
+    * Add test to assert creating new segments with payload index
+    
+    * Fix unit test because the collection payload schema wasn't updated
+    
+    * Add test for updating payload index configuration on segment load
+    
+    * Update test documentation
+    
+    * Also create payload indices in temporary snapshot segment
+    
+    * do not delete extra payload index from segments
+    
+    * do not delete extra payload index from segments
+    
+    * fix test
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 0c61d4da0..133b77226 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -9,6 +9,7 @@ use collection::operations::types::CoreSearchRequestBatch;
+ use collection::operations::vector_params_builder::VectorParamsBuilder;
+ use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
++use collection::save_on_disk::SaveOnDisk;
+ use collection::shards::local_shard::LocalShard;
+ use collection::shards::shard_trait::ShardOperation;
+ use common::cpu::CpuBudget;
+@@ -86,6 +87,11 @@ fn batch_search_bench(c: &mut Criterion) {
+ 
+     let shared_config = Arc::new(RwLock::new(collection_config));
+ 
++    let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
++    let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
++    let payload_index_schema =
++        Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
++
+     let shard = handle
+         .block_on(LocalShard::build_local(
+             0,
+@@ -93,6 +99,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             storage_dir.path(),
+             shared_config,
+             Default::default(),
++            payload_index_schema,
+             handle.clone(),
+             CpuBudget::default(),
+             optimizers_config,
+
+commit c7da6ae36c455a67859dbc2a9f1e3ce274645121
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Thu Aug 8 12:41:33 2024 +0200
+
+    Non blocking retrieve with timeout and cancellation support (#4844)
+    
+    * Non blocking retrieve with timeout and cancellation support
+    
+    * apply timeout for extra retrieve in rescoring
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 133b77226..e203df1a3 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -101,6 +101,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             Default::default(),
+             payload_index_schema,
+             handle.clone(),
++            handle.clone(),
+             CpuBudget::default(),
+             optimizers_config,
+         ))
+
+commit 3377530c6263ec3c723b16c0fefec712406ddfdd
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Aug 29 10:49:23 2024 +0200
+
+    [Strict-Mode] Basic implementation (#4887)
+    
+    * add CollectionRequestVerification
+    
+    * add to api
+    
+    * rebase
+    
+    * improve implementation
+    
+    * implement strict mode for SearchRequest+Batch
+    
+    * improve code + fix Clippy
+    
+    * improve error handling
+    
+    * restructure StrictModeVerification trait
+    
+    * generate docs
+    
+    * check `enabled` option
+    
+    * review remarks
+    
+    * rename StrictModeConfigDiff in grpc
+    
+    * use missing payload detection from issue api
+    
+    * performance improvement
+    
+    * decouple extractor from issues (#4945)
+    
+    * some review remarks
+    
+    * don't default to empty functions in StrictModeVerification trait
+    
+    * update openapi
+    
+    * filter_limit => query_limit
+    
+    * replace discovery_max_context_size and recommend_max_examples with max_input_examples
+    
+    * review remarks
+    
+    * review fix: include possible index types into error message
+    
+    * review remarks
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index e203df1a3..93d2795f9 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -81,6 +81,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         wal_config,
+         hnsw_config: Default::default(),
+         quantization_config: Default::default(),
++        strict_mode_config: Default::default(),
+     };
+ 
+     let optimizers_config = collection_config.optimizer_config.clone();
+
+commit 1d0ee7ea32043598f8b240e6a3a52be20663fa44
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Wed Oct 9 10:15:46 2024 +0200
+
+    Inference interface in REST and gRPC (#5165)
+    
+    * include document & image objects into grpc API
+    
+    * introduce image and object to rest api
+    
+    * minor refactoring
+    
+    * rename Vector -> VectorInternal
+    
+    * decompose vector data structures
+    
+    * add schema
+    
+    * fmt
+    
+    * grpc docs
+    
+    * fix conversion
+    
+    * fix clippy
+    
+    * fix another conversion
+    
+    * rename VectorInput -> VectorInputInternal
+    
+    * replace grpc TryFrom with async functions
+    
+    * fmt
+    
+    * replace rest TryFrom with async functions
+    
+    * add image and object into query rest
+    
+    * separate inference related conversions
+    
+    * move json-related conversions into a separate file
+    
+    * move vector-related transformations into a separate file
+    
+    * move more vector related-conversions into dedicated module
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 93d2795f9..061293553 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -3,7 +3,7 @@ use std::sync::Arc;
+ use api::rest::SearchRequestInternal;
+ use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{
+-    PointInsertOperationsInternal, PointOperations, PointStruct,
++    PointInsertOperationsInternal, PointOperations, PointStructPersisted,
+ };
+ use collection::operations::types::CoreSearchRequestBatch;
+ use collection::operations::vector_params_builder::VectorParamsBuilder;
+@@ -36,7 +36,7 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
+         payload_map.insert("a".to_string(), (i % 5).into());
+         let vector = random_vector(&mut rng, dim);
+         let vectors = only_default_vector(&vector);
+-        let point = PointStruct {
++        let point = PointStructPersisted {
+             id: (i as u64).into(),
+             vector: VectorStructInternal::from(vectors).into(),
+             payload: Some(Payload(payload_map)),
+
+commit c1d0a8d61e2d825770fa65a05cbf085e20a4e7a9
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Tue Oct 29 22:15:37 2024 +0100
+
+    Populate hardware counter to REST API (#5308)
+    
+    * populate hardware counter
+    
+    * make consume semantic explicit
+    
+    * Merge pull request #5328
+    
+    * add hardware info to more endpoints
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 061293553..d0e5b1d71 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -12,6 +12,7 @@ use collection::optimizers_builder::OptimizersConfig;
+ use collection::save_on_disk::SaveOnDisk;
+ use collection::shards::local_shard::LocalShard;
+ use collection::shards::shard_trait::ShardOperation;
++use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::cpu::CpuBudget;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::thread_rng;
+@@ -160,6 +161,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                                 }),
+                                 search_runtime_handle,
+                                 None,
++                                HwMeasurementAcc::new(),
+                             )
+                             .await
+                             .unwrap();
+@@ -191,7 +193,12 @@ fn batch_search_bench(c: &mut Criterion) {
+ 
+                     let search_query = CoreSearchRequestBatch { searches };
+                     let result = shard
+-                        .core_search(Arc::new(search_query), search_runtime_handle, None)
++                        .core_search(
++                            Arc::new(search_query),
++                            search_runtime_handle,
++                            None,
++                            HwMeasurementAcc::new(),
++                        )
+                         .await
+                         .unwrap();
+                     assert!(!result.is_empty());
+
+commit 2656b7be1bb6247a10a90dea9735993a96c2e0e1
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Nov 5 17:46:02 2024 +0100
+
+    Experiment: disable clocks in initializing state, propagate ignore flag (#5372)
+    
+    * Propagate flag for ignoring clocks on local shard from replica set
+    
+    * Also ignore local clocks in initializing state, is similar to partial
+    
+    * Remove previous logic for disabling clocks
+    
+    * We can make static replica set state functions inlined const
+    
+    * Fix typo
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index d0e5b1d71..18f08190a 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -112,7 +112,7 @@ fn batch_search_bench(c: &mut Criterion) {
+     let rnd_batch = create_rnd_batch();
+ 
+     handle
+-        .block_on(shard.update(rnd_batch.into(), true))
++        .block_on(shard.update(rnd_batch.into(), true, false))
+         .unwrap();
+ 
+     let mut group = c.benchmark_group("batch-search-bench");
+
+commit 9eb0626a315693619d5191c705f978c56a020dff
+Author: Tim Visée <tim+github@visee.me>
+Date:   Fri Nov 8 14:48:53 2024 +0100
+
+    Revert experiment: ignore WAL clocks in partial state (#5353)
+    
+    * Revert "Experiment: in stream records, set cutoff to latest clocks receiver is guaranteed to have (#5375)"
+    
+    This reverts commit e843647c954c60360fa82287e3aa21a2a773598d.
+    
+    * Revert "Set replica state function does not need to be async anymore (#5379)"
+    
+    This reverts commit fdf08e0a59b443d339faffd465211ff36402d896.
+    
+    * Revert "Experiment: disable clocks in initializing state, propagate ignore flag (#5372)"
+    
+    This reverts commit 0d98f6fe1a4da3c5d8699f50df41d84844ee3d51.
+    
+    * Revert "Experiment: also don't write clock tags to WAL in partial state (#5352)"
+    
+    This reverts commit f69ec6184805e5560632a00cf97761645c2ab01a.
+    
+    * Revert "Experiment: ignore clock tags when replica is in partial state (#5349)"
+    
+    This reverts commit 1b8a38f70b86cb9b5fda20f93c3d8e10d1abf80a.
+    
+    * Keep change to not send updates to replicas in recovery state
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 18f08190a..d0e5b1d71 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -112,7 +112,7 @@ fn batch_search_bench(c: &mut Criterion) {
+     let rnd_batch = create_rnd_batch();
+ 
+     handle
+-        .block_on(shard.update(rnd_batch.into(), true, false))
++        .block_on(shard.update(rnd_batch.into(), true))
+         .unwrap();
+ 
+     let mut group = c.benchmark_group("batch-search-bench");
+
+commit 9e06d68661402bb2df271134bab5d9aeda995048
+Author: Roman Titov <ffuugoo@users.noreply.github.com>
+Date:   Sat Nov 16 01:03:50 2024 +0700
+
+    Add UUID to collection config (#5378)
+    
+    * Add UUID to collection...
+    
+    ...and recreate collection, when applying Raft snapshot, if UUID of collection is different
+    
+    * fixup! Add UUID to collection...
+    
+    Remove UUID field from gRPC and exclude it from OpenAPI spec 🤡
+    
+    * fixup! fixup! Add UUID to collection...
+    
+    Always generate collection UUID 🤦‍♀️
+    
+    * Raft snapshot recreate collection no expose UUID (#5452)
+    
+    * separate colleciton config structure from API
+    
+    * fmt
+    
+    * Update lib/collection/src/operations/types.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index d0e5b1d71..f0be97bdd 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -1,7 +1,7 @@
+ use std::sync::Arc;
+ 
+ use api::rest::SearchRequestInternal;
+-use collection::config::{CollectionConfig, CollectionParams, WalConfig};
++use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+ use collection::operations::point_ops::{
+     PointInsertOperationsInternal, PointOperations, PointStructPersisted,
+ };
+@@ -67,7 +67,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         ..CollectionParams::empty()
+     };
+ 
+-    let collection_config = CollectionConfig {
++    let collection_config = CollectionConfigInternal {
+         params: collection_params,
+         optimizer_config: OptimizersConfig {
+             deleted_threshold: 0.9,
+@@ -83,6 +83,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         hnsw_config: Default::default(),
+         quantization_config: Default::default(),
+         strict_mode_config: Default::default(),
++        uuid: None,
+     };
+ 
+     let optimizers_config = collection_config.optimizer_config.clone();
+
+commit b4e30ad6bfff857e212b7d63079783569e572267
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Sun Nov 17 12:46:01 2024 +0100
+
+    Per collection hardware measurements  (#5453)
+    
+    * Add HwMeasurementCollector
+    
+    * Add hardware reporting to TOC + RequestHwCounter
+    
+    * Pass HwMeasurementAcc by reference + Update accumulation
+    
+    * Update tests and benchmarks
+    
+    * update REST API
+    
+    * Update gRPC API
+    
+    * codespell
+    
+    * Adjust internal API
+    
+    * improve docs
+    
+    * introduce drain to the HwMeasurementAcc
+    
+    * fmt
+    
+    * use drain to report to the collection counter
+    
+    * implement hw metrics drain for internal and external queries
+    
+    * fix drinage
+    
+    * refactor rest models: move away from grpc crate
+    
+    * fmt
+    
+    * implement usage reporting to collection acc for rest api
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index f0be97bdd..9d0f97c99 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -155,6 +155,7 @@ fn batch_search_bench(c: &mut Criterion) {
+                             with_vector: None,
+                             score_threshold: None,
+                         };
++                        let hw_acc = HwMeasurementAcc::new();
+                         let result = shard
+                             .core_search(
+                                 Arc::new(CoreSearchRequestBatch {
+@@ -162,10 +163,11 @@ fn batch_search_bench(c: &mut Criterion) {
+                                 }),
+                                 search_runtime_handle,
+                                 None,
+-                                HwMeasurementAcc::new(),
++                                &hw_acc,
+                             )
+                             .await
+                             .unwrap();
++                        hw_acc.discard();
+                         assert!(!result.is_empty());
+                     }
+                 });
+@@ -192,17 +194,14 @@ fn batch_search_bench(c: &mut Criterion) {
+                         searches.push(search_query.into());
+                     }
+ 
++                    let hw_acc = HwMeasurementAcc::new();
+                     let search_query = CoreSearchRequestBatch { searches };
+                     let result = shard
+-                        .core_search(
+-                            Arc::new(search_query),
+-                            search_runtime_handle,
+-                            None,
+-                            HwMeasurementAcc::new(),
+-                        )
++                        .core_search(Arc::new(search_query), search_runtime_handle, None, &hw_acc)
+                         .await
+                         .unwrap();
+                     assert!(!result.is_empty());
++                    hw_acc.discard();
+                 });
+             })
+         });
+
+commit 5aee24cc089b0ddedacb80c508e33d40fcea1950
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Tue Dec 10 12:12:36 2024 +0100
+
+    Timeout aware hardware counter (#5555)
+    
+    * Make hardware counting timeout aware
+    
+    * improve test
+    
+    * rebuild everything
+    
+    * fmt
+    
+    * post-rebase fixes
+    
+    * upd tests
+    
+    * fix tests
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 9d0f97c99..487fb7a90 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -163,11 +163,10 @@ fn batch_search_bench(c: &mut Criterion) {
+                                 }),
+                                 search_runtime_handle,
+                                 None,
+-                                &hw_acc,
++                                hw_acc,
+                             )
+                             .await
+                             .unwrap();
+-                        hw_acc.discard();
+                         assert!(!result.is_empty());
+                     }
+                 });
+@@ -197,11 +196,10 @@ fn batch_search_bench(c: &mut Criterion) {
+                     let hw_acc = HwMeasurementAcc::new();
+                     let search_query = CoreSearchRequestBatch { searches };
+                     let result = shard
+-                        .core_search(Arc::new(search_query), search_runtime_handle, None, &hw_acc)
++                        .core_search(Arc::new(search_query), search_runtime_handle, None, hw_acc)
+                         .await
+                         .unwrap();
+                     assert!(!result.is_empty());
+-                    hw_acc.discard();
+                 });
+             })
+         });
+
+commit 97743b1b625d42f73955ecb32d54ca34ea3a5cb7
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Jan 24 16:33:44 2025 +0100
+
+    Propagate hardware counter for more functions (#5844)
+    
+    * Propagate hardware counter for more functions
+    
+    * Minor improvements
+    
+    * use vector_query_contexts hardware_counter
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 487fb7a90..192cc41ee 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -113,7 +113,7 @@ fn batch_search_bench(c: &mut Criterion) {
+     let rnd_batch = create_rnd_batch();
+ 
+     handle
+-        .block_on(shard.update(rnd_batch.into(), true))
++        .block_on(shard.update(rnd_batch.into(), true, HwMeasurementAcc::new()))
+         .unwrap();
+ 
+     let mut group = c.benchmark_group("batch-search-bench");
+
+commit f11032829662bbf68fd2bf3cbd8483152fa92b44
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Tue Jan 28 12:19:11 2025 -0300
+
+    bump and migrate to `rand` 0.9.0 (#5892)
+    
+    * bump and migrate to rand 0.9.0
+    
+    also bump rand_distr to 0.5.0 to match it
+    
+    * Migrate AVX2 and SSE implementations
+    
+    * Remove unused thread_rng placeholders
+    
+    * More random migrations
+    
+    * Migrate GPU tests
+    
+    * bump seed
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 192cc41ee..040040e92 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -15,7 +15,7 @@ use collection::shards::shard_trait::ShardOperation;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::cpu::CpuBudget;
+ use criterion::{criterion_group, criterion_main, Criterion};
+-use rand::thread_rng;
++use rand::rng;
+ use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
+ use segment::fixtures::payload_fixtures::random_vector;
+ use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
+@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
+ mod prof;
+ 
+ fn create_rnd_batch() -> CollectionUpdateOperations {
+-    let mut rng = thread_rng();
++    let mut rng = rng();
+     let num_points = 2000;
+     let dim = 100;
+     let mut points = Vec::with_capacity(num_points);
+@@ -142,7 +142,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         group.bench_function(format!("search-{fid}"), |b| {
+             b.iter(|| {
+                 runtime.block_on(async {
+-                    let mut rng = thread_rng();
++                    let mut rng = rng();
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+                         let search_query = SearchRequestInternal {
+@@ -176,7 +176,7 @@ fn batch_search_bench(c: &mut Criterion) {
+         group.bench_function(format!("search-batch-{fid}"), |b| {
+             b.iter(|| {
+                 runtime.block_on(async {
+-                    let mut rng = thread_rng();
++                    let mut rng = rng();
+                     let mut searches = Vec::with_capacity(batch_size);
+                     for _i in 0..batch_size {
+                         let query = random_vector(&mut rng, 100);
+
+commit caed5729e5b7ff3db9dcb4531a4af0929b186682
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Feb 20 09:05:00 2025 +0100
+
+    IO resource usage permit (#6015)
+    
+    * rename cpu_budget -> resource_budget
+    
+    * clippy
+    
+    * add io budget to resources
+    
+    * fmt
+    
+    * move budget structures into a separate file
+    
+    * add extend permit function
+    
+    * dont extend existing permit
+    
+    * switch from IO to CPU permit
+    
+    * do not release resource before aquiring an extension
+    
+    * fmt
+    
+    * Review remarks
+    
+    * Improve resource permit number assertion
+    
+    * Make resource permit replace_with only acquire extra needed permits
+    
+    * Remove obsolete drop implementation
+    
+    * allocate IO budget same as CPU
+    
+    * review fixes
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 040040e92..8bab34ceb 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -12,8 +12,8 @@ use collection::optimizers_builder::OptimizersConfig;
+ use collection::save_on_disk::SaveOnDisk;
+ use collection::shards::local_shard::LocalShard;
+ use collection::shards::shard_trait::ShardOperation;
++use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+-use common::cpu::CpuBudget;
+ use criterion::{criterion_group, criterion_main, Criterion};
+ use rand::rng;
+ use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
+@@ -105,7 +105,7 @@ fn batch_search_bench(c: &mut Criterion) {
+             payload_index_schema,
+             handle.clone(),
+             handle.clone(),
+-            CpuBudget::default(),
++            ResourceBudget::default(),
+             optimizers_config,
+         ))
+         .unwrap();
+
+commit 8ad2b34265448ec01b89d4093de5fbb1a86dcd4d
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Feb 25 11:21:25 2025 +0100
+
+    Bump Rust edition to 2024 (#6042)
+    
+    * Bump Rust edition to 2024
+    
+    * gen is a reserved keyword now
+    
+    * Remove ref mut on references
+    
+    * Mark extern C as unsafe
+    
+    * Wrap unsafe function bodies in unsafe block
+    
+    * Geo hash implements Copy, don't reference but pass by value instead
+    
+    * Replace secluded self import with parent
+    
+    * Update execute_cluster_read_operation with new match semantics
+    
+    * Fix lifetime issue
+    
+    * Replace map_or with is_none_or
+    
+    * set_var is unsafe now
+    
+    * Reformat
+
+diff --git a/lib/collection/benches/batch_search_bench.rs b/lib/collection/benches/batch_search_bench.rs
+index 8bab34ceb..5238063fb 100644
+--- a/lib/collection/benches/batch_search_bench.rs
++++ b/lib/collection/benches/batch_search_bench.rs
+@@ -2,21 +2,21 @@ use std::sync::Arc;
+ 
+ use api::rest::SearchRequestInternal;
+ use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
++use collection::operations::CollectionUpdateOperations;
+ use collection::operations::point_ops::{
+     PointInsertOperationsInternal, PointOperations, PointStructPersisted,
+ };
+ use collection::operations::types::CoreSearchRequestBatch;
+ use collection::operations::vector_params_builder::VectorParamsBuilder;
+-use collection::operations::CollectionUpdateOperations;
+ use collection::optimizers_builder::OptimizersConfig;
+ use collection::save_on_disk::SaveOnDisk;
+ use collection::shards::local_shard::LocalShard;
+ use collection::shards::shard_trait::ShardOperation;
+ use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+-use criterion::{criterion_group, criterion_main, Criterion};
++use criterion::{Criterion, criterion_group, criterion_main};
+ use rand::rng;
+-use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
++use segment::data_types::vectors::{VectorStructInternal, only_default_vector};
+ use segment::fixtures::payload_fixtures::random_vector;
+ use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
+ use serde_json::Map;
+

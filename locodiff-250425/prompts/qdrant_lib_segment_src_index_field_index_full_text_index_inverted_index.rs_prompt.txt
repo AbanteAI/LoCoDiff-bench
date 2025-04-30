@@ -1,0 +1,3819 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+
+commit b9eee55a9fb6d53572622f62756a80e62484009e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Thu Sep 1 12:50:12 2022 +0200
+
+    Full text search (#963)
+    
+    * allow additional params for payload field index
+    
+    * fmt
+    
+    * wip: full text index building
+    
+    * fmt
+    
+    * text search request
+    
+    * text search request
+    
+    * full text index persitance and loading
+    
+    * fmt
+    
+    * enable fts index in mapping
+    
+    * clippy
+    
+    * fix tests + add integration test
+    
+    * review fixes: extend payload index test
+    
+    * revert incedental change
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+new file mode 100644
+index 000000000..d8717d25e
+--- /dev/null
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -0,0 +1,189 @@
++use std::collections::{BTreeMap, BTreeSet};
++
++use serde::{Deserialize, Serialize};
++
++use crate::index::field_index::full_text_index::postings_iterator::intersect_btree_iterator;
++use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
++use crate::types::{FieldCondition, Match, MatchText, PayloadKeyType, PointOffsetType};
++
++type PostingList = BTreeSet<PointOffsetType>;
++
++#[derive(Default, Serialize, Deserialize, Clone)]
++pub struct Document {
++    pub tokens: BTreeSet<String>,
++}
++
++impl Document {
++    pub fn is_empty(&self) -> bool {
++        self.tokens.is_empty()
++    }
++}
++
++pub struct ParsedQuery {
++    pub tokens: BTreeSet<String>,
++}
++
++impl ParsedQuery {
++    pub fn check_match(&self, document: &Document) -> bool {
++        // Check that all tokens are in document
++        self.tokens
++            .iter()
++            .all(|query_token| document.tokens.contains(query_token))
++    }
++}
++
++pub struct InvertedIndex {
++    postings: BTreeMap<String, PostingList>,
++    pub point_to_docs: Vec<Option<Document>>,
++    pub points_count: usize,
++}
++
++impl InvertedIndex {
++    pub fn new() -> InvertedIndex {
++        InvertedIndex {
++            postings: BTreeMap::new(),
++            point_to_docs: Vec::new(),
++            points_count: 0,
++        }
++    }
++
++    pub fn index_document(&mut self, idx: PointOffsetType, document: Document) {
++        for token in &document.tokens {
++            let posting = self
++                .postings
++                .entry(token.to_owned())
++                .or_insert_with(BTreeSet::new);
++            posting.insert(idx);
++        }
++        self.points_count += 1;
++        if self.point_to_docs.len() <= idx as usize {
++            self.point_to_docs
++                .resize(idx as usize + 1, Default::default());
++        }
++
++        self.point_to_docs[idx as usize] = Some(document);
++    }
++
++    pub fn remove_document(&mut self, idx: PointOffsetType) -> Option<Document> {
++        if self.point_to_docs.len() <= idx as usize {
++            return None; // Already removed or never actually existed
++        }
++
++        let removed_doc = match std::mem::take(&mut self.point_to_docs[idx as usize]) {
++            Some(doc) => doc,
++            None => return None,
++        };
++
++        self.points_count -= 1;
++
++        for removed_token in &removed_doc.tokens {
++            let posting = self.postings.get_mut(removed_token);
++            if let Some(posting) = posting {
++                posting.remove(&idx);
++                if posting.is_empty() {
++                    self.postings.remove(removed_token);
++                }
++            }
++        }
++        Some(removed_doc)
++    }
++
++    pub fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++        let postings_opt: Option<Vec<_>> = query
++            .tokens
++            .iter()
++            .map(|token| self.postings.get(token))
++            .collect();
++        if postings_opt.is_none() {
++            // There are unseen tokens -> no matches
++            return Box::new(vec![].into_iter());
++        }
++        let postings = postings_opt.unwrap();
++        if postings.is_empty() {
++            // Empty request -> no matches
++            return Box::new(vec![].into_iter());
++        }
++        intersect_btree_iterator(postings)
++    }
++
++    pub fn estimate_cardinality(
++        &self,
++        query: &ParsedQuery,
++        condition: &FieldCondition,
++    ) -> CardinalityEstimation {
++        let postings_opt: Option<Vec<_>> = query
++            .tokens
++            .iter()
++            .map(|token| self.postings.get(token))
++            .collect();
++        if postings_opt.is_none() {
++            // There are unseen tokens -> no matches
++            return CardinalityEstimation {
++                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                min: 0,
++                exp: 0,
++                max: 0,
++            };
++        }
++        let postings = postings_opt.unwrap();
++        if postings.is_empty() {
++            // Empty request -> no matches
++            return CardinalityEstimation {
++                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                min: 0,
++                exp: 0,
++                max: 0,
++            };
++        }
++        // Smallest posting is the largest possible cardinality
++        let smallest_posting = postings.iter().map(|posting| posting.len()).min().unwrap();
++
++        return if postings.len() == 1 {
++            CardinalityEstimation {
++                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                min: smallest_posting,
++                exp: smallest_posting,
++                max: smallest_posting,
++            }
++        } else {
++            let expected_frac: f64 = postings
++                .iter()
++                .map(|posting| posting.len() as f64 / self.points_count as f64)
++                .product();
++            let exp = (expected_frac * self.points_count as f64) as usize;
++            CardinalityEstimation {
++                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                min: 0, // ToDo: make better estimation
++                exp,
++                max: smallest_posting,
++            }
++        };
++    }
++
++    pub fn payload_blocks(
++        &self,
++        threshold: usize,
++        key: PayloadKeyType,
++    ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
++        // It might be very hard to predict possible combinations of conditions,
++        // so we only build it for individual tokens
++        Box::new(
++            self.postings
++                .iter()
++                .filter(move |(_token, posting)| posting.len() >= threshold)
++                .map(move |(token, posting)| PayloadBlockCondition {
++                    condition: FieldCondition {
++                        key: key.clone(),
++                        r#match: Some(Match::Text(MatchText {
++                            text: token.to_owned(),
++                        })),
++                        range: None,
++                        geo_bounding_box: None,
++                        geo_radius: None,
++                        values_count: None,
++                    },
++                    cardinality: posting.len(),
++                }),
++        )
++    }
++}
+
+commit a13206d0924b05be75c91b8b63d032ca512dd1d9
+Author: Ibrahim M. Akrab <ibrahim.m.akrab@gmail.com>
+Date:   Tue Apr 18 18:46:06 2023 +0200
+
+    Inverted index optimization (#1677)
+    
+    * Change BTreeSet/BTreeMap to HashSet/HashMap
+    Use Vec in Document
+    Use Vec in Postinglist
+    
+    * fix document removal index out of range
+    
+    * add common vocabulary dictionary to inverted index
+    
+    * use radix-trie to store vocabulary
+    
+    * add documentation for seemingly dangerous unwraps
+    
+    * Implement BitVec representation of PostingList
+    Add dynamic switching between Vec and BitVec representation
+    Split PostingList into its own module
+    
+    * use same persistent storage for documents
+    
+    * clean up
+    
+    * remove unused comments
+    
+    * keep stored document format the same
+    
+    * add reverse dictionary for faster document building
+    
+    * get rid of reverse vocabulary
+    
+    * review + fix tests
+    
+    * review + fix clippy
+    
+    * fix typo
+    
+    * use u32 as token id
+    
+    * fmt
+    
+    * remove patricia_tree
+    
+    * fmt
+    
+    * only use vec for posting
+    
+    ---------
+    
+    Co-authored-by: Andrey Vasnetsov <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index d8717d25e..d8d25e5de 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -1,66 +1,109 @@
+-use std::collections::{BTreeMap, BTreeSet};
++use std::collections::{BTreeSet, HashMap};
+ 
+ use serde::{Deserialize, Serialize};
+ 
+-use crate::index::field_index::full_text_index::postings_iterator::intersect_btree_iterator;
++use super::posting_list::PostingList;
++use super::postings_iterator::intersect_postings_iterator;
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+ use crate::types::{FieldCondition, Match, MatchText, PayloadKeyType, PointOffsetType};
+ 
+-type PostingList = BTreeSet<PointOffsetType>;
++pub type TokenId = u32;
+ 
+-#[derive(Default, Serialize, Deserialize, Clone)]
++#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+ pub struct Document {
+-    pub tokens: BTreeSet<String>,
++    tokens: Vec<TokenId>,
+ }
+ 
+ impl Document {
++    pub fn new(mut tokens: Vec<TokenId>) -> Self {
++        tokens.sort_unstable();
++        Self { tokens }
++    }
++
+     pub fn is_empty(&self) -> bool {
+         self.tokens.is_empty()
+     }
++
++    pub fn tokens(&self) -> &[TokenId] {
++        &self.tokens
++    }
++
++    pub fn check(&self, token: TokenId) -> bool {
++        self.tokens.binary_search(&token).is_ok()
++    }
+ }
+ 
++#[derive(Debug)]
+ pub struct ParsedQuery {
+-    pub tokens: BTreeSet<String>,
++    pub tokens: Vec<Option<TokenId>>,
+ }
+ 
+ impl ParsedQuery {
+     pub fn check_match(&self, document: &Document) -> bool {
++        if self.tokens.contains(&None) {
++            return false;
++        }
+         // Check that all tokens are in document
+         self.tokens
+             .iter()
+-            .all(|query_token| document.tokens.contains(query_token))
++            // unwrap crash safety: all tokens exist in the vocabulary if it passes the above check
++            .all(|query_token| document.check(query_token.unwrap()))
+     }
+ }
+ 
++#[derive(Default)]
+ pub struct InvertedIndex {
+-    postings: BTreeMap<String, PostingList>,
++    postings: Vec<Option<PostingList>>,
++    pub vocab: HashMap<String, TokenId>,
+     pub point_to_docs: Vec<Option<Document>>,
+     pub points_count: usize,
+ }
+ 
+ impl InvertedIndex {
+     pub fn new() -> InvertedIndex {
+-        InvertedIndex {
+-            postings: BTreeMap::new(),
+-            point_to_docs: Vec::new(),
+-            points_count: 0,
++        Default::default()
++    }
++
++    pub fn document_from_tokens(&mut self, tokens: &BTreeSet<String>) -> Document {
++        let mut document_tokens = vec![];
++        for token in tokens {
++            // check if in vocab
++            let vocab_idx = match self.vocab.get(token) {
++                Some(&idx) => idx,
++                None => {
++                    let next_token_id = self.vocab.len() as TokenId;
++                    self.vocab.insert(token.to_string(), next_token_id);
++                    next_token_id
++                }
++            };
++            document_tokens.push(vocab_idx);
+         }
++
++        Document::new(document_tokens)
+     }
+ 
+     pub fn index_document(&mut self, idx: PointOffsetType, document: Document) {
+-        for token in &document.tokens {
+-            let posting = self
+-                .postings
+-                .entry(token.to_owned())
+-                .or_insert_with(BTreeSet::new);
+-            posting.insert(idx);
+-        }
+         self.points_count += 1;
+         if self.point_to_docs.len() <= idx as usize {
+             self.point_to_docs
+                 .resize(idx as usize + 1, Default::default());
+         }
+ 
++        for token_idx in document.tokens() {
++            let token_idx_usize = *token_idx as usize;
++            if self.postings.len() <= token_idx_usize {
++                self.postings
++                    .resize(token_idx_usize + 1, Default::default());
++            }
++            let posting = self
++                .postings
++                .get_mut(token_idx_usize)
++                .expect("posting must exist even if with None");
++            match posting {
++                None => *posting = Some(PostingList::new(idx)),
++                Some(vec) => vec.insert(idx),
++            }
++        }
+         self.point_to_docs[idx as usize] = Some(document);
+     }
+ 
+@@ -76,13 +119,11 @@ impl InvertedIndex {
+ 
+         self.points_count -= 1;
+ 
+-        for removed_token in &removed_doc.tokens {
+-            let posting = self.postings.get_mut(removed_token);
+-            if let Some(posting) = posting {
+-                posting.remove(&idx);
+-                if posting.is_empty() {
+-                    self.postings.remove(removed_token);
+-                }
++        for removed_token in removed_doc.tokens() {
++            // unwrap safety: posting list exists and contains the document id
++            let posting = self.postings.get_mut(*removed_token as usize).unwrap();
++            if let Some(vec) = posting {
++                vec.remove(idx);
+             }
+         }
+         Some(removed_doc)
+@@ -92,7 +133,12 @@ impl InvertedIndex {
+         let postings_opt: Option<Vec<_>> = query
+             .tokens
+             .iter()
+-            .map(|token| self.postings.get(token))
++            .map(|&vocab_idx| match vocab_idx {
++                None => None,
++                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
++                // dictionary. Posting list entry can be None but it exists.
++                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
++            })
+             .collect();
+         if postings_opt.is_none() {
+             // There are unseen tokens -> no matches
+@@ -103,7 +149,7 @@ impl InvertedIndex {
+             // Empty request -> no matches
+             return Box::new(vec![].into_iter());
+         }
+-        intersect_btree_iterator(postings)
++        intersect_postings_iterator(postings)
+     }
+ 
+     pub fn estimate_cardinality(
+@@ -114,7 +160,11 @@ impl InvertedIndex {
+         let postings_opt: Option<Vec<_>> = query
+             .tokens
+             .iter()
+-            .map(|token| self.postings.get(token))
++            .map(|&vocab_idx| match vocab_idx {
++                None => None,
++                // unwrap safety: same as in filter()
++                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
++            })
+             .collect();
+         if postings_opt.is_none() {
+             // There are unseen tokens -> no matches
+@@ -168,14 +218,25 @@ impl InvertedIndex {
+         // It might be very hard to predict possible combinations of conditions,
+         // so we only build it for individual tokens
+         Box::new(
+-            self.postings
++            self.vocab
+                 .iter()
+-                .filter(move |(_token, posting)| posting.len() >= threshold)
++                .filter(|(_token, &posting_idx)| self.postings[posting_idx as usize].is_some())
++                .filter(move |(_token, &posting_idx)| {
++                    // unwrap crash safety: all tokens that passes the first filter should have postings
++                    self.postings[posting_idx as usize].as_ref().unwrap().len() >= threshold
++                })
++                .map(|(token, &posting_idx)| {
++                    (
++                        token,
++                        // same as the above case
++                        self.postings[posting_idx as usize].as_ref().unwrap(),
++                    )
++                })
+                 .map(move |(token, posting)| PayloadBlockCondition {
+                     condition: FieldCondition {
+                         key: key.clone(),
+                         r#match: Some(Match::Text(MatchText {
+-                            text: token.to_owned(),
++                            text: token.clone(),
+                         })),
+                         range: None,
+                         geo_bounding_box: None,
+
+commit f5dfeeff4c4baf35045bc6904d88076f2e58d094
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Mon May 22 20:32:35 2023 +0200
+
+    Fixes for group-by (#1938)
+    
+    * fix payload seletor
+    
+    * clippy
+    
+    * except cardinality estimation
+    
+    * implement match except iterator and api
+    
+    * use except instead of must-not + test
+    
+    * Fix doc error
+    
+    * Update lib/collection/src/grouping/group_by.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/query_optimization/condition_converter.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/query_optimization/condition_converter.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/query_optimization/condition_converter.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/vector_storage/mod.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/collection/src/grouping/group_by.rs
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs
+    
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    
+    * Update lib/segment/src/index/field_index/map_index.rs [skip ci]
+    
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    
+    * fix: `except_on` and `match_on` now produce `Vec<Condition>`s
+    
+    * Apply suggestions from code review (lib/segment/src/index/field_index/map_index.rs)
+    
+    * fix: reset review suggestion
+    
+    * Remove unnecessary move
+    
+    * Use Rust idiomatic map_else rather than match-none-false
+    
+    * is-null -> is-empty
+    
+    * de-comment drop_collection
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+    Co-authored-by: Luis Cossío <luis.cossio@qdrant.com>
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index d8d25e5de..0f04038cf 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -20,6 +20,10 @@ impl Document {
+         Self { tokens }
+     }
+ 
++    pub fn len(&self) -> usize {
++        self.tokens.len()
++    }
++
+     pub fn is_empty(&self) -> bool {
+         self.tokens.is_empty()
+     }
+
+commit bd40a58e65e58ba5cfea79be5603faf88dc62248
+Author: Zein Wen <85084498+zzzz-vincent@users.noreply.github.com>
+Date:   Mon Jul 17 03:36:50 2023 -0700
+
+    Add geo_polygon filter to proto interface, complete conversion fn, and add an integration test (#2188)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 0f04038cf..cc2215bc3 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -245,6 +245,7 @@ impl InvertedIndex {
+                         range: None,
+                         geo_bounding_box: None,
+                         geo_radius: None,
++                        geo_polygon: None,
+                         values_count: None,
+                     },
+                     cardinality: posting.len(),
+
+commit 0d4a3736590dc33b39db2aeea0a799c05ec632f3
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Thu Sep 28 12:11:29 2023 +0200
+
+    Move ScoredPointOffset into common (#2734)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index cc2215bc3..97ecfb4f0 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -1,11 +1,12 @@
+ use std::collections::{BTreeSet, HashMap};
+ 
++use common::types::PointOffsetType;
+ use serde::{Deserialize, Serialize};
+ 
+ use super::posting_list::PostingList;
+ use super::postings_iterator::intersect_postings_iterator;
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+-use crate::types::{FieldCondition, Match, MatchText, PayloadKeyType, PointOffsetType};
++use crate::types::{FieldCondition, Match, MatchText, PayloadKeyType};
+ 
+ pub type TokenId = u32;
+ 
+
+commit 0d0f8459d77913fcde705307a75314d045419d06
+Author: Tim Visée <tim+github@visee.me>
+Date:   Fri Nov 10 09:42:14 2023 +0100
+
+    Some micro optimizations in reserve/resize usage (#2967)
+    
+    * In HNSW graph layer building, infer right capacity on collect
+    
+    * Resize with empty vector, use constant function rather than clone
+    
+    * Use resize_with in other places as well
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 97ecfb4f0..3b676ffed 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -91,14 +91,14 @@ impl InvertedIndex {
+         self.points_count += 1;
+         if self.point_to_docs.len() <= idx as usize {
+             self.point_to_docs
+-                .resize(idx as usize + 1, Default::default());
++                .resize_with(idx as usize + 1, Default::default);
+         }
+ 
+         for token_idx in document.tokens() {
+             let token_idx_usize = *token_idx as usize;
+             if self.postings.len() <= token_idx_usize {
+                 self.postings
+-                    .resize(token_idx_usize + 1, Default::default());
++                    .resize_with(token_idx_usize + 1, Default::default);
+             }
+             let posting = self
+                 .postings
+
+commit 2f76603ddfbe5f995443c1e5e85c2d9345a55db0
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Wed Jan 31 10:14:31 2024 +0000
+
+    DateTime payload index (#3395)
+    
+    * Datetime payload index
+    
+    * Introduce IndexMapItem
+    
+    * Drop FieldIndex::DatetimeIndex
+    
+    * Rename OpenAPI struct names
+    
+    * Switch to microseconds
+    
+    * Validate and serialize grpc timestamps
+    
+    * Add tests with different timezones
+    
+    * minor review fixes
+    
+    * Revert "Drop FieldIndex::DatetimeIndex"
+    
+    This reverts commit d55f251afdbb418ef732a3e6799b92f924fc3035.
+    
+    * Revert "Introduce IndexMapItem"
+    
+    This reverts commit c5255f6b1aafa2b9552bac5d1811f9e826eb8d61.
+    
+    * fix: back to microseconds after reverts
+    
+    * extract range conversion from boxed checker fn
+    
+    * add log to deps
+    
+    * don't run macro doctest
+    
+    * no_run -> ignore
+    
+    * remove prost-types in favor of prost-wkt-types
+    
+    * better assertion on test_payload_indexing.py
+    
+    * propagate unparsable datetime
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 3b676ffed..09f4a2536 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
+ use super::posting_list::PostingList;
+ use super::postings_iterator::intersect_postings_iterator;
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+-use crate::types::{FieldCondition, Match, MatchText, PayloadKeyType};
++use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+ pub type TokenId = u32;
+ 
+@@ -238,17 +238,7 @@ impl InvertedIndex {
+                     )
+                 })
+                 .map(move |(token, posting)| PayloadBlockCondition {
+-                    condition: FieldCondition {
+-                        key: key.clone(),
+-                        r#match: Some(Match::Text(MatchText {
+-                            text: token.clone(),
+-                        })),
+-                        range: None,
+-                        geo_bounding_box: None,
+-                        geo_radius: None,
+-                        geo_polygon: None,
+-                        values_count: None,
+-                    },
++                    condition: FieldCondition::new_match(key.clone(), Match::new_text(token)),
+                     cardinality: posting.len(),
+                 }),
+         )
+
+commit 97e0ae1716ec34d372775bb1de999241a387815b
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Wed Feb 14 12:09:05 2024 +0100
+
+    text index immutable state without documents (#3497)
+    
+    color ci into green
+    
+    immutable index tests
+    
+    deletion test
+    
+    separate filter function
+    
+    are you happy fmt
+    
+    add shrink_to_fit
+    
+    refactor estimate_cardinality
+    
+    check is points_count is zero
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 09f4a2536..bf5cfa514 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
+ 
+ use super::posting_list::PostingList;
+ use super::postings_iterator::intersect_postings_iterator;
++use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+@@ -56,28 +57,40 @@ impl ParsedQuery {
+     }
+ }
+ 
+-#[derive(Default)]
+-pub struct InvertedIndex {
+-    postings: Vec<Option<PostingList>>,
+-    pub vocab: HashMap<String, TokenId>,
+-    pub point_to_docs: Vec<Option<Document>>,
+-    pub points_count: usize,
++pub enum InvertedIndex {
++    Mutable(MutableInvertedIndex),
++    Immutable(ImmutableInvertedIndex),
+ }
+ 
+ impl InvertedIndex {
+-    pub fn new() -> InvertedIndex {
+-        Default::default()
++    pub fn new(is_appendable: bool) -> InvertedIndex {
++        if is_appendable {
++            InvertedIndex::Mutable(MutableInvertedIndex::default())
++        } else {
++            InvertedIndex::Immutable(ImmutableInvertedIndex::default())
++        }
+     }
+ 
+     pub fn document_from_tokens(&mut self, tokens: &BTreeSet<String>) -> Document {
++        let vocab = match self {
++            InvertedIndex::Mutable(index) => &mut index.vocab,
++            InvertedIndex::Immutable(index) => &mut index.vocab,
++        };
++        Self::document_from_tokens_impl(vocab, tokens)
++    }
++
++    fn document_from_tokens_impl(
++        vocab: &mut HashMap<String, TokenId>,
++        tokens: &BTreeSet<String>,
++    ) -> Document {
+         let mut document_tokens = vec![];
+         for token in tokens {
+             // check if in vocab
+-            let vocab_idx = match self.vocab.get(token) {
++            let vocab_idx = match vocab.get(token) {
+                 Some(&idx) => idx,
+                 None => {
+-                    let next_token_id = self.vocab.len() as TokenId;
+-                    self.vocab.insert(token.to_string(), next_token_id);
++                    let next_token_id = vocab.len() as TokenId;
++                    vocab.insert(token.to_string(), next_token_id);
+                     next_token_id
+                 }
+             };
+@@ -87,74 +100,31 @@ impl InvertedIndex {
+         Document::new(document_tokens)
+     }
+ 
+-    pub fn index_document(&mut self, idx: PointOffsetType, document: Document) {
+-        self.points_count += 1;
+-        if self.point_to_docs.len() <= idx as usize {
+-            self.point_to_docs
+-                .resize_with(idx as usize + 1, Default::default);
+-        }
+-
+-        for token_idx in document.tokens() {
+-            let token_idx_usize = *token_idx as usize;
+-            if self.postings.len() <= token_idx_usize {
+-                self.postings
+-                    .resize_with(token_idx_usize + 1, Default::default);
+-            }
+-            let posting = self
+-                .postings
+-                .get_mut(token_idx_usize)
+-                .expect("posting must exist even if with None");
+-            match posting {
+-                None => *posting = Some(PostingList::new(idx)),
+-                Some(vec) => vec.insert(idx),
+-            }
++    pub fn index_document(
++        &mut self,
++        idx: PointOffsetType,
++        document: Document,
++    ) -> OperationResult<()> {
++        match self {
++            InvertedIndex::Mutable(index) => index.index_document(idx, document),
++            InvertedIndex::Immutable(_index) => Err(OperationError::service_error(
++                "Can't add values to immutable text index",
++            )),
+         }
+-        self.point_to_docs[idx as usize] = Some(document);
+     }
+ 
+-    pub fn remove_document(&mut self, idx: PointOffsetType) -> Option<Document> {
+-        if self.point_to_docs.len() <= idx as usize {
+-            return None; // Already removed or never actually existed
+-        }
+-
+-        let removed_doc = match std::mem::take(&mut self.point_to_docs[idx as usize]) {
+-            Some(doc) => doc,
+-            None => return None,
+-        };
+-
+-        self.points_count -= 1;
+-
+-        for removed_token in removed_doc.tokens() {
+-            // unwrap safety: posting list exists and contains the document id
+-            let posting = self.postings.get_mut(*removed_token as usize).unwrap();
+-            if let Some(vec) = posting {
+-                vec.remove(idx);
+-            }
++    pub fn remove_document(&mut self, idx: PointOffsetType) -> bool {
++        match self {
++            InvertedIndex::Mutable(index) => index.remove_document(idx),
++            InvertedIndex::Immutable(index) => index.remove_document(idx),
+         }
+-        Some(removed_doc)
+     }
+ 
+     pub fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+-        let postings_opt: Option<Vec<_>> = query
+-            .tokens
+-            .iter()
+-            .map(|&vocab_idx| match vocab_idx {
+-                None => None,
+-                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
+-                // dictionary. Posting list entry can be None but it exists.
+-                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
+-            })
+-            .collect();
+-        if postings_opt.is_none() {
+-            // There are unseen tokens -> no matches
+-            return Box::new(vec![].into_iter());
++        match self {
++            InvertedIndex::Mutable(index) => index.filter(query),
++            InvertedIndex::Immutable(index) => index.filter(query),
+         }
+-        let postings = postings_opt.unwrap();
+-        if postings.is_empty() {
+-            // Empty request -> no matches
+-            return Box::new(vec![].into_iter());
+-        }
+-        intersect_postings_iterator(postings)
+     }
+ 
+     pub fn estimate_cardinality(
+@@ -162,16 +132,20 @@ impl InvertedIndex {
+         query: &ParsedQuery,
+         condition: &FieldCondition,
+     ) -> CardinalityEstimation {
++        let (points_count, index_postings) = match self {
++            InvertedIndex::Mutable(index) => (index.points_count, &index.postings),
++            InvertedIndex::Immutable(index) => (index.points_count, &index.postings),
++        };
+         let postings_opt: Option<Vec<_>> = query
+             .tokens
+             .iter()
+             .map(|&vocab_idx| match vocab_idx {
+                 None => None,
+                 // unwrap safety: same as in filter()
+-                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
++                Some(idx) => index_postings.get(idx as usize).unwrap().as_ref(),
+             })
+             .collect();
+-        if postings_opt.is_none() {
++        if postings_opt.is_none() || points_count == 0 {
+             // There are unseen tokens -> no matches
+             return CardinalityEstimation {
+                 primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+@@ -203,9 +177,9 @@ impl InvertedIndex {
+         } else {
+             let expected_frac: f64 = postings
+                 .iter()
+-                .map(|posting| posting.len() as f64 / self.points_count as f64)
++                .map(|posting| posting.len() as f64 / points_count as f64)
+                 .product();
+-            let exp = (expected_frac * self.points_count as f64) as usize;
++            let exp = (expected_frac * points_count as f64) as usize;
+             CardinalityEstimation {
+                 primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+                 min: 0, // ToDo: make better estimation
+@@ -222,19 +196,23 @@ impl InvertedIndex {
+     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
+         // It might be very hard to predict possible combinations of conditions,
+         // so we only build it for individual tokens
++        let (vocab, postings) = match self {
++            InvertedIndex::Mutable(index) => (&index.vocab, &index.postings),
++            InvertedIndex::Immutable(index) => (&index.vocab, &index.postings),
++        };
+         Box::new(
+-            self.vocab
++            vocab
+                 .iter()
+-                .filter(|(_token, &posting_idx)| self.postings[posting_idx as usize].is_some())
++                .filter(|(_token, &posting_idx)| postings[posting_idx as usize].is_some())
+                 .filter(move |(_token, &posting_idx)| {
+                     // unwrap crash safety: all tokens that passes the first filter should have postings
+-                    self.postings[posting_idx as usize].as_ref().unwrap().len() >= threshold
++                    postings[posting_idx as usize].as_ref().unwrap().len() >= threshold
+                 })
+                 .map(|(token, &posting_idx)| {
+                     (
+                         token,
+                         // same as the above case
+-                        self.postings[posting_idx as usize].as_ref().unwrap(),
++                        postings[posting_idx as usize].as_ref().unwrap(),
+                     )
+                 })
+                 .map(move |(token, posting)| PayloadBlockCondition {
+@@ -243,4 +221,271 @@ impl InvertedIndex {
+                 }),
+         )
+     }
++
++    pub fn build_index(
++        &mut self,
++        iter: impl Iterator<Item = OperationResult<(PointOffsetType, BTreeSet<String>)>>,
++    ) -> OperationResult<()> {
++        let mut index = MutableInvertedIndex::default();
++        for i in iter {
++            let (idx, tokens) = i?;
++            let doc = Self::document_from_tokens_impl(&mut index.vocab, &tokens);
++            index.index_document(idx, doc)?;
++        }
++
++        match self {
++            InvertedIndex::Mutable(i) => {
++                *i = index;
++            }
++            InvertedIndex::Immutable(i) => {
++                *i = index.into();
++            }
++        }
++
++        Ok(())
++    }
++
++    pub fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
++        match self {
++            InvertedIndex::Mutable(index) => index.check_match(parsed_query, point_id),
++            InvertedIndex::Immutable(index) => index.check_match(parsed_query, point_id),
++        }
++    }
++
++    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
++        match self {
++            InvertedIndex::Mutable(index) => index.values_is_empty(point_id),
++            InvertedIndex::Immutable(index) => index.values_is_empty(point_id),
++        }
++    }
++
++    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
++        match self {
++            InvertedIndex::Mutable(index) => index.values_count(point_id),
++            InvertedIndex::Immutable(index) => index.values_count(point_id),
++        }
++    }
++
++    pub fn points_count(&self) -> usize {
++        match self {
++            InvertedIndex::Mutable(index) => index.points_count,
++            InvertedIndex::Immutable(index) => index.points_count,
++        }
++    }
++
++    pub fn get_token(&self, token: &str) -> Option<TokenId> {
++        match self {
++            InvertedIndex::Mutable(index) => index.vocab.get(token).copied(),
++            InvertedIndex::Immutable(index) => index.vocab.get(token).copied(),
++        }
++    }
++}
++
++#[derive(Default)]
++pub struct MutableInvertedIndex {
++    postings: Vec<Option<PostingList>>,
++    vocab: HashMap<String, TokenId>,
++    point_to_docs: Vec<Option<Document>>,
++    points_count: usize,
++}
++
++impl MutableInvertedIndex {
++    fn index_document(&mut self, idx: PointOffsetType, document: Document) -> OperationResult<()> {
++        self.points_count += 1;
++        if self.point_to_docs.len() <= idx as usize {
++            self.point_to_docs
++                .resize_with(idx as usize + 1, Default::default);
++        }
++
++        for token_idx in document.tokens() {
++            let token_idx_usize = *token_idx as usize;
++            if self.postings.len() <= token_idx_usize {
++                self.postings
++                    .resize_with(token_idx_usize + 1, Default::default);
++            }
++            let posting = self
++                .postings
++                .get_mut(token_idx_usize)
++                .expect("posting must exist even if with None");
++            match posting {
++                None => *posting = Some(PostingList::new(idx)),
++                Some(vec) => vec.insert(idx),
++            }
++        }
++        self.point_to_docs[idx as usize] = Some(document);
++        Ok(())
++    }
++
++    fn remove_document(&mut self, idx: PointOffsetType) -> bool {
++        if self.point_to_docs.len() <= idx as usize {
++            return false; // Already removed or never actually existed
++        }
++
++        let removed_doc = match std::mem::take(&mut self.point_to_docs[idx as usize]) {
++            Some(doc) => doc,
++            None => return false,
++        };
++
++        self.points_count -= 1;
++
++        for removed_token in removed_doc.tokens() {
++            // unwrap safety: posting list exists and contains the document id
++            let posting = self.postings.get_mut(*removed_token as usize).unwrap();
++            if let Some(vec) = posting {
++                vec.remove(idx);
++            }
++        }
++        true
++    }
++
++    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++        let postings_opt: Option<Vec<_>> = query
++            .tokens
++            .iter()
++            .map(|&vocab_idx| match vocab_idx {
++                None => None,
++                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
++                // dictionary. Posting list entry can be None but it exists.
++                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
++            })
++            .collect();
++        if postings_opt.is_none() {
++            // There are unseen tokens -> no matches
++            return Box::new(vec![].into_iter());
++        }
++        let postings = postings_opt.unwrap();
++        if postings.is_empty() {
++            // Empty request -> no matches
++            return Box::new(vec![].into_iter());
++        }
++        intersect_postings_iterator(postings, |_| true)
++    }
++
++    fn values_count(&self, point_id: PointOffsetType) -> usize {
++        // Maybe we want number of documents in the future?
++        self.get_doc(point_id).map(|x| x.len()).unwrap_or(0)
++    }
++
++    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
++        self.get_doc(point_id).map(|x| x.is_empty()).unwrap_or(true)
++    }
++
++    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
++        if let Some(doc) = self.get_doc(point_id) {
++            parsed_query.check_match(doc)
++        } else {
++            false
++        }
++    }
++
++    fn get_doc(&self, idx: PointOffsetType) -> Option<&Document> {
++        self.point_to_docs.get(idx as usize)?.as_ref()
++    }
++}
++
++#[derive(Default)]
++pub struct ImmutableInvertedIndex {
++    postings: Vec<Option<PostingList>>,
++    vocab: HashMap<String, TokenId>,
++    point_documents_tokens: Vec<Option<usize>>,
++    points_count: usize,
++}
++
++impl ImmutableInvertedIndex {
++    fn remove_document(&mut self, idx: PointOffsetType) -> bool {
++        if self.values_is_empty(idx) {
++            return false; // Already removed or never actually existed
++        }
++        self.point_documents_tokens[idx as usize] = None;
++        self.points_count -= 1;
++        true
++    }
++
++    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
++        let postings_opt: Option<Vec<_>> = query
++            .tokens
++            .iter()
++            .map(|&vocab_idx| match vocab_idx {
++                None => None,
++                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
++                // dictionary. Posting list entry can be None but it exists.
++                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
++            })
++            .collect();
++        if postings_opt.is_none() {
++            // There are unseen tokens -> no matches
++            return Box::new(vec![].into_iter());
++        }
++        let postings = postings_opt.unwrap();
++        if postings.is_empty() {
++            // Empty request -> no matches
++            return Box::new(vec![].into_iter());
++        }
++
++        // deleted documents are still in the postings
++        let filter =
++            move |idx| matches!(self.point_documents_tokens.get(idx as usize), Some(Some(_)));
++        intersect_postings_iterator(postings, filter)
++    }
++
++    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
++        if self.point_documents_tokens.len() <= point_id as usize {
++            return true;
++        }
++        self.point_documents_tokens[point_id as usize].is_none()
++    }
++
++    fn values_count(&self, point_id: PointOffsetType) -> usize {
++        if self.point_documents_tokens.len() <= point_id as usize {
++            return 0;
++        }
++        self.point_documents_tokens[point_id as usize].unwrap_or(0)
++    }
++
++    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
++        if parsed_query.tokens.contains(&None) {
++            return false;
++        }
++        // check presence of the document
++        if self.values_is_empty(point_id) {
++            return false;
++        }
++        // Check that all tokens are in document
++        parsed_query
++            .tokens
++            .iter()
++            // unwrap crash safety: all tokens exist in the vocabulary if it passes the above check
++            .all(|query_token| {
++                if let Some(posting_list) = &self.postings[query_token.unwrap() as usize] {
++                    posting_list.contains(&point_id)
++                } else {
++                    false
++                }
++            })
++    }
++}
++
++impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
++    fn from(mut index: MutableInvertedIndex) -> Self {
++        index
++            .postings
++            .iter_mut()
++            .filter_map(|posting| posting.as_mut())
++            .for_each(|posting| {
++                posting.shrink_to_fit();
++            });
++        index.postings.shrink_to_fit();
++        index.vocab.shrink_to_fit();
++
++        ImmutableInvertedIndex {
++            postings: index.postings,
++            vocab: index.vocab,
++            point_documents_tokens: index
++                .point_to_docs
++                .iter()
++                .map(|doc| doc.as_ref().map(|doc| doc.len()))
++                .collect(),
++            points_count: index.points_count,
++        }
++    }
+ }
+
+commit 50892d6596cf0bfd122f61b662d86737ff905e05
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Thu Feb 15 12:14:28 2024 +0100
+
+    text index fast loading (#3625)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index bf5cfa514..023eb2220 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -227,11 +227,7 @@ impl InvertedIndex {
+         iter: impl Iterator<Item = OperationResult<(PointOffsetType, BTreeSet<String>)>>,
+     ) -> OperationResult<()> {
+         let mut index = MutableInvertedIndex::default();
+-        for i in iter {
+-            let (idx, tokens) = i?;
+-            let doc = Self::document_from_tokens_impl(&mut index.vocab, &tokens);
+-            index.index_document(idx, doc)?;
+-        }
++        index.build_index(iter)?;
+ 
+         match self {
+             InvertedIndex::Mutable(i) => {
+@@ -290,6 +286,53 @@ pub struct MutableInvertedIndex {
+ }
+ 
+ impl MutableInvertedIndex {
++    fn build_index(
++        &mut self,
++        iter: impl Iterator<Item = OperationResult<(PointOffsetType, BTreeSet<String>)>>,
++    ) -> OperationResult<()> {
++        self.points_count = 0;
++        self.vocab.clear();
++        self.postings.clear();
++        self.point_to_docs.clear();
++
++        // update point_to_docs
++        for i in iter {
++            self.points_count += 1;
++            let (idx, tokens) = i?;
++
++            if self.point_to_docs.len() <= idx as usize {
++                self.point_to_docs
++                    .resize_with(idx as usize + 1, Default::default);
++            }
++
++            let document = InvertedIndex::document_from_tokens_impl(&mut self.vocab, &tokens);
++            self.point_to_docs[idx as usize] = Some(document);
++        }
++
++        // build postings from point_to_docs
++        // build in order to increase document id
++        for (idx, doc) in self.point_to_docs.iter().enumerate() {
++            if let Some(doc) = doc {
++                for token_idx in doc.tokens() {
++                    if self.postings.len() <= *token_idx as usize {
++                        self.postings
++                            .resize_with(*token_idx as usize + 1, Default::default);
++                    }
++                    let posting = self
++                        .postings
++                        .get_mut(*token_idx as usize)
++                        .expect("posting must exist even if with None");
++                    match posting {
++                        None => *posting = Some(PostingList::new(idx as PointOffsetType)),
++                        Some(vec) => vec.insert(idx as PointOffsetType),
++                    }
++                }
++            }
++        }
++
++        Ok(())
++    }
++
+     fn index_document(&mut self, idx: PointOffsetType, document: Document) -> OperationResult<()> {
+         self.points_count += 1;
+         if self.point_to_docs.len() <= idx as usize {
+
+commit 402051e19d82446686243c4166db8c751aa9977d
+Author: Ivan Pleshkov <pleshkov.ivan@gmail.com>
+Date:   Wed Feb 28 15:47:24 2024 +0300
+
+    Text index inverted index compression (#3563)
+    
+    * compressed posting list definition
+    
+    log compressed size
+    
+    compress sorted
+    
+    fix unit tests
+    
+    flatten chunks
+    
+    use visitor pattern to avoid multiple decompressions
+    
+    check postings list boundaries
+    
+    debug increasing order check
+    
+    simplify ranges check
+    
+    unit tests for visitor
+    
+    remove debug size measurements
+    
+    fix build
+    
+    * more comments
+    
+    * review remarks
+    
+    * are you happy clippy
+    
+    * don't compress remainder
+    
+    * review remarks
+    
+    * rename methods
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 023eb2220..ab77970ee 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -3,8 +3,10 @@ use std::collections::{BTreeSet, HashMap};
+ use common::types::PointOffsetType;
+ use serde::{Deserialize, Serialize};
+ 
+-use super::posting_list::PostingList;
+-use super::postings_iterator::intersect_postings_iterator;
++use super::posting_list::{CompressedPostingList, PostingList};
++use super::postings_iterator::{
++    intersect_compressed_postings_iterator, intersect_postings_iterator,
++};
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+@@ -132,20 +134,33 @@ impl InvertedIndex {
+         query: &ParsedQuery,
+         condition: &FieldCondition,
+     ) -> CardinalityEstimation {
+-        let (points_count, index_postings) = match self {
+-            InvertedIndex::Mutable(index) => (index.points_count, &index.postings),
+-            InvertedIndex::Immutable(index) => (index.points_count, &index.postings),
++        let points_count = match self {
++            InvertedIndex::Mutable(index) => index.points_count,
++            InvertedIndex::Immutable(index) => index.points_count,
+         };
+-        let postings_opt: Option<Vec<_>> = query
++        let posting_lengths: Option<Vec<usize>> = query
+             .tokens
+             .iter()
+             .map(|&vocab_idx| match vocab_idx {
+                 None => None,
+                 // unwrap safety: same as in filter()
+-                Some(idx) => index_postings.get(idx as usize).unwrap().as_ref(),
++                Some(idx) => match &self {
++                    Self::Mutable(index) => index
++                        .postings
++                        .get(idx as usize)
++                        .unwrap()
++                        .as_ref()
++                        .map(|p| p.len()),
++                    Self::Immutable(index) => index
++                        .postings
++                        .get(idx as usize)
++                        .unwrap()
++                        .as_ref()
++                        .map(|p| p.len()),
++                },
+             })
+             .collect();
+-        if postings_opt.is_none() || points_count == 0 {
++        if posting_lengths.is_none() || points_count == 0 {
+             // There are unseen tokens -> no matches
+             return CardinalityEstimation {
+                 primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+@@ -154,7 +169,7 @@ impl InvertedIndex {
+                 max: 0,
+             };
+         }
+-        let postings = postings_opt.unwrap();
++        let postings = posting_lengths.unwrap();
+         if postings.is_empty() {
+             // Empty request -> no matches
+             return CardinalityEstimation {
+@@ -165,7 +180,7 @@ impl InvertedIndex {
+             };
+         }
+         // Smallest posting is the largest possible cardinality
+-        let smallest_posting = postings.iter().map(|posting| posting.len()).min().unwrap();
++        let smallest_posting = postings.iter().min().copied().unwrap();
+ 
+         return if postings.len() == 1 {
+             CardinalityEstimation {
+@@ -177,7 +192,7 @@ impl InvertedIndex {
+         } else {
+             let expected_frac: f64 = postings
+                 .iter()
+-                .map(|posting| posting.len() as f64 / points_count as f64)
++                .map(|posting| *posting as f64 / points_count as f64)
+                 .product();
+             let exp = (expected_frac * points_count as f64) as usize;
+             CardinalityEstimation {
+@@ -194,32 +209,31 @@ impl InvertedIndex {
+         threshold: usize,
+         key: PayloadKeyType,
+     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
++        let map_filter_condition = move |(token, postings_len): (&str, usize)| {
++            if postings_len >= threshold {
++                Some(PayloadBlockCondition {
++                    condition: FieldCondition::new_match(key.clone(), Match::new_text(token)),
++                    cardinality: postings_len,
++                })
++            } else {
++                None
++            }
++        };
++
+         // It might be very hard to predict possible combinations of conditions,
+         // so we only build it for individual tokens
+-        let (vocab, postings) = match self {
+-            InvertedIndex::Mutable(index) => (&index.vocab, &index.postings),
+-            InvertedIndex::Immutable(index) => (&index.vocab, &index.postings),
+-        };
+-        Box::new(
+-            vocab
+-                .iter()
+-                .filter(|(_token, &posting_idx)| postings[posting_idx as usize].is_some())
+-                .filter(move |(_token, &posting_idx)| {
+-                    // unwrap crash safety: all tokens that passes the first filter should have postings
+-                    postings[posting_idx as usize].as_ref().unwrap().len() >= threshold
+-                })
+-                .map(|(token, &posting_idx)| {
+-                    (
+-                        token,
+-                        // same as the above case
+-                        postings[posting_idx as usize].as_ref().unwrap(),
+-                    )
+-                })
+-                .map(move |(token, posting)| PayloadBlockCondition {
+-                    condition: FieldCondition::new_match(key.clone(), Match::new_text(token)),
+-                    cardinality: posting.len(),
+-                }),
+-        )
++        match &self {
++            InvertedIndex::Mutable(index) => Box::new(
++                index
++                    .vocab_with_positngs_len_iter()
++                    .filter_map(map_filter_condition),
++            ),
++            InvertedIndex::Immutable(index) => Box::new(
++                index
++                    .vocab_with_positngs_len_iter()
++                    .filter_map(map_filter_condition),
++            ),
++        }
+     }
+ 
+     pub fn build_index(
+@@ -401,7 +415,7 @@ impl MutableInvertedIndex {
+             // Empty request -> no matches
+             return Box::new(vec![].into_iter());
+         }
+-        intersect_postings_iterator(postings, |_| true)
++        intersect_postings_iterator(postings)
+     }
+ 
+     fn values_count(&self, point_id: PointOffsetType) -> usize {
+@@ -424,11 +438,21 @@ impl MutableInvertedIndex {
+     fn get_doc(&self, idx: PointOffsetType) -> Option<&Document> {
+         self.point_to_docs.get(idx as usize)?.as_ref()
+     }
++
++    fn vocab_with_positngs_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
++        self.vocab.iter().filter_map(|(token, &posting_idx)| {
++            if let Some(Some(postings)) = self.postings.get(posting_idx as usize) {
++                Some((token.as_str(), postings.len()))
++            } else {
++                None
++            }
++        })
++    }
+ }
+ 
+ #[derive(Default)]
+ pub struct ImmutableInvertedIndex {
+-    postings: Vec<Option<PostingList>>,
++    postings: Vec<Option<CompressedPostingList>>,
+     vocab: HashMap<String, TokenId>,
+     point_documents_tokens: Vec<Option<usize>>,
+     points_count: usize,
+@@ -465,10 +489,10 @@ impl ImmutableInvertedIndex {
+             return Box::new(vec![].into_iter());
+         }
+ 
+-        // deleted documents are still in the postings
++        // in case of immutable index, deleted documents are still in the postings
+         let filter =
+             move |idx| matches!(self.point_documents_tokens.get(idx as usize), Some(Some(_)));
+-        intersect_postings_iterator(postings, filter)
++        intersect_compressed_postings_iterator(postings, filter)
+     }
+ 
+     fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+@@ -506,22 +530,29 @@ impl ImmutableInvertedIndex {
+                 }
+             })
+     }
++
++    fn vocab_with_positngs_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
++        self.vocab.iter().filter_map(|(token, &posting_idx)| {
++            if let Some(Some(postings)) = self.postings.get(posting_idx as usize) {
++                Some((token.as_str(), postings.len()))
++            } else {
++                None
++            }
++        })
++    }
+ }
+ 
+ impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
+     fn from(mut index: MutableInvertedIndex) -> Self {
+-        index
++        let postings: Vec<Option<CompressedPostingList>> = index
+             .postings
+-            .iter_mut()
+-            .filter_map(|posting| posting.as_mut())
+-            .for_each(|posting| {
+-                posting.shrink_to_fit();
+-            });
+-        index.postings.shrink_to_fit();
++            .into_iter()
++            .map(|x| x.map(CompressedPostingList::new))
++            .collect();
+         index.vocab.shrink_to_fit();
+ 
+         ImmutableInvertedIndex {
+-            postings: index.postings,
++            postings,
+             vocab: index.vocab,
+             point_documents_tokens: index
+                 .point_to_docs
+
+commit 07c278ad51084c98adf9a7093619ffc5a73f87c9
+Author: xzfc <5121426+xzfc@users.noreply.github.com>
+Date:   Mon Jul 22 08:19:19 2024 +0000
+
+    Enable some of the pedantic clippy lints (#4715)
+    
+    * Use workspace lints
+    
+    * Enable lint: manual_let_else
+    
+    * Enable lint: enum_glob_use
+    
+    * Enable lint: filter_map_next
+    
+    * Enable lint: ref_as_ptr
+    
+    * Enable lint: ref_option_ref
+    
+    * Enable lint: manual_is_variant_and
+    
+    * Enable lint: flat_map_option
+    
+    * Enable lint: inefficient_to_string
+    
+    * Enable lint: implicit_clone
+    
+    * Enable lint: inconsistent_struct_constructor
+    
+    * Enable lint: unnecessary_wraps
+    
+    * Enable lint: needless_continue
+    
+    * Enable lint: unused_self
+    
+    * Enable lint: from_iter_instead_of_collect
+    
+    * Enable lint: uninlined_format_args
+    
+    * Enable lint: doc_link_with_quotes
+    
+    * Enable lint: needless_raw_string_hashes
+    
+    * Enable lint: used_underscore_binding
+    
+    * Enable lint: ptr_as_ptr
+    
+    * Enable lint: explicit_into_iter_loop
+    
+    * Enable lint: cast_lossless
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index ab77970ee..37a3f6264 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -108,7 +108,10 @@ impl InvertedIndex {
+         document: Document,
+     ) -> OperationResult<()> {
+         match self {
+-            InvertedIndex::Mutable(index) => index.index_document(idx, document),
++            InvertedIndex::Mutable(index) => {
++                index.index_document(idx, document);
++                Ok(())
++            }
+             InvertedIndex::Immutable(_index) => Err(OperationError::service_error(
+                 "Can't add values to immutable text index",
+             )),
+@@ -347,7 +350,7 @@ impl MutableInvertedIndex {
+         Ok(())
+     }
+ 
+-    fn index_document(&mut self, idx: PointOffsetType, document: Document) -> OperationResult<()> {
++    fn index_document(&mut self, idx: PointOffsetType, document: Document) {
+         self.points_count += 1;
+         if self.point_to_docs.len() <= idx as usize {
+             self.point_to_docs
+@@ -370,7 +373,6 @@ impl MutableInvertedIndex {
+             }
+         }
+         self.point_to_docs[idx as usize] = Some(document);
+-        Ok(())
+     }
+ 
+     fn remove_document(&mut self, idx: PointOffsetType) -> bool {
+@@ -378,9 +380,8 @@ impl MutableInvertedIndex {
+             return false; // Already removed or never actually existed
+         }
+ 
+-        let removed_doc = match std::mem::take(&mut self.point_to_docs[idx as usize]) {
+-            Some(doc) => doc,
+-            None => return false,
++        let Some(removed_doc) = std::mem::take(&mut self.point_to_docs[idx as usize]) else {
++            return false;
+         };
+ 
+         self.points_count -= 1;
+
+commit 35f4b6e3d08d60ea3ab711a3bda23f6dbd3c21d7
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Fri Aug 30 13:59:33 2024 +0200
+
+    Refactor compressed posting list (#4948)
+    
+    * move CompressedPostingList into a separate file
+    
+    * decouple posting list from visitor using the reader abstraction
+    
+    * refactor comressed_posting
+    
+    * separate iterator into a new file + include diagram
+    
+    * fmt
+    
+    * decouple CompressedPostingList from PostingList
+    
+    * decouple compression
+    
+    * delete unused iter
+    
+    * review: use correct names in diagrma
+    
+    * review: fix comments
+    
+    * review: code fixes
+    
+    * fmt
+    
+    * add tests
+    
+    * hide compression logic
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 37a3f6264..b751e68db 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -3,11 +3,12 @@ use std::collections::{BTreeSet, HashMap};
+ use common::types::PointOffsetType;
+ use serde::{Deserialize, Serialize};
+ 
+-use super::posting_list::{CompressedPostingList, PostingList};
++use super::posting_list::PostingList;
+ use super::postings_iterator::{
+     intersect_compressed_postings_iterator, intersect_postings_iterator,
+ };
+ use crate::common::operation_error::{OperationError, OperationResult};
++use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_list::CompressedPostingList;
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+@@ -548,7 +549,12 @@ impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
+         let postings: Vec<Option<CompressedPostingList>> = index
+             .postings
+             .into_iter()
+-            .map(|x| x.map(CompressedPostingList::new))
++            .map(|opt_posting| {
++                opt_posting
++                    .map(PostingList::into_vec)
++                    .as_deref()
++                    .map(CompressedPostingList::new)
++            })
+             .collect();
+         index.vocab.shrink_to_fit();
+ 
+
+commit fcbd0d9e10397b58ec0b8cd262ab6d942c439750
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Sat Sep 7 13:07:55 2024 -0400
+
+    Immutable text index without optional posting lists (#5040)
+    
+    * discard unused token ids to slim down immutable text index
+    
+    * clippy
+    
+    * review: use custom types
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index b751e68db..ee372b0c2 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -155,12 +155,7 @@ impl InvertedIndex {
+                         .unwrap()
+                         .as_ref()
+                         .map(|p| p.len()),
+-                    Self::Immutable(index) => index
+-                        .postings
+-                        .get(idx as usize)
+-                        .unwrap()
+-                        .as_ref()
+-                        .map(|p| p.len()),
++                    Self::Immutable(index) => index.postings.get(idx as usize).map(|p| p.len()),
+                 },
+             })
+             .collect();
+@@ -229,12 +224,12 @@ impl InvertedIndex {
+         match &self {
+             InvertedIndex::Mutable(index) => Box::new(
+                 index
+-                    .vocab_with_positngs_len_iter()
++                    .vocab_with_postings_len_iter()
+                     .filter_map(map_filter_condition),
+             ),
+             InvertedIndex::Immutable(index) => Box::new(
+                 index
+-                    .vocab_with_positngs_len_iter()
++                    .vocab_with_postings_len_iter()
+                     .filter_map(map_filter_condition),
+             ),
+         }
+@@ -441,7 +436,7 @@ impl MutableInvertedIndex {
+         self.point_to_docs.get(idx as usize)?.as_ref()
+     }
+ 
+-    fn vocab_with_positngs_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
++    fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+         self.vocab.iter().filter_map(|(token, &posting_idx)| {
+             if let Some(Some(postings)) = self.postings.get(posting_idx as usize) {
+                 Some((token.as_str(), postings.len()))
+@@ -454,9 +449,9 @@ impl MutableInvertedIndex {
+ 
+ #[derive(Default)]
+ pub struct ImmutableInvertedIndex {
+-    postings: Vec<Option<CompressedPostingList>>,
++    postings: Vec<CompressedPostingList>,
+     vocab: HashMap<String, TokenId>,
+-    point_documents_tokens: Vec<Option<usize>>,
++    point_to_tokens_count: Vec<Option<usize>>,
+     points_count: usize,
+ }
+ 
+@@ -465,7 +460,7 @@ impl ImmutableInvertedIndex {
+         if self.values_is_empty(idx) {
+             return false; // Already removed or never actually existed
+         }
+-        self.point_documents_tokens[idx as usize] = None;
++        self.point_to_tokens_count[idx as usize] = None;
+         self.points_count -= 1;
+         true
+     }
+@@ -474,11 +469,10 @@ impl ImmutableInvertedIndex {
+         let postings_opt: Option<Vec<_>> = query
+             .tokens
+             .iter()
+-            .map(|&vocab_idx| match vocab_idx {
++            .map(|&token_id| match token_id {
+                 None => None,
+                 // if a ParsedQuery token was given an index, then it must exist in the vocabulary
+-                // dictionary. Posting list entry can be None but it exists.
+-                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
++                Some(idx) => self.postings.get(idx as usize),
+             })
+             .collect();
+         if postings_opt.is_none() {
+@@ -493,22 +487,22 @@ impl ImmutableInvertedIndex {
+ 
+         // in case of immutable index, deleted documents are still in the postings
+         let filter =
+-            move |idx| matches!(self.point_documents_tokens.get(idx as usize), Some(Some(_)));
++            move |idx| matches!(self.point_to_tokens_count.get(idx as usize), Some(Some(_)));
+         intersect_compressed_postings_iterator(postings, filter)
+     }
+ 
+     fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        if self.point_documents_tokens.len() <= point_id as usize {
++        if self.point_to_tokens_count.len() <= point_id as usize {
+             return true;
+         }
+-        self.point_documents_tokens[point_id as usize].is_none()
++        self.point_to_tokens_count[point_id as usize].is_none()
+     }
+ 
+     fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        if self.point_documents_tokens.len() <= point_id as usize {
++        if self.point_to_tokens_count.len() <= point_id as usize {
+             return 0;
+         }
+-        self.point_documents_tokens[point_id as usize].unwrap_or(0)
++        self.point_to_tokens_count[point_id as usize].unwrap_or(0)
+     }
+ 
+     fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+@@ -524,44 +518,56 @@ impl ImmutableInvertedIndex {
+             .tokens
+             .iter()
+             // unwrap crash safety: all tokens exist in the vocabulary if it passes the above check
+-            .all(|query_token| {
+-                if let Some(posting_list) = &self.postings[query_token.unwrap() as usize] {
+-                    posting_list.contains(&point_id)
+-                } else {
+-                    false
+-                }
+-            })
++            .all(|query_token| self.postings[query_token.unwrap() as usize].contains(&point_id))
+     }
+ 
+-    fn vocab_with_positngs_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
++    fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+         self.vocab.iter().filter_map(|(token, &posting_idx)| {
+-            if let Some(Some(postings)) = self.postings.get(posting_idx as usize) {
+-                Some((token.as_str(), postings.len()))
+-            } else {
+-                None
+-            }
++            self.postings
++                .get(posting_idx as usize)
++                .map(|posting| (token.as_str(), posting.len()))
+         })
+     }
+ }
+ 
+ impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
+-    fn from(mut index: MutableInvertedIndex) -> Self {
+-        let postings: Vec<Option<CompressedPostingList>> = index
++    fn from(index: MutableInvertedIndex) -> Self {
++        // Keep only tokens that have non-empty postings
++        let (postings, orig_to_new_token): (Vec<_>, HashMap<_, _>) = index
+             .postings
+             .into_iter()
+-            .map(|opt_posting| {
+-                opt_posting
+-                    .map(PostingList::into_vec)
+-                    .as_deref()
+-                    .map(CompressedPostingList::new)
++            .enumerate()
++            .filter_map(|(orig_token, posting)| match posting {
++                Some(posting) if posting.len() > 0 => Some((orig_token, posting)),
++                _ => None,
++            })
++            .enumerate()
++            .map(|(new_token, (orig_token, posting))| {
++                (posting, (orig_token as TokenId, new_token as TokenId))
++            })
++            .unzip();
++
++        // Update vocab entries
++        let mut vocab: HashMap<String, TokenId> = index
++            .vocab
++            .into_iter()
++            .filter_map(|(key, orig_token)| {
++                orig_to_new_token
++                    .get(&orig_token)
++                    .map(|new_token| (key, *new_token))
+             })
+             .collect();
+-        index.vocab.shrink_to_fit();
++
++        let postings: Vec<CompressedPostingList> = postings
++            .into_iter()
++            .map(|posting| CompressedPostingList::new(&posting.into_vec()))
++            .collect();
++        vocab.shrink_to_fit();
+ 
+         ImmutableInvertedIndex {
+             postings,
+-            vocab: index.vocab,
+-            point_documents_tokens: index
++            vocab,
++            point_to_tokens_count: index
+                 .point_to_docs
+                 .iter()
+                 .map(|doc| doc.as_ref().map(|doc| doc.len()))
+@@ -570,3 +576,85 @@ impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeSet;
++
++    use rand::Rng;
++
++    use super::{InvertedIndex, MutableInvertedIndex};
++    use crate::index::field_index::full_text_index::inverted_index::ImmutableInvertedIndex;
++
++    fn mutable_inverted_index() -> InvertedIndex {
++        let mut index = InvertedIndex::Mutable(MutableInvertedIndex::default());
++
++        let indexed_points = 2000;
++
++        // 20% of indexed points get removed
++        let deleted_points = 400;
++
++        for idx in 0..indexed_points {
++            // Generate 10-word documents
++            let tokens: BTreeSet<String> = (0..10)
++                .map(|_| {
++                    let mut rng = rand::thread_rng();
++                    // Each word is 1 to 3 characters long
++                    let len = rng.gen_range(1..=3);
++                    rng.sample_iter(rand::distributions::Alphanumeric)
++                        .take(len)
++                        .map(char::from)
++                        .collect()
++                })
++                .collect();
++            let document = index.document_from_tokens(&tokens);
++            index.index_document(idx, document).unwrap();
++        }
++
++        // Remove some points
++        for idx in 0..deleted_points {
++            index.remove_document(idx);
++        }
++
++        index
++    }
++
++    #[test]
++    fn test_mutable_to_immutable() {
++        let InvertedIndex::Mutable(index) = mutable_inverted_index() else {
++            panic!("Expected mutable index");
++        };
++
++        let (orig_vocab, orig_postings) = (index.vocab.clone(), index.postings.clone());
++
++        let index = ImmutableInvertedIndex::from(index);
++
++        assert!(index.vocab.len() < orig_vocab.len());
++        assert!(index.postings.len() < orig_postings.len());
++        assert!(!index.vocab.is_empty());
++
++        // Check that new vocabulary token ids leads to the same posting lists
++        assert!({
++            index.vocab.iter().all(|(key, new_token)| {
++                let new_posting = index.postings.get(*new_token as usize).cloned().unwrap();
++
++                let orig_token = orig_vocab.get(key).unwrap();
++
++                let orig_posting = orig_postings
++                    .get(*orig_token as usize)
++                    .cloned()
++                    .unwrap()
++                    .unwrap();
++
++                let new_contains_orig = orig_posting
++                    .iter()
++                    .all(|point_id| new_posting.contains(&point_id));
++                let orig_contains_new = new_posting
++                    .iter()
++                    .all(|point_id| orig_posting.contains(&point_id));
++
++                new_contains_orig && orig_contains_new
++            })
++        });
++    }
++}
+
+commit 9821368fcee646bca5901037eb2260b43948f659
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Sep 10 12:02:05 2024 +0200
+
+    initial structures for reading mmap text index (#5029)
+    
+    * initial structures for reading mmap text index
+    
+    * creation of text index mmap
+    
+    * WIP create mmap inverted index
+    
+    * use same file writing technique as in MmapHashmap
+    
+    * Save points_to_tokens_count in two files
+    
+    * clippy
+    
+    * fill slice with iterator
+    
+    * review fixes
+    
+    * fix after review
+    
+    * implement loading of MmapInvertedIndex
+    
+    * WIP: prepare for converting ChunkReader into trait
+    
+    * fmt
+    
+    * WIP: prepare ChunkReader to be a trai
+    
+    * WIP: replace ChunkReaderImpl with trait
+    
+    * implement chunk reader for mmap view
+    
+    * rollback ChunkReader trait and remove CompressedMmapPostingListView
+    
+    * move ImmutableInvertedIndex and MutableInvertedIndex into separate files
+    
+    * impl ops for MmapInvertedIndex
+    
+    * make mmap hashmap value param generic (#5042)
+    
+    * make mmap hashmap value param generic
+    
+    * test + fixes
+    
+    * Update lib/common/common/src/mmap_hashmap.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * Update lib/common/common/src/mmap_hashmap.rs
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    
+    * fixups
+    
+    ---------
+    
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    Co-authored-by: xzfc <xzfcpw@gmail.com>
+    
+    * test and fix immutable to mmap conversion
+    
+    * fix case 4 and refactor MmapBitSlice::create
+    
+    * more tests
+    
+    * fmt
+    
+    ---------
+    
+    Co-authored-by: Luis Cossío <luis.cossio@outlook.com>
+    Co-authored-by: Tim Visée <tim+github@visee.me>
+    Co-authored-by: xzfc <xzfcpw@gmail.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index ee372b0c2..c615dd6b9 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -3,12 +3,9 @@ use std::collections::{BTreeSet, HashMap};
+ use common::types::PointOffsetType;
+ use serde::{Deserialize, Serialize};
+ 
+-use super::posting_list::PostingList;
+-use super::postings_iterator::{
+-    intersect_compressed_postings_iterator, intersect_postings_iterator,
+-};
+ use crate::common::operation_error::{OperationError, OperationResult};
+-use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_list::CompressedPostingList;
++use crate::index::field_index::full_text_index::immutable_inverted_index::ImmutableInvertedIndex;
++use crate::index::field_index::full_text_index::mutable_inverted_index::MutableInvertedIndex;
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+@@ -82,7 +79,7 @@ impl InvertedIndex {
+         Self::document_from_tokens_impl(vocab, tokens)
+     }
+ 
+-    fn document_from_tokens_impl(
++    pub fn document_from_tokens_impl(
+         vocab: &mut HashMap<String, TokenId>,
+         tokens: &BTreeSet<String>,
+     ) -> Document {
+@@ -290,371 +287,212 @@ impl InvertedIndex {
+     }
+ }
+ 
+-#[derive(Default)]
+-pub struct MutableInvertedIndex {
+-    postings: Vec<Option<PostingList>>,
+-    vocab: HashMap<String, TokenId>,
+-    point_to_docs: Vec<Option<Document>>,
+-    points_count: usize,
+-}
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeSet;
+ 
+-impl MutableInvertedIndex {
+-    fn build_index(
+-        &mut self,
+-        iter: impl Iterator<Item = OperationResult<(PointOffsetType, BTreeSet<String>)>>,
+-    ) -> OperationResult<()> {
+-        self.points_count = 0;
+-        self.vocab.clear();
+-        self.postings.clear();
+-        self.point_to_docs.clear();
+-
+-        // update point_to_docs
+-        for i in iter {
+-            self.points_count += 1;
+-            let (idx, tokens) = i?;
+-
+-            if self.point_to_docs.len() <= idx as usize {
+-                self.point_to_docs
+-                    .resize_with(idx as usize + 1, Default::default);
+-            }
++    use rand::seq::SliceRandom;
++    use rand::Rng;
++    use rstest::rstest;
+ 
+-            let document = InvertedIndex::document_from_tokens_impl(&mut self.vocab, &tokens);
+-            self.point_to_docs[idx as usize] = Some(document);
+-        }
++    use super::{InvertedIndex, ParsedQuery, TokenId};
++    use crate::index::field_index::full_text_index::immutable_inverted_index::ImmutableInvertedIndex;
++    use crate::index::field_index::full_text_index::mmap_inverted_index::MmapInvertedIndex;
++    use crate::index::field_index::full_text_index::mutable_inverted_index::MutableInvertedIndex;
+ 
+-        // build postings from point_to_docs
+-        // build in order to increase document id
+-        for (idx, doc) in self.point_to_docs.iter().enumerate() {
+-            if let Some(doc) = doc {
+-                for token_idx in doc.tokens() {
+-                    if self.postings.len() <= *token_idx as usize {
+-                        self.postings
+-                            .resize_with(*token_idx as usize + 1, Default::default);
+-                    }
+-                    let posting = self
+-                        .postings
+-                        .get_mut(*token_idx as usize)
+-                        .expect("posting must exist even if with None");
+-                    match posting {
+-                        None => *posting = Some(PostingList::new(idx as PointOffsetType)),
+-                        Some(vec) => vec.insert(idx as PointOffsetType),
+-                    }
+-                }
+-            }
+-        }
++    fn generate_word() -> String {
++        let mut rng = rand::thread_rng();
+ 
+-        Ok(())
++        // Each word is 1 to 3 characters long
++        let len = rng.gen_range(1..=3);
++        rng.sample_iter(rand::distributions::Alphanumeric)
++            .take(len)
++            .map(char::from)
++            .collect()
+     }
+ 
+-    fn index_document(&mut self, idx: PointOffsetType, document: Document) {
+-        self.points_count += 1;
+-        if self.point_to_docs.len() <= idx as usize {
+-            self.point_to_docs
+-                .resize_with(idx as usize + 1, Default::default);
+-        }
++    fn generate_query() -> Vec<String> {
++        let mut rng = rand::thread_rng();
++        let len = rng.gen_range(1..=2);
++        (0..len).map(|_| generate_word()).collect()
++    }
+ 
+-        for token_idx in document.tokens() {
+-            let token_idx_usize = *token_idx as usize;
+-            if self.postings.len() <= token_idx_usize {
+-                self.postings
+-                    .resize_with(token_idx_usize + 1, Default::default);
+-            }
+-            let posting = self
+-                .postings
+-                .get_mut(token_idx_usize)
+-                .expect("posting must exist even if with None");
+-            match posting {
+-                None => *posting = Some(PostingList::new(idx)),
+-                Some(vec) => vec.insert(idx),
+-            }
+-        }
+-        self.point_to_docs[idx as usize] = Some(document);
++    fn to_parsed_query(
++        query: Vec<String>,
++        token_to_id: impl Fn(String) -> Option<TokenId>,
++    ) -> ParsedQuery {
++        let tokens: Vec<_> = query.into_iter().map(token_to_id).collect();
++        ParsedQuery { tokens }
+     }
+ 
+-    fn remove_document(&mut self, idx: PointOffsetType) -> bool {
+-        if self.point_to_docs.len() <= idx as usize {
+-            return false; // Already removed or never actually existed
++    fn mutable_inverted_index(indexed_count: u32, deleted_count: u32) -> MutableInvertedIndex {
++        let mut index = InvertedIndex::Mutable(MutableInvertedIndex::default());
++
++        for idx in 0..indexed_count {
++            // Generate 10 tot 30-word documents
++            let doc_len = rand::thread_rng().gen_range(10..=30);
++            let tokens: BTreeSet<String> = (0..doc_len).map(|_| generate_word()).collect();
++            let document = index.document_from_tokens(&tokens);
++            index.index_document(idx, document).unwrap();
+         }
+ 
+-        let Some(removed_doc) = std::mem::take(&mut self.point_to_docs[idx as usize]) else {
+-            return false;
+-        };
++        // Remove some points
++        let mut points_to_delete = (0..indexed_count).collect::<Vec<_>>();
++        points_to_delete.shuffle(&mut rand::thread_rng());
++        for idx in &points_to_delete[..deleted_count as usize] {
++            index.remove_document(*idx);
++        }
+ 
+-        self.points_count -= 1;
++        let InvertedIndex::Mutable(index) = index else {
++            panic!("Expected mutable index");
++        };
+ 
+-        for removed_token in removed_doc.tokens() {
+-            // unwrap safety: posting list exists and contains the document id
+-            let posting = self.postings.get_mut(*removed_token as usize).unwrap();
+-            if let Some(vec) = posting {
+-                vec.remove(idx);
+-            }
+-        }
+-        true
++        index
+     }
+ 
+-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+-        let postings_opt: Option<Vec<_>> = query
+-            .tokens
+-            .iter()
+-            .map(|&vocab_idx| match vocab_idx {
+-                None => None,
+-                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
+-                // dictionary. Posting list entry can be None but it exists.
+-                Some(idx) => self.postings.get(idx as usize).unwrap().as_ref(),
+-            })
+-            .collect();
+-        if postings_opt.is_none() {
+-            // There are unseen tokens -> no matches
+-            return Box::new(vec![].into_iter());
+-        }
+-        let postings = postings_opt.unwrap();
+-        if postings.is_empty() {
+-            // Empty request -> no matches
+-            return Box::new(vec![].into_iter());
+-        }
+-        intersect_postings_iterator(postings)
+-    }
++    #[test]
++    fn test_mutable_to_immutable() {
++        let mutable = mutable_inverted_index(2000, 400);
+ 
+-    fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        // Maybe we want number of documents in the future?
+-        self.get_doc(point_id).map(|x| x.len()).unwrap_or(0)
+-    }
++        let immutable = ImmutableInvertedIndex::from(mutable.clone());
+ 
+-    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        self.get_doc(point_id).map(|x| x.is_empty()).unwrap_or(true)
+-    }
++        assert!(immutable.vocab.len() < mutable.vocab.len());
++        assert!(immutable.postings.len() < mutable.postings.len());
++        assert!(!immutable.vocab.is_empty());
+ 
+-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+-        if let Some(doc) = self.get_doc(point_id) {
+-            parsed_query.check_match(doc)
+-        } else {
+-            false
+-        }
+-    }
++        // Check that new vocabulary token ids leads to the same posting lists
++        assert!({
++            immutable.vocab.iter().all(|(key, new_token)| {
++                let new_posting = immutable
++                    .postings
++                    .get(*new_token as usize)
++                    .cloned()
++                    .unwrap();
+ 
+-    fn get_doc(&self, idx: PointOffsetType) -> Option<&Document> {
+-        self.point_to_docs.get(idx as usize)?.as_ref()
+-    }
++                let orig_token = mutable.vocab.get(key).unwrap();
+ 
+-    fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+-        self.vocab.iter().filter_map(|(token, &posting_idx)| {
+-            if let Some(Some(postings)) = self.postings.get(posting_idx as usize) {
+-                Some((token.as_str(), postings.len()))
+-            } else {
+-                None
+-            }
+-        })
+-    }
+-}
++                let orig_posting = mutable
++                    .postings
++                    .get(*orig_token as usize)
++                    .cloned()
++                    .unwrap()
++                    .unwrap();
+ 
+-#[derive(Default)]
+-pub struct ImmutableInvertedIndex {
+-    postings: Vec<CompressedPostingList>,
+-    vocab: HashMap<String, TokenId>,
+-    point_to_tokens_count: Vec<Option<usize>>,
+-    points_count: usize,
+-}
++                let new_contains_orig = orig_posting
++                    .iter()
++                    .all(|point_id| new_posting.contains(&point_id));
+ 
+-impl ImmutableInvertedIndex {
+-    fn remove_document(&mut self, idx: PointOffsetType) -> bool {
+-        if self.values_is_empty(idx) {
+-            return false; // Already removed or never actually existed
+-        }
+-        self.point_to_tokens_count[idx as usize] = None;
+-        self.points_count -= 1;
+-        true
+-    }
++                let orig_contains_new = new_posting
++                    .iter()
++                    .all(|point_id| orig_posting.contains(&point_id));
+ 
+-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+-        let postings_opt: Option<Vec<_>> = query
+-            .tokens
+-            .iter()
+-            .map(|&token_id| match token_id {
+-                None => None,
+-                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
+-                Some(idx) => self.postings.get(idx as usize),
++                new_contains_orig && orig_contains_new
+             })
+-            .collect();
+-        if postings_opt.is_none() {
+-            // There are unseen tokens -> no matches
+-            return Box::new(vec![].into_iter());
+-        }
+-        let postings = postings_opt.unwrap();
+-        if postings.is_empty() {
+-            // Empty request -> no matches
+-            return Box::new(vec![].into_iter());
+-        }
+-
+-        // in case of immutable index, deleted documents are still in the postings
+-        let filter =
+-            move |idx| matches!(self.point_to_tokens_count.get(idx as usize), Some(Some(_)));
+-        intersect_compressed_postings_iterator(postings, filter)
++        });
+     }
+ 
+-    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        if self.point_to_tokens_count.len() <= point_id as usize {
+-            return true;
+-        }
+-        self.point_to_tokens_count[point_id as usize].is_none()
+-    }
++    #[rstest]
++    #[case(2000, 400)]
++    #[case(2000, 2000)]
++    #[case(1111, 1110)]
++    #[case(1111, 0)]
++    #[case(10, 2)]
++    #[test]
++    fn test_immutable_to_mmap(#[case] indexed_count: u32, #[case] deleted_count: u32) {
++        let mutable = mutable_inverted_index(indexed_count, deleted_count);
++        let immutable = ImmutableInvertedIndex::from(mutable);
+ 
+-    fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        if self.point_to_tokens_count.len() <= point_id as usize {
+-            return 0;
+-        }
+-        self.point_to_tokens_count[point_id as usize].unwrap_or(0)
+-    }
++        let path = tempfile::tempdir().unwrap().into_path();
+ 
+-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+-        if parsed_query.tokens.contains(&None) {
+-            return false;
+-        }
+-        // check presence of the document
+-        if self.values_is_empty(point_id) {
+-            return false;
+-        }
+-        // Check that all tokens are in document
+-        parsed_query
+-            .tokens
+-            .iter()
+-            // unwrap crash safety: all tokens exist in the vocabulary if it passes the above check
+-            .all(|query_token| self.postings[query_token.unwrap() as usize].contains(&point_id))
+-    }
++        MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
+ 
+-    fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+-        self.vocab.iter().filter_map(|(token, &posting_idx)| {
+-            self.postings
+-                .get(posting_idx as usize)
+-                .map(|posting| (token.as_str(), posting.len()))
+-        })
+-    }
+-}
++        let mmap = MmapInvertedIndex::open(path).unwrap();
+ 
+-impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
+-    fn from(index: MutableInvertedIndex) -> Self {
+-        // Keep only tokens that have non-empty postings
+-        let (postings, orig_to_new_token): (Vec<_>, HashMap<_, _>) = index
+-            .postings
+-            .into_iter()
+-            .enumerate()
+-            .filter_map(|(orig_token, posting)| match posting {
+-                Some(posting) if posting.len() > 0 => Some((orig_token, posting)),
+-                _ => None,
+-            })
+-            .enumerate()
+-            .map(|(new_token, (orig_token, posting))| {
+-                (posting, (orig_token as TokenId, new_token as TokenId))
+-            })
+-            .unzip();
++        // Check same vocabulary
++        for (token, token_id) in immutable.vocab.iter() {
++            assert_eq!(mmap.get_token_id(token).unwrap(), Some(*token_id));
++        }
+ 
+-        // Update vocab entries
+-        let mut vocab: HashMap<String, TokenId> = index
+-            .vocab
+-            .into_iter()
+-            .filter_map(|(key, orig_token)| {
+-                orig_to_new_token
+-                    .get(&orig_token)
+-                    .map(|new_token| (key, *new_token))
+-            })
+-            .collect();
++        // Check same postings
++        for (token_id, posting) in immutable.postings.iter().enumerate() {
++            let chunk_reader = mmap.postings.get(token_id as u32).unwrap();
+ 
+-        let postings: Vec<CompressedPostingList> = postings
+-            .into_iter()
+-            .map(|posting| CompressedPostingList::new(&posting.into_vec()))
+-            .collect();
+-        vocab.shrink_to_fit();
++            for point_id in posting.iter() {
++                assert!(chunk_reader.contains(&point_id));
++            }
++        }
+ 
+-        ImmutableInvertedIndex {
+-            postings,
+-            vocab,
+-            point_to_tokens_count: index
+-                .point_to_docs
+-                .iter()
+-                .map(|doc| doc.as_ref().map(|doc| doc.len()))
+-                .collect(),
+-            points_count: index.points_count,
++        for (point_id, count) in immutable.point_to_tokens_count.iter().enumerate() {
++            // Check same deleted points
++            assert_eq!(
++                mmap.deleted_points.get(point_id).unwrap(),
++                count.is_none(),
++                "point_id: {point_id}"
++            );
++
++            // Check same count
++            assert_eq!(
++                *mmap.point_to_tokens_count.get(point_id).unwrap(),
++                count.unwrap_or(0)
++            );
+         }
++
++        // Check same points count
++        assert_eq!(mmap.active_points_count, immutable.points_count);
+     }
+-}
+ 
+-#[cfg(test)]
+-mod tests {
+-    use std::collections::BTreeSet;
++    #[test]
++    fn test_mmap_index_congruence() {
++        let indexed_count = 10000;
++        let deleted_count = 500;
+ 
+-    use rand::Rng;
++        let mut mutable = mutable_inverted_index(indexed_count, deleted_count);
++        let immutable = ImmutableInvertedIndex::from(mutable.clone());
+ 
+-    use super::{InvertedIndex, MutableInvertedIndex};
+-    use crate::index::field_index::full_text_index::inverted_index::ImmutableInvertedIndex;
++        let path = tempfile::tempdir().unwrap().into_path();
+ 
+-    fn mutable_inverted_index() -> InvertedIndex {
+-        let mut index = InvertedIndex::Mutable(MutableInvertedIndex::default());
++        MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
+ 
+-        let indexed_points = 2000;
+-
+-        // 20% of indexed points get removed
+-        let deleted_points = 400;
+-
+-        for idx in 0..indexed_points {
+-            // Generate 10-word documents
+-            let tokens: BTreeSet<String> = (0..10)
+-                .map(|_| {
+-                    let mut rng = rand::thread_rng();
+-                    // Each word is 1 to 3 characters long
+-                    let len = rng.gen_range(1..=3);
+-                    rng.sample_iter(rand::distributions::Alphanumeric)
+-                        .take(len)
+-                        .map(char::from)
+-                        .collect()
+-                })
+-                .collect();
+-            let document = index.document_from_tokens(&tokens);
+-            index.index_document(idx, document).unwrap();
+-        }
++        let mut mmap_index = MmapInvertedIndex::open(path).unwrap();
+ 
+-        // Remove some points
+-        for idx in 0..deleted_points {
+-            index.remove_document(idx);
+-        }
++        let queries: Vec<_> = (0..100).map(|_| generate_query()).collect();
+ 
+-        index
+-    }
++        let mut_parsed_queries: Vec<_> = queries
++            .clone()
++            .into_iter()
++            .map(|query| to_parsed_query(query, |token| mutable.vocab.get(&token).copied()))
++            .collect();
+ 
+-    #[test]
+-    fn test_mutable_to_immutable() {
+-        let InvertedIndex::Mutable(index) = mutable_inverted_index() else {
+-            panic!("Expected mutable index");
+-        };
++        let imm_parsed_queries: Vec<_> = queries
++            .into_iter()
++            .map(|query| to_parsed_query(query, |token| mmap_index.get_token_id(&token).unwrap()))
++            .collect();
+ 
+-        let (orig_vocab, orig_postings) = (index.vocab.clone(), index.postings.clone());
++        for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
++            let mut_filtered = mutable.filter(mut_query).collect::<Vec<_>>();
++            let imm_filtered = mmap_index.filter(imm_query).collect::<Vec<_>>();
+ 
+-        let index = ImmutableInvertedIndex::from(index);
++            assert_eq!(mut_filtered, imm_filtered);
++        }
+ 
+-        assert!(index.vocab.len() < orig_vocab.len());
+-        assert!(index.postings.len() < orig_postings.len());
+-        assert!(!index.vocab.is_empty());
++        // Delete random documents from both indexes
+ 
+-        // Check that new vocabulary token ids leads to the same posting lists
+-        assert!({
+-            index.vocab.iter().all(|(key, new_token)| {
+-                let new_posting = index.postings.get(*new_token as usize).cloned().unwrap();
++        let points_to_delete: Vec<_> = (0..deleted_count)
++            .map(|_| rand::thread_rng().gen_range(0..indexed_count))
++            .collect();
+ 
+-                let orig_token = orig_vocab.get(key).unwrap();
++        for point_id in &points_to_delete {
++            mutable.remove_document(*point_id);
++            mmap_index.remove_document(*point_id);
++        }
+ 
+-                let orig_posting = orig_postings
+-                    .get(*orig_token as usize)
+-                    .cloned()
+-                    .unwrap()
+-                    .unwrap();
++        // Check congruence after deletion
+ 
+-                let new_contains_orig = orig_posting
+-                    .iter()
+-                    .all(|point_id| new_posting.contains(&point_id));
+-                let orig_contains_new = new_posting
+-                    .iter()
+-                    .all(|point_id| orig_posting.contains(&point_id));
++        for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
++            let mut_filtered = mutable.filter(mut_query).collect::<Vec<_>>();
++            let imm_filtered = mmap_index.filter(imm_query).collect::<Vec<_>>();
+ 
+-                new_contains_orig && orig_contains_new
+-            })
+-        });
++            assert_eq!(mut_filtered, imm_filtered);
++        }
+     }
+ }
+
+commit 2d456df948f91bb770100f63f42a9ca5349e2113
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Fri Sep 13 16:40:20 2024 -0300
+
+    Refactor `FullTextIndex` as enum (#5067)
+    
+    * refactor inverted index into trait
+    
+    * create immutable and mutable versions of text index
+    
+    * migrate to full text index enum
+    
+    * fix clippy
+    
+    * review remarks
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index c615dd6b9..c6d036b77 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -3,9 +3,7 @@ use std::collections::{BTreeSet, HashMap};
+ use common::types::PointOffsetType;
+ use serde::{Deserialize, Serialize};
+ 
+-use crate::common::operation_error::{OperationError, OperationResult};
+-use crate::index::field_index::full_text_index::immutable_inverted_index::ImmutableInvertedIndex;
+-use crate::index::field_index::full_text_index::mutable_inverted_index::MutableInvertedIndex;
++use crate::common::operation_error::OperationResult;
+ use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
+ use crate::types::{FieldCondition, Match, PayloadKeyType};
+ 
+@@ -57,32 +55,11 @@ impl ParsedQuery {
+     }
+ }
+ 
+-pub enum InvertedIndex {
+-    Mutable(MutableInvertedIndex),
+-    Immutable(ImmutableInvertedIndex),
+-}
+-
+-impl InvertedIndex {
+-    pub fn new(is_appendable: bool) -> InvertedIndex {
+-        if is_appendable {
+-            InvertedIndex::Mutable(MutableInvertedIndex::default())
+-        } else {
+-            InvertedIndex::Immutable(ImmutableInvertedIndex::default())
+-        }
+-    }
++pub trait InvertedIndex {
++    fn get_vocab_mut(&mut self) -> &mut HashMap<String, TokenId>;
+ 
+-    pub fn document_from_tokens(&mut self, tokens: &BTreeSet<String>) -> Document {
+-        let vocab = match self {
+-            InvertedIndex::Mutable(index) => &mut index.vocab,
+-            InvertedIndex::Immutable(index) => &mut index.vocab,
+-        };
+-        Self::document_from_tokens_impl(vocab, tokens)
+-    }
+-
+-    pub fn document_from_tokens_impl(
+-        vocab: &mut HashMap<String, TokenId>,
+-        tokens: &BTreeSet<String>,
+-    ) -> Document {
++    fn document_from_tokens(&mut self, tokens: &BTreeSet<String>) -> Document {
++        let vocab = self.get_vocab_mut();
+         let mut document_tokens = vec![];
+         for token in tokens {
+             // check if in vocab
+@@ -100,60 +77,27 @@ impl InvertedIndex {
+         Document::new(document_tokens)
+     }
+ 
+-    pub fn index_document(
+-        &mut self,
+-        idx: PointOffsetType,
+-        document: Document,
+-    ) -> OperationResult<()> {
+-        match self {
+-            InvertedIndex::Mutable(index) => {
+-                index.index_document(idx, document);
+-                Ok(())
+-            }
+-            InvertedIndex::Immutable(_index) => Err(OperationError::service_error(
+-                "Can't add values to immutable text index",
+-            )),
+-        }
+-    }
++    fn index_document(&mut self, idx: PointOffsetType, document: Document) -> OperationResult<()>;
+ 
+-    pub fn remove_document(&mut self, idx: PointOffsetType) -> bool {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.remove_document(idx),
+-            InvertedIndex::Immutable(index) => index.remove_document(idx),
+-        }
+-    }
++    fn remove_document(&mut self, idx: PointOffsetType) -> bool;
+ 
+-    pub fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.filter(query),
+-            InvertedIndex::Immutable(index) => index.filter(query),
+-        }
+-    }
++    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_>;
++
++    fn get_posting_len(&self, token_id: TokenId) -> Option<usize>;
+ 
+-    pub fn estimate_cardinality(
++    fn estimate_cardinality(
+         &self,
+         query: &ParsedQuery,
+         condition: &FieldCondition,
+     ) -> CardinalityEstimation {
+-        let points_count = match self {
+-            InvertedIndex::Mutable(index) => index.points_count,
+-            InvertedIndex::Immutable(index) => index.points_count,
+-        };
++        let points_count = self.points_count();
++
+         let posting_lengths: Option<Vec<usize>> = query
+             .tokens
+             .iter()
+             .map(|&vocab_idx| match vocab_idx {
+                 None => None,
+-                // unwrap safety: same as in filter()
+-                Some(idx) => match &self {
+-                    Self::Mutable(index) => index
+-                        .postings
+-                        .get(idx as usize)
+-                        .unwrap()
+-                        .as_ref()
+-                        .map(|p| p.len()),
+-                    Self::Immutable(index) => index.postings.get(idx as usize).map(|p| p.len()),
+-                },
++                Some(idx) => self.get_posting_len(idx),
+             })
+             .collect();
+         if posting_lengths.is_none() || points_count == 0 {
+@@ -200,11 +144,13 @@ impl InvertedIndex {
+         };
+     }
+ 
+-    pub fn payload_blocks(
++    fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_;
++
++    fn payload_blocks(
+         &self,
+         threshold: usize,
+         key: PayloadKeyType,
+-    ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
++    ) -> impl Iterator<Item = PayloadBlockCondition> + '_ {
+         let map_filter_condition = move |(token, postings_len): (&str, usize)| {
+             if postings_len >= threshold {
+                 Some(PayloadBlockCondition {
+@@ -218,73 +164,19 @@ impl InvertedIndex {
+ 
+         // It might be very hard to predict possible combinations of conditions,
+         // so we only build it for individual tokens
+-        match &self {
+-            InvertedIndex::Mutable(index) => Box::new(
+-                index
+-                    .vocab_with_postings_len_iter()
+-                    .filter_map(map_filter_condition),
+-            ),
+-            InvertedIndex::Immutable(index) => Box::new(
+-                index
+-                    .vocab_with_postings_len_iter()
+-                    .filter_map(map_filter_condition),
+-            ),
+-        }
++        self.vocab_with_postings_len_iter()
++            .filter_map(map_filter_condition)
+     }
+ 
+-    pub fn build_index(
+-        &mut self,
+-        iter: impl Iterator<Item = OperationResult<(PointOffsetType, BTreeSet<String>)>>,
+-    ) -> OperationResult<()> {
+-        let mut index = MutableInvertedIndex::default();
+-        index.build_index(iter)?;
++    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool;
+ 
+-        match self {
+-            InvertedIndex::Mutable(i) => {
+-                *i = index;
+-            }
+-            InvertedIndex::Immutable(i) => {
+-                *i = index.into();
+-            }
+-        }
+-
+-        Ok(())
+-    }
+-
+-    pub fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.check_match(parsed_query, point_id),
+-            InvertedIndex::Immutable(index) => index.check_match(parsed_query, point_id),
+-        }
+-    }
+-
+-    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.values_is_empty(point_id),
+-            InvertedIndex::Immutable(index) => index.values_is_empty(point_id),
+-        }
+-    }
++    fn values_is_empty(&self, point_id: PointOffsetType) -> bool;
+ 
+-    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.values_count(point_id),
+-            InvertedIndex::Immutable(index) => index.values_count(point_id),
+-        }
+-    }
++    fn values_count(&self, point_id: PointOffsetType) -> usize;
+ 
+-    pub fn points_count(&self) -> usize {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.points_count,
+-            InvertedIndex::Immutable(index) => index.points_count,
+-        }
+-    }
++    fn points_count(&self) -> usize;
+ 
+-    pub fn get_token(&self, token: &str) -> Option<TokenId> {
+-        match self {
+-            InvertedIndex::Mutable(index) => index.vocab.get(token).copied(),
+-            InvertedIndex::Immutable(index) => index.vocab.get(token).copied(),
+-        }
+-    }
++    fn get_token_id(&self, token: &str) -> Option<TokenId>;
+ }
+ 
+ #[cfg(test)]
+@@ -326,7 +218,7 @@ mod tests {
+     }
+ 
+     fn mutable_inverted_index(indexed_count: u32, deleted_count: u32) -> MutableInvertedIndex {
+-        let mut index = InvertedIndex::Mutable(MutableInvertedIndex::default());
++        let mut index = MutableInvertedIndex::default();
+ 
+         for idx in 0..indexed_count {
+             // Generate 10 tot 30-word documents
+@@ -343,10 +235,6 @@ mod tests {
+             index.remove_document(*idx);
+         }
+ 
+-        let InvertedIndex::Mutable(index) = index else {
+-            panic!("Expected mutable index");
+-        };
+-
+         index
+     }
+ 
+
+commit b3b22793769d2a18b5be99beb96b29fbf275521e
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Sat Sep 14 20:53:07 2024 +0200
+
+    Allow explicit populate of mmap (#4923)
+    
+    * expose mmap populate
+    
+    * expose mmap populate in open_read_mmap
+    
+    * FOR TEST, REVERSE IT: make InRamChunkedMmap default
+    
+    * enable populate advise on unix
+    
+    * fix clippy
+    
+    * unix -> linux
+    
+    * Update lib/collection/src/config.rs
+    
+    * clippy fixes
+    
+    * resolve conflicts
+    
+    * fmt
+    
+    * Runtime check for PopulateRead
+    
+    ---------
+    
+    Co-authored-by: xzfc <xzfcpw@gmail.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index c6d036b77..a0f5d1fbb 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -294,7 +294,7 @@ mod tests {
+ 
+         MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
+ 
+-        let mmap = MmapInvertedIndex::open(path).unwrap();
++        let mmap = MmapInvertedIndex::open(path, false).unwrap();
+ 
+         // Check same vocabulary
+         for (token, token_id) in immutable.vocab.iter() {
+@@ -341,7 +341,7 @@ mod tests {
+ 
+         MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
+ 
+-        let mut mmap_index = MmapInvertedIndex::open(path).unwrap();
++        let mut mmap_index = MmapInvertedIndex::open(path, false).unwrap();
+ 
+         let queries: Vec<_> = (0..100).map(|_| generate_query()).collect();
+ 
+
+commit cf8971503637f3d089670d74df81e31fb76f4fcf
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Mon Sep 16 16:27:30 2024 -0300
+
+    Expose `on_disk` text index (#5074)
+    
+    * map index: fix reachable code marked as unreachable
+    
+    * plumber work to get mmap text index to interfaces
+    
+    * test: add fixture for mmap text index, always create mmap segment
+    
+    * various fixes
+    
+    - ensure dir is created for mmap
+    - implement is_on_disk() for text index
+    - invert deleted condition for filter in mmap inverted index
+    
+    * update grpc docs and openapi
+    
+    * implement return of files
+    
+    * review nit
+    
+    * fix after rebase
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index a0f5d1fbb..5d23fafd6 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -298,7 +298,7 @@ mod tests {
+ 
+         // Check same vocabulary
+         for (token, token_id) in immutable.vocab.iter() {
+-            assert_eq!(mmap.get_token_id(token).unwrap(), Some(*token_id));
++            assert_eq!(mmap.get_token_id(token), Some(*token_id));
+         }
+ 
+         // Check same postings
+@@ -353,7 +353,7 @@ mod tests {
+ 
+         let imm_parsed_queries: Vec<_> = queries
+             .into_iter()
+-            .map(|query| to_parsed_query(query, |token| mmap_index.get_token_id(&token).unwrap()))
++            .map(|query| to_parsed_query(query, |token| mmap_index.get_token_id(&token)))
+             .collect();
+ 
+         for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
+
+commit 28dfb3ef747ca8a2e0f3ab4aef096bcb13c0c835
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Fri Nov 8 13:02:23 2024 +0100
+
+    Remove redundant clones (#5402)
+    
+    * Remove redundant clones
+    
+    * fmt
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 5d23fafd6..2d85fb820 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -339,7 +339,7 @@ mod tests {
+ 
+         let path = tempfile::tempdir().unwrap().into_path();
+ 
+-        MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
++        MmapInvertedIndex::create(path.clone(), immutable).unwrap();
+ 
+         let mut mmap_index = MmapInvertedIndex::open(path, false).unwrap();
+ 
+
+commit 103b86841b5dafa8515c917086a3e0ecc60e4768
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Fri Nov 8 16:54:52 2024 +0100
+
+    Do not pass PointOffsetType by reference (#5406)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 2d85fb820..8822b4171 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -268,11 +268,11 @@ mod tests {
+ 
+                 let new_contains_orig = orig_posting
+                     .iter()
+-                    .all(|point_id| new_posting.contains(&point_id));
++                    .all(|point_id| new_posting.contains(point_id));
+ 
+                 let orig_contains_new = new_posting
+                     .iter()
+-                    .all(|point_id| orig_posting.contains(&point_id));
++                    .all(|point_id| orig_posting.contains(point_id));
+ 
+                 new_contains_orig && orig_contains_new
+             })
+@@ -306,7 +306,7 @@ mod tests {
+             let chunk_reader = mmap.postings.get(token_id as u32).unwrap();
+ 
+             for point_id in posting.iter() {
+-                assert!(chunk_reader.contains(&point_id));
++                assert!(chunk_reader.contains(point_id));
+             }
+         }
+ 
+
+commit c3068aaf272e63195c6bde395cf5d4021026d061
+Author: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+Date:   Mon Nov 18 11:03:18 2024 +0100
+
+    Fix clippy large variant for filter condition (#5455)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 8822b4171..ef81bcf3c 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -103,7 +103,7 @@ pub trait InvertedIndex {
+         if posting_lengths.is_none() || points_count == 0 {
+             // There are unseen tokens -> no matches
+             return CardinalityEstimation {
+-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
+                 min: 0,
+                 exp: 0,
+                 max: 0,
+@@ -113,7 +113,7 @@ pub trait InvertedIndex {
+         if postings.is_empty() {
+             // Empty request -> no matches
+             return CardinalityEstimation {
+-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
+                 min: 0,
+                 exp: 0,
+                 max: 0,
+@@ -122,9 +122,9 @@ pub trait InvertedIndex {
+         // Smallest posting is the largest possible cardinality
+         let smallest_posting = postings.iter().min().copied().unwrap();
+ 
+-        return if postings.len() == 1 {
++        if postings.len() == 1 {
+             CardinalityEstimation {
+-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
+                 min: smallest_posting,
+                 exp: smallest_posting,
+                 max: smallest_posting,
+@@ -136,12 +136,12 @@ pub trait InvertedIndex {
+                 .product();
+             let exp = (expected_frac * points_count as f64) as usize;
+             CardinalityEstimation {
+-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
++                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
+                 min: 0, // ToDo: make better estimation
+                 exp,
+                 max: smallest_posting,
+             }
+-        };
++        }
+     }
+ 
+     fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_;
+
+commit 6b47b7e1b47e2573102a052dc284b7648dce9d45
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Tue Jan 21 16:11:19 2025 -0300
+
+    Avoid flushing a zero-sized mmapped file (#5842)
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index ef81bcf3c..24f77487b 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -285,6 +285,7 @@ mod tests {
+     #[case(1111, 1110)]
+     #[case(1111, 0)]
+     #[case(10, 2)]
++    #[case(0, 0)]
+     #[test]
+     fn test_immutable_to_mmap(#[case] indexed_count: u32, #[case] deleted_count: u32) {
+         let mutable = mutable_inverted_index(indexed_count, deleted_count);
+
+commit f11032829662bbf68fd2bf3cbd8483152fa92b44
+Author: Luis Cossío <luis.cossio@qdrant.com>
+Date:   Tue Jan 28 12:19:11 2025 -0300
+
+    bump and migrate to `rand` 0.9.0 (#5892)
+    
+    * bump and migrate to rand 0.9.0
+    
+    also bump rand_distr to 0.5.0 to match it
+    
+    * Migrate AVX2 and SSE implementations
+    
+    * Remove unused thread_rng placeholders
+    
+    * More random migrations
+    
+    * Migrate GPU tests
+    
+    * bump seed
+    
+    ---------
+    
+    Co-authored-by: timvisee <tim@visee.me>
+    Co-authored-by: Arnaud Gourlay <arnaud.gourlay@gmail.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 24f77487b..521f4c69e 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -193,19 +193,19 @@ mod tests {
+     use crate::index::field_index::full_text_index::mutable_inverted_index::MutableInvertedIndex;
+ 
+     fn generate_word() -> String {
+-        let mut rng = rand::thread_rng();
++        let mut rng = rand::rng();
+ 
+         // Each word is 1 to 3 characters long
+-        let len = rng.gen_range(1..=3);
+-        rng.sample_iter(rand::distributions::Alphanumeric)
++        let len = rng.random_range(1..=3);
++        rng.sample_iter(rand::distr::Alphanumeric)
+             .take(len)
+             .map(char::from)
+             .collect()
+     }
+ 
+     fn generate_query() -> Vec<String> {
+-        let mut rng = rand::thread_rng();
+-        let len = rng.gen_range(1..=2);
++        let mut rng = rand::rng();
++        let len = rng.random_range(1..=2);
+         (0..len).map(|_| generate_word()).collect()
+     }
+ 
+@@ -222,7 +222,7 @@ mod tests {
+ 
+         for idx in 0..indexed_count {
+             // Generate 10 tot 30-word documents
+-            let doc_len = rand::thread_rng().gen_range(10..=30);
++            let doc_len = rand::rng().random_range(10..=30);
+             let tokens: BTreeSet<String> = (0..doc_len).map(|_| generate_word()).collect();
+             let document = index.document_from_tokens(&tokens);
+             index.index_document(idx, document).unwrap();
+@@ -230,7 +230,7 @@ mod tests {
+ 
+         // Remove some points
+         let mut points_to_delete = (0..indexed_count).collect::<Vec<_>>();
+-        points_to_delete.shuffle(&mut rand::thread_rng());
++        points_to_delete.shuffle(&mut rand::rng());
+         for idx in &points_to_delete[..deleted_count as usize] {
+             index.remove_document(*idx);
+         }
+@@ -367,7 +367,7 @@ mod tests {
+         // Delete random documents from both indexes
+ 
+         let points_to_delete: Vec<_> = (0..deleted_count)
+-            .map(|_| rand::thread_rng().gen_range(0..indexed_count))
++            .map(|_| rand::rng().random_range(0..indexed_count))
+             .collect();
+ 
+         for point_id in &points_to_delete {
+
+commit 8ad2b34265448ec01b89d4093de5fbb1a86dcd4d
+Author: Tim Visée <tim+github@visee.me>
+Date:   Tue Feb 25 11:21:25 2025 +0100
+
+    Bump Rust edition to 2024 (#6042)
+    
+    * Bump Rust edition to 2024
+    
+    * gen is a reserved keyword now
+    
+    * Remove ref mut on references
+    
+    * Mark extern C as unsafe
+    
+    * Wrap unsafe function bodies in unsafe block
+    
+    * Geo hash implements Copy, don't reference but pass by value instead
+    
+    * Replace secluded self import with parent
+    
+    * Update execute_cluster_read_operation with new match semantics
+    
+    * Fix lifetime issue
+    
+    * Replace map_or with is_none_or
+    
+    * set_var is unsafe now
+    
+    * Reformat
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 521f4c69e..aa72f968e 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -183,8 +183,8 @@ pub trait InvertedIndex {
+ mod tests {
+     use std::collections::BTreeSet;
+ 
+-    use rand::seq::SliceRandom;
+     use rand::Rng;
++    use rand::seq::SliceRandom;
+     use rstest::rstest;
+ 
+     use super::{InvertedIndex, ParsedQuery, TokenId};
+
+commit 9554383a1e455dffa21d713b8622d0c991e24582
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Mar 13 09:32:24 2025 +0100
+
+    Payload fulltext index IO read measurements (#5954)
+    
+    * FullTextIndex filter measurements
+    
+    * Clippy
+    
+    * Add test for `new_accumulator`
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index aa72f968e..6c78d473e 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -1,5 +1,6 @@
+ use std::collections::{BTreeSet, HashMap};
+ 
++use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ use serde::{Deserialize, Serialize};
+ 
+@@ -43,10 +44,15 @@ pub struct ParsedQuery {
+ }
+ 
+ impl ParsedQuery {
+-    pub fn check_match(&self, document: &Document) -> bool {
++    pub fn check_match(&self, document: &Document, hw_counter: &HardwareCounterCell) -> bool {
+         if self.tokens.contains(&None) {
+             return false;
+         }
++
++        hw_counter
++            .payload_index_io_read_counter()
++            .incr_delta(self.tokens.len() + document.tokens().len());
++
+         // Check that all tokens are in document
+         self.tokens
+             .iter()
+@@ -81,7 +87,11 @@ pub trait InvertedIndex {
+ 
+     fn remove_document(&mut self, idx: PointOffsetType) -> bool;
+ 
+-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_>;
++    fn filter(
++        &self,
++        query: &ParsedQuery,
++        hw_counter: &HardwareCounterCell,
++    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_>;
+ 
+     fn get_posting_len(&self, token_id: TokenId) -> Option<usize>;
+ 
+@@ -168,7 +178,12 @@ pub trait InvertedIndex {
+             .filter_map(map_filter_condition)
+     }
+ 
+-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool;
++    fn check_match(
++        &self,
++        parsed_query: &ParsedQuery,
++        point_id: PointOffsetType,
++        hw_coutner: &HardwareCounterCell,
++    ) -> bool;
+ 
+     fn values_is_empty(&self, point_id: PointOffsetType) -> bool;
+ 
+@@ -176,13 +191,14 @@ pub trait InvertedIndex {
+ 
+     fn points_count(&self) -> usize;
+ 
+-    fn get_token_id(&self, token: &str) -> Option<TokenId>;
++    fn get_token_id(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId>;
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use std::collections::BTreeSet;
+ 
++    use common::counter::hardware_counter::HardwareCounterCell;
+     use rand::Rng;
+     use rand::seq::SliceRandom;
+     use rstest::rstest;
+@@ -295,16 +311,18 @@ mod tests {
+ 
+         MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
+ 
++        let hw_counter = HardwareCounterCell::new();
++
+         let mmap = MmapInvertedIndex::open(path, false).unwrap();
+ 
+         // Check same vocabulary
+         for (token, token_id) in immutable.vocab.iter() {
+-            assert_eq!(mmap.get_token_id(token), Some(*token_id));
++            assert_eq!(mmap.get_token_id(token, &hw_counter), Some(*token_id));
+         }
+ 
+         // Check same postings
+         for (token_id, posting) in immutable.postings.iter().enumerate() {
+-            let chunk_reader = mmap.postings.get(token_id as u32).unwrap();
++            let chunk_reader = mmap.postings.get(token_id as u32, &hw_counter).unwrap();
+ 
+             for point_id in posting.iter() {
+                 assert!(chunk_reader.contains(point_id));
+@@ -352,14 +370,20 @@ mod tests {
+             .map(|query| to_parsed_query(query, |token| mutable.vocab.get(&token).copied()))
+             .collect();
+ 
++        let hw_counter = HardwareCounterCell::new();
++
+         let imm_parsed_queries: Vec<_> = queries
+             .into_iter()
+-            .map(|query| to_parsed_query(query, |token| mmap_index.get_token_id(&token)))
++            .map(|query| {
++                to_parsed_query(query, |token| mmap_index.get_token_id(&token, &hw_counter))
++            })
+             .collect();
+ 
+         for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
+-            let mut_filtered = mutable.filter(mut_query).collect::<Vec<_>>();
+-            let imm_filtered = mmap_index.filter(imm_query).collect::<Vec<_>>();
++            let mut_filtered = mutable.filter(mut_query, &hw_counter).collect::<Vec<_>>();
++            let imm_filtered = mmap_index
++                .filter(imm_query, &hw_counter)
++                .collect::<Vec<_>>();
+ 
+             assert_eq!(mut_filtered, imm_filtered);
+         }
+@@ -378,8 +402,10 @@ mod tests {
+         // Check congruence after deletion
+ 
+         for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
+-            let mut_filtered = mutable.filter(mut_query).collect::<Vec<_>>();
+-            let imm_filtered = mmap_index.filter(imm_query).collect::<Vec<_>>();
++            let mut_filtered = mutable.filter(mut_query, &hw_counter).collect::<Vec<_>>();
++            let imm_filtered = mmap_index
++                .filter(imm_query, &hw_counter)
++                .collect::<Vec<_>>();
+ 
+             assert_eq!(mut_filtered, imm_filtered);
+         }
+
+commit 56a7cfdb205f90df28d2816d9e8ef6251fc517a2
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Fri Mar 14 11:05:38 2025 +0100
+
+    Cardinality estimation IO measurements (#6117)
+    
+    * Cardinality estimation measurements
+    
+    * Apply hw measurements to latest changes from dev
+    
+    * Clippy
+    
+    * Also measure cardinality estimation for geo index
+    
+    * Make measured units 'bytes'
+    
+    * Use PointOffsetType instead of u32 for size calculation
+    
+    * fix memory cost for check_values_any in mmap index
+    
+    * fix double counting for value reading in mmap, remove hw_counter from mmap hashmap
+    
+    * fmt
+    
+    * fix hw measurement for text index
+    
+    * Remove non necessary lifetime annotations
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 6c78d473e..17d2f60bb 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -38,7 +38,7 @@ impl Document {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct ParsedQuery {
+     pub tokens: Vec<Option<TokenId>>,
+ }
+@@ -51,7 +51,7 @@ impl ParsedQuery {
+ 
+         hw_counter
+             .payload_index_io_read_counter()
+-            .incr_delta(self.tokens.len() + document.tokens().len());
++            .incr_delta((self.tokens.len() + document.tokens().len()) * size_of::<TokenId>());
+ 
+         // Check that all tokens are in document
+         self.tokens
+@@ -87,18 +87,20 @@ pub trait InvertedIndex {
+ 
+     fn remove_document(&mut self, idx: PointOffsetType) -> bool;
+ 
+-    fn filter(
+-        &self,
+-        query: &ParsedQuery,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_>;
++    fn filter<'a>(
++        &'a self,
++        query: ParsedQuery,
++        hw_counter: &'a HardwareCounterCell,
++    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a>;
+ 
+-    fn get_posting_len(&self, token_id: TokenId) -> Option<usize>;
++    fn get_posting_len(&self, token_id: TokenId, hw_counter: &HardwareCounterCell)
++    -> Option<usize>;
+ 
+     fn estimate_cardinality(
+         &self,
+         query: &ParsedQuery,
+         condition: &FieldCondition,
++        hw_counter: &HardwareCounterCell,
+     ) -> CardinalityEstimation {
+         let points_count = self.points_count();
+ 
+@@ -107,7 +109,7 @@ pub trait InvertedIndex {
+             .iter()
+             .map(|&vocab_idx| match vocab_idx {
+                 None => None,
+-                Some(idx) => self.get_posting_len(idx),
++                Some(idx) => self.get_posting_len(idx, hw_counter),
+             })
+             .collect();
+         if posting_lengths.is_none() || points_count == 0 {
+@@ -182,7 +184,7 @@ pub trait InvertedIndex {
+         &self,
+         parsed_query: &ParsedQuery,
+         point_id: PointOffsetType,
+-        hw_coutner: &HardwareCounterCell,
++        hw_counter: &HardwareCounterCell,
+     ) -> bool;
+ 
+     fn values_is_empty(&self, point_id: PointOffsetType) -> bool;
+@@ -264,6 +266,8 @@ mod tests {
+         assert!(immutable.postings.len() < mutable.postings.len());
+         assert!(!immutable.vocab.is_empty());
+ 
++        let hw_counter = HardwareCounterCell::new();
++
+         // Check that new vocabulary token ids leads to the same posting lists
+         assert!({
+             immutable.vocab.iter().all(|(key, new_token)| {
+@@ -284,10 +288,10 @@ mod tests {
+ 
+                 let new_contains_orig = orig_posting
+                     .iter()
+-                    .all(|point_id| new_posting.contains(point_id));
++                    .all(|point_id| new_posting.reader(&hw_counter).contains(point_id));
+ 
+                 let orig_contains_new = new_posting
+-                    .iter()
++                    .iter(&hw_counter)
+                     .all(|point_id| orig_posting.contains(point_id));
+ 
+                 new_contains_orig && orig_contains_new
+@@ -324,7 +328,7 @@ mod tests {
+         for (token_id, posting) in immutable.postings.iter().enumerate() {
+             let chunk_reader = mmap.postings.get(token_id as u32, &hw_counter).unwrap();
+ 
+-            for point_id in posting.iter() {
++            for point_id in posting.iter(&hw_counter) {
+                 assert!(chunk_reader.contains(point_id));
+             }
+         }
+@@ -379,7 +383,11 @@ mod tests {
+             })
+             .collect();
+ 
+-        for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
++        for (mut_query, imm_query) in mut_parsed_queries
++            .iter()
++            .cloned()
++            .zip(imm_parsed_queries.iter().cloned())
++        {
+             let mut_filtered = mutable.filter(mut_query, &hw_counter).collect::<Vec<_>>();
+             let imm_filtered = mmap_index
+                 .filter(imm_query, &hw_counter)
+@@ -401,7 +409,11 @@ mod tests {
+ 
+         // Check congruence after deletion
+ 
+-        for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
++        for (mut_query, imm_query) in mut_parsed_queries
++            .iter()
++            .cloned()
++            .zip(imm_parsed_queries.iter().cloned())
++        {
+             let mut_filtered = mutable.filter(mut_query, &hw_counter).collect::<Vec<_>>();
+             let imm_filtered = mmap_index
+                 .filter(imm_query, &hw_counter)
+
+commit 5cd7239b61d1a6944984132283f762850275670f
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Mon Mar 24 19:39:17 2025 +0100
+
+    Measure Payload Index IO Writes (#6137)
+    
+    * Prepare measurement of index creation + Remove vector deletion
+    measurement
+    
+    * add hw_counter to add_point functions
+    
+    * Adjust add_point(..) function signatures
+    
+    * Add new measurement type: payload index IO write
+    
+    * Measure payload index IO writes
+    
+    * Some Hw measurement performance improvements
+    
+    * Review remarks
+    
+    * Fix measurements in distributed setups
+    
+    * review fixes
+    
+    ---------
+    
+    Co-authored-by: generall <andrey@vasnetsov.com>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 17d2f60bb..413009547 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -83,7 +83,12 @@ pub trait InvertedIndex {
+         Document::new(document_tokens)
+     }
+ 
+-    fn index_document(&mut self, idx: PointOffsetType, document: Document) -> OperationResult<()>;
++    fn index_document(
++        &mut self,
++        idx: PointOffsetType,
++        document: Document,
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()>;
+ 
+     fn remove_document(&mut self, idx: PointOffsetType) -> bool;
+ 
+@@ -238,12 +243,14 @@ mod tests {
+     fn mutable_inverted_index(indexed_count: u32, deleted_count: u32) -> MutableInvertedIndex {
+         let mut index = MutableInvertedIndex::default();
+ 
++        let hw_counter = HardwareCounterCell::new();
++
+         for idx in 0..indexed_count {
+             // Generate 10 tot 30-word documents
+             let doc_len = rand::rng().random_range(10..=30);
+             let tokens: BTreeSet<String> = (0..doc_len).map(|_| generate_word()).collect();
+             let document = index.document_from_tokens(&tokens);
+-            index.index_document(idx, document).unwrap();
++            index.index_document(idx, document, &hw_counter).unwrap();
+         }
+ 
+         // Remove some points
+
+commit 07fbe5465b5b4b412275480f7e4c1aeb6eca50b4
+Author: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+Date:   Thu Apr 3 19:43:32 2025 +0200
+
+    Don't measure in-memory hw for full text indices (#6309)
+    
+    * Don't measure in-memory full text index
+    
+    * Clippy
+    
+    * Fix mmap_postings conditioned counting
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 413009547..9cbd4ef8b 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -44,15 +44,11 @@ pub struct ParsedQuery {
+ }
+ 
+ impl ParsedQuery {
+-    pub fn check_match(&self, document: &Document, hw_counter: &HardwareCounterCell) -> bool {
++    pub fn check_match(&self, document: &Document) -> bool {
+         if self.tokens.contains(&None) {
+             return false;
+         }
+ 
+-        hw_counter
+-            .payload_index_io_read_counter()
+-            .incr_delta((self.tokens.len() + document.tokens().len()) * size_of::<TokenId>());
+-
+         // Check that all tokens are in document
+         self.tokens
+             .iter()
+
+commit a9795f7ce495c5d19aa2078dc957625f6c9b8d51
+Author: Andrey Vasnetsov <andrey@vasnetsov.com>
+Date:   Tue Apr 15 16:58:38 2025 +0200
+
+    faster mmap numeric index (#6381)
+    
+    * wip: attempt to investigate slow mmap numeric index
+    
+    * fmt
+    
+    * Improve performance of ConditionedCounter (#6384)
+    
+    * Improve Performance of ConditionedCounter
+    
+    * Remove unneeded hw_counter from signatures
+    
+    * Clippy
+    
+    * Fix Clippy II
+    
+    * Fix Clippy III
+    
+    * Fix Clippy IV
+    
+    * Use static string, don't allocate string
+    
+    * Remove allow dead code attribute
+    
+    ---------
+    
+    Co-authored-by: Jojii <15957865+JojiiOfficial@users.noreply.github.com>
+    Co-authored-by: timvisee <tim@visee.me>
+
+diff --git a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+index 9cbd4ef8b..53b29bb21 100644
+--- a/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
++++ b/lib/segment/src/index/field_index/full_text_index/inverted_index.rs
+@@ -269,8 +269,6 @@ mod tests {
+         assert!(immutable.postings.len() < mutable.postings.len());
+         assert!(!immutable.vocab.is_empty());
+ 
+-        let hw_counter = HardwareCounterCell::new();
+-
+         // Check that new vocabulary token ids leads to the same posting lists
+         assert!({
+             immutable.vocab.iter().all(|(key, new_token)| {
+@@ -291,10 +289,10 @@ mod tests {
+ 
+                 let new_contains_orig = orig_posting
+                     .iter()
+-                    .all(|point_id| new_posting.reader(&hw_counter).contains(point_id));
++                    .all(|point_id| new_posting.reader().contains(point_id));
+ 
+                 let orig_contains_new = new_posting
+-                    .iter(&hw_counter)
++                    .iter()
+                     .all(|point_id| orig_posting.contains(point_id));
+ 
+                 new_contains_orig && orig_contains_new
+@@ -331,7 +329,7 @@ mod tests {
+         for (token_id, posting) in immutable.postings.iter().enumerate() {
+             let chunk_reader = mmap.postings.get(token_id as u32, &hw_counter).unwrap();
+ 
+-            for point_id in posting.iter(&hw_counter) {
++            for point_id in posting.iter() {
+                 assert!(chunk_reader.contains(point_id));
+             }
+         }
+
