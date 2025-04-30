@@ -1,0 +1,343 @@
+#!/usr/bin/env rust
+#![allow(unused)]
+mod collection_ops;
+mod point_ops;
+mod search;
+mod shard_transfer;
+mod snapshots;
+
+use std::collections::HashSet;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use segment::common::version::StorageVersion;
+use semver::Version;
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+
+use crate::collection_state::{ShardInfo, State};
+use crate::common::is_ready::IsReady;
+use crate::config::CollectionConfig;
+use crate::hash_ring::HashRing;
+use crate::operations::shared_storage_config::SharedStorageConfig;
+use crate::operations::types::{CollectionError, CollectionResult, NodeType};
+use crate::shards::channel_service::ChannelService;
+use crate::shards::collection_shard_distribution::CollectionShardDistribution;
+use crate::shards::replica_set::ReplicaState::{Active, Dead, Initializing, Listener};
+use crate::shards::replica_set::{ChangePeerState, ReplicaState, ShardReplicaSet};
+use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard_holder::{shard_not_found_error, LockedShardHolder, ShardHolder};
+use crate::shards::transfer::shard_transfer::{check_transfer_conflicts_strict, ShardTransfer};
+use crate::shards::transfer::transfer_tasks_pool::TransferTasksPool;
+use crate::shards::{replica_set, CollectionId, HASH_RING_SHARD_SCALE};
+use crate::telemetry::CollectionTelemetry;
+
+/// Collection's data is split into several shards.
+pub struct Collection {
+    pub(crate) id: CollectionId,
+    pub(crate) shards_holder: Arc<LockedShardHolder>,
+    pub(crate) collection_config: Arc<RwLock<CollectionConfig>>,
+    pub(crate) shared_storage_config: Arc<SharedStorageConfig>,
+    this_peer_id: PeerId,
+    path: PathBuf,
+    snapshots_path: PathBuf,
+    channel_service: ChannelService,
+    transfer_tasks: Mutex<TransferTasksPool>,
+    request_shard_transfer_cb: RequestShardTransfer,
+    #[allow(dead_code)] //Might be useful in case of repartition implementation
+    notify_peer_failure_cb: ChangePeerState,
+    init_time: Duration,
+    is_initialized: Arc<IsReady>,
+    updates_lock: RwLock<()>,
+    update_runtime: Handle,
+}
+
+pub type RequestShardTransfer = Arc<dyn Fn(ShardTransfer) + Send + Sync>;
+pub type OnTransferFailure = Arc<dyn Fn(ShardTransfer, CollectionId, &str) + Send + Sync>;
+pub type OnTransferSuccess = Arc<dyn Fn(ShardTransfer, CollectionId) + Send + Sync>;
+
+impl Collection {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        name: CollectionId,
+        this_peer_id: PeerId,
+        path: &Path,
+        snapshots_path: &Path,
+        collection_config: &CollectionConfig,
+        shared_storage_config: Arc<SharedStorageConfig>,
+        shard_distribution: CollectionShardDistribution,
+        channel_service: ChannelService,
+        on_replica_failure: ChangePeerState,
+        request_shard_transfer: RequestShardTransfer,
+        search_runtime: Option<Handle>,
+        update_runtime: Option<Handle>,
+    ) -> Result<Self, CollectionError> {
+        let start_time = std::time::Instant::now();
+
+        let mut shard_holder = ShardHolder::new(path, HashRing::fair(HASH_RING_SHARD_SCALE))?;
+
+        let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
+        for (shard_id, mut peers) in shard_distribution.shards {
+            let is_local = peers.remove(&this_peer_id);
+
+            let replica_set = ShardReplicaSet::build(
+                shard_id,
+                name.clone(),
+                this_peer_id,
+                is_local,
+                peers,
+                on_replica_failure.clone(),
+                path,
+                shared_collection_config.clone(),
+                shared_storage_config.clone(),
+                channel_service.clone(),
+                update_runtime.clone().unwrap_or_else(Handle::current),
+                search_runtime.clone().unwrap_or_else(Handle::current),
+            )
+            .await?;
+
+            shard_holder.add_shard(shard_id, replica_set, None)?;
+        }
+
+        let locked_shard_holder = Arc::new(LockedShardHolder::new(shard_holder));
+
+        CollectionVersion::save(path)?;
+        collection_config.save(path)?;
+
+        Ok(Self {
+            id: name.clone(),
+            shards_holder: locked_shard_holder,
+            collection_config: shared_collection_config,
+            shared_storage_config,
+            this_peer_id,
+            path: path.to_owned(),
+            snapshots_path: snapshots_path.to_owned(),
+            channel_service,
+            transfer_tasks: Mutex::new(TransferTasksPool::new(name.clone())),
+            request_shard_transfer_cb: request_shard_transfer.clone(),
+            notify_peer_failure_cb: on_replica_failure.clone(),
+            init_time: start_time.elapsed(),
+            is_initialized: Arc::new(Default::default()),
+            updates_lock: RwLock::new(()),
+            update_runtime: update_runtime.unwrap_or_else(Handle::current),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load(
+        collection_id: CollectionId,
+        this_peer_id: PeerId,
+        path: &Path,
+        snapshots_path: &Path,
+        shared_storage_config: Arc<SharedStorageConfig>,
+        channel_service: ChannelService,
+        on_replica_failure: replica_set::ChangePeerState,
+        request_shard_transfer: RequestShardTransfer,
+        search_runtime: Option<Handle>,
+        update_runtime: Option<Handle>,
+    ) -> Self {
+        let start_time = std::time::Instant::now();
+        let stored_version = CollectionVersion::load(path)
+            .expect("Can't read collection version")
+            .parse()
+            .expect("Failed to parse stored collection version as semver");
+
+        let app_version: Version = CollectionVersion::current()
+            .parse()
+            .expect("Failed to parse current collection version as semver");
+
+        if stored_version > app_version {
+            panic!("Collection version is greater than application version");
+        }
+
+        if stored_version != app_version {
+            if Self::can_upgrade_storage(&stored_version, &app_version) {
+                log::info!("Migrating collection {stored_version} -> {app_version}");
+                CollectionVersion::save(path)
+                    .unwrap_or_else(|err| panic!("Can't save collection version {err}"));
+            } else {
+                panic!("Cannot upgrade version {stored_version} to {app_version}. Try using an older version of Qdrant first.");
+            }
+        }
+
+        let collection_config = CollectionConfig::load(path).unwrap_or_else(|err| {
+            panic!(
+                "Can't read collection config due to {}\nat {}",
+                err,
+                path.to_str().unwrap(),
+            )
+        });
+
+        let ring = HashRing::fair(HASH_RING_SHARD_SCALE);
+        let mut shard_holder = ShardHolder::new(path, ring).expect("Can not create shard holder");
+
+        let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
+
+        shard_holder
+            .load_shards(
+                path,
+                &collection_id,
+                shared_collection_config.clone(),
+                shared_storage_config.clone(),
+                channel_service.clone(),
+                on_replica_failure.clone(),
+                this_peer_id,
+                update_runtime.clone().unwrap_or_else(Handle::current),
+                search_runtime.clone().unwrap_or_else(Handle::current),
+            )
+            .await;
+
+        let locked_shard_holder = Arc::new(LockedShardHolder::new(shard_holder));
+
+        Self {
+            id: collection_id.clone(),
+            shards_holder: locked_shard_holder,
+            collection_config: shared_collection_config,
+            shared_storage_config,
+            this_peer_id,
+            path: path.to_owned(),
+            snapshots_path: snapshots_path.to_owned(),
+            channel_service,
+            transfer_tasks: Mutex::new(TransferTasksPool::new(collection_id.clone())),
+            request_shard_transfer_cb: request_shard_transfer.clone(),
+            notify_peer_failure_cb: on_replica_failure,
+            init_time: start_time.elapsed(),
+            is_initialized: Arc::new(Default::default()),
+            updates_lock: RwLock::new(()),
+            update_runtime: update_runtime.unwrap_or_else(Handle::current),
+        }
+    }
+
+    fn can_upgrade_storage(stored: &Version, app: &Version) -> bool {
+        stored.major == app.major && stored.minor == app.minor && stored.patch + 1 >= app.patch
+    }
+
+    pub fn name(&self) -> String {
+        self.id.clone()
+    }
+
+    pub async fn get_local_shards(&self) -> Vec<ShardId> {
+        self.shards_holder.read().await.get_local_shards().await
+    }
+
+    pub async fn contains_shard(&self, shard_id: ShardId) -> bool {
+        self.shards_holder.read().await.contains_shard(&shard_id)
+    }
+
+    pub async fn set_shard_replica_state(
+        &self,
+        shard_id: ShardId,
+        peer_id: PeerId,
+        state: ReplicaState,
+        from_state: Option<ReplicaState>,
+    ) -> CollectionResult<()> {
+        let shard_holder = self.shards_holder.read().await;
+        let replica_set = shard_holder
+            .get_shard(&shard_id)
+            .ok_or_else(|| shard_not_found_error(shard_id))?;
+
+        if let Some(expected_state) = from_state {
+            let current_state = replica_set.peer_state(&peer_id);
+            if current_state != expected_state {
+                return Err(CollectionError::bad_input(format!(
+                    "Replica {peer_id} of shard {shard_id} has state {current_state:?}, expected {expected_state:?}"
+                )));
+            }
+        }
+
+        if state != ReplicaState::Active {
+            let active_replicas: HashSet<_> = replica_set
+                .peers()
+                .into_iter()
+                .filter_map(|(peer, s)| (s == ReplicaState::Active).then_some(peer))
+                .collect();
+            if active_replicas.len() == 1 && active_replicas.contains(&peer_id) {
+                return Err(CollectionError::bad_input(format!(
+                    "Cannot deactivate last active replica {peer_id} of shard {shard_id}"
+                )));
+            }
+        }
+
+        replica_set.ensure_replica_with_state(&peer_id, state).await?;
+
+        if state == ReplicaState::Dead {
+            for transfer in shard_holder.get_related_transfers(&shard_id, &peer_id) {
+                self._abort_shard_transfer(transfer.key(), &shard_holder)
+                    .await?;
+            }
+        }
+
+        if !self.is_initialized.check_ready() {
+            let state = self.state().await;
+            let all_active = state.shards.values().all(|info| {
+                info.replicas
+                    .values()
+                    .all(|s| *s == ReplicaState::Active)
+            });
+            if all_active {
+                self.is_initialized.make_ready();
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn state(&self) -> State {
+        let shards_holder = self.shards_holder.read().await;
+        State {
+            config: self.collection_config.read().await.clone(),
+            shards: shards_holder
+                .get_shards()
+                .map(|(id, replica_set)| (*id, ShardInfo::from(replica_set)))
+                .collect(),
+            transfers: shards_holder.shard_transfers.read().clone(),
+        }
+    }
+
+    pub async fn sync_local_state(
+        &self,
+        on_transfer_failure: OnTransferFailure,
+        on_transfer_success: OnTransferSuccess,
+        on_finish_init: ChangePeerState,
+    ) -> CollectionResult<()> {
+        let shard_holder = self.shards_holder.read().await;
+        for replica_set in shard_holder.all_shards() {
+            replica_set.sync_local_state().await?;
+        }
+
+        let outgoing_transfers = shard_holder
+            .get_outgoing_transfers(&self.this_peer_id)
+            .await;
+        let tasks = self.transfer_tasks.lock().await;
+        for transfer in outgoing_transfers {
+            match tasks.get_task_result(&transfer.key()) {
+                None => on_transfer_failure(transfer, self.name(), "task_absent"),
+                Some(true) => on_transfer_success(transfer, self.name()),
+                Some(false) => on_transfer_failure(transfer, self.name(), "task_failed"),
+            }
+        }
+
+        for replica_set in shard_holder.all_shards() {
+            if replica_set.peer_state(&self.this_peer_id) == Some(Initializing) {
+                on_finish_init(self.this_peer_id, replica_set.shard_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    // Other methods omitted for brevity...
+}
+
+struct CollectionVersion;
+
+impl StorageVersion for CollectionVersion {
+    fn current() -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+}
+```
+
+```rust
