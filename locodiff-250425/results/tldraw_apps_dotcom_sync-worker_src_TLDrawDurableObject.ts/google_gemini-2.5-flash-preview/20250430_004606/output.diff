@@ -1,0 +1,103 @@
+--- tldraw_apps_dotcom_sync-worker_src_TLDrawDurableObject.ts_expectedoutput.txt (expected)+++ tldraw_apps_dotcom_sync-worker_src_TLDrawDurableObject.ts_extracted.txt (actual)@@ -18,8 +18,8 @@ } from '@tldraw/dotcom-shared'
+ import {
+ 	RoomSnapshot,
++	TLCloseEventCode,
+ 	TLSocketRoom,
+-	TLSyncErrorCloseEventCode,
+ 	TLSyncErrorCloseEventReason,
+ 	TLSyncRoom,
+ 	type PersistedRoomSnapshotForSupabase,
+@@ -45,7 +45,7 @@ import { Analytics, DBLoadResult, Environment, TLServerEvent } from './types'
+ import { EventData, writeDataPoint } from './utils/analytics'
+ import { createSupabaseClient } from './utils/createSupabaseClient'
+-import { getRoomDurableObject } from './utils/durableObjects'
++import { getRoomDurableObject, getReplicator } from './utils/durableObjects'
+ import { isRateLimited } from './utils/rateLimit'
+ import { getSlug } from './utils/roomOpenMode'
+ import { throttle } from './utils/throttle'
+@@ -74,6 +74,7 @@ 	// A unique identifier for this instance of the Durable Object
+ 	id: DurableObjectId
+ 
++	// For TLSyncRoom
+ 	_room: Promise<TLSocketRoom<TLRecord, SessionMeta>> | null = null
+ 
+ 	sentry: ReturnType<typeof createSentry> | null = null
+@@ -133,7 +134,7 @@ 
+ 						this.logEvent({ type: 'room', roomId: slug, name: 'room_start' })
+ 						// Also associate file assets after we load the room
+-						setTimeout(this.maybeAssociateFileAssets.bind(this), PERSIST_INTERVAL_MS)
++						setTimeout(this.maybeAssociateFileAssets.bind(this), PERSIST_INTERVAL_MS * 0.5)
+ 						return room
+ 					}
+ 					case 'room_not_found': {
+@@ -167,6 +168,7 @@ 	readonly r2: {
+ 		readonly rooms: R2Bucket
+ 		readonly versionCache: R2Bucket
++		readonly roomSnapshots: R2Bucket
+ 	}
+ 
+ 	_documentInfo: DocumentInfo | null = null
+@@ -182,6 +184,7 @@ 		this.storage = state.storage
+ 		this.sentryDSN = env.SENTRY_DSN
+ 		this.measure = env.MEASURE
++
+ 		this.sentry = createSentry(this.state, this.env)
+ 		this.supabaseClient = createSupabaseClient(env)
+ 
+@@ -189,6 +192,7 @@ 		this.r2 = {
+ 			rooms: env.ROOMS,
+ 			versionCache: env.ROOMS_HISTORY_EPHEMERAL,
++			roomSnapshots: env.ROOM_SNAPSHOTS,
+ 		}
+ 
+ 		state.blockConcurrencyWhile(async () => {
+@@ -268,14 +272,10 @@ 
+ 	// Handle a request to the Durable Object.
+ 	override async fetch(req: IRequest) {
+-		const sentry = createSentry(this.state, this.env, req)
+-
+ 		try {
+ 			return await this.router.fetch(req)
+ 		} catch (err) {
+-			console.error(err)
+-			// eslint-disable-next-line @typescript-eslint/no-deprecated
+-			sentry?.captureException(err)
++			this.reportError(err)
+ 			return new Response('Something went wrong', {
+ 				status: 500,
+ 				statusText: 'Internal Server Error',
+@@ -357,7 +357,7 @@ 		serverWebSocket.accept()
+ 
+ 		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
+-			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
++			serverWebSocket.close(TLCloseEventCode.APPLICATION_ERROR, reason)
+ 			return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 		}
+ 
+@@ -497,7 +497,7 @@ 		}
+ 	}
+ 
+-	async handleFileCreateFromSource() {
++	async handleFileCreateFromSource(): Promise<DBLoadResult> {
+ 		assert(this._fileRecordCache, 'we need to have a file record to create a file from source')
+ 		const split = this._fileRecordCache.createSource?.split('/')
+ 		if (!split || split?.length !== 2) {
+@@ -526,9 +526,6 @@ 			case SNAPSHOT_PREFIX:
+ 				data = await getLegacyRoomData(this.env, id, 'snapshot')
+ 				break
+-			case PUBLISH_PREFIX:
+-				data = await getPublishedRoomSnapshot(this.env, id)
+-				break
+ 			case LOCAL_FILE_PREFIX:
+ 				// create empty room, the client will populate it
+ 				data = new TLSyncRoom({ schema: createTLSchema() }).getSnapshot()
+@@ -601,10 +598,6 @@ 			return { type: 'error', error: error as Error }
+ 		}
+ 	}
+-
+-	_lastPersistedClock: number | null = null
+-
+-	executionQueue = new ExecutionQueue()
+ 
+ 	// We use this to make sure that all of the assets in a tldraw app file are associated with that file.
+ 	// This is needed for a few cases like duplicating a file, copy pasting images between files, slurping legacy files.

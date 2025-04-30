@@ -1,0 +1,401 @@
+--- ghostty_src_App.zig_expectedoutput.txt (expected)+++ ghostty_src_App.zig_extracted.txt (actual)@@ -4,10 +4,9 @@ const App = @This();
+ 
+ const std = @import("std");
++const assert = std.debug.assert;
+ const builtin = @import("builtin");
+-const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+-const build_config = @import("build_config.zig");
+ const apprt = @import("apprt.zig");
+ const Surface = @import("Surface.zig");
+ const tracy = @import("tracy");
+@@ -20,13 +19,36 @@ const internal_os = @import("os/main.zig");
+ const macos = @import("macos");
+ const objc = @import("objc");
++const DevMode = @import("DevMode.zig"); // NOTE: DevMode is temporary
+ 
+ const log = std.log.scoped(.app);
+ 
+ const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
++
++/// The type used for sending messages to the app thread.
++pub const Mailbox = struct {
++    /// The type used for sending messages to the app thread.
++    pub const Queue = BlockingQueue(Message, 64);
++
++    rt_app: *apprt.App,
++    mailbox: *Queue,
++
++    /// Send a message to the surface.
++    pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
++        const result = self.mailbox.push(msg, timeout);
++
++        // Wake up our app loop
++        self.rt_app.wakeup();
++
++        return result;
++    }
++};
+ 
+ /// General purpose allocator
+ alloc: Allocator,
++
++/// The runtime for this app.
++runtime: *apprt.App,
+ 
+ /// The list of surfaces that are currently active.
+ surfaces: SurfaceList,
+@@ -51,7 +73,7 @@ focused_surface: ?*Surface = null,
+ 
+ /// The mailbox that can be used to send this thread messages. Note
+-/// this is a blocking queue so if it is full you will get errors (or block).
++/// This queue is owned by the app, this is a pointer to it.
+ mailbox: Mailbox.Queue,
+ 
+ /// The set of font GroupCache instances shared by surfaces with the
+@@ -64,11 +86,6 @@ last_notification_time: ?std.time.Instant = null,
+ last_notification_digest: u64 = 0,
+ 
+-/// The conditional state of the configuration. See the equivalent field
+-/// in the Surface struct for more information. In this case, this applies
+-/// to the app-level config and as a default for new surfaces.
+-config_conditional_state: configpkg.ConditionalState,
+-
+ /// Set to false once we've created at least one surface. This
+ /// never goes true again. This can be used by surfaces to determine
+ /// if they are the first surface.
+@@ -76,14 +93,14 @@ 
+ pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
+ 
+-/// Initialize the main app instance. This creates the main window, sets
+-/// up the renderer state, compiles the shaders, etc. This is the primary
+-/// "startup" logic.
++/// Initialize the main app instance. This wraps the primary app runtime,
++/// allowing multiple surfaces etc.
+ ///
+ /// After calling this function, well behaved apprts should then call
+ /// `focusEvent` to set the initial focus state of the app.
+ pub fn create(
+     alloc: Allocator,
++    rt_app: *apprt.App,
+ ) CreateError!*App {
+     var app = try alloc.create(App);
+     errdefer alloc.destroy(app);
+@@ -93,17 +110,30 @@ 
+     app.* = .{
+         .alloc = alloc,
++        .runtime = rt_app,
+         .surfaces = .{},
+         .mailbox = .{},
++        .focused = true,
++        .focused_surface = null,
+         .font_grid_set = font_grid_set,
+-        .config_conditional_state = .{},
++        .last_notification_time = null,
++        .last_notification_digest = 0,
++        .first = true,
+     };
+     errdefer app.surfaces.deinit(alloc);
+ 
++    // If we have DevMode on, we save a reference to the app so DevMode
++    // can communicate with us. This is generally bad architecture but
++    // DevMode is temporary.
++    if (DevMode.enabled) DevMode.instance.app = app;
++
+     return app;
+ }
+ 
+ pub fn destroy(self: *App) void {
++    // If we have DevMode on, clear the app reference.
++    if (DevMode.enabled) DevMode.instance.app = null;
++
+     // Clean up all our surfaces
+     for (self.surfaces.items) |surface| surface.deinit();
+     self.surfaces.deinit(self.alloc);
+@@ -127,7 +157,7 @@     while (i < self.surfaces.items.len) {
+         const surface = self.surfaces.items[i];
+         if (surface.shouldClose()) {
+-            surface.close(false);
++            rt_app.closeSurface(surface);
+             continue;
+         }
+ 
+@@ -147,10 +177,13 @@         try surface.core_surface.handleMessage(.{ .change_config = config });
+     }
+ 
+-    // Apply our conditional state. If we fail to apply the conditional state
++    // If we fail to apply the conditional state
+     // then we log and attempt to move forward with the old config.
+     // We only apply this to the app-level config because the surface
+     // config applies its own conditional state.
++    // TODO(conditional): Reflow app-specific config options.
++    // For now we just calculate the conditional state for default
++    // and pass it to the rt_app for future surfaces.
+     var applied_: ?configpkg.Config = config.changeConditionalState(
+         self.config_conditional_state,
+     ) catch |err| err: {
+@@ -241,13 +274,19 @@     return false;
+ }
+ 
++/// Request the app runtime to process app events via tick.
++pub fn wakeup(self: App) void {
++    self.runtime.wakeup() catch return;
++}
++
+ /// Drain the mailbox.
+ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
+     while (self.mailbox.pop()) |message| {
+         log.debug("mailbox message={s}", .{@tagName(message)});
+         switch (message) {
++            .reload_config => _ = try rt_app.performAction(.app, .reload_config, .{}),
+             .open_config => try self.performAction(rt_app, .open_config),
+-            .new_window => |msg| try self.newWindow(rt_app, msg),
++            .new_window => try self.newWindow(rt_app, msg),
+             .close => |surface| self.closeSurface(surface),
+             .surface_message => |msg| try self.surfaceMessage(msg.surface, msg.message),
+             .redraw_surface => |surface| self.redrawSurface(rt_app, surface),
+@@ -294,11 +333,14 @@         break :target .app;
+     };
+ 
+-    _ = try rt_app.performAction(
++    try rt_app.performAction(
+         target,
+         .new_window,
+         {},
+     );
++
++    // If this is the first window being created, mark our first flag.
++    if (self.first) self.first = false;
+ }
+ 
+ /// Handle an app-level focus event. This should be called whenever
+@@ -365,6 +407,9 @@         .leaf => |leaf| leaf,
+     };
+ 
++    // We only care about global keybinds
++    if (!leaf.flags.global) return false;
++
+     // If we aren't focused, then we only process global keybinds.
+     if (!self.focused and !leaf.flags.global) return false;
+ 
+@@ -399,6 +444,75 @@     return true;
+ }
+ 
++/// Perform a binding action. This only accepts actions that are scoped
++/// to the app. Callers can use performAllAction to perform any action
++/// and any non-app-scoped actions will be performed on all surfaces.
++pub fn performAction(
++    self: *App,
++    rt_app: *apprt.App,
++    action: input.Binding.Action.Scoped(.app),
++) !bool {
++    log.debug("performing app action: {s}", .{@tagName(action)});
++    switch (action) {
++        .unbind => unreachable,
++        .ignore => {},
++        .quit => _ = try rt_app.performAction(.app, .quit, {}),
++        .new_window => try self.newWindow(rt_app, .{ .parent = null }),
++        .open_config => _ = try rt_app.performAction(.app, .open_config, {}),
++        .reload_config => _ = try rt_app.performAction(.app, .reload_config, .{ .soft = true }),
++        .close_all_windows => _ = try rt_app.performAction(.app, .close_all_windows, {}),
++        .toggle_quick_terminal => _ = try rt_app.performAction(.app, .toggle_quick_terminal, {}),
++        .toggle_visibility => _ = try rt_app.performAction(.app, .toggle_visibility, {}),
++    }
++    return true;
++}
++
++/// Perform an app-wide binding action. If the action is surface-specific
++/// then it will be performed on all surfaces. To perform only app-scoped
++/// actions, use performAction.
++pub fn performAllAction(
++    self: *App,
++    rt_app: *apprt.App,
++    action: input.Binding.Action,
++) !bool {
++    // If the action is app-scoped, forward it to the app.
++    if (action.scoped(.app)) |app_action| {
++        return self.performAction(rt_app, app_action);
++    }
++
++    // Surface-scoped actions are performed on all surfaces. Errors
++    // are logged but processing continues.
++    // The rt_app must implement performSurfaceAction.
++    if (@hasDecl(apprt.App, "performSurfaceAction")) {
++        var ret: bool = false;
++        for (self.surfaces.items) |surface| {
++            ret = ret or surface.app.performSurfaceAction(
++                surface,
++                action.scoped(.surface).?, // asserted via scoped(.app) check
++                .{},
++            ) catch |err| {
++                log.warn("error performing binding action on surface ptr={X} err={}", .{
++                    @intFromPtr(surface),
++                    err,
++                });
++                false
++            };
++        }
++        return ret;
++    } else {
++        log.warn("runtime cannot perform non-app actions action={s}", .{@tagName(action)});
++        return false;
++    }
++}
++
++fn hasSurface(self: *const App, surface: *const Surface) bool {
++    for (self.surfaces.items) |v| {
++        if (&v.core_surface == surface) return true;
++    }
++
++    return false;
++}
++
+ /// Call to notify Ghostty that the color scheme for the app has changed.
+ /// "Color scheme" in this case refers to system themes such as "light/dark".
+ pub fn colorSchemeEvent(
+@@ -426,78 +540,6 @@     );
+ }
+ 
+-/// Perform a binding action. This only accepts actions that are scoped
+-/// to the app. Callers can use performAllAction to perform any action
+-/// and any non-app-scoped actions will be performed on all surfaces.
+-pub fn performAction(
+-    self: *App,
+-    rt_app: *apprt.App,
+-    action: input.Binding.Action.Scoped(.app),
+-) !void {
+-    switch (action) {
+-        .unbind => unreachable,
+-        .ignore => {},
+-        .quit => _ = try rt_app.performAction(.app, .quit, {}),
+-        .new_window => _ = try self.newWindow(rt_app, .{ .parent = null }),
+-        .open_config => _ = try rt_app.performAction(.app, .open_config, {}),
+-        .reload_config => _ = try rt_app.performAction(.app, .reload_config, .{}),
+-        .close_all_windows => _ = try rt_app.performAction(.app, .close_all_windows, {}),
+-        .toggle_quick_terminal => _ = try rt_app.performAction(.app, .toggle_quick_terminal, {}),
+-        .toggle_visibility => _ = try rt_app.performAction(.app, .toggle_visibility, {}),
+-    }
+-}
+-
+-/// Perform an app-wide binding action. If the action is surface-specific
+-/// then it will be performed on all surfaces. To perform only app-scoped
+-/// actions, use performAction.
+-pub fn performAllAction(
+-    self: *App,
+-    rt_app: *apprt.App,
+-    action: input.Binding.Action,
+-) !void {
+-    switch (action.scope()) {
+-        // App-scoped actions are handled by the app so that they aren't
+-        // repeated for each surface (since each surface forwards
+-        // app-scoped actions back up).
+-        .app => try self.performAction(
+-            rt_app,
+-            action.scoped(.app).?, // asserted through the scope match
+-        ),
+-
+-        // Surface-scoped actions are performed on all surfaces. Errors
+-        // are logged but processing continues.
+-        .surface => for (self.surfaces.items) |surface| {
+-            _ = surface.core_surface.performBindingAction(action) catch |err| {
+-                log.warn("error performing binding action on surface ptr={X} err={}", .{
+-                    @intFromPtr(surface),
+-                    err,
+-                });
+-            };
+-        },
+-    }
+-}
+-
+-/// Handle a window message
+-fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !void {
+-    // We want to ensure our window is still active. Window messages
+-    // are quite rare and we normally don't have many windows so we do
+-    // a simple linear search here.
+-    if (self.hasSurface(surface)) {
+-        try surface.handleMessage(msg);
+-    }
+-
+-    // Window was not found, it probably quit before we handled the message.
+-    // Not a problem.
+-}
+-
+-fn hasSurface(self: *const App, surface: *const Surface) bool {
+-    for (self.surfaces.items) |v| {
+-        if (&v.core_surface == surface) return true;
+-    }
+-
+-    return false;
+-}
+-
+ /// The message types that can be sent to the app thread.
+ pub const Message = union(enum) {
+     // Open the configuration file
+@@ -510,8 +552,10 @@     /// should close.
+     close: *Surface,
+ 
+-    /// Quit
+-    quit: void,
++    /// The last focused surface. The app keeps track of this to
++    /// enable "inheriting" various configurations from the last
++    /// surface.
++    focus: *Surface,
+ 
+     /// A message for a specific surface.
+     surface_message: struct {
+@@ -529,55 +573,9 @@     /// causes the inspector to need to be redrawn.
+     redraw_inspector: *apprt.Surface,
+ 
++
+     const NewWindow = struct {
+         /// The parent surface
+         parent: ?*Surface = null,
+     };
+-};
+-
+-/// Mailbox is the way that other threads send the app thread messages.
+-pub const Mailbox = struct {
+-    /// The type used for sending messages to the app thread.
+-    pub const Queue = BlockingQueue(Message, 64);
+-
+-    rt_app: *apprt.App,
+-    mailbox: *Queue,
+-
+-    /// Send a message to the surface.
+-    pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
+-        const result = self.mailbox.push(msg, timeout);
+-
+-        // Wake up our app loop
+-        self.rt_app.wakeup();
+-
+-        return result;
+-    }
+-};
+-
+-// Wasm API.
+-pub const Wasm = if (!builtin.target.isWasm()) struct {} else struct {
+-    const wasm = @import("os/wasm.zig");
+-    const alloc = wasm.alloc;
+-
+-    // export fn app_new(config: *Config) ?*App {
+-    //     return app_new_(config) catch |err| { log.err("error initializing app err={}", .{err});
+-    //         return null;
+-    //     };
+-    // }
+-    //
+-    // fn app_new_(config: *Config) !*App {
+-    //     const app = try App.create(alloc, config);
+-    //     errdefer app.destroy();
+-    //
+-    //     const result = try alloc.create(App);
+-    //     result.* = app;
+-    //     return result;
+-    // }
+-    //
+-    // export fn app_free(ptr: ?*App) void {
+-    //     if (ptr) |v| {
+-    //         v.destroy();
+-    //         alloc.destroy(v);
+-    //     }
+-    // }
+ };

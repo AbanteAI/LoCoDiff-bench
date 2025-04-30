@@ -1,0 +1,275 @@
+//! Command launches sub-processes. This is an alternate implementation to the
+//! Zig std.process.Child since at the time of authoring this, std.process.Child
+//! didn't support the options necessary to spawn a shell attached to a pty.
+//!
+//! Consequently, I didn't implement a lot of features that std.process.Child
+//! supports because we didn't need them. Cross-platform subprocessing is not
+//! a trivial thing to implement (I've done it in three separate languages now)
+//! so if we want to replatform onto std.process.Child I'd love to do that.
+//! This was just the fastest way to get something built.
+//!
+//! Issues with std.process.Child:
+//!
+//!   * No pre_exec callback for logic after fork but before exec.
+//!   * posix_spawn is used for Mac, but doesn't support the necessary
+//!     features for tty setup.
+//!
+ const Command = @This();
+
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const global_state = &@import("global.zig").state;
+ const internal_os = @import("os/main.zig");
+ const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+-const linux = std.os.linux;
+ const posix = std.posix;
+ const debug = std.debug;
+ const testing = std.testing;
+ const Allocator = std.mem.Allocator;
+ const File = std.fs.File;
+ const EnvMap = std.process.EnvMap;
+
+ const PreExecFn = fn (*Command) void;
+
+-const log = std.log.scoped(.command);
+-
+-/// Path to the command to run. This must be an absolute path. This
+-/// library does not do PATH lookup.
+-path: []const u8,
++/// Path to the command to run. This doesn't have to be an absolute path,
++/// because use exec functions that search the PATH, if necessary.
++///
++/// This field is null-terminated to avoid a copy for the sake of
++/// adding a null terminator since POSIX systems are so common.
++path: [:0]const u8,
+
+ /// Command-line arguments. It is the responsibility of the caller to set
+ /// args[0] to the command. If args is empty then args[0] will automatically
+ /// be set to equal path.
+-args: []const []const u8,
++args: []const [:0]const u8,
+
+ /// Environment variables for the child process. If this is null, inherits
+ /// the environment variables from this process. These are the exact
+@@ -61,6 +64,11 @@ stderr: ?File = null,
+ /// exec process takes over, such as signal handlers, setsid, setuid, etc.
+ pre_exec: ?*const PreExecFn = null,
+
++/// LinuxCGroup type depends on our target OS
++pub const LinuxCgroup = if (builtin.os.tag == .linux) ?[]const u8 else void;
++pub const linux_cgroup_default = if (LinuxCgroup == void)
++{} else null;
++
+ linux_cgroup: LinuxCgroup = linux_cgroup_default,
+
+ /// If set, then the process will be created attached to this pseudo console.
+@@ -72,7 +80,7 @@ data: ?*anyopaque = null,
+
+ /// Process ID is set after start is called.
+ pid: ?posix.pid_t = null,
+
+-/// The various methods a process may exit.
++/// The various methods a process may exit. Note that the format depends on the OS.
+ pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+     Exited: u32,
+ } else union(enum) {
+@@ -91,12 +99,12 @@ pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+     Unknown: u32,
+
+     pub fn init(status: u32) Exit {
+-        return if (os.W.IFEXITED(status))
+-            Exit{ .Exited = os.W.EXITSTATUS(status) }
+-        else if (os.W.IFSIGNALED(status))
+-            Exit{ .Signal = os.W.TERMSIG(status) }
+-        else if (os.W.IFSTOPPED(status))
+-            Exit{ .Stopped = os.W.STOPSIG(status) }
++        return if (posix.W.IFEXITED(status))
++            Exit{ .Exited = posix.W.EXITSTATUS(status) }
++        else if (posix.W.IFSIGNALED(status))
++            Exit{ .Signal = posix.W.TERMSIG(status) }
++        else if (posix.W.IFSTOPPED(status))
++            Exit{ .Stopped = posix.W.STOPSIG(status) }
+         else
+             Exit{ .Unknown = status };
+     }
+@@ -129,9 +137,8 @@ pub fn start(self: *Command, alloc: Allocator) !void {
+
+ fn startPosix(self: *Command, arena: Allocator) !void {
+     // Null-terminate all our arguments
+-    const pathZ = try arena.dupeZ(u8, self.path);
+-    const argsZ = try arena.allocSentinel(?[*:0]u8, self.args.len, null);
+-    for (self.args, 0..) |arg, i| argsZ[i] = (try arena.dupeZ(u8, arg)).ptr;
++    const argsZ = try arena.allocSentinel(?[*:0]const u8, self.args.len, null);
++    for (self.args, 0..) |arg, i| argsZ[i] = arg.ptr;
+
+     // Determine our env vars
+     const envp = if (self.env) |env_map|
+@@ -139,9 +146,12 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     else if (builtin.link_libc)
+         std.c.environ
+     else
+-        @compileError("missing env vars");
++        @compileError("missing env vars. Link against libc or supply env");
+
++    // Fork. If we have a cgroup specified on Linxu then we use clone
+     const pid: posix.pid_t = switch (builtin.os.tag) {
++        .linux => if (self.linux_cgroup) |cgroup|
++            try internal_os.cgroup.cloneInto(cgroup)
+         .linux => if (self.linux_cgroup) |cgroup| try internal_os.cgroup.cloneInto(cgroup) else try posix.fork(),
+         else => try posix.fork(),
+     };
+
+     if (pid != 0) {
+@@ -152,12 +162,15 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+     // We are the child.
+
+     // Setup our file descriptors for std streams.
+-    if (self.stdin) |f| try setupFd(f.handle, posix.STDIN_FILENO);
+-    if (self.stdout) |f| try setupFd(f.handle, posix.STDOUT_FILENO);
+-    if (self.stderr) |f| try setupFd(f.handle, posix.STDERR_FILENO);
++    if (self.stdin) |f| setupFd(f.handle, posix.STDIN_FILENO) catch
++        return error.ExecFailedInChild;
++    if (self.stdout) |f| setupFd(f.handle, posix.STDOUT_FILENO) catch
++        return error.ExecFailedInChild;
++    if (self.stderr) |f| setupFd(f.handle, posix.STDERR_FILENO) catch
++        return error.ExecFailedInChild;
+
+     // Setup our working directory
+-    if (self.cwd) |cwd| try posix.chdir(cwd);
++    if (self.cwd) |cwd| posix.chdir(cwd) catch {
+ 
+     // Restore any rlimits that were set by Ghostty. This might fail but
+     // any failures are ignored (its best effort).
+@@ -165,9 +178,11 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+         internal_os.rlimits.restore();
+
+     // If the user requested a pre exec callback, call it now.
++        // This can fail if we don't have permission to go to
++        // this directory or if due to race conditions it doesn't
++        // exist or any various other reasons. We don't want to
++        // crash the entire process if this fails so we ignore it.
++        // We don't log because that'll show up in the output.
+     if (self.pre_exec) |f| f(self);
+
+-    if (global_state.rlimits.nofile) |lim| {
+-        internal_os.restoreMaxFiles(lim);
+-    }
++    };
+
+     // Finally, replace our process.
+-    _ = posix.execveZ(pathZ, argsZ, envp) catch null;
++    // Note: we must use the "p"-variant of exec here because we
++    // do not guarantee our command is looked up already in the path.
++    _ = posix.execvpeZ(self.path, argsZ, envp) catch null;
+
+     // If we are executing this code, the exec failed. In that scenario,
+     // we return a very specific error that can be detected to determine
+@@ -177,11 +192,11 @@ fn startPosix(self: *Command, arena: Allocator) !void {
+ }
+
+ fn startWindows(self: *Command, arena: Allocator) !void {
+-    const application_w = try std.unicode.utf8ToUtf16LeWithNull(arena, self.path);
+-    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeWithNull(arena, cwd) else null;
++    const application_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, self.path);
++    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeAllocZ(arena, cwd) else null;
+     const command_line_w = if (self.args.len > 0) b: {
+         const command_line = try windowsCreateCommandLine(arena, self.args);
+-        break :b try std.unicode.utf8ToUtf16LeWithNull(arena, command_line);
++        break :b try std.unicode.utf8ToUtf16LeAllocZ(arena, command_line);
+     } else null;
+     const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
+
+@@ -193,7 +208,7 @@ fn startWindows(self: *Command, arena: Allocator) !void {
+             .creation = windows.OPEN_EXISTING,
+         },
+     ) else null;
+-    defer if (null_fd) |fd| std.os.close(fd);
++    defer if (null_fd) |fd| posix.close(fd);
+
+     // TODO: In the case of having FDs instead of pty, need to set up
+     // attributes such that the child process only inherits these handles,
+@@ -272,8 +287,8 @@ fn setupFd(src: File.Handle, target: i32) !void {
+             // file descriptor to be closed on exec since we're exactly exec-ing after
+             // this.
+             while (true) {
+-                const rc = os.linux.dup3(src, target, 0);
+-                switch (os.errno(rc)) {
++                const rc = std.os.linux.dup3(src, target, 0);
++                switch (posix.errno(rc)) {
+                     .SUCCESS => break,
+                     .INTR => continue,
+                     .AGAIN, .ACCES => return error.Locked,
+@@ -322,7 +337,7 @@ pub fn wait(self: Command, block: bool) !Exit {
+         return .{ .Exited = exit_code };
+     }
+
+-    const res = if (block) std.os.waitpid(self.pid.?, 0) else res: {
++    const res = if (block) posix.waitpid(self.pid.?, 0) else res: {
+         // We specify NOHANG because its not our fault if the process we launch
+         // for the tty doesn't properly waitpid its children. We don't want
+         // to hang the terminal over it.
+@@ -331,7 +346,7 @@ pub fn wait(self: Command, block: bool) !Exit {
+         // wait call has not been performed, so we need to keep trying until we get
+         // a non-zero pid back, otherwise we end up with zombie processes.
+         while (true) {
+-            const res = std.os.waitpid(self.pid.?, std.c.W.NOHANG);
++            const res = posix.waitpid(self.pid.?, std.c.W.NOHANG);
+             if (res.pid != 0) break :res res;
+         }
+     };
+@@ -361,11 +376,11 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+ 
+     const PATH = switch (builtin.os.tag) {
+         .windows => blk: {
+-            const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
+-            const path = try std.unicode.utf16leToUtf8Alloc(alloc, win_path);
++            const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeZ("PATH")) orelse return null;
++            const path = try std.unicode.utf16LeToUtf8Alloc(alloc, mem.span(win_path));
+             break :blk path;
+         },
+-        else => std.posix.getenvZ("PATH") orelse return null,
++        else => posix.getenvZ("PATH") orelse return null,
+     };
+     defer if (builtin.os.tag == .windows) alloc.free(PATH);
+
+@@ -392,7 +407,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+         if (path_buf.len < path_len) return error.PathTooLong;
+
+         // Copy in the full path
+-        @memcpy(path_buf[0..search_path.len], search_path);
++        @memcpy(path_buf[0..search_path.len], search_path.ptr, search_path.len);
+         path_buf[search_path.len] = std.fs.path.sep;
+         @memcpy(path_buf[search_path.len + 1 ..][0..cmd.len], cmd);
+         path_buf[path_len] = 0;
+@@ -440,9 +455,9 @@ fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:nu
+     var i: usize = 0;
+     while (it.next()) |pair| : (i += 1) {
+         const env_buf = try arena.allocSentinel(u8, pair.key_ptr.len + pair.value_ptr.len + 1, 0);
+-        @memcpy(env_buf[0..pair.key_ptr.len], pair.key_ptr.*);
++        @memcpy(env_buf[0..pair.key_ptr.len], pair.key_ptr.*.ptr, pair.key_ptr.len);
+         env_buf[pair.key_ptr.len] = '=';
+-        @memcpy(env_buf[pair.key_ptr.len + 1 ..], pair.value_ptr.*);
++        @memcpy(env_buf[pair.key_ptr.len + 1 ..], pair.value_ptr.*.ptr, pair.value_ptr.len);
+         envp_buf[i] = env_buf.ptr;
+     }
+     std.debug.assert(i == envp_count);
+@@ -571,7 +586,7 @@ test "Command: pre exec" {
+             fn do(_: *Command) void {
+                 // This runs in the child, so we can exit and it won't
+                 // kill the test runner.
+-                posix.exit(42);
++                return posix.exit(42);
+             }
+         }).do,
+     };
+@@ -747,7 +762,7 @@ fn testingStart(self: *Command) !void {
+     self.start(testing.allocator) catch |err| {
+         if (err == error.ExecFailedInChild) {
+             // I am a child process, I must not get confused and continue running the rest of the test suite.
+-            posix.exit(1);
++            return posix.exit(1);
+         }
+         return err;
+     };
