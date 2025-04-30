@@ -1,0 +1,189 @@
+--- tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_expectedoutput.txt (expected)+++ tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_extracted.txt (actual)@@ -95,13 +95,14 @@ 	override async fetch(req: IRequest) {
+ 		const sentry = createSentry(this.ctx, this.env, req)
+ 		try {
+-			// Using storage pins the location of the DO
+-			this.ctx.storage.get('pin-the-do')
+ 			return await this.router.fetch(req)
+ 		} catch (err) {
+ 			if (sentry) {
+ 				// eslint-disable-next-line @typescript-eslint/no-deprecated
+-				sentry?.captureException(err)
++				sentry?.captureException(err, {
++					req: req.url,
++					method: req.method,
++				})
+ 			} else {
+ 				console.error(err)
+ 			}
+@@ -114,15 +115,27 @@ 
+ 	private assertCache(): asserts this is { cache: UserDataSyncer } {
+ 		assert(this.cache, 'no cache')
++		this.maybeStartInterval()
+ 	}
+ 
+ 	interval: NodeJS.Timeout | null = null
++	// lastMutationTimestamp = Date.now()
++	nextMutationTimestamp = Date.now() + 2e3 + 5e3 * Math.random() // Initial random interval
+ 
+ 	private maybeStartInterval() {
+ 		if (!this.interval) {
+ 			this.interval = setInterval(() => {
+ 				// do cache persist + cleanup
+ 				this.cache?.onInterval()
++				// do a noop mutation every 5 seconds
++				// Add some randomness to prevent this happening across all DOs at once on deploy
++				if (Date.now() > this.nextMutationTimestamp) {
++					this.bumpMutationNumber(this.db)
++						.then(() => {
++							this.nextMutationTimestamp = Date.now() + 5e3
++						})
++						.catch((e) => this.captureException(e, { source: 'noop mutation' }))
++				}
+ 
+ 				// clean up closed sockets if there are any
+ 				for (const socket of this.sockets) {
+@@ -140,6 +153,69 @@ 	}
+ 
+ 	private readonly sockets = new Set<WebSocket>()
++	private readonly messageQueue = new ExecutionQueue()
++
++	maybeClose() {
++		if (this.sockets.size === 0) {
++			this.cache?.stopInterval()
++		}
++	}
++
++	async onRequest(req: IRequest) {
++		assert(this.userId, 'User ID not set')
++		// handle legacy param names
++
++		const url = new URL(req.url)
++		const params = Object.fromEntries(url.searchParams.entries())
++		const { sessionId } = params
++
++		const protocolVersion = params.protocolVersion ? Number(params.protocolVersion) : 1
++
++		assert(sessionId, 'Session ID is required')
++		assert(Number.isFinite(protocolVersion), `Invalid protocol version ${params.protocolVersion}`)
++
++		this.assertCache()
++
++		// Create the websocket pair for the client
++		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
++		serverWebSocket.accept()
++
++		if (Number(protocolVersion) !== Z_PROTOCOL_VERSION || this.__test__isForceDowngraded) {
++			serverWebSocket.close(TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
++			return new Response(null, { status: 101, webSocket: clientWebSocket })
++		}
++
++		serverWebSocket.addEventListener('message', (e) =>
++			this.messageQueue.push(() => this.handleSocketMessage(serverWebSocket, e.data.toString()))
++		)
++		serverWebSocket.addEventListener('close', () => {
++			this.sockets.delete(serverWebSocket)
++			this.maybeClose()
++		})
++		serverWebSocket.addEventListener('error', (e) => {
++			this.captureException(e, { source: 'serverWebSocket "error" event' })
++			this.sockets.delete(serverWebSocket)
++			this.maybeClose()
++		})
++
++		this.sockets.add(serverWebSocket)
++		this.maybeStartInterval()
++
++		const initialData = this.cache.store.getCommittedData()
++		if (initialData) {
++			this.log.debug('sending initial data on connect', this.userId)
++			serverWebSocket.send(
++				JSON.stringify({
++					type: 'initial_data',
++					initialData,
++				} satisfies ZServerSentMessage)
++			)
++		} else {
++			this.log.debug('no initial data to send, waiting for boot to finish', this.userId)
++		}
++
++		return new Response(null, { status: 101, webSocket: clientWebSocket })
++	}
+ 
+ 	maybeReportColdStartTime(type: ZServerSentMessage['type']) {
+ 		if (type !== 'initial_data' || !this.coldStartStartTime) return
+@@ -162,61 +238,6 @@ 				this.sockets.delete(socket)
+ 			}
+ 		}
+-	}
+-	private readonly messageQueue = new ExecutionQueue()
+-
+-	async onRequest(req: IRequest) {
+-		assert(this.userId, 'User ID not set')
+-		// handle legacy param names
+-
+-		const url = new URL(req.url)
+-		const params = Object.fromEntries(url.searchParams.entries())
+-		const { sessionId } = params
+-
+-		const protocolVersion = params.protocolVersion ? Number(params.protocolVersion) : 1
+-
+-		assert(sessionId, 'Session ID is required')
+-		assert(Number.isFinite(protocolVersion), `Invalid protocol version ${params.protocolVersion}`)
+-
+-		this.assertCache()
+-
+-		// Create the websocket pair for the client
+-		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+-		serverWebSocket.accept()
+-
+-		if (Number(protocolVersion) !== Z_PROTOCOL_VERSION || this.__test__isForceDowngraded) {
+-			serverWebSocket.close(TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+-			return new Response(null, { status: 101, webSocket: clientWebSocket })
+-		}
+-
+-		serverWebSocket.addEventListener('message', (e) =>
+-			this.messageQueue.push(() => this.handleSocketMessage(serverWebSocket, e.data.toString()))
+-		)
+-		serverWebSocket.addEventListener('close', () => {
+-			this.sockets.delete(serverWebSocket)
+-		})
+-		serverWebSocket.addEventListener('error', (e) => {
+-			this.captureException(e, { source: 'serverWebSocket "error" event' })
+-			this.sockets.delete(serverWebSocket)
+-		})
+-
+-		this.sockets.add(serverWebSocket)
+-		this.maybeStartInterval()
+-
+-		const initialData = this.cache.store.getCommittedData()
+-		if (initialData) {
+-			this.log.debug('sending initial data on connect', this.userId)
+-			serverWebSocket.send(
+-				JSON.stringify({
+-					type: 'initial_data',
+-					initialData,
+-				} satisfies ZServerSentMessage)
+-			)
+-		} else {
+-			this.log.debug('no initial data to send, waiting for boot to finish', this.userId)
+-		}
+-
+-		return new Response(null, { status: 101, webSocket: clientWebSocket })
+ 	}
+ 
+ 	private async handleSocketMessage(socket: WebSocket, message: string) {
+@@ -428,6 +449,7 @@ 								.execute()
+ 						} else {
+ 							const { id } = update.row as any
++
+ 							await tx.updateTable(update.table).set(updates).where('id', '=', id).execute()
+ 						}
+ 						break
+@@ -450,6 +472,8 @@ 			}
+ 			const result = await this.bumpMutationNumber(tx)
+ 
++			this.nextMutationTimestamp = Date.now() + 5e3
++
+ 			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+ 			const mutationNumber = result.mutationNumber
+ 			assert(

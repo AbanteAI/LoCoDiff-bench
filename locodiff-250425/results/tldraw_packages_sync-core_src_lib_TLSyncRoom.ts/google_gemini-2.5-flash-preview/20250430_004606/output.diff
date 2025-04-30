@@ -1,0 +1,170 @@
+--- tldraw_packages_sync-core_src_lib_TLSyncRoom.ts_expectedoutput.txt (expected)+++ tldraw_packages_sync-core_src_lib_TLSyncRoom.ts_extracted.txt (actual)@@ -617,53 +617,12 @@ 	}
+ 
+ 	/**
+-	 * When we send a diff to a client, if that client is on a lower version than us, we need to make
+-	 * the diff compatible with their version. At the moment this means migrating each affected record
+-	 * to the client's version and sending the whole record again. We can optimize this later by
+-	 * keeping the previous versions of records around long enough to recalculate these diffs for
+-	 * older client versions.
+-	 */
+-	private migrateDiffForSession(
+-		serializedSchema: SerializedSchema,
+-		diff: NetworkDiff<R>
+-	): Result<NetworkDiff<R>, MigrationFailureReason> {
+-		// TODO: optimize this by recalculating patches using the previous versions of records
+-
+-		// when the client connects we check whether the schema is identical and make sure
+-		// to use the same object reference so that === works on this line
+-		if (serializedSchema === this.serializedSchema) {
+-			return Result.ok(diff)
+-		}
+-
+-		const result: NetworkDiff<R> = {}
+-		for (const [id, op] of Object.entries(diff)) {
+-			if (op[0] === RecordOpType.Remove) {
+-				result[id] = op
+-				continue
+-			}
+-
+-			const migrationResult = this.schema.migratePersistedRecord(
+-				this.getDocument(id).state,
+-				serializedSchema,
+-				'down'
+-			)
+-
+-			if (migrationResult.type === 'error') {
+-				return Result.err(migrationResult.reason)
+-			}
+-
+-			result[id] = [RecordOpType.Put, migrationResult.value]
+-		}
+-
+-		return Result.ok(result)
+-	}
+-
+-	/**
+ 	 * When the server receives a message from the clients Currently, supports connect and patches.
+ 	 * Invalid messages types throws an error. Currently, doesn't validate data.
+ 	 *
+ 	 * @param sessionId - The session that sent the message
+ 	 * @param message - The message that was sent
++	 * @internal
+ 	 */
+ 	async handleMessage(sessionId: string, message: TLSocketClientSentEvent<R>) {
+ 		const session = this.sessions.get(sessionId)
+@@ -690,7 +649,10 @@ 		}
+ 	}
+ 
+-	/** If the client is out of date, or we are out of date, we need to let them know */
++	/** If the client is out of date, or we are out of date, we need to let them know
++	 * @param sessionId - The session of the client to reject.
++	 * @param fatalReason - The reason for rejecting the session.
++	 */
+ 	rejectSession(sessionId: string, fatalReason?: TLSyncErrorCloseEventReason | string) {
+ 		const session = this.sessions.get(sessionId)
+ 		if (!session) return
+@@ -729,7 +691,7 @@ 			} catch {
+ 				// noop
+ 			} finally {
+-				this.removeSession(sessionId)
++				this.removeSession(sessionId, fatalReason)
+ 			}
+ 		} else {
+ 			this.removeSession(sessionId, fatalReason)
+@@ -923,7 +885,9 @@ 				if (session) {
+ 					this.rejectSession(session.sessionId, reason)
+ 				} else {
+-					throw new Error('failed to apply changes: ' + reason, underlyingError)
++					throw new Error('failed to apply changes: ' + reason, {
++						cause: underlyingError,
++					})
+ 				}
+ 				if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
+ 					this.log?.error?.('failed to apply push', reason, message, underlyingError)
+@@ -1049,6 +1013,10 @@ 						if (!res.ok) return
+ 						break
+ 					}
++					case RecordOpType.Remove: {
++						// there is no remove op for presence
++						return fail(TLSyncErrorCloseEventReason.INVALID_OPERATION)
++					}
+ 				}
+ 			}
+ 			if (message.diff && !session?.isReadonly) {
+@@ -1056,7 +1024,6 @@ 				for (const [id, op] of Object.entries(message.diff!)) {
+ 					switch (op[0]) {
+ 						case RecordOpType.Put: {
+-							// Try to add the document.
+ 							// If we're putting a record with a type that we don't recognize, fail
+ 							if (!this.documentTypes.has(op[1].typeName)) {
+ 								return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+@@ -1089,43 +1056,43 @@ 						}
+ 					}
+ 				}
++			} else if (message.diff) {
++				// client is readonly and tried to push a diff
++				return fail(TLSyncErrorCloseEventReason.INVALID_OPERATION)
+ 			}
+ 
+ 			// Let the client know what action to take based on the results of the push
+-			if (
++			if (session) {
+ 				// if there was only a presence push, the client doesn't need to do anything aside from
+ 				// shift the push request.
+-				!message.diff ||
+-				isEqual(docChanges.diff, message.diff)
+-			) {
+-				// COMMIT
+-				// Applying the client's changes had the exact same effect on the server as
+-				// they had on the client, so the client should keep the diff
+-				if (session) {
++				if (
++					//
++					!message.diff ||
++					isEqual(docChanges.diff, message.diff)
++				) {
++					// COMMIT
++					// Applying the client's changes had the exact same effect on the server as
++					// they had on the client, so the client should keep the diff
+ 					this.sendMessage(session.sessionId, {
+ 						type: 'push_result',
+ 						serverClock: this.clock,
+ 						clientClock,
+ 						action: 'commit',
+ 					})
+-				}
+-			} else if (!docChanges.diff) {
+-				// DISCARD
+-				// Applying the client's changes had no effect, so the client should drop the diff
+-				if (session) {
++				} else if (!docChanges.diff) {
++					// DISCARD
++					// Applying the client's changes had no effect, so the client should drop the diff
+ 					this.sendMessage(session.sessionId, {
+ 						type: 'push_result',
+ 						serverClock: this.clock,
+ 						clientClock,
+ 						action: 'discard',
+ 					})
+-				}
+-			} else {
+-				// REBASE
+-				// Applying the client's changes had a different non-empty effect on the server,
+-				// so the client should rebase with our gold-standard / authoritative diff.
+-				// First we need to migrate the diff to the client's version
+-				if (session) {
++				} else {
++					// REBASE
++					// Applying the client's changes had a different non-empty effect on the server,
++					// so the client should rebase with our gold-standard / authoritative diff.
++					// First we need to migrate the diff to the client's version
+ 					const migrateResult = this.migrateDiffForSession(
+ 						session.serializedSchema,
+ 						docChanges.diff
+@@ -1175,6 +1142,7 @@ 	 * Handle the event when a client disconnects.
+ 	 *
+ 	 * @param sessionId - The session that disconnected.
++	 * @internal
+ 	 */
+ 	handleClose(sessionId: string) {
+ 		this.cancelSession(sessionId)
