@@ -427,8 +427,8 @@ def create_overall_stats_table(
                     <td>{display_name}</td>
                     <td>{success_rate:.2f}% ({stats["successful"]}/{attempts})</td>
                     <td>{attempts}/{num_cases} ({attempts / num_cases * 100:.2f}%)</td>
-                    <td>${total_cost:.6f}</td>
-                    <td>${avg_cost:.6f}</td>
+                    <td>${total_cost:.2f}</td>
+                    <td>${avg_cost:.1f}</td>
                 </tr>
         """
 
