@@ -1,0 +1,2587 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/build/SharedDeps.zig
+
+commit 8bf5c4ed7f8e39ca6dcadd036c8c72924590b200
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 7 07:14:32 2025 -0800
+
+    This is a major refactor of `build.zig`.
+    
+    The major idea behind the refactor is to split the `build.zig` file up into
+    distinct `src/build/*.zig` files. By doing so, we can improve readability of
+    the primary `build.zig` while also enabling better reuse of steps. Our
+    `build.zig` is now less than 150 lines of code (of course, it calls into a lot
+    more lines but they're neatly organized now).
+    
+    Improvements:
+    
+      * `build.zig` is less than 150 lines of readable code.
+      * Help strings and unicode table generators are only run once when multiple
+        artifacts are built since the results are the same regardless of target.
+      * Metal lib is only built once per architecture (rather than once per artifact)
+      * Resources (shell integration, terminfo, etc.) and docs are only
+        built/installed for artifacts that need them
+    
+    Breaking changes:
+    
+      * Removed broken wasm build (@gabydd will re-add)
+      * Removed conformance files, shell scripts are better and we don't run
+        these anymore
+      * Removed macOS app bundle creation, we don't use this anymore since we
+        use Xcode
+    
+    ## Some History
+    
+    Our `build.zig` hasn't been significantly refactored since the project started,
+    when Zig was _version 0.10_. Since then, the build system has changed
+    significantly. We've only ever duct taped the `build.zig` as we needed to
+    support new Zig versions, new features, etc. It was a mess.
+    
+    The major improvement is adapting the entire Ghostty `build.zig` to the Step
+    and LazyPath changes introduced way back in Zig 0.12. This lets us better take
+    advantage of parallelism and the dependency graph so that steps are only
+    executed as they're needed.
+    
+    As such, you can see in the build.zig that we initialize a lot of things, but
+    unless a final target (i.e. install, run) references those steps, _they'll
+    never be executed_. This lets us clean up a lot.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+new file mode 100644
+index 00000000..79219921
+--- /dev/null
++++ b/src/build/SharedDeps.zig
+@@ -0,0 +1,501 @@
++const SharedDeps = @This();
++
++const std = @import("std");
++const Scanner = @import("zig_wayland").Scanner;
++const Config = @import("Config.zig");
++const HelpStrings = @import("HelpStrings.zig");
++const MetallibStep = @import("MetallibStep.zig");
++const UnicodeTables = @import("UnicodeTables.zig");
++
++config: *const Config,
++
++options: *std.Build.Step.Options,
++help_strings: HelpStrings,
++metallib: ?*MetallibStep,
++unicode_tables: UnicodeTables,
++
++/// Used to keep track of a list of file sources.
++pub const LazyPathList = std.ArrayList(std.Build.LazyPath);
++
++pub fn init(b: *std.Build, cfg: *const Config) !SharedDeps {
++    var result: SharedDeps = .{
++        .config = cfg,
++        .help_strings = try HelpStrings.init(b, cfg),
++        .unicode_tables = try UnicodeTables.init(b),
++
++        // Setup by retarget
++        .options = undefined,
++        .metallib = undefined,
++    };
++    try result.initTarget(b, cfg.target);
++    return result;
++}
++
++/// Retarget our dependencies for another build target. Modifies in-place.
++pub fn retarget(
++    self: *const SharedDeps,
++    b: *std.Build,
++    target: std.Build.ResolvedTarget,
++) !SharedDeps {
++    var result = self.*;
++    try result.initTarget(b, target);
++    return result;
++}
++
++/// Change the exe entrypoint.
++pub fn changeEntrypoint(
++    self: *const SharedDeps,
++    b: *std.Build,
++    entrypoint: Config.ExeEntrypoint,
++) !SharedDeps {
++    // Change our config
++    const config = try b.allocator.create(Config);
++    config.* = self.config.*;
++    config.exe_entrypoint = entrypoint;
++
++    var result = self.*;
++    result.config = config;
++    return result;
++}
++
++fn initTarget(
++    self: *SharedDeps,
++    b: *std.Build,
++    target: std.Build.ResolvedTarget,
++) !void {
++    // Update our metallib
++    self.metallib = MetallibStep.create(b, .{
++        .name = "Ghostty",
++        .target = target,
++        .sources = &.{b.path("src/renderer/shaders/cell.metal")},
++    });
++
++    // Change our config
++    const config = try b.allocator.create(Config);
++    config.* = self.config.*;
++    config.target = target;
++    self.config = config;
++
++    // Setup our shared build options
++    self.options = b.addOptions();
++    try self.config.addOptions(self.options);
++}
++
++pub fn add(
++    self: *const SharedDeps,
++    step: *std.Build.Step.Compile,
++) !LazyPathList {
++    const b = step.step.owner;
++
++    // We could use our config.target/optimize fields here but its more
++    // correct to always match our step.
++    const target = step.root_module.resolved_target.?;
++    const optimize = step.root_module.optimize.?;
++
++    // We maintain a list of our static libraries and return it so that
++    // we can build a single fat static library for the final app.
++    var static_libs = LazyPathList.init(b.allocator);
++    errdefer static_libs.deinit();
++
++    // Every exe gets build options populated
++    step.root_module.addOptions("build_options", self.options);
++
++    // Freetype
++    _ = b.systemIntegrationOption("freetype", .{}); // Shows it in help
++    if (self.config.font_backend.hasFreetype()) {
++        const freetype_dep = b.dependency("freetype", .{
++            .target = target,
++            .optimize = optimize,
++            .@"enable-libpng" = true,
++        });
++        step.root_module.addImport("freetype", freetype_dep.module("freetype"));
++
++        if (b.systemIntegrationOption("freetype", .{})) {
++            step.linkSystemLibrary2("bzip2", dynamic_link_opts);
++            step.linkSystemLibrary2("freetype2", dynamic_link_opts);
++        } else {
++            step.linkLibrary(freetype_dep.artifact("freetype"));
++            try static_libs.append(freetype_dep.artifact("freetype").getEmittedBin());
++        }
++    }
++
++    // Harfbuzz
++    _ = b.systemIntegrationOption("harfbuzz", .{}); // Shows it in help
++    if (self.config.font_backend.hasHarfbuzz()) {
++        const harfbuzz_dep = b.dependency("harfbuzz", .{
++            .target = target,
++            .optimize = optimize,
++            .@"enable-freetype" = true,
++            .@"enable-coretext" = self.config.font_backend.hasCoretext(),
++        });
++
++        step.root_module.addImport(
++            "harfbuzz",
++            harfbuzz_dep.module("harfbuzz"),
++        );
++        if (b.systemIntegrationOption("harfbuzz", .{})) {
++            step.linkSystemLibrary2("harfbuzz", dynamic_link_opts);
++        } else {
++            step.linkLibrary(harfbuzz_dep.artifact("harfbuzz"));
++            try static_libs.append(harfbuzz_dep.artifact("harfbuzz").getEmittedBin());
++        }
++    }
++
++    // Fontconfig
++    _ = b.systemIntegrationOption("fontconfig", .{}); // Shows it in help
++    if (self.config.font_backend.hasFontconfig()) {
++        const fontconfig_dep = b.dependency("fontconfig", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        step.root_module.addImport(
++            "fontconfig",
++            fontconfig_dep.module("fontconfig"),
++        );
++
++        if (b.systemIntegrationOption("fontconfig", .{})) {
++            step.linkSystemLibrary2("fontconfig", dynamic_link_opts);
++        } else {
++            step.linkLibrary(fontconfig_dep.artifact("fontconfig"));
++            try static_libs.append(fontconfig_dep.artifact("fontconfig").getEmittedBin());
++        }
++    }
++
++    // Libpng - Ghostty doesn't actually use this directly, its only used
++    // through dependencies, so we only need to add it to our static
++    // libs list if we're not using system integration. The dependencies
++    // will handle linking it.
++    if (!b.systemIntegrationOption("libpng", .{})) {
++        const libpng_dep = b.dependency("libpng", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        step.linkLibrary(libpng_dep.artifact("png"));
++        try static_libs.append(libpng_dep.artifact("png").getEmittedBin());
++    }
++
++    // Zlib - same as libpng, only used through dependencies.
++    if (!b.systemIntegrationOption("zlib", .{})) {
++        const zlib_dep = b.dependency("zlib", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        step.linkLibrary(zlib_dep.artifact("z"));
++        try static_libs.append(zlib_dep.artifact("z").getEmittedBin());
++    }
++
++    // Oniguruma
++    const oniguruma_dep = b.dependency("oniguruma", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    step.root_module.addImport("oniguruma", oniguruma_dep.module("oniguruma"));
++    if (b.systemIntegrationOption("oniguruma", .{})) {
++        step.linkSystemLibrary2("oniguruma", dynamic_link_opts);
++    } else {
++        step.linkLibrary(oniguruma_dep.artifact("oniguruma"));
++        try static_libs.append(oniguruma_dep.artifact("oniguruma").getEmittedBin());
++    }
++
++    // Glslang
++    const glslang_dep = b.dependency("glslang", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    step.root_module.addImport("glslang", glslang_dep.module("glslang"));
++    if (b.systemIntegrationOption("glslang", .{})) {
++        step.linkSystemLibrary2("glslang", dynamic_link_opts);
++        step.linkSystemLibrary2("glslang-default-resource-limits", dynamic_link_opts);
++    } else {
++        step.linkLibrary(glslang_dep.artifact("glslang"));
++        try static_libs.append(glslang_dep.artifact("glslang").getEmittedBin());
++    }
++
++    // Spirv-cross
++    const spirv_cross_dep = b.dependency("spirv_cross", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    step.root_module.addImport("spirv_cross", spirv_cross_dep.module("spirv_cross"));
++    if (b.systemIntegrationOption("spirv-cross", .{})) {
++        step.linkSystemLibrary2("spirv-cross", dynamic_link_opts);
++    } else {
++        step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
++        try static_libs.append(spirv_cross_dep.artifact("spirv_cross").getEmittedBin());
++    }
++
++    // Simdutf
++    if (b.systemIntegrationOption("simdutf", .{})) {
++        step.linkSystemLibrary2("simdutf", dynamic_link_opts);
++    } else {
++        const simdutf_dep = b.dependency("simdutf", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        step.linkLibrary(simdutf_dep.artifact("simdutf"));
++        try static_libs.append(simdutf_dep.artifact("simdutf").getEmittedBin());
++    }
++
++    // Sentry
++    if (self.config.sentry) {
++        const sentry_dep = b.dependency("sentry", .{
++            .target = target,
++            .optimize = optimize,
++            .backend = .breakpad,
++        });
++
++        step.root_module.addImport("sentry", sentry_dep.module("sentry"));
++
++        // Sentry
++        step.linkLibrary(sentry_dep.artifact("sentry"));
++        try static_libs.append(sentry_dep.artifact("sentry").getEmittedBin());
++
++        // We also need to include breakpad in the static libs.
++        const breakpad_dep = sentry_dep.builder.dependency("breakpad", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        try static_libs.append(breakpad_dep.artifact("breakpad").getEmittedBin());
++    }
++
++    // Wasm we do manually since it is such a different build.
++    if (step.rootModuleTarget().cpu.arch == .wasm32) {
++        const js_dep = b.dependency("zig_js", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        step.root_module.addImport("zig-js", js_dep.module("zig-js"));
++
++        return static_libs;
++    }
++
++    // On Linux, we need to add a couple common library paths that aren't
++    // on the standard search list. i.e. GTK is often in /usr/lib/x86_64-linux-gnu
++    // on x86_64.
++    if (step.rootModuleTarget().os.tag == .linux) {
++        const triple = try step.rootModuleTarget().linuxTriple(b.allocator);
++        step.addLibraryPath(.{ .cwd_relative = b.fmt("/usr/lib/{s}", .{triple}) });
++    }
++
++    // C files
++    step.linkLibC();
++    step.addIncludePath(b.path("src/stb"));
++    step.addCSourceFiles(.{ .files = &.{"src/stb/stb.c"} });
++    if (step.rootModuleTarget().os.tag == .linux) {
++        step.addIncludePath(b.path("src/apprt/gtk"));
++    }
++
++    // C++ files
++    step.linkLibCpp();
++    step.addIncludePath(b.path("src"));
++    {
++        // From hwy/detect_targets.h
++        const HWY_AVX3_SPR: c_int = 1 << 4;
++        const HWY_AVX3_ZEN4: c_int = 1 << 6;
++        const HWY_AVX3_DL: c_int = 1 << 7;
++        const HWY_AVX3: c_int = 1 << 8;
++
++        // Zig 0.13 bug: https://github.com/ziglang/zig/issues/20414
++        // To workaround this we just disable AVX512 support completely.
++        // The performance difference between AVX2 and AVX512 is not
++        // significant for our use case and AVX512 is very rare on consumer
++        // hardware anyways.
++        const HWY_DISABLED_TARGETS: c_int = HWY_AVX3_SPR | HWY_AVX3_ZEN4 | HWY_AVX3_DL | HWY_AVX3;
++
++        step.addCSourceFiles(.{
++            .files = &.{
++                "src/simd/base64.cpp",
++                "src/simd/codepoint_width.cpp",
++                "src/simd/index_of.cpp",
++                "src/simd/vt.cpp",
++            },
++            .flags = if (step.rootModuleTarget().cpu.arch == .x86_64) &.{
++                b.fmt("-DHWY_DISABLED_TARGETS={}", .{HWY_DISABLED_TARGETS}),
++            } else &.{},
++        });
++    }
++
++    // We always require the system SDK so that our system headers are available.
++    // This makes things like `os/log.h` available for cross-compiling.
++    if (step.rootModuleTarget().isDarwin()) {
++        try @import("apple_sdk").addPaths(b, &step.root_module);
++
++        const metallib = self.metallib.?;
++        metallib.output.addStepDependencies(&step.step);
++        step.root_module.addAnonymousImport("ghostty_metallib", .{
++            .root_source_file = metallib.output,
++        });
++    }
++
++    // Other dependencies, mostly pure Zig
++    step.root_module.addImport("opengl", b.dependency(
++        "opengl",
++        .{},
++    ).module("opengl"));
++    step.root_module.addImport("vaxis", b.dependency("vaxis", .{
++        .target = target,
++        .optimize = optimize,
++    }).module("vaxis"));
++    step.root_module.addImport("wuffs", b.dependency("wuffs", .{
++        .target = target,
++        .optimize = optimize,
++    }).module("wuffs"));
++    step.root_module.addImport("xev", b.dependency("libxev", .{
++        .target = target,
++        .optimize = optimize,
++    }).module("xev"));
++    step.root_module.addImport("z2d", b.addModule("z2d", .{
++        .root_source_file = b.dependency("z2d", .{}).path("src/z2d.zig"),
++        .target = target,
++        .optimize = optimize,
++    }));
++    step.root_module.addImport("ziglyph", b.dependency("ziglyph", .{
++        .target = target,
++        .optimize = optimize,
++    }).module("ziglyph"));
++    step.root_module.addImport("zf", b.dependency("zf", .{
++        .target = target,
++        .optimize = optimize,
++        .with_tui = false,
++    }).module("zf"));
++
++    // Mac Stuff
++    if (step.rootModuleTarget().isDarwin()) {
++        const objc_dep = b.dependency("zig_objc", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        const macos_dep = b.dependency("macos", .{
++            .target = target,
++            .optimize = optimize,
++        });
++
++        step.root_module.addImport("objc", objc_dep.module("objc"));
++        step.root_module.addImport("macos", macos_dep.module("macos"));
++        step.linkLibrary(macos_dep.artifact("macos"));
++        try static_libs.append(macos_dep.artifact("macos").getEmittedBin());
++
++        if (self.config.renderer == .opengl) {
++            step.linkFramework("OpenGL");
++        }
++    }
++
++    // cimgui
++    const cimgui_dep = b.dependency("cimgui", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    step.root_module.addImport("cimgui", cimgui_dep.module("cimgui"));
++    step.linkLibrary(cimgui_dep.artifact("cimgui"));
++    try static_libs.append(cimgui_dep.artifact("cimgui").getEmittedBin());
++
++    // Highway
++    const highway_dep = b.dependency("highway", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    step.linkLibrary(highway_dep.artifact("highway"));
++    try static_libs.append(highway_dep.artifact("highway").getEmittedBin());
++
++    // utfcpp - This is used as a dependency on our hand-written C++ code
++    const utfcpp_dep = b.dependency("utfcpp", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    step.linkLibrary(utfcpp_dep.artifact("utfcpp"));
++    try static_libs.append(utfcpp_dep.artifact("utfcpp").getEmittedBin());
++
++    // If we're building an exe then we have additional dependencies.
++    if (step.kind != .lib) {
++        // We always statically compile glad
++        step.addIncludePath(b.path("vendor/glad/include/"));
++        step.addCSourceFile(.{
++            .file = b.path("vendor/glad/src/gl.c"),
++            .flags = &.{},
++        });
++
++        // When we're targeting flatpak we ALWAYS link GTK so we
++        // get access to glib for dbus.
++        if (self.config.flatpak) step.linkSystemLibrary2("gtk4", dynamic_link_opts);
++
++        switch (self.config.app_runtime) {
++            .none => {},
++
++            .glfw => glfw: {
++                const mach_glfw_dep = b.lazyDependency("mach_glfw", .{
++                    .target = target,
++                    .optimize = optimize,
++                }) orelse break :glfw;
++                step.root_module.addImport("glfw", mach_glfw_dep.module("mach-glfw"));
++            },
++
++            .gtk => {
++                step.linkSystemLibrary2("gtk4", dynamic_link_opts);
++                if (self.config.adwaita) step.linkSystemLibrary2("adwaita-1", dynamic_link_opts);
++                if (self.config.x11) step.linkSystemLibrary2("X11", dynamic_link_opts);
++
++                if (self.config.wayland) {
++                    const scanner = Scanner.create(b, .{});
++
++                    const wayland = b.createModule(.{ .root_source_file = scanner.result });
++
++                    const plasma_wayland_protocols = b.dependency("plasma_wayland_protocols", .{
++                        .target = target,
++                        .optimize = optimize,
++                    });
++                    scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/blur.xml"));
++
++                    scanner.generate("wl_compositor", 1);
++                    scanner.generate("org_kde_kwin_blur_manager", 1);
++
++                    step.root_module.addImport("wayland", wayland);
++                    step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
++                }
++
++                {
++                    const gresource = @import("../apprt/gtk/gresource.zig");
++
++                    const wf = b.addWriteFiles();
++                    const gresource_xml = wf.add("gresource.xml", gresource.gresource_xml);
++
++                    const generate_resources_c = b.addSystemCommand(&.{
++                        "glib-compile-resources",
++                        "--c-name",
++                        "ghostty",
++                        "--generate-source",
++                        "--target",
++                    });
++                    const ghostty_resources_c = generate_resources_c.addOutputFileArg("ghostty_resources.c");
++                    generate_resources_c.addFileArg(gresource_xml);
++                    generate_resources_c.extra_file_dependencies = &gresource.dependencies;
++                    step.addCSourceFile(.{ .file = ghostty_resources_c, .flags = &.{} });
++
++                    const generate_resources_h = b.addSystemCommand(&.{
++                        "glib-compile-resources",
++                        "--c-name",
++                        "ghostty",
++                        "--generate-header",
++                        "--target",
++                    });
++                    const ghostty_resources_h = generate_resources_h.addOutputFileArg("ghostty_resources.h");
++                    generate_resources_h.addFileArg(gresource_xml);
++                    generate_resources_h.extra_file_dependencies = &gresource.dependencies;
++                    step.addIncludePath(ghostty_resources_h.dirname());
++                }
++            },
++        }
++    }
++
++    self.help_strings.addImport(step);
++    self.unicode_tables.addImport(step);
++
++    return static_libs;
++}
++
++// For dynamic linking, we prefer dynamic linking and to search by
++// mode first. Mode first will search all paths for a dynamic library
++// before falling back to static.
++const dynamic_link_opts: std.Build.Module.LinkSystemLibraryOptions = .{
++    .preferred_link_mode = .dynamic,
++    .search_strategy = .mode_first,
++};
+
+commit bade7be021c531a9ca02b8d5ebf2a767a11d5007
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Jan 7 20:19:08 2025 -0800
+
+    Use build.zig.zon for Wayland protocols
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 79219921..077da96a 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -435,7 +435,16 @@ pub fn add(
+                 if (self.config.x11) step.linkSystemLibrary2("X11", dynamic_link_opts);
+ 
+                 if (self.config.wayland) {
+-                    const scanner = Scanner.create(b, .{});
++                    const scanner = Scanner.create(b, .{
++                        // We shouldn't be using getPath but we need to for now
++                        // https://codeberg.org/ifreund/zig-wayland/issues/66
++                        .wayland_xml_path = b.dependency("wayland", .{})
++                            .path("protocol/wayland.xml")
++                            .getPath(b),
++                        .wayland_protocols_path = b.dependency("wayland_protocols", .{})
++                            .path("")
++                            .getPath(b),
++                    });
+ 
+                     const wayland = b.createModule(.{ .root_source_file = scanner.result });
+ 
+
+commit 40442ac02fad9c54a363feadef78bf70878b17f7
+Author: Kwee Lung Sin <kweelungsin@gmail.com>
+Date:   Fri Jan 3 16:10:48 2025 +0800
+
+    chore: replace adwaita-1 to libadwaita-1 for better pkg-config handling
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 077da96a..013aa559 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -431,7 +431,7 @@ pub fn add(
+ 
+             .gtk => {
+                 step.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-                if (self.config.adwaita) step.linkSystemLibrary2("adwaita-1", dynamic_link_opts);
++                if (self.config.adwaita) step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+                 if (self.config.x11) step.linkSystemLibrary2("X11", dynamic_link_opts);
+ 
+                 if (self.config.wayland) {
+
+commit 622cc3f9c7c0181e1f57c09b88f5ca53f1499b98
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Jan 8 19:51:16 2025 -0800
+
+    build: update zig-wayland to use new LazyPath API
+    
+    This is a more idiomatic way to handle build paths in Zig 0.13 and
+    later.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 013aa559..16e7381f 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -435,15 +435,13 @@ pub fn add(
+                 if (self.config.x11) step.linkSystemLibrary2("X11", dynamic_link_opts);
+ 
+                 if (self.config.wayland) {
+-                    const scanner = Scanner.create(b, .{
++                    const scanner = Scanner.create(b.dependency("zig_wayland", .{}), .{
+                         // We shouldn't be using getPath but we need to for now
+                         // https://codeberg.org/ifreund/zig-wayland/issues/66
+-                        .wayland_xml_path = b.dependency("wayland", .{})
+-                            .path("protocol/wayland.xml")
+-                            .getPath(b),
+-                        .wayland_protocols_path = b.dependency("wayland_protocols", .{})
+-                            .path("")
+-                            .getPath(b),
++                        .wayland_xml = b.dependency("wayland", .{})
++                            .path("protocol/wayland.xml"),
++                        .wayland_protocols = b.dependency("wayland_protocols", .{})
++                            .path(""),
+                     });
+ 
+                     const wayland = b.createModule(.{ .root_source_file = scanner.result });
+
+commit 4e0d9b1b277aac2e60e253750a175e80ff2ab973
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Mon Jan 6 21:58:22 2025 +0100
+
+    gtk(wayland): implement server-side decorations
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 16e7381f..64068658 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -450,10 +450,14 @@ pub fn add(
+                         .target = target,
+                         .optimize = optimize,
+                     });
++
++                    // FIXME: replace with `zxdg_decoration_v1` once GTK merges https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/6398
+                     scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/blur.xml"));
++                    scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/server-decoration.xml"));
+ 
+                     scanner.generate("wl_compositor", 1);
+                     scanner.generate("org_kde_kwin_blur_manager", 1);
++                    scanner.generate("org_kde_kwin_server_decoration_manager", 1);
+ 
+                     step.root_module.addImport("wayland", wayland);
+                     step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
+
+commit 843c7140880f002c52d4c4a3715062b02e967990
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Fri Jan 31 11:54:31 2025 +0100
+
+    gtk: introduce Zig bindings for GTK/GObject
+    
+    `zig-gobject` is a set of GObject bindings that allow us to write
+    GTK-facing code in Zig instead of getting hands dirty with C.
+    It's been tested and refined in real-life applications and several
+    GTK contributors agree that it is a marked improvement over using
+    the C API directly, such as allowing method call syntax and avoiding
+    many manual `@ptrCast`s.
+    
+    This commit doesn't actually contain any changes to our preexisting
+    GTK code — the migration process is intended to begin in chunks,
+    firstly in self-contained components (e.g. the header bar, overlays,
+    etc.), and then full-scale migration can begin when we remove non-Adwaita
+    GTK builds for 1.2. (After all, why port code that you'll remove later
+    either way?)
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 64068658..34666cf8 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -430,9 +430,32 @@ pub fn add(
+             },
+ 
+             .gtk => {
++                const gobject = b.dependency("gobject", .{
++                    .target = target,
++                    .optimize = optimize,
++                });
++                const gobject_imports = .{
++                    .{ "gobject", "gobject2" },
++                    .{ "glib", "glib2" },
++                    .{ "gtk", "gtk4" },
++                    .{ "gdk", "gdk4" },
++                };
++                inline for (gobject_imports) |import| {
++                    const name, const module = import;
++                    step.root_module.addImport(name, gobject.module(module));
++                }
++
+                 step.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-                if (self.config.adwaita) step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-                if (self.config.x11) step.linkSystemLibrary2("X11", dynamic_link_opts);
++
++                if (self.config.adwaita) {
++                    step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++                    step.root_module.addImport("adw", gobject.module("adw1"));
++                }
++
++                if (self.config.x11) {
++                    step.linkSystemLibrary2("X11", dynamic_link_opts);
++                    step.root_module.addImport("gdk_x11", gobject.module("gdkx114"));
++                }
+ 
+                 if (self.config.wayland) {
+                     const scanner = Scanner.create(b.dependency("zig_wayland", .{}), .{
+@@ -460,6 +483,7 @@ pub fn add(
+                     scanner.generate("org_kde_kwin_server_decoration_manager", 1);
+ 
+                     step.root_module.addImport("wayland", wayland);
++                    step.root_module.addImport("gdk_wayland", gobject.module("gdkwayland4"));
+                     step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
+                 }
+ 
+
+commit f63242f7fb755b44df17ddef518089ca713f2778
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Wed Feb 12 14:14:37 2025 -0600
+
+    gtk: add support for using GTK Builder UI files and Blueprints
+    
+    Adds buildtime and comptime checks to make sure that Blueprints/UI files
+    are availble and correctly formed. Will also compile Blueprints to UI
+    files so that they are available to GTK code.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 34666cf8..f00b79f0 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -490,8 +490,48 @@ pub fn add(
+                 {
+                     const gresource = @import("../apprt/gtk/gresource.zig");
+ 
+-                    const wf = b.addWriteFiles();
+-                    const gresource_xml = wf.add("gresource.xml", gresource.gresource_xml);
++                    const gresource_xml = gresource_xml: {
++                        const generate_gresource_xml = b.addExecutable(.{
++                            .name = "generate_gresource_xml",
++                            .root_source_file = b.path("src/apprt/gtk/gresource.zig"),
++                            .target = b.host,
++                        });
++
++                        const generate = b.addRunArtifact(generate_gresource_xml);
++
++                        for (gresource.blueprint_files) |blueprint_file| {
++                            const blueprint_compiler = b.addSystemCommand(&.{
++                                "blueprint-compiler",
++                                "compile",
++                                "--output",
++                            });
++                            const ui_file = blueprint_compiler.addOutputFileArg(b.fmt("{s}.ui", .{blueprint_file}));
++                            blueprint_compiler.addFileArg(b.path(b.fmt("src/apprt/gtk/ui/{s}.blp", .{blueprint_file})));
++                            generate.addFileArg(ui_file);
++                        }
++
++                        break :gresource_xml generate.captureStdOut();
++                    };
++
++                    {
++                        const gtk_builder_check = b.addExecutable(.{
++                            .name = "gtk_builder_check",
++                            .root_source_file = b.path("src/apprt/gtk/builder_check.zig"),
++                            .target = b.host,
++                        });
++                        gtk_builder_check.root_module.addOptions("build_options", self.options);
++                        gtk_builder_check.linkSystemLibrary2("gtk4", dynamic_link_opts);
++                        if (self.config.adwaita) gtk_builder_check.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++                        gtk_builder_check.linkLibC();
++
++                        for (gresource.dependencies) |pathname| {
++                            const extension = std.fs.path.extension(pathname);
++                            if (!std.mem.eql(u8, extension, ".ui")) continue;
++                            const check = b.addRunArtifact(gtk_builder_check);
++                            check.addFileArg(b.path(pathname));
++                            step.step.dependOn(&check.step);
++                        }
++                    }
+ 
+                     const generate_resources_c = b.addSystemCommand(&.{
+                         "glib-compile-resources",
+
+commit e396c8538aa3197be3c2f2f3c4780dcad20f3bb0
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Wed Feb 12 22:08:33 2025 -0600
+
+    gtk: fix ui/blueprint builder
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index f00b79f0..0a1d6f90 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -436,6 +436,7 @@ pub fn add(
+                 });
+                 const gobject_imports = .{
+                     .{ "gobject", "gobject2" },
++                    .{ "gio", "gio2" },
+                     .{ "glib", "glib2" },
+                     .{ "gtk", "gtk4" },
+                     .{ "gdk", "gdk4" },
+@@ -520,9 +521,8 @@ pub fn add(
+                             .target = b.host,
+                         });
+                         gtk_builder_check.root_module.addOptions("build_options", self.options);
+-                        gtk_builder_check.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-                        if (self.config.adwaita) gtk_builder_check.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-                        gtk_builder_check.linkLibC();
++                        gtk_builder_check.root_module.addImport("gtk", gobject.module("gtk4"));
++                        if (self.config.adwaita) gtk_builder_check.root_module.addImport("adw", gobject.module("adw1"));
+ 
+                         for (gresource.dependencies) |pathname| {
+                             const extension = std.fs.path.extension(pathname);
+
+commit 9cb297202ba7ee85534ed33f6cfc5681996aa5b0
+Author: Tim Culverhouse <tim@timculverhouse.com>
+Date:   Wed Jan 8 20:58:50 2025 -0600
+
+    cli: add +boo command
+    
+    Add a `+boo` command to show the animation from the website. The data
+    for the frames is compressed during the build process. This build step
+    was added to the SharedDeps object because it is used in both
+    libghostty and in binaries.
+    
+    The compression is done as follows:
+    - All files are concatenated together using \x01 as a combining byte
+    - The files are compressed to a cached build file
+    - A zig file is written to stdout which `@embedFile`s the compressed
+      file and exposes it to the importer
+    - A new anonymous module "framedata" is added in the SharedDeps object
+    
+    Any file can import framedata and access the compressed bytes via
+    `framedata.compressed`. In the `boo` command, we decompress the file and
+    split it into frames for use in the animation.
+    
+    The overall addition to the binary size is 348k.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 0a1d6f90..7d0b64c5 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -6,6 +6,7 @@ const Config = @import("Config.zig");
+ const HelpStrings = @import("HelpStrings.zig");
+ const MetallibStep = @import("MetallibStep.zig");
+ const UnicodeTables = @import("UnicodeTables.zig");
++const GhosttyFrameData = @import("GhosttyFrameData.zig");
+ 
+ config: *const Config,
+ 
+@@ -13,6 +14,7 @@ options: *std.Build.Step.Options,
+ help_strings: HelpStrings,
+ metallib: ?*MetallibStep,
+ unicode_tables: UnicodeTables,
++framedata: GhosttyFrameData,
+ 
+ /// Used to keep track of a list of file sources.
+ pub const LazyPathList = std.ArrayList(std.Build.LazyPath);
+@@ -22,6 +24,7 @@ pub fn init(b: *std.Build, cfg: *const Config) !SharedDeps {
+         .config = cfg,
+         .help_strings = try HelpStrings.init(b, cfg),
+         .unicode_tables = try UnicodeTables.init(b),
++        .framedata = try GhosttyFrameData.init(b),
+ 
+         // Setup by retarget
+         .options = undefined,
+@@ -563,6 +566,7 @@ pub fn add(
+ 
+     self.help_strings.addImport(step);
+     self.unicode_tables.addImport(step);
++    self.framedata.addImport(step);
+ 
+     return static_libs;
+ }
+
+commit 25c5ecf553a1460ad88607c838e2f282612d1b9f
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Thu Jan 30 22:59:36 2025 -0600
+
+    gtk: require libadwaita
+    
+    This commit removes support for building without libadwaita.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 7d0b64c5..a90fc330 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -450,11 +450,8 @@ pub fn add(
+                 }
+ 
+                 step.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-
+-                if (self.config.adwaita) {
+-                    step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-                    step.root_module.addImport("adw", gobject.module("adw1"));
+-                }
++                step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++                step.root_module.addImport("adw", gobject.module("adw1"));
+ 
+                 if (self.config.x11) {
+                     step.linkSystemLibrary2("X11", dynamic_link_opts);
+@@ -525,7 +522,7 @@ pub fn add(
+                         });
+                         gtk_builder_check.root_module.addOptions("build_options", self.options);
+                         gtk_builder_check.root_module.addImport("gtk", gobject.module("gtk4"));
+-                        if (self.config.adwaita) gtk_builder_check.root_module.addImport("adw", gobject.module("adw1"));
++                        gtk_builder_check.root_module.addImport("adw", gobject.module("adw1"));
+ 
+                         for (gresource.dependencies) |pathname| {
+                             const extension = std.fs.path.extension(pathname);
+
+commit 4f3c4037aa35914af9633cbf7d051c9d9f85b65d
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Feb 22 12:54:08 2025 -0600
+
+    gtk: get 'Change Title' working with older distros
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index a90fc330..65b2b47d 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -443,6 +443,7 @@ pub fn add(
+                     .{ "glib", "glib2" },
+                     .{ "gtk", "gtk4" },
+                     .{ "gdk", "gdk4" },
++                    .{ "adw", "adw1" },
+                 };
+                 inline for (gobject_imports) |import| {
+                     const name, const module = import;
+@@ -451,7 +452,6 @@ pub fn add(
+ 
+                 step.linkSystemLibrary2("gtk4", dynamic_link_opts);
+                 step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-                step.root_module.addImport("adw", gobject.module("adw1"));
+ 
+                 if (self.config.x11) {
+                     step.linkSystemLibrary2("X11", dynamic_link_opts);
+@@ -500,14 +500,24 @@ pub fn add(
+ 
+                         const generate = b.addRunArtifact(generate_gresource_xml);
+ 
++                        const gtk_blueprint_compiler = b.addExecutable(.{
++                            .name = "gtk_blueprint_compiler",
++                            .root_source_file = b.path("src/apprt/gtk/blueprint_compiler.zig"),
++                            .target = b.host,
++                        });
++                        gtk_blueprint_compiler.linkSystemLibrary2("gtk4", dynamic_link_opts);
++                        gtk_blueprint_compiler.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++                        gtk_blueprint_compiler.linkLibC();
++
+                         for (gresource.blueprint_files) |blueprint_file| {
+-                            const blueprint_compiler = b.addSystemCommand(&.{
+-                                "blueprint-compiler",
+-                                "compile",
+-                                "--output",
++                            const blueprint_compiler = b.addRunArtifact(gtk_blueprint_compiler);
++                            blueprint_compiler.addArgs(&.{
++                                b.fmt("{d}", .{blueprint_file.major}),
++                                b.fmt("{d}", .{blueprint_file.minor}),
++                                b.fmt("{d}", .{blueprint_file.micro}),
+                             });
+-                            const ui_file = blueprint_compiler.addOutputFileArg(b.fmt("{s}.ui", .{blueprint_file}));
+-                            blueprint_compiler.addFileArg(b.path(b.fmt("src/apprt/gtk/ui/{s}.blp", .{blueprint_file})));
++                            const ui_file = blueprint_compiler.addOutputFileArg(b.fmt("{s}.ui", .{blueprint_file.name}));
++                            blueprint_compiler.addFileArg(b.path(b.fmt("src/apprt/gtk/ui/{s}.blp", .{blueprint_file.name})));
+                             generate.addFileArg(ui_file);
+                         }
+ 
+
+commit 0638eca63347a630c273ef1aaf14b5c00529fd26
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Mon Feb 24 18:19:22 2025 -0600
+
+    gtk: use versioned directories to store blueprint files
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 65b2b47d..38d4787d 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -514,10 +514,23 @@ pub fn add(
+                             blueprint_compiler.addArgs(&.{
+                                 b.fmt("{d}", .{blueprint_file.major}),
+                                 b.fmt("{d}", .{blueprint_file.minor}),
+-                                b.fmt("{d}", .{blueprint_file.micro}),
+                             });
+-                            const ui_file = blueprint_compiler.addOutputFileArg(b.fmt("{s}.ui", .{blueprint_file.name}));
+-                            blueprint_compiler.addFileArg(b.path(b.fmt("src/apprt/gtk/ui/{s}.blp", .{blueprint_file.name})));
++                            const ui_file = blueprint_compiler.addOutputFileArg(b.fmt(
++                                "{d}.{d}/{s}.ui",
++                                .{
++                                    blueprint_file.major,
++                                    blueprint_file.minor,
++                                    blueprint_file.name,
++                                },
++                            ));
++                            blueprint_compiler.addFileArg(b.path(b.fmt(
++                                "src/apprt/gtk/ui/{d}.{d}/{s}.blp",
++                                .{
++                                    blueprint_file.major,
++                                    blueprint_file.minor,
++                                    blueprint_file.name,
++                                },
++                            )));
+                             generate.addFileArg(ui_file);
+                         }
+ 
+
+commit a85651fe4f11375257ca7b4c33c44cca06a1353e
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Fri Feb 28 11:33:08 2025 +0100
+
+    gtk: implement quick terminal
+    
+    Using `gtk4-layer-shell` still seems like the path of least resistance,
+    and to my delight it pretty much Just Works. Hurrah!
+    
+    This implementation could do with some further polish (e.g. animations,
+    which can be implemented via libadwaita's animations API, and global
+    shortcuts), but as a MVP it works well enough.
+    
+    It even supports tabs!
+    
+    Fixes #4624.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 38d4787d..26c4d84c 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -460,12 +460,8 @@ pub fn add(
+ 
+                 if (self.config.wayland) {
+                     const scanner = Scanner.create(b.dependency("zig_wayland", .{}), .{
+-                        // We shouldn't be using getPath but we need to for now
+-                        // https://codeberg.org/ifreund/zig-wayland/issues/66
+-                        .wayland_xml = b.dependency("wayland", .{})
+-                            .path("protocol/wayland.xml"),
+-                        .wayland_protocols = b.dependency("wayland_protocols", .{})
+-                            .path(""),
++                        .wayland_xml = b.dependency("wayland", .{}).path("protocol/wayland.xml"),
++                        .wayland_protocols = b.dependency("wayland_protocols", .{}).path(""),
+                     });
+ 
+                     const wayland = b.createModule(.{ .root_source_file = scanner.result });
+@@ -485,6 +481,8 @@ pub fn add(
+ 
+                     step.root_module.addImport("wayland", wayland);
+                     step.root_module.addImport("gdk_wayland", gobject.module("gdkwayland4"));
++
++                    if (self.config.layer_shell) step.linkSystemLibrary2("gtk4-layer-shell", dynamic_link_opts);
+                     step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
+                 }
+ 
+
+commit 8f7425f78c5d284bf149cc43847af2d998fa067f
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Tue Mar 4 21:01:04 2025 +0100
+
+    gtk: implement quick terminal slide animation
+    
+    Yet another protocol that as far as I know only KWin implements.
+    Oh well, might as well let KDE users such as myself enjoy it OOTB
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 26c4d84c..7b2d10c6 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -474,10 +474,12 @@ pub fn add(
+                     // FIXME: replace with `zxdg_decoration_v1` once GTK merges https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/6398
+                     scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/blur.xml"));
+                     scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/server-decoration.xml"));
++                    scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/slide.xml"));
+ 
+                     scanner.generate("wl_compositor", 1);
+                     scanner.generate("org_kde_kwin_blur_manager", 1);
+                     scanner.generate("org_kde_kwin_server_decoration_manager", 1);
++                    scanner.generate("org_kde_kwin_slide_manager", 1);
+ 
+                     step.root_module.addImport("wayland", wayland);
+                     step.root_module.addImport("gdk_wayland", gobject.module("gdkwayland4"));
+
+commit cd442eb9e26e2eb0dbae9a292d0203ef23c615fd
+Author: Leah Amelia Chen <hi@pluie.me>
+Date:   Fri Mar 7 17:03:23 2025 +0100
+
+    gtk: build gtk4-layer-shell ourselves
+    
+    As of now `gtk4-layer-shell` is unavailable on recent, stable releases
+    of many distros (Debian 12, Ubuntu 24.04, openSUSE Leap & Tumbleweed, etc.)
+    and outdated on many others (Nixpkgs 24.11/unstable, Fedora 41, etc.)
+    This is inconvenient for our users and severely limits where the quick
+    terminal can be used. As a result we then build gtk4-layer-shell ourselves
+    by default unless `--system` or `-fsys=gtk4-layer-shell` are specified.
+    This also allows me to add an idiomatic Zig API on top of the library
+    and avoiding adding even more raw C code in the GTK apprt.
+    
+    Since we now build gtk4-layer-shell it should be theoretically available
+    on all Linux systems we target. As such, the `-Dgtk-layer-shell` build
+    option has been removed. This is somewhat of an experimental change as
+    I don't know if gtk4-layer-shell works perfectly across all distros, and
+    we can always add the option back if need be.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 7b2d10c6..d592aee7 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -484,7 +484,24 @@ pub fn add(
+                     step.root_module.addImport("wayland", wayland);
+                     step.root_module.addImport("gdk_wayland", gobject.module("gdkwayland4"));
+ 
+-                    if (self.config.layer_shell) step.linkSystemLibrary2("gtk4-layer-shell", dynamic_link_opts);
++                    const gtk4_layer_shell = b.dependency("gtk4_layer_shell", .{
++                        .target = target,
++                        .optimize = optimize,
++                    });
++                    const layer_shell_module = gtk4_layer_shell.module("gtk4-layer-shell");
++                    layer_shell_module.addImport("gtk", gobject.module("gtk4"));
++                    step.root_module.addImport("gtk4-layer-shell", layer_shell_module);
++
++                    // IMPORTANT: gtk4-layer-shell must be linked BEFORE
++                    // wayland-client, as it relies on shimming libwayland's APIs.
++                    if (b.systemIntegrationOption("gtk4-layer-shell", .{})) {
++                        step.linkSystemLibrary2("gtk4-layer-shell", dynamic_link_opts);
++                    } else {
++                        // gtk4-layer-shell *must* be dynamically linked,
++                        // so we don't add it as a static library
++                        step.linkLibrary(gtk4_layer_shell.artifact("gtk4-layer-shell"));
++                    }
++
+                     step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
+                 }
+ 
+
+commit dd95f727ec785ba288fd874fb8b1c3a9b182db95
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 6 07:23:00 2025 -0800
+
+    build: add libintl for macOS builds
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index d592aee7..28eb7fa6 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -381,6 +381,17 @@ pub fn add(
+         if (self.config.renderer == .opengl) {
+             step.linkFramework("OpenGL");
+         }
++
++        // Apple platforms do not include libc libintl so we bundle it.
++        // This is LGPL but since our source code is open source we are
++        // in compliance with the LGPL since end users can modify this
++        // build script to replace the bundled libintl with their own.
++        const libintl_dep = b.dependency("libintl", .{
++            .target = target,
++            .optimize = optimize,
++        });
++        step.linkLibrary(libintl_dep.artifact("intl"));
++        try static_libs.append(libintl_dep.artifact("intl").getEmittedBin());
+     }
+ 
+     // cimgui
+
+commit 35aab1a3027127e082e000312e26f3db7362def8
+Author: azhn <anthony.zh.oon@gmail.com>
+Date:   Sat Mar 8 18:13:17 2025 +1100
+
+    build: use pkgconfig name for gtk4-layer-shell system integration
+    
+    By linking using the pkg-config name we gain the compiler flags in pkgconf
+    for linking, specifically the -I <headers> to include system-installed
+    headers. This allows the gtk4-layer-shell pkg to not require the source
+    files specified in the `pkg/gtk4-layer-shell/build.zig.zon`.
+    
+    pkg(gtk4-layer-shell): Refactor to allow dynamic linking
+    
+    Refactored `pkg/gtk4-layer-shell/build.zig` to have similar structure
+    to `pkg/oniguruma/build.zig`.
+    
+    Now dynamic link using pkgconfig, this adds pkgconfig compiler flags.
+    So we are now using system-installed headers to resolve @cInclude().
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 28eb7fa6..a1a38587 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -506,7 +506,7 @@ pub fn add(
+                     // IMPORTANT: gtk4-layer-shell must be linked BEFORE
+                     // wayland-client, as it relies on shimming libwayland's APIs.
+                     if (b.systemIntegrationOption("gtk4-layer-shell", .{})) {
+-                        step.linkSystemLibrary2("gtk4-layer-shell", dynamic_link_opts);
++                        step.linkSystemLibrary2("gtk4-layer-shell-0", dynamic_link_opts);
+                     } else {
+                         // gtk4-layer-shell *must* be dynamically linked,
+                         // so we don't add it as a static library
+
+commit 7e2286eb8c603ade782a3970911531595d57e280
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Mar 11 14:33:33 2025 -0700
+
+    Zig 0.14
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index a1a38587..18f43b38 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -320,8 +320,8 @@ pub fn add(
+ 
+     // We always require the system SDK so that our system headers are available.
+     // This makes things like `os/log.h` available for cross-compiling.
+-    if (step.rootModuleTarget().isDarwin()) {
+-        try @import("apple_sdk").addPaths(b, &step.root_module);
++    if (step.rootModuleTarget().os.tag.isDarwin()) {
++        try @import("apple_sdk").addPaths(b, step.root_module);
+ 
+         const metallib = self.metallib.?;
+         metallib.output.addStepDependencies(&step.step);
+@@ -363,7 +363,7 @@ pub fn add(
+     }).module("zf"));
+ 
+     // Mac Stuff
+-    if (step.rootModuleTarget().isDarwin()) {
++    if (step.rootModuleTarget().os.tag.isDarwin()) {
+         const objc_dep = b.dependency("zig_objc", .{
+             .target = target,
+             .optimize = optimize,
+@@ -470,7 +470,7 @@ pub fn add(
+                 }
+ 
+                 if (self.config.wayland) {
+-                    const scanner = Scanner.create(b.dependency("zig_wayland", .{}), .{
++                    const scanner = Scanner.create(b.dependency("zig_wayland", .{}).builder, .{
+                         .wayland_xml = b.dependency("wayland", .{}).path("protocol/wayland.xml"),
+                         .wayland_protocols = b.dependency("wayland_protocols", .{}).path(""),
+                     });
+@@ -523,7 +523,7 @@ pub fn add(
+                         const generate_gresource_xml = b.addExecutable(.{
+                             .name = "generate_gresource_xml",
+                             .root_source_file = b.path("src/apprt/gtk/gresource.zig"),
+-                            .target = b.host,
++                            .target = b.graph.host,
+                         });
+ 
+                         const generate = b.addRunArtifact(generate_gresource_xml);
+@@ -531,7 +531,7 @@ pub fn add(
+                         const gtk_blueprint_compiler = b.addExecutable(.{
+                             .name = "gtk_blueprint_compiler",
+                             .root_source_file = b.path("src/apprt/gtk/blueprint_compiler.zig"),
+-                            .target = b.host,
++                            .target = b.graph.host,
+                         });
+                         gtk_blueprint_compiler.linkSystemLibrary2("gtk4", dynamic_link_opts);
+                         gtk_blueprint_compiler.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+@@ -569,7 +569,7 @@ pub fn add(
+                         const gtk_builder_check = b.addExecutable(.{
+                             .name = "gtk_builder_check",
+                             .root_source_file = b.path("src/apprt/gtk/builder_check.zig"),
+-                            .target = b.host,
++                            .target = b.graph.host,
+                         });
+                         gtk_builder_check.root_module.addOptions("build_options", self.options);
+                         gtk_builder_check.root_module.addImport("gtk", gobject.module("gtk4"));
+@@ -593,7 +593,6 @@ pub fn add(
+                     });
+                     const ghostty_resources_c = generate_resources_c.addOutputFileArg("ghostty_resources.c");
+                     generate_resources_c.addFileArg(gresource_xml);
+-                    generate_resources_c.extra_file_dependencies = &gresource.dependencies;
+                     step.addCSourceFile(.{ .file = ghostty_resources_c, .flags = &.{} });
+ 
+                     const generate_resources_h = b.addSystemCommand(&.{
+@@ -605,7 +604,6 @@ pub fn add(
+                     });
+                     const ghostty_resources_h = generate_resources_h.addOutputFileArg("ghostty_resources.h");
+                     generate_resources_h.addFileArg(gresource_xml);
+-                    generate_resources_h.extra_file_dependencies = &gresource.dependencies;
+                     step.addIncludePath(ghostty_resources_h.dirname());
+                 }
+             },
+
+commit 99bde549af7a6ea9fbfe47ca16f6ec50bd10ab80
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 12 13:53:28 2025 -0700
+
+    fix /usr/lib issues
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 18f43b38..ae9f09af 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -277,7 +277,10 @@ pub fn add(
+     // on x86_64.
+     if (step.rootModuleTarget().os.tag == .linux) {
+         const triple = try step.rootModuleTarget().linuxTriple(b.allocator);
+-        step.addLibraryPath(.{ .cwd_relative = b.fmt("/usr/lib/{s}", .{triple}) });
++        const path = b.fmt("/usr/lib/{s}", .{triple});
++        if (std.fs.accessAbsolute(path, .{})) {
++            step.addLibraryPath(.{ .cwd_relative = path });
++        } else |_| {}
+     }
+ 
+     // C files
+
+commit 221f905a1c5332a96f04918ea87d1c85a05af035
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 13 20:05:33 2025 -0700
+
+    pkg/glfw
+    
+    Closes #6702
+    
+    This removes our mach-glfw dependency and replaces it with an in-tree
+    pkg/glfw that includes both the source for compiling glfw as well as the
+    Zig bindings. This matches the pattern from our other packages.
+    
+    This is based on the upstream mach-glfw work and therefore includes the
+    original license and copyright information.
+    
+    The reasoning is stated in the issue but to summarize for the commit:
+    
+      - mach-glfw is no longer maintained, so we have to take ownership
+      - mach-glfw depended on some large blobs of header files to enable
+        cross-compilation but this isn't something we actually care about,
+        so we can (and do) drop the blobs
+      - mach-glfw blobs were hosted on mach hosts. given mach-glfw is
+        unmaintained, we can't rely on this hosting
+      - mach-glfw relied on a "glfw" package which was owned by another
+        person to be Zig 0.14 compatible, but we no longer need to rely on
+        this
+      - mach-glfw builds were outdated based on latest Zig practices
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index ae9f09af..4e39c0b3 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -438,12 +438,15 @@ pub fn add(
+         switch (self.config.app_runtime) {
+             .none => {},
+ 
+-            .glfw => glfw: {
+-                const mach_glfw_dep = b.lazyDependency("mach_glfw", .{
++            .glfw => {
++                const glfw_dep = b.dependency("glfw", .{
+                     .target = target,
+                     .optimize = optimize,
+-                }) orelse break :glfw;
+-                step.root_module.addImport("glfw", mach_glfw_dep.module("mach-glfw"));
++                });
++                step.root_module.addImport(
++                    "glfw",
++                    glfw_dep.module("glfw"),
++                );
+             },
+ 
+             .gtk => {
+
+commit 572fc8b5d78310d86cda493b241bc17714f7d44b
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Mar 8 23:19:16 2025 -0600
+
+    gtk: convert Surface to zig-gobject
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index ae9f09af..0ccf769e 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -452,12 +452,12 @@ pub fn add(
+                     .optimize = optimize,
+                 });
+                 const gobject_imports = .{
+-                    .{ "gobject", "gobject2" },
++                    .{ "adw", "adw1" },
++                    .{ "gdk", "gdk4" },
+                     .{ "gio", "gio2" },
+                     .{ "glib", "glib2" },
++                    .{ "gobject", "gobject2" },
+                     .{ "gtk", "gtk4" },
+-                    .{ "gdk", "gdk4" },
+-                    .{ "adw", "adw1" },
+                 };
+                 inline for (gobject_imports) |import| {
+                     const name, const module = import;
+
+commit f37d1fd7eda5596226582e6e43c01c3251fd6eb9
+Merge: c2aac458 572fc8b5
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Fri Mar 14 10:14:33 2025 -0500
+
+    gtk: convert Surface to zig-gobject (#6634)
+    
+    Marking this is as draft because I want to test this further before
+    saying that it's ready, but putting it out there for feedback.
+
+
+commit cfea2ea12cf1ef805659ffeae058f03b4639c788
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Mar 13 21:30:24 2025 -0700
+
+    build: mark most dependencies as lazy
+    
+    Lazy dependencies are only fetched if the build script would actually
+    reach a usage of that dependency at runtime (when the `lazyDependency`
+    function is called). This can save a lot of network traffic, disk uage,
+    and time because we don't have to fetch and build dependencies that we
+    don't actually need.
+    
+    Prior to this commit, Ghostty fetched almost everything for all
+    platforms and configurations all the time. This commit reverses that to
+    fetching almost nothing until it's actually needed.
+    
+    There are very little downsides to doing this[1]. One downside is `zig
+    build --fetch` doesn't fetch lazy dependencies, but we don't rely on
+    this command for packaging and suggest using our custom shell script
+    that downloads a cached list of URLs (`build.zig.zon.txt`).
+    
+    This commit doesn't cover 100% of dependencies, since some provide no
+    benefit to make lazy while the complexity to make them lazy is higher
+    (in code style typically).
+    
+    Conversely, some simple dependencies are marked lazy even if they're
+    almost always needed if they don't introduce any real complexity to the
+    code, because there is very little downside to do so.
+    
+    [1]: https://ziggit.dev/t/lazy-dependencies-best-dependencies/5509/5
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index b9fb9383..88d64ca3 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -1,7 +1,6 @@
+ const SharedDeps = @This();
+ 
+ const std = @import("std");
+-const Scanner = @import("zig_wayland").Scanner;
+ const Config = @import("Config.zig");
+ const HelpStrings = @import("HelpStrings.zig");
+ const MetallibStep = @import("MetallibStep.zig");
+@@ -106,61 +105,72 @@ pub fn add(
+     // Freetype
+     _ = b.systemIntegrationOption("freetype", .{}); // Shows it in help
+     if (self.config.font_backend.hasFreetype()) {
+-        const freetype_dep = b.dependency("freetype", .{
++        if (b.lazyDependency("freetype", .{
+             .target = target,
+             .optimize = optimize,
+             .@"enable-libpng" = true,
+-        });
+-        step.root_module.addImport("freetype", freetype_dep.module("freetype"));
+-
+-        if (b.systemIntegrationOption("freetype", .{})) {
+-            step.linkSystemLibrary2("bzip2", dynamic_link_opts);
+-            step.linkSystemLibrary2("freetype2", dynamic_link_opts);
+-        } else {
+-            step.linkLibrary(freetype_dep.artifact("freetype"));
+-            try static_libs.append(freetype_dep.artifact("freetype").getEmittedBin());
++        })) |freetype_dep| {
++            step.root_module.addImport(
++                "freetype",
++                freetype_dep.module("freetype"),
++            );
++
++            if (b.systemIntegrationOption("freetype", .{})) {
++                step.linkSystemLibrary2("bzip2", dynamic_link_opts);
++                step.linkSystemLibrary2("freetype2", dynamic_link_opts);
++            } else {
++                step.linkLibrary(freetype_dep.artifact("freetype"));
++                try static_libs.append(
++                    freetype_dep.artifact("freetype").getEmittedBin(),
++                );
++            }
+         }
+     }
+ 
+     // Harfbuzz
+     _ = b.systemIntegrationOption("harfbuzz", .{}); // Shows it in help
+     if (self.config.font_backend.hasHarfbuzz()) {
+-        const harfbuzz_dep = b.dependency("harfbuzz", .{
++        if (b.lazyDependency("harfbuzz", .{
+             .target = target,
+             .optimize = optimize,
+             .@"enable-freetype" = true,
+             .@"enable-coretext" = self.config.font_backend.hasCoretext(),
+-        });
+-
+-        step.root_module.addImport(
+-            "harfbuzz",
+-            harfbuzz_dep.module("harfbuzz"),
+-        );
+-        if (b.systemIntegrationOption("harfbuzz", .{})) {
+-            step.linkSystemLibrary2("harfbuzz", dynamic_link_opts);
+-        } else {
+-            step.linkLibrary(harfbuzz_dep.artifact("harfbuzz"));
+-            try static_libs.append(harfbuzz_dep.artifact("harfbuzz").getEmittedBin());
++        })) |harfbuzz_dep| {
++            step.root_module.addImport(
++                "harfbuzz",
++                harfbuzz_dep.module("harfbuzz"),
++            );
++            if (b.systemIntegrationOption("harfbuzz", .{})) {
++                step.linkSystemLibrary2("harfbuzz", dynamic_link_opts);
++            } else {
++                step.linkLibrary(harfbuzz_dep.artifact("harfbuzz"));
++                try static_libs.append(
++                    harfbuzz_dep.artifact("harfbuzz").getEmittedBin(),
++                );
++            }
+         }
+     }
+ 
+     // Fontconfig
+     _ = b.systemIntegrationOption("fontconfig", .{}); // Shows it in help
+     if (self.config.font_backend.hasFontconfig()) {
+-        const fontconfig_dep = b.dependency("fontconfig", .{
++        if (b.lazyDependency("fontconfig", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        step.root_module.addImport(
+-            "fontconfig",
+-            fontconfig_dep.module("fontconfig"),
+-        );
+-
+-        if (b.systemIntegrationOption("fontconfig", .{})) {
+-            step.linkSystemLibrary2("fontconfig", dynamic_link_opts);
+-        } else {
+-            step.linkLibrary(fontconfig_dep.artifact("fontconfig"));
+-            try static_libs.append(fontconfig_dep.artifact("fontconfig").getEmittedBin());
++        })) |fontconfig_dep| {
++            step.root_module.addImport(
++                "fontconfig",
++                fontconfig_dep.module("fontconfig"),
++            );
++
++            if (b.systemIntegrationOption("fontconfig", .{})) {
++                step.linkSystemLibrary2("fontconfig", dynamic_link_opts);
++            } else {
++                step.linkLibrary(fontconfig_dep.artifact("fontconfig"));
++                try static_libs.append(
++                    fontconfig_dep.artifact("fontconfig").getEmittedBin(),
++                );
++            }
+         }
+     }
+ 
+@@ -169,105 +179,142 @@ pub fn add(
+     // libs list if we're not using system integration. The dependencies
+     // will handle linking it.
+     if (!b.systemIntegrationOption("libpng", .{})) {
+-        const libpng_dep = b.dependency("libpng", .{
++        if (b.lazyDependency("libpng", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        step.linkLibrary(libpng_dep.artifact("png"));
+-        try static_libs.append(libpng_dep.artifact("png").getEmittedBin());
++        })) |libpng_dep| {
++            step.linkLibrary(libpng_dep.artifact("png"));
++            try static_libs.append(
++                libpng_dep.artifact("png").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // Zlib - same as libpng, only used through dependencies.
+     if (!b.systemIntegrationOption("zlib", .{})) {
+-        const zlib_dep = b.dependency("zlib", .{
++        if (b.lazyDependency("zlib", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        step.linkLibrary(zlib_dep.artifact("z"));
+-        try static_libs.append(zlib_dep.artifact("z").getEmittedBin());
++        })) |zlib_dep| {
++            step.linkLibrary(zlib_dep.artifact("z"));
++            try static_libs.append(
++                zlib_dep.artifact("z").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // Oniguruma
+-    const oniguruma_dep = b.dependency("oniguruma", .{
++    if (b.lazyDependency("oniguruma", .{
+         .target = target,
+         .optimize = optimize,
+-    });
+-    step.root_module.addImport("oniguruma", oniguruma_dep.module("oniguruma"));
+-    if (b.systemIntegrationOption("oniguruma", .{})) {
+-        step.linkSystemLibrary2("oniguruma", dynamic_link_opts);
+-    } else {
+-        step.linkLibrary(oniguruma_dep.artifact("oniguruma"));
+-        try static_libs.append(oniguruma_dep.artifact("oniguruma").getEmittedBin());
++    })) |oniguruma_dep| {
++        step.root_module.addImport(
++            "oniguruma",
++            oniguruma_dep.module("oniguruma"),
++        );
++        if (b.systemIntegrationOption("oniguruma", .{})) {
++            step.linkSystemLibrary2("oniguruma", dynamic_link_opts);
++        } else {
++            step.linkLibrary(oniguruma_dep.artifact("oniguruma"));
++            try static_libs.append(
++                oniguruma_dep.artifact("oniguruma").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // Glslang
+-    const glslang_dep = b.dependency("glslang", .{
++    if (b.lazyDependency("glslang", .{
+         .target = target,
+         .optimize = optimize,
+-    });
+-    step.root_module.addImport("glslang", glslang_dep.module("glslang"));
+-    if (b.systemIntegrationOption("glslang", .{})) {
+-        step.linkSystemLibrary2("glslang", dynamic_link_opts);
+-        step.linkSystemLibrary2("glslang-default-resource-limits", dynamic_link_opts);
+-    } else {
+-        step.linkLibrary(glslang_dep.artifact("glslang"));
+-        try static_libs.append(glslang_dep.artifact("glslang").getEmittedBin());
++    })) |glslang_dep| {
++        step.root_module.addImport("glslang", glslang_dep.module("glslang"));
++        if (b.systemIntegrationOption("glslang", .{})) {
++            step.linkSystemLibrary2("glslang", dynamic_link_opts);
++            step.linkSystemLibrary2(
++                "glslang-default-resource-limits",
++                dynamic_link_opts,
++            );
++        } else {
++            step.linkLibrary(glslang_dep.artifact("glslang"));
++            try static_libs.append(
++                glslang_dep.artifact("glslang").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // Spirv-cross
+-    const spirv_cross_dep = b.dependency("spirv_cross", .{
++    if (b.lazyDependency("spirv_cross", .{
+         .target = target,
+         .optimize = optimize,
+-    });
+-    step.root_module.addImport("spirv_cross", spirv_cross_dep.module("spirv_cross"));
+-    if (b.systemIntegrationOption("spirv-cross", .{})) {
+-        step.linkSystemLibrary2("spirv-cross", dynamic_link_opts);
+-    } else {
+-        step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
+-        try static_libs.append(spirv_cross_dep.artifact("spirv_cross").getEmittedBin());
++    })) |spirv_cross_dep| {
++        step.root_module.addImport(
++            "spirv_cross",
++            spirv_cross_dep.module("spirv_cross"),
++        );
++        if (b.systemIntegrationOption("spirv-cross", .{})) {
++            step.linkSystemLibrary2("spirv-cross", dynamic_link_opts);
++        } else {
++            step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
++            try static_libs.append(
++                spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // Simdutf
+     if (b.systemIntegrationOption("simdutf", .{})) {
+         step.linkSystemLibrary2("simdutf", dynamic_link_opts);
+     } else {
+-        const simdutf_dep = b.dependency("simdutf", .{
++        if (b.lazyDependency("simdutf", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        step.linkLibrary(simdutf_dep.artifact("simdutf"));
+-        try static_libs.append(simdutf_dep.artifact("simdutf").getEmittedBin());
++        })) |simdutf_dep| {
++            step.linkLibrary(simdutf_dep.artifact("simdutf"));
++            try static_libs.append(
++                simdutf_dep.artifact("simdutf").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // Sentry
+     if (self.config.sentry) {
+-        const sentry_dep = b.dependency("sentry", .{
++        if (b.lazyDependency("sentry", .{
+             .target = target,
+             .optimize = optimize,
+             .backend = .breakpad,
+-        });
+-
+-        step.root_module.addImport("sentry", sentry_dep.module("sentry"));
+-
+-        // Sentry
+-        step.linkLibrary(sentry_dep.artifact("sentry"));
+-        try static_libs.append(sentry_dep.artifact("sentry").getEmittedBin());
+-
+-        // We also need to include breakpad in the static libs.
+-        const breakpad_dep = sentry_dep.builder.dependency("breakpad", .{
+-            .target = target,
+-            .optimize = optimize,
+-        });
+-        try static_libs.append(breakpad_dep.artifact("breakpad").getEmittedBin());
++        })) |sentry_dep| {
++            step.root_module.addImport(
++                "sentry",
++                sentry_dep.module("sentry"),
++            );
++            step.linkLibrary(sentry_dep.artifact("sentry"));
++            try static_libs.append(
++                sentry_dep.artifact("sentry").getEmittedBin(),
++            );
++
++            // We also need to include breakpad in the static libs.
++            if (sentry_dep.builder.lazyDependency("breakpad", .{
++                .target = target,
++                .optimize = optimize,
++            })) |breakpad_dep| {
++                try static_libs.append(
++                    breakpad_dep.artifact("breakpad").getEmittedBin(),
++                );
++            }
++        }
+     }
+ 
+     // Wasm we do manually since it is such a different build.
+     if (step.rootModuleTarget().cpu.arch == .wasm32) {
+-        const js_dep = b.dependency("zig_js", .{
++        if (b.lazyDependency("zig_js", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        step.root_module.addImport("zig-js", js_dep.module("zig-js"));
++        })) |js_dep| {
++            step.root_module.addImport(
++                "zig-js",
++                js_dep.module("zig-js"),
++            );
++        }
+ 
+         return static_libs;
+     }
+@@ -334,52 +381,72 @@ pub fn add(
+     }
+ 
+     // Other dependencies, mostly pure Zig
+-    step.root_module.addImport("opengl", b.dependency(
+-        "opengl",
+-        .{},
+-    ).module("opengl"));
+-    step.root_module.addImport("vaxis", b.dependency("vaxis", .{
+-        .target = target,
+-        .optimize = optimize,
+-    }).module("vaxis"));
+-    step.root_module.addImport("wuffs", b.dependency("wuffs", .{
+-        .target = target,
+-        .optimize = optimize,
+-    }).module("wuffs"));
+-    step.root_module.addImport("xev", b.dependency("libxev", .{
++    if (b.lazyDependency("opengl", .{})) |dep| {
++        step.root_module.addImport("opengl", dep.module("opengl"));
++    }
++    if (b.lazyDependency("vaxis", .{})) |dep| {
++        step.root_module.addImport("vaxis", dep.module("vaxis"));
++    }
++    if (b.lazyDependency("wuffs", .{
+         .target = target,
+         .optimize = optimize,
+-    }).module("xev"));
+-    step.root_module.addImport("z2d", b.addModule("z2d", .{
+-        .root_source_file = b.dependency("z2d", .{}).path("src/z2d.zig"),
++    })) |dep| {
++        step.root_module.addImport("wuffs", dep.module("wuffs"));
++    }
++    if (b.lazyDependency("libxev", .{
+         .target = target,
+         .optimize = optimize,
+-    }));
+-    step.root_module.addImport("ziglyph", b.dependency("ziglyph", .{
++    })) |dep| {
++        step.root_module.addImport("xev", dep.module("xev"));
++    }
++    if (b.lazyDependency("z2d", .{})) |dep| {
++        step.root_module.addImport("z2d", b.addModule("z2d", .{
++            .root_source_file = dep.path("src/z2d.zig"),
++            .target = target,
++            .optimize = optimize,
++        }));
++    }
++    if (b.lazyDependency("ziglyph", .{
+         .target = target,
+         .optimize = optimize,
+-    }).module("ziglyph"));
+-    step.root_module.addImport("zf", b.dependency("zf", .{
++    })) |dep| {
++        step.root_module.addImport("ziglyph", dep.module("ziglyph"));
++    }
++    if (b.lazyDependency("zf", .{
+         .target = target,
+         .optimize = optimize,
+         .with_tui = false,
+-    }).module("zf"));
++    })) |dep| {
++        step.root_module.addImport("zf", dep.module("zf"));
++    }
+ 
+     // Mac Stuff
+     if (step.rootModuleTarget().os.tag.isDarwin()) {
+-        const objc_dep = b.dependency("zig_objc", .{
++        if (b.lazyDependency("zig_objc", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        const macos_dep = b.dependency("macos", .{
++        })) |objc_dep| {
++            step.root_module.addImport(
++                "objc",
++                objc_dep.module("objc"),
++            );
++        }
++
++        if (b.lazyDependency("macos", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-
+-        step.root_module.addImport("objc", objc_dep.module("objc"));
+-        step.root_module.addImport("macos", macos_dep.module("macos"));
+-        step.linkLibrary(macos_dep.artifact("macos"));
+-        try static_libs.append(macos_dep.artifact("macos").getEmittedBin());
++        })) |macos_dep| {
++            step.root_module.addImport(
++                "macos",
++                macos_dep.module("macos"),
++            );
++            step.linkLibrary(
++                macos_dep.artifact("macos"),
++            );
++            try static_libs.append(
++                macos_dep.artifact("macos").getEmittedBin(),
++            );
++        }
+ 
+         if (self.config.renderer == .opengl) {
+             step.linkFramework("OpenGL");
+@@ -389,38 +456,44 @@ pub fn add(
+         // This is LGPL but since our source code is open source we are
+         // in compliance with the LGPL since end users can modify this
+         // build script to replace the bundled libintl with their own.
+-        const libintl_dep = b.dependency("libintl", .{
++        if (b.lazyDependency("libintl", .{
+             .target = target,
+             .optimize = optimize,
+-        });
+-        step.linkLibrary(libintl_dep.artifact("intl"));
+-        try static_libs.append(libintl_dep.artifact("intl").getEmittedBin());
++        })) |libintl_dep| {
++            step.linkLibrary(libintl_dep.artifact("intl"));
++            try static_libs.append(
++                libintl_dep.artifact("intl").getEmittedBin(),
++            );
++        }
+     }
+ 
+     // cimgui
+-    const cimgui_dep = b.dependency("cimgui", .{
++    if (b.lazyDependency("cimgui", .{
+         .target = target,
+         .optimize = optimize,
+-    });
+-    step.root_module.addImport("cimgui", cimgui_dep.module("cimgui"));
+-    step.linkLibrary(cimgui_dep.artifact("cimgui"));
+-    try static_libs.append(cimgui_dep.artifact("cimgui").getEmittedBin());
++    })) |cimgui_dep| {
++        step.root_module.addImport("cimgui", cimgui_dep.module("cimgui"));
++        step.linkLibrary(cimgui_dep.artifact("cimgui"));
++        try static_libs.append(cimgui_dep.artifact("cimgui").getEmittedBin());
++    }
+ 
+     // Highway
+-    const highway_dep = b.dependency("highway", .{
++    if (b.lazyDependency("highway", .{
+         .target = target,
+         .optimize = optimize,
+-    });
+-    step.linkLibrary(highway_dep.artifact("highway"));
+-    try static_libs.append(highway_dep.artifact("highway").getEmittedBin());
++    })) |highway_dep| {
++        step.linkLibrary(highway_dep.artifact("highway"));
++        try static_libs.append(highway_dep.artifact("highway").getEmittedBin());
++    }
+ 
+     // utfcpp - This is used as a dependency on our hand-written C++ code
+-    const utfcpp_dep = b.dependency("utfcpp", .{
++    if (b.lazyDependency("utfcpp", .{
+         .target = target,
+         .optimize = optimize,
+-    });
+-    step.linkLibrary(utfcpp_dep.artifact("utfcpp"));
+-    try static_libs.append(utfcpp_dep.artifact("utfcpp").getEmittedBin());
++    })) |utfcpp_dep| {
++        step.linkLibrary(utfcpp_dep.artifact("utfcpp"));
++        try static_libs.append(utfcpp_dep.artifact("utfcpp").getEmittedBin());
++    }
+ 
+     // If we're building an exe then we have additional dependencies.
+     if (step.kind != .lib) {
+@@ -438,181 +511,17 @@ pub fn add(
+         switch (self.config.app_runtime) {
+             .none => {},
+ 
+-            .glfw => {
+-                const glfw_dep = b.dependency("glfw", .{
+-                    .target = target,
+-                    .optimize = optimize,
+-                });
++            .glfw => if (b.lazyDependency("glfw", .{
++                .target = target,
++                .optimize = optimize,
++            })) |glfw_dep| {
+                 step.root_module.addImport(
+                     "glfw",
+                     glfw_dep.module("glfw"),
+                 );
+             },
+ 
+-            .gtk => {
+-                const gobject = b.dependency("gobject", .{
+-                    .target = target,
+-                    .optimize = optimize,
+-                });
+-                const gobject_imports = .{
+-                    .{ "adw", "adw1" },
+-                    .{ "gdk", "gdk4" },
+-                    .{ "gio", "gio2" },
+-                    .{ "glib", "glib2" },
+-                    .{ "gobject", "gobject2" },
+-                    .{ "gtk", "gtk4" },
+-                };
+-                inline for (gobject_imports) |import| {
+-                    const name, const module = import;
+-                    step.root_module.addImport(name, gobject.module(module));
+-                }
+-
+-                step.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-                step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-
+-                if (self.config.x11) {
+-                    step.linkSystemLibrary2("X11", dynamic_link_opts);
+-                    step.root_module.addImport("gdk_x11", gobject.module("gdkx114"));
+-                }
+-
+-                if (self.config.wayland) {
+-                    const scanner = Scanner.create(b.dependency("zig_wayland", .{}).builder, .{
+-                        .wayland_xml = b.dependency("wayland", .{}).path("protocol/wayland.xml"),
+-                        .wayland_protocols = b.dependency("wayland_protocols", .{}).path(""),
+-                    });
+-
+-                    const wayland = b.createModule(.{ .root_source_file = scanner.result });
+-
+-                    const plasma_wayland_protocols = b.dependency("plasma_wayland_protocols", .{
+-                        .target = target,
+-                        .optimize = optimize,
+-                    });
+-
+-                    // FIXME: replace with `zxdg_decoration_v1` once GTK merges https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/6398
+-                    scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/blur.xml"));
+-                    scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/server-decoration.xml"));
+-                    scanner.addCustomProtocol(plasma_wayland_protocols.path("src/protocols/slide.xml"));
+-
+-                    scanner.generate("wl_compositor", 1);
+-                    scanner.generate("org_kde_kwin_blur_manager", 1);
+-                    scanner.generate("org_kde_kwin_server_decoration_manager", 1);
+-                    scanner.generate("org_kde_kwin_slide_manager", 1);
+-
+-                    step.root_module.addImport("wayland", wayland);
+-                    step.root_module.addImport("gdk_wayland", gobject.module("gdkwayland4"));
+-
+-                    const gtk4_layer_shell = b.dependency("gtk4_layer_shell", .{
+-                        .target = target,
+-                        .optimize = optimize,
+-                    });
+-                    const layer_shell_module = gtk4_layer_shell.module("gtk4-layer-shell");
+-                    layer_shell_module.addImport("gtk", gobject.module("gtk4"));
+-                    step.root_module.addImport("gtk4-layer-shell", layer_shell_module);
+-
+-                    // IMPORTANT: gtk4-layer-shell must be linked BEFORE
+-                    // wayland-client, as it relies on shimming libwayland's APIs.
+-                    if (b.systemIntegrationOption("gtk4-layer-shell", .{})) {
+-                        step.linkSystemLibrary2("gtk4-layer-shell-0", dynamic_link_opts);
+-                    } else {
+-                        // gtk4-layer-shell *must* be dynamically linked,
+-                        // so we don't add it as a static library
+-                        step.linkLibrary(gtk4_layer_shell.artifact("gtk4-layer-shell"));
+-                    }
+-
+-                    step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
+-                }
+-
+-                {
+-                    const gresource = @import("../apprt/gtk/gresource.zig");
+-
+-                    const gresource_xml = gresource_xml: {
+-                        const generate_gresource_xml = b.addExecutable(.{
+-                            .name = "generate_gresource_xml",
+-                            .root_source_file = b.path("src/apprt/gtk/gresource.zig"),
+-                            .target = b.graph.host,
+-                        });
+-
+-                        const generate = b.addRunArtifact(generate_gresource_xml);
+-
+-                        const gtk_blueprint_compiler = b.addExecutable(.{
+-                            .name = "gtk_blueprint_compiler",
+-                            .root_source_file = b.path("src/apprt/gtk/blueprint_compiler.zig"),
+-                            .target = b.graph.host,
+-                        });
+-                        gtk_blueprint_compiler.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-                        gtk_blueprint_compiler.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-                        gtk_blueprint_compiler.linkLibC();
+-
+-                        for (gresource.blueprint_files) |blueprint_file| {
+-                            const blueprint_compiler = b.addRunArtifact(gtk_blueprint_compiler);
+-                            blueprint_compiler.addArgs(&.{
+-                                b.fmt("{d}", .{blueprint_file.major}),
+-                                b.fmt("{d}", .{blueprint_file.minor}),
+-                            });
+-                            const ui_file = blueprint_compiler.addOutputFileArg(b.fmt(
+-                                "{d}.{d}/{s}.ui",
+-                                .{
+-                                    blueprint_file.major,
+-                                    blueprint_file.minor,
+-                                    blueprint_file.name,
+-                                },
+-                            ));
+-                            blueprint_compiler.addFileArg(b.path(b.fmt(
+-                                "src/apprt/gtk/ui/{d}.{d}/{s}.blp",
+-                                .{
+-                                    blueprint_file.major,
+-                                    blueprint_file.minor,
+-                                    blueprint_file.name,
+-                                },
+-                            )));
+-                            generate.addFileArg(ui_file);
+-                        }
+-
+-                        break :gresource_xml generate.captureStdOut();
+-                    };
+-
+-                    {
+-                        const gtk_builder_check = b.addExecutable(.{
+-                            .name = "gtk_builder_check",
+-                            .root_source_file = b.path("src/apprt/gtk/builder_check.zig"),
+-                            .target = b.graph.host,
+-                        });
+-                        gtk_builder_check.root_module.addOptions("build_options", self.options);
+-                        gtk_builder_check.root_module.addImport("gtk", gobject.module("gtk4"));
+-                        gtk_builder_check.root_module.addImport("adw", gobject.module("adw1"));
+-
+-                        for (gresource.dependencies) |pathname| {
+-                            const extension = std.fs.path.extension(pathname);
+-                            if (!std.mem.eql(u8, extension, ".ui")) continue;
+-                            const check = b.addRunArtifact(gtk_builder_check);
+-                            check.addFileArg(b.path(pathname));
+-                            step.step.dependOn(&check.step);
+-                        }
+-                    }
+-
+-                    const generate_resources_c = b.addSystemCommand(&.{
+-                        "glib-compile-resources",
+-                        "--c-name",
+-                        "ghostty",
+-                        "--generate-source",
+-                        "--target",
+-                    });
+-                    const ghostty_resources_c = generate_resources_c.addOutputFileArg("ghostty_resources.c");
+-                    generate_resources_c.addFileArg(gresource_xml);
+-                    step.addCSourceFile(.{ .file = ghostty_resources_c, .flags = &.{} });
+-
+-                    const generate_resources_h = b.addSystemCommand(&.{
+-                        "glib-compile-resources",
+-                        "--c-name",
+-                        "ghostty",
+-                        "--generate-header",
+-                        "--target",
+-                    });
+-                    const ghostty_resources_h = generate_resources_h.addOutputFileArg("ghostty_resources.h");
+-                    generate_resources_h.addFileArg(gresource_xml);
+-                    step.addIncludePath(ghostty_resources_h.dirname());
+-                }
+-            },
++            .gtk => try self.addGTK(step),
+         }
+     }
+ 
+@@ -623,6 +532,231 @@ pub fn add(
+     return static_libs;
+ }
+ 
++/// Setup the dependencies for the GTK apprt build. The GTK apprt
++/// is particularly involved compared to others so we pull this out
++/// into a dedicated function.
++fn addGTK(
++    self: *const SharedDeps,
++    step: *std.Build.Step.Compile,
++) !void {
++    const b = step.step.owner;
++    const target = step.root_module.resolved_target.?;
++    const optimize = step.root_module.optimize.?;
++
++    const gobject_ = b.lazyDependency("gobject", .{
++        .target = target,
++        .optimize = optimize,
++    });
++    if (gobject_) |gobject| {
++        const gobject_imports = .{
++            .{ "adw", "adw1" },
++            .{ "gdk", "gdk4" },
++            .{ "gio", "gio2" },
++            .{ "glib", "glib2" },
++            .{ "gobject", "gobject2" },
++            .{ "gtk", "gtk4" },
++        };
++        inline for (gobject_imports) |import| {
++            const name, const module = import;
++            step.root_module.addImport(name, gobject.module(module));
++        }
++    }
++
++    step.linkSystemLibrary2("gtk4", dynamic_link_opts);
++    step.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++
++    if (self.config.x11) {
++        step.linkSystemLibrary2("X11", dynamic_link_opts);
++        if (gobject_) |gobject| {
++            step.root_module.addImport(
++                "gdk_x11",
++                gobject.module("gdkx114"),
++            );
++        }
++    }
++
++    if (self.config.wayland) wayland: {
++        // These need to be all be called to note that we need them.
++        const wayland_dep_ = b.lazyDependency("wayland", .{});
++        const wayland_protocols_dep_ = b.lazyDependency(
++            "wayland_protocols",
++            .{},
++        );
++        const plasma_wayland_protocols_dep_ = b.lazyDependency(
++            "plasma_wayland_protocols",
++            .{},
++        );
++
++        // Unwrap or return, there are no more dependencies below.
++        const wayland_dep = wayland_dep_ orelse break :wayland;
++        const wayland_protocols_dep = wayland_protocols_dep_ orelse break :wayland;
++        const plasma_wayland_protocols_dep = plasma_wayland_protocols_dep_ orelse break :wayland;
++
++        // Note that zig_wayland cannot be lazy because lazy dependencies
++        // can't be imported since they don't exist and imports are
++        // resolved at compile time of the build.
++        const zig_wayland_dep = b.dependency("zig_wayland", .{});
++        const Scanner = @import("zig_wayland").Scanner;
++        const scanner = Scanner.create(zig_wayland_dep.builder, .{
++            .wayland_xml = wayland_dep.path("protocol/wayland.xml"),
++            .wayland_protocols = wayland_protocols_dep.path(""),
++        });
++
++        // FIXME: replace with `zxdg_decoration_v1` once GTK merges https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/6398
++        scanner.addCustomProtocol(
++            plasma_wayland_protocols_dep.path("src/protocols/blur.xml"),
++        );
++        scanner.addCustomProtocol(
++            plasma_wayland_protocols_dep.path("src/protocols/server-decoration.xml"),
++        );
++        scanner.addCustomProtocol(
++            plasma_wayland_protocols_dep.path("src/protocols/slide.xml"),
++        );
++
++        scanner.generate("wl_compositor", 1);
++        scanner.generate("org_kde_kwin_blur_manager", 1);
++        scanner.generate("org_kde_kwin_server_decoration_manager", 1);
++        scanner.generate("org_kde_kwin_slide_manager", 1);
++
++        step.root_module.addImport("wayland", b.createModule(.{
++            .root_source_file = scanner.result,
++        }));
++        if (gobject_) |gobject| step.root_module.addImport(
++            "gdk_wayland",
++            gobject.module("gdkwayland4"),
++        );
++
++        if (b.lazyDependency("gtk4_layer_shell", .{
++            .target = target,
++            .optimize = optimize,
++        })) |gtk4_layer_shell| {
++            const layer_shell_module = gtk4_layer_shell.module("gtk4-layer-shell");
++            if (gobject_) |gobject| layer_shell_module.addImport(
++                "gtk",
++                gobject.module("gtk4"),
++            );
++            step.root_module.addImport(
++                "gtk4-layer-shell",
++                layer_shell_module,
++            );
++
++            // IMPORTANT: gtk4-layer-shell must be linked BEFORE
++            // wayland-client, as it relies on shimming libwayland's APIs.
++            if (b.systemIntegrationOption("gtk4-layer-shell", .{})) {
++                step.linkSystemLibrary2(
++                    "gtk4-layer-shell-0",
++                    dynamic_link_opts,
++                );
++            } else {
++                // gtk4-layer-shell *must* be dynamically linked,
++                // so we don't add it as a static library
++                step.linkLibrary(gtk4_layer_shell.artifact("gtk4-layer-shell"));
++            }
++        }
++
++        step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
++    }
++
++    {
++        const gresource = @import("../apprt/gtk/gresource.zig");
++
++        const gresource_xml = gresource_xml: {
++            const generate_gresource_xml = b.addExecutable(.{
++                .name = "generate_gresource_xml",
++                .root_source_file = b.path("src/apprt/gtk/gresource.zig"),
++                .target = b.graph.host,
++            });
++
++            const generate = b.addRunArtifact(generate_gresource_xml);
++
++            const gtk_blueprint_compiler = b.addExecutable(.{
++                .name = "gtk_blueprint_compiler",
++                .root_source_file = b.path("src/apprt/gtk/blueprint_compiler.zig"),
++                .target = b.graph.host,
++            });
++            gtk_blueprint_compiler.linkSystemLibrary2("gtk4", dynamic_link_opts);
++            gtk_blueprint_compiler.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++            gtk_blueprint_compiler.linkLibC();
++
++            for (gresource.blueprint_files) |blueprint_file| {
++                const blueprint_compiler = b.addRunArtifact(gtk_blueprint_compiler);
++                blueprint_compiler.addArgs(&.{
++                    b.fmt("{d}", .{blueprint_file.major}),
++                    b.fmt("{d}", .{blueprint_file.minor}),
++                });
++                const ui_file = blueprint_compiler.addOutputFileArg(b.fmt(
++                    "{d}.{d}/{s}.ui",
++                    .{
++                        blueprint_file.major,
++                        blueprint_file.minor,
++                        blueprint_file.name,
++                    },
++                ));
++                blueprint_compiler.addFileArg(b.path(b.fmt(
++                    "src/apprt/gtk/ui/{d}.{d}/{s}.blp",
++                    .{
++                        blueprint_file.major,
++                        blueprint_file.minor,
++                        blueprint_file.name,
++                    },
++                )));
++                generate.addFileArg(ui_file);
++            }
++
++            break :gresource_xml generate.captureStdOut();
++        };
++
++        {
++            const gtk_builder_check = b.addExecutable(.{
++                .name = "gtk_builder_check",
++                .root_source_file = b.path("src/apprt/gtk/builder_check.zig"),
++                .target = b.graph.host,
++            });
++            gtk_builder_check.root_module.addOptions("build_options", self.options);
++            if (gobject_) |gobject| {
++                gtk_builder_check.root_module.addImport(
++                    "gtk",
++                    gobject.module("gtk4"),
++                );
++                gtk_builder_check.root_module.addImport(
++                    "adw",
++                    gobject.module("adw1"),
++                );
++            }
++
++            for (gresource.dependencies) |pathname| {
++                const extension = std.fs.path.extension(pathname);
++                if (!std.mem.eql(u8, extension, ".ui")) continue;
++                const check = b.addRunArtifact(gtk_builder_check);
++                check.addFileArg(b.path(pathname));
++                step.step.dependOn(&check.step);
++            }
++        }
++
++        const generate_resources_c = b.addSystemCommand(&.{
++            "glib-compile-resources",
++            "--c-name",
++            "ghostty",
++            "--generate-source",
++            "--target",
++        });
++        const ghostty_resources_c = generate_resources_c.addOutputFileArg("ghostty_resources.c");
++        generate_resources_c.addFileArg(gresource_xml);
++        step.addCSourceFile(.{ .file = ghostty_resources_c, .flags = &.{} });
++
++        const generate_resources_h = b.addSystemCommand(&.{
++            "glib-compile-resources",
++            "--c-name",
++            "ghostty",
++            "--generate-header",
++            "--target",
++        });
++        const ghostty_resources_h = generate_resources_h.addOutputFileArg("ghostty_resources.h");
++        generate_resources_h.addFileArg(gresource_xml);
++        step.addIncludePath(ghostty_resources_h.dirname());
++    }
++}
++
+ // For dynamic linking, we prefer dynamic linking and to search by
+ // mode first. Mode first will search all paths for a dynamic library
+ // before falling back to static.
+
+commit 29322535a5d372b38e5f2e465210950eb315067f
+Author: Jeffrey C. Ollie <jeff@ocjtech.us>
+Date:   Sat Mar 15 21:56:44 2025 -0500
+
+    gtk: convert Window (and some related files) to zig-gobject
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 88d64ca3..cf7602c2 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -555,6 +555,7 @@ fn addGTK(
+             .{ "glib", "glib2" },
+             .{ "gobject", "gobject2" },
+             .{ "gtk", "gtk4" },
++            .{ "xlib", "xlib2" },
+         };
+         inline for (gobject_imports) |import| {
+             const name, const module = import;
+
+commit 7b8c2232d3ea5d3693e40ce2aab91edd366951f6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 19 10:12:45 2025 -0700
+
+    build: distribute gresource c/h with source tarball
+    
+    This introduces the concept of a "dist resource" (specifically a
+    `GhosttyDist.Resource` type). This is a resource that may be present in
+    dist tarballs but not in the source tree. If the resource is present and
+    we're not in a Git checkout, then we use it directly instead of
+    generating it.
+    
+    This is used for the first time in this commit for the gresource c/h
+    files, which depend on a variety of external tools (blueprint-compiler,
+    glib-compile-resources, etc.) that we do not want to require downstream
+    users/packagers to have and we also do not want to worry about them
+    having the right versions.
+    
+    This also adds a check for `distcheck` to ensure our distribution
+    contains all the expected files.
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index cf7602c2..4f9373ad 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -6,6 +6,9 @@ const HelpStrings = @import("HelpStrings.zig");
+ const MetallibStep = @import("MetallibStep.zig");
+ const UnicodeTables = @import("UnicodeTables.zig");
+ const GhosttyFrameData = @import("GhosttyFrameData.zig");
++const DistResource = @import("GhosttyDist.zig").Resource;
++
++const gresource = @import("../apprt/gtk/gresource.zig");
+ 
+ config: *const Config,
+ 
+@@ -659,54 +662,7 @@ fn addGTK(
+     }
+ 
+     {
+-        const gresource = @import("../apprt/gtk/gresource.zig");
+-
+-        const gresource_xml = gresource_xml: {
+-            const generate_gresource_xml = b.addExecutable(.{
+-                .name = "generate_gresource_xml",
+-                .root_source_file = b.path("src/apprt/gtk/gresource.zig"),
+-                .target = b.graph.host,
+-            });
+-
+-            const generate = b.addRunArtifact(generate_gresource_xml);
+-
+-            const gtk_blueprint_compiler = b.addExecutable(.{
+-                .name = "gtk_blueprint_compiler",
+-                .root_source_file = b.path("src/apprt/gtk/blueprint_compiler.zig"),
+-                .target = b.graph.host,
+-            });
+-            gtk_blueprint_compiler.linkSystemLibrary2("gtk4", dynamic_link_opts);
+-            gtk_blueprint_compiler.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
+-            gtk_blueprint_compiler.linkLibC();
+-
+-            for (gresource.blueprint_files) |blueprint_file| {
+-                const blueprint_compiler = b.addRunArtifact(gtk_blueprint_compiler);
+-                blueprint_compiler.addArgs(&.{
+-                    b.fmt("{d}", .{blueprint_file.major}),
+-                    b.fmt("{d}", .{blueprint_file.minor}),
+-                });
+-                const ui_file = blueprint_compiler.addOutputFileArg(b.fmt(
+-                    "{d}.{d}/{s}.ui",
+-                    .{
+-                        blueprint_file.major,
+-                        blueprint_file.minor,
+-                        blueprint_file.name,
+-                    },
+-                ));
+-                blueprint_compiler.addFileArg(b.path(b.fmt(
+-                    "src/apprt/gtk/ui/{d}.{d}/{s}.blp",
+-                    .{
+-                        blueprint_file.major,
+-                        blueprint_file.minor,
+-                        blueprint_file.name,
+-                    },
+-                )));
+-                generate.addFileArg(ui_file);
+-            }
+-
+-            break :gresource_xml generate.captureStdOut();
+-        };
+-
++        // For our actual build, we validate our GTK builder files if we can.
+         {
+             const gtk_builder_check = b.addExecutable(.{
+                 .name = "gtk_builder_check",
+@@ -734,28 +690,96 @@ fn addGTK(
+             }
+         }
+ 
+-        const generate_resources_c = b.addSystemCommand(&.{
+-            "glib-compile-resources",
+-            "--c-name",
+-            "ghostty",
+-            "--generate-source",
+-            "--target",
++        // Get our gresource c/h files and add them to our build.
++        const dist = gtkDistResources(b);
++        step.addCSourceFile(.{ .file = dist.resources_c.path(b), .flags = &.{} });
++        step.addIncludePath(dist.resources_h.path(b).dirname());
++    }
++}
++
++/// Creates the resources that can be prebuilt for our dist build.
++pub fn gtkDistResources(
++    b: *std.Build,
++) struct {
++    resources_c: DistResource,
++    resources_h: DistResource,
++} {
++    const gresource_xml = gresource_xml: {
++        const xml_exe = b.addExecutable(.{
++            .name = "generate_gresource_xml",
++            .root_source_file = b.path("src/apprt/gtk/gresource.zig"),
++            .target = b.graph.host,
+         });
+-        const ghostty_resources_c = generate_resources_c.addOutputFileArg("ghostty_resources.c");
+-        generate_resources_c.addFileArg(gresource_xml);
+-        step.addCSourceFile(.{ .file = ghostty_resources_c, .flags = &.{} });
+-
+-        const generate_resources_h = b.addSystemCommand(&.{
+-            "glib-compile-resources",
+-            "--c-name",
+-            "ghostty",
+-            "--generate-header",
+-            "--target",
++        const xml_run = b.addRunArtifact(xml_exe);
++
++        const blueprint_exe = b.addExecutable(.{
++            .name = "gtk_blueprint_compiler",
++            .root_source_file = b.path("src/apprt/gtk/blueprint_compiler.zig"),
++            .target = b.graph.host,
+         });
+-        const ghostty_resources_h = generate_resources_h.addOutputFileArg("ghostty_resources.h");
+-        generate_resources_h.addFileArg(gresource_xml);
+-        step.addIncludePath(ghostty_resources_h.dirname());
+-    }
++        blueprint_exe.linkLibC();
++        blueprint_exe.linkSystemLibrary2("gtk4", dynamic_link_opts);
++        blueprint_exe.linkSystemLibrary2("libadwaita-1", dynamic_link_opts);
++
++        for (gresource.blueprint_files) |blueprint_file| {
++            const blueprint_run = b.addRunArtifact(blueprint_exe);
++            blueprint_run.addArgs(&.{
++                b.fmt("{d}", .{blueprint_file.major}),
++                b.fmt("{d}", .{blueprint_file.minor}),
++            });
++            const ui_file = blueprint_run.addOutputFileArg(b.fmt(
++                "{d}.{d}/{s}.ui",
++                .{
++                    blueprint_file.major,
++                    blueprint_file.minor,
++                    blueprint_file.name,
++                },
++            ));
++            blueprint_run.addFileArg(b.path(b.fmt(
++                "src/apprt/gtk/ui/{d}.{d}/{s}.blp",
++                .{
++                    blueprint_file.major,
++                    blueprint_file.minor,
++                    blueprint_file.name,
++                },
++            )));
++
++            xml_run.addFileArg(ui_file);
++        }
++
++        break :gresource_xml xml_run.captureStdOut();
++    };
++
++    const generate_c = b.addSystemCommand(&.{
++        "glib-compile-resources",
++        "--c-name",
++        "ghostty",
++        "--generate-source",
++        "--target",
++    });
++    const resources_c = generate_c.addOutputFileArg("ghostty_resources.c");
++    generate_c.addFileArg(gresource_xml);
++
++    const generate_h = b.addSystemCommand(&.{
++        "glib-compile-resources",
++        "--c-name",
++        "ghostty",
++        "--generate-header",
++        "--target",
++    });
++    const resources_h = generate_h.addOutputFileArg("ghostty_resources.h");
++    generate_h.addFileArg(gresource_xml);
++
++    return .{
++        .resources_c = .{
++            .dist = "src/apprt/gtk/ghostty_resources.c",
++            .generated = resources_c,
++        },
++        .resources_h = .{
++            .dist = "src/apprt/gtk/ghostty_resources.h",
++            .generated = resources_h,
++        },
++    };
+ }
+ 
+ // For dynamic linking, we prefer dynamic linking and to search by
+
