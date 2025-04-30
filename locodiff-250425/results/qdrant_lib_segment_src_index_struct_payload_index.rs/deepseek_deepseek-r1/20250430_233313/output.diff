@@ -1,0 +1,154 @@
+--- qdrant_lib_segment_src_index_struct_payload_index.rs_expectedoutput.txt (expected)+++ qdrant_lib_segment_src_index_struct_payload_index.rs_extracted.txt (actual)@@ -1,3 +1,5 @@+#![allow(clippy::too_many_arguments)]
++
+ use std::collections::HashMap;
+ use std::fs::create_dir_all;
+ use std::path::{Path, PathBuf};
+@@ -15,23 +17,25 @@ use rocksdb::DB;
+ use schemars::_serde_json::Value;
+ 
+-use super::field_index::FieldIndexBuilderTrait as _;
+ use super::field_index::facet_index::FacetIndexEnum;
+ use super::field_index::index_selector::{IndexSelector, IndexSelectorMmap, IndexSelectorRocksDb};
+-use crate::common::Flusher;
++use super::field_index::FieldIndexBuilderTrait as _;
++use crate::common::counter::hardware_accumulator::HwMeasurementAcc;
+ use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+ use crate::common::utils::IndexesMap;
++use crate::common::Flusher;
+ use crate::id_tracker::IdTrackerSS;
+-use crate::index::PayloadIndex;
+ use crate::index::field_index::{
+-    CardinalityEstimation, FieldIndex, PayloadBlockCondition, PrimaryCondition,
++    CardinalityEstimation, FieldIndex, PayloadBlockCondition, PayloadFieldIndexBuilder,
++    PrimaryCondition,
+ };
+ use crate::index::payload_config::PayloadConfig;
+ use crate::index::query_estimator::estimate_filter;
+ use crate::index::query_optimization::payload_provider::PayloadProvider;
+ use crate::index::struct_filter_context::StructFilterContext;
+ use crate::index::visited_pool::VisitedPool;
++use crate::index::PayloadIndex;
+ use crate::json_path::JsonPath;
+ use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+ use crate::payload_storage::{FilterContext, PayloadStorage};
+@@ -80,7 +84,7 @@         self.field_indexes.get(&full_path).and_then(|indexes| {
+             // rewrite condition with fullpath to enable cardinality estimation
+             let full_path_condition = FieldCondition {
+-                key: full_path,
++                key: full_path.clone(),
+                 ..condition.clone()
+             };
+ 
+@@ -146,7 +150,6 @@         }
+         if !is_loaded {
+             debug!("Index for `{field}` was not loaded. Building...");
+-            // todo(ivan): decide what to do with indexes, which were not loaded
+             indexes = self.build_field_indexes(
+                 field,
+                 payload_schema,
+@@ -344,25 +347,6 @@             .collect()
+     }
+ 
+-    pub fn restore_database_snapshot(
+-        snapshot_path: &Path,
+-        segment_path: &Path,
+-    ) -> OperationResult<()> {
+-        crate::rocksdb_backup::restore(snapshot_path, &segment_path.join("payload_index"))
+-    }
+-
+-    fn clear_index_for_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
+-        for (_, field_indexes) in self.field_indexes.iter_mut() {
+-            for index in field_indexes {
+-                index.remove_point(point_id)?;
+-            }
+-        }
+-        Ok(())
+-    }
+-    pub fn config(&self) -> &PayloadConfig {
+-        &self.config
+-    }
+-
+     pub fn iter_filtered_points<'a>(
+         &'a self,
+         filter: &'a Filter,
+@@ -388,20 +372,37 @@                 .primary_clauses
+                 .iter()
+                 .flat_map(move |clause| {
+-                    self.query_field(clause, hw_counter).unwrap_or_else(|| {
+-                        // index is not built
+-                        Box::new(id_tracker.iter_ids().measure_hw_with_cell(
+-                            hw_counter,
+-                            size_of::<PointOffsetType>(),
+-                            |i| i.cpu_counter(),
+-                        ))
+-                    })
++                    self.query_field(clause, hw_counter)
++                        .unwrap_or_else(|| {
++                            // index is not built
++                            Box::new(id_tracker.iter_ids().measure_hw_with_cell(
++                                hw_counter,
++                                std::mem::size_of::<PointOffsetType>(),
++                                |i| i.cpu_counter(),
++                            ))
++                        })
+                 })
+                 .filter(move |&id| !visited_list.check_and_update_visited(id))
+                 .filter(move |&i| struct_filtered_context.check(i));
+ 
+             Either::Right(iter)
+         }
++    }
++
++    pub fn restore_database_snapshot(
++        snapshot_path: &Path,
++        segment_path: &Path,
++    ) -> OperationResult<()> {
++        crate::rocksdb_backup::restore(snapshot_path, &segment_path.join("payload_index"))
++    }
++
++    fn clear_index_for_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
++        for (_, field_indexes) in self.field_indexes.iter_mut() {
++            for index in field_indexes {
++                index.remove_point(point_id)?;
++            }
++        }
++        Ok(())
+     }
+ 
+     /// Select which type of PayloadIndex to use for the field
+@@ -592,9 +593,11 @@             None => Box::new(vec![].into_iter()),
+             Some(indexes) => {
+                 let field_clone = field.to_owned();
+-                Box::new(indexes.iter().flat_map(move |field_index| {
+-                    field_index.payload_blocks(threshold, field_clone.clone())
+-                }))
++                Box::new(
++                    indexes
++                        .iter()
++                        .flat_map(move |field_index| field_index.payload_blocks(threshold, field_clone.clone())),
++                )
+             }
+         }
+     }
+@@ -624,7 +627,20 @@         Ok(())
+     }
+ 
+-    fn set_payload(
++    fn overwrite_payload_by_filter(
++        &mut self,
++        filter: &Filter,
++        payload: &Payload,
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
++        let collected_points = self.query_points(filter, hw_counter);
++        for &point_id in &collected_points {
++            self.overwrite_payload(point_id, payload, hw_counter)?;
++        }
++        Ok(())
++    }
++
++    fn assign_payload(
+         &mut self,
+         point_id: PointOffsetType,
+         payload: &Payload,
