@@ -1,0 +1,2745 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/terminal/kitty/graphics_exec.zig
+
+commit c7658df978068d966edff3739bc69fb2bcaf3cca
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 14:34:33 2023 -0700
+
+    terminal/kitty-gfx: support "query", loading images, tests
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+new file mode 100644
+index 00000000..be62cd20
+--- /dev/null
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -0,0 +1,63 @@
++const std = @import("std");
++const assert = std.debug.assert;
++const Allocator = std.mem.Allocator;
++
++const Terminal = @import("../Terminal.zig");
++const command = @import("graphics_command.zig");
++const image = @import("graphics_image.zig");
++const Command = command.Command;
++const Response = command.Response;
++const Image = image.Image;
++
++/// Execute a Kitty graphics command against the given terminal. This
++/// will never fail, but the response may indicate an error and the
++/// terminal state may not be updated to reflect the command. This will
++/// never put the terminal in an unrecoverable state, however.
++///
++/// The allocator must be the same allocator that was used to build
++/// the command.
++pub fn execute(
++    alloc: Allocator,
++    terminal: *Terminal,
++    buf: []u8,
++    cmd: *Command,
++) ?Response {
++    _ = terminal;
++    _ = buf;
++    switch (cmd.control) {
++        .query => return query(alloc, cmd),
++        else => return .{ .message = "ERROR: unimplemented action" },
++    }
++}
++
++/// Execute a "query" command.
++///
++/// This command is used to attempt to load an image and respond with
++/// success/error but does not persist any of the command to the terminal
++/// state.
++fn query(alloc: Allocator, cmd: *Command) Response {
++    const t = cmd.control.query;
++
++    // Build a partial response to start
++    var result: Response = .{
++        .id = t.image_id,
++        .image_number = t.image_number,
++        .placement_id = t.placement_id,
++    };
++
++    // Attempt to load the image. If we cannot, then set an appropriate error.
++    if (Image.load(alloc, t, cmd.data)) |img| {
++        // Tell the command we've consumed the data.
++        _ = cmd.toOwnedData();
++
++        // We need a mutable reference to deinit the image.
++        var img_c = img;
++        img_c.deinit(alloc);
++    } else |err| switch (err) {
++        error.InvalidData => result.message = "ERROR: invalid data",
++        error.UnsupportedFormat => result.message = "ERROR: unsupported format",
++        error.DimensionsRequired => result.message = "ERROR: dimensions required",
++    }
++
++    return result;
++}
+
+commit eeddda57ff458cc0a8f5dac932fa10ed2fb767f7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 14:48:42 2023 -0700
+
+    terminal/kitty-gfx: handle quiet settings for response
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index be62cd20..0cb77a9a 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -24,10 +24,22 @@ pub fn execute(
+ ) ?Response {
+     _ = terminal;
+     _ = buf;
+-    switch (cmd.control) {
+-        .query => return query(alloc, cmd),
+-        else => return .{ .message = "ERROR: unimplemented action" },
++
++    const resp_: ?Response = switch (cmd.control) {
++        .query => query(alloc, cmd),
++        else => .{ .message = "ERROR: unimplemented action" },
++    };
++
++    // Handle the quiet settings
++    if (resp_) |resp| {
++        return switch (cmd.quiet) {
++            .no => resp,
++            .ok => if (resp.ok()) null else resp,
++            .failures => null,
++        };
+     }
++
++    return null;
+ }
+ 
+ /// Execute a "query" command.
+
+commit 1b7fbd00d1fcc45708f8427deb240d5c3cb4dd5c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 15:02:29 2023 -0700
+
+    terminal/kitty-gfx: add some validation from Kitty
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 0cb77a9a..f21e82c1 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -50,6 +50,13 @@ pub fn execute(
+ fn query(alloc: Allocator, cmd: *Command) Response {
+     const t = cmd.control.query;
+ 
++    // Query requires image ID. We can't actually send a response without
++    // an image ID either but we return an error and this will be logged
++    // downstream.
++    if (t.image_id == 0) {
++        return .{ .message = "EINVAL: image ID required" };
++    }
++
+     // Build a partial response to start
+     var result: Response = .{
+         .id = t.image_id,
+@@ -61,14 +68,19 @@ fn query(alloc: Allocator, cmd: *Command) Response {
+     if (Image.load(alloc, t, cmd.data)) |img| {
+         // Tell the command we've consumed the data.
+         _ = cmd.toOwnedData();
++        defer {
++            // We need a mutable reference to deinit the image.
++            var img_c = img;
++            img_c.deinit(alloc);
++        }
+ 
+-        // We need a mutable reference to deinit the image.
+-        var img_c = img;
+-        img_c.deinit(alloc);
++        // If the image is greater than a predetermined max size, then we
++        // error. The max size here is taken directly from Kitty.
+     } else |err| switch (err) {
+-        error.InvalidData => result.message = "ERROR: invalid data",
+-        error.UnsupportedFormat => result.message = "ERROR: unsupported format",
+-        error.DimensionsRequired => result.message = "ERROR: dimensions required",
++        error.InvalidData => result.message = "EINVAL: invalid data",
++        error.UnsupportedFormat => result.message = "EINVAL: unsupported format",
++        error.DimensionsRequired => result.message = "EINVAL: dimensions required",
++        error.DimensionsTooLarge => result.message = "EINVAL: dimensions too large",
+     }
+ 
+     return result;
+
+commit f82899bd58d26950cfc6e8d7111d1d2595fc85cf
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 15:20:02 2023 -0700
+
+    terminal/kitty-gfx: better memory ownership semantics around func calls
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index f21e82c1..aaf7a922 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -27,6 +27,7 @@ pub fn execute(
+ 
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
++        .transmit => transmit(alloc, cmd),
+         else => .{ .message = "ERROR: unimplemented action" },
+     };
+ 
+@@ -65,23 +66,46 @@ fn query(alloc: Allocator, cmd: *Command) Response {
+     };
+ 
+     // Attempt to load the image. If we cannot, then set an appropriate error.
+-    if (Image.load(alloc, t, cmd.data)) |img| {
+-        // Tell the command we've consumed the data.
+-        _ = cmd.toOwnedData();
+-        defer {
+-            // We need a mutable reference to deinit the image.
+-            var img_c = img;
+-            img_c.deinit(alloc);
+-        }
+-
+-        // If the image is greater than a predetermined max size, then we
+-        // error. The max size here is taken directly from Kitty.
+-    } else |err| switch (err) {
+-        error.InvalidData => result.message = "EINVAL: invalid data",
+-        error.UnsupportedFormat => result.message = "EINVAL: unsupported format",
+-        error.DimensionsRequired => result.message = "EINVAL: dimensions required",
+-        error.DimensionsTooLarge => result.message = "EINVAL: dimensions too large",
+-    }
++    var img = Image.load(alloc, cmd) catch |err| {
++        encodeError(&result, err);
++        return result;
++    };
++    img.deinit(alloc);
++
++    return result;
++}
++
++/// Transmit image data.
++fn transmit(alloc: Allocator, cmd: *Command) Response {
++    const t = cmd.control.transmit;
++    var result: Response = .{
++        .id = t.image_id,
++        .image_number = t.image_number,
++        .placement_id = t.placement_id,
++    };
++
++    // Load our image. This will also validate all the metadata.
++    var img = Image.load(alloc, cmd) catch |err| {
++        encodeError(&result, err);
++        return result;
++    };
++    errdefer img.deinit(alloc);
++
++    // Store our image
++    // TODO
++    img.deinit(alloc);
+ 
+     return result;
+ }
++
++const EncodeableError = Image.Error;
++
++/// Encode an error code into a message for a response.
++fn encodeError(r: *Response, err: EncodeableError) void {
++    switch (err) {
++        error.InvalidData => r.message = "EINVAL: invalid data",
++        error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
++        error.DimensionsRequired => r.message = "EINVAL: dimensions required",
++        error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
++    }
++}
+
+commit 80c7f09a36bee3d2e2d9598de7838d402329234d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 15:55:44 2023 -0700
+
+    terminal/kitty-gfx: start terminal state, can load and add images
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index aaf7a922..1c88aa5a 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -22,13 +22,19 @@ pub fn execute(
+     buf: []u8,
+     cmd: *Command,
+ ) ?Response {
+-    _ = terminal;
+     _ = buf;
+ 
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
+-        .transmit => transmit(alloc, cmd),
+-        else => .{ .message = "ERROR: unimplemented action" },
++        .transmit => transmit(alloc, terminal, cmd),
++        .transmit_and_display => transmitAndDisplay(alloc, terminal, cmd),
++        .display => display(alloc, terminal, cmd),
++
++        .delete,
++        .transmit_animation_frame,
++        .control_animation,
++        .compose_animation,
++        => .{ .message = "ERROR: unimplemented action" },
+     };
+ 
+     // Handle the quiet settings
+@@ -42,7 +48,6 @@ pub fn execute(
+ 
+     return null;
+ }
+-
+ /// Execute a "query" command.
+ ///
+ /// This command is used to attempt to load an image and respond with
+@@ -76,33 +81,74 @@ fn query(alloc: Allocator, cmd: *Command) Response {
+ }
+ 
+ /// Transmit image data.
+-fn transmit(alloc: Allocator, cmd: *Command) Response {
+-    const t = cmd.control.transmit;
++///
++/// This loads the image, validates it, and puts it into the terminal
++/// screen storage. It does not display the image.
++fn transmit(
++    alloc: Allocator,
++    terminal: *Terminal,
++    cmd: *Command,
++) Response {
++    const t = cmd.transmission().?;
+     var result: Response = .{
+         .id = t.image_id,
+         .image_number = t.image_number,
+         .placement_id = t.placement_id,
+     };
+ 
+-    // Load our image. This will also validate all the metadata.
+-    var img = Image.load(alloc, cmd) catch |err| {
++    var img = loadAndAddImage(alloc, terminal, cmd) catch |err| {
+         encodeError(&result, err);
+         return result;
+     };
++    img.deinit(alloc);
++
++    return result;
++}
++
++/// Display a previously transmitted image.
++fn display(
++    alloc: Allocator,
++    terminal: *Terminal,
++    cmd: *Command,
++) Response {
++    _ = alloc;
++    _ = terminal;
++    _ = cmd;
++    return .{};
++}
++
++/// A combination of transmit and display. Nothing special.
++fn transmitAndDisplay(
++    alloc: Allocator,
++    terminal: *Terminal,
++    cmd: *Command,
++) Response {
++    const resp = transmit(alloc, terminal, cmd);
++    if (!resp.ok()) return resp;
++    return display(alloc, terminal, cmd);
++}
++
++fn loadAndAddImage(
++    alloc: Allocator,
++    terminal: *Terminal,
++    cmd: *Command,
++) !Image {
++    // Load the image
++    var img = try Image.load(alloc, cmd);
+     errdefer img.deinit(alloc);
+ 
+     // Store our image
+-    // TODO
+-    img.deinit(alloc);
++    try terminal.screen.kitty_images.add(alloc, img);
+ 
+-    return result;
++    return img;
+ }
+ 
+-const EncodeableError = Image.Error;
++const EncodeableError = Image.Error || Allocator.Error;
+ 
+ /// Encode an error code into a message for a response.
+ fn encodeError(r: *Response, err: EncodeableError) void {
+     switch (err) {
++        error.OutOfMemory => r.message = "ENOMEM: out of memory",
+         error.InvalidData => r.message = "EINVAL: invalid data",
+         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
+         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
+
+commit 7bec2820a740e11c45fffccba69753c669b36d16
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 16:19:23 2023 -0700
+
+    terminal/kitty-gfx: start working on placements
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 1c88aa5a..c0ac58f2 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -111,10 +111,18 @@ fn display(
+     terminal: *Terminal,
+     cmd: *Command,
+ ) Response {
++    const d = cmd.display().?;
++    var result: Response = .{
++        .id = d.image_id,
++        .image_number = d.image_number,
++        .placement_id = d.placement_id,
++    };
++
++    // TODO
++
+     _ = alloc;
+     _ = terminal;
+-    _ = cmd;
+-    return .{};
++    return result;
+ }
+ 
+ /// A combination of transmit and display. Nothing special.
+@@ -138,7 +146,7 @@ fn loadAndAddImage(
+     errdefer img.deinit(alloc);
+ 
+     // Store our image
+-    try terminal.screen.kitty_images.add(alloc, img);
++    try terminal.screen.kitty_images.addImage(alloc, img);
+ 
+     return img;
+ }
+
+commit b3a3ca11823200b974d7f3aa0c564bab50026194
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 16:56:44 2023 -0700
+
+    terminal/kitty-gfx: placement now works properly
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index c0ac58f2..e7fcac5f 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -2,6 +2,7 @@ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+ 
++const point = @import("../point.zig");
+ const Terminal = @import("../Terminal.zig");
+ const command = @import("graphics_command.zig");
+ const image = @import("graphics_image.zig");
+@@ -9,6 +10,11 @@ const Command = command.Command;
+ const Response = command.Response;
+ const Image = image.Image;
+ 
++// TODO:
++// - image ids need to be assigned, can't just be zero
++// - delete
++// (not exhaustive, almost every op is ignoring additional config)
++
+ /// Execute a Kitty graphics command against the given terminal. This
+ /// will never fail, but the response may indicate an error and the
+ /// terminal state may not be updated to reflect the command. This will
+@@ -112,16 +118,47 @@ fn display(
+     cmd: *Command,
+ ) Response {
+     const d = cmd.display().?;
++
++    // Display requires image ID or number.
++    if (d.image_id == 0 and d.image_number == 0) {
++        return .{ .message = "EINVAL: image ID or number required" };
++    }
++
++    // Build up our response
+     var result: Response = .{
+         .id = d.image_id,
+         .image_number = d.image_number,
+         .placement_id = d.placement_id,
+     };
+ 
+-    // TODO
++    // Verify the requested image exists if we have an ID
++    const storage = &terminal.screen.kitty_images;
++    const img_: ?Image = if (d.image_id != 0)
++        storage.imageById(d.image_id)
++    else
++        storage.imageByNumber(d.image_number);
++    const img = img_ orelse {
++        result.message = "EINVAL: image not found";
++        return result;
++    };
++
++    // Make sure our response has the image id in case we looked up by number
++    result.id = img.id;
++
++    // Determine the screen point for the placement.
++    const placement_point = (point.Viewport{
++        .x = terminal.screen.cursor.x,
++        .y = terminal.screen.cursor.y,
++    }).toScreen(&terminal.screen);
++
++    // Add the placement
++    storage.addPlacement(alloc, img.id, d.placement_id, .{
++        .point = placement_point,
++    }) catch |err| {
++        encodeError(&result, err);
++        return result;
++    };
+ 
+-    _ = alloc;
+-    _ = terminal;
+     return result;
+ }
+ 
+
+commit e84f82bd97a99b0ce24c9c74bdb2dfac34cb3ce2
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 16:59:20 2023 -0700
+
+    terminal/kitty-gfx: assign an internal image id
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index e7fcac5f..005ee39a 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -108,6 +108,9 @@ fn transmit(
+     };
+     img.deinit(alloc);
+ 
++    // After the image is added, set the ID in case it changed
++    result.id = img.id;
++
+     return result;
+ }
+ 
+@@ -182,8 +185,15 @@ fn loadAndAddImage(
+     var img = try Image.load(alloc, cmd);
+     errdefer img.deinit(alloc);
+ 
++    // If the image has no ID, we assign one
++    const storage = &terminal.screen.kitty_images;
++    if (img.id == 0) {
++        img.id = storage.next_id;
++        storage.next_id +%= 1;
++    }
++
+     // Store our image
+-    try terminal.screen.kitty_images.addImage(alloc, img);
++    try storage.addImage(alloc, img);
+ 
+     return img;
+ }
+
+commit bbcb2f96c8ad9ac62370c54ed11590e6de876bef
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 19:28:39 2023 -0700
+
+    terminal/kitty-gfx: huge progress on chunked transfers, lots of issues
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 005ee39a..115e26e9 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -8,11 +8,14 @@ const command = @import("graphics_command.zig");
+ const image = @import("graphics_image.zig");
+ const Command = command.Command;
+ const Response = command.Response;
++const ChunkedImage = image.ChunkedImage;
+ const Image = image.Image;
+ 
++const log = std.log.scoped(.kitty_gfx);
++
+ // TODO:
+-// - image ids need to be assigned, can't just be zero
+ // - delete
++// - zlib deflate compression
+ // (not exhaustive, almost every op is ignoring additional config)
+ 
+ /// Execute a Kitty graphics command against the given terminal. This
+@@ -29,6 +32,7 @@ pub fn execute(
+     cmd: *Command,
+ ) ?Response {
+     _ = buf;
++    log.debug("executing kitty graphics command: {}", .{cmd.control});
+ 
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
+@@ -45,6 +49,10 @@ pub fn execute(
+ 
+     // Handle the quiet settings
+     if (resp_) |resp| {
++        if (!resp.ok()) {
++            log.warn("erroneous kitty graphics response: {s}", .{resp.message});
++        }
++
+         return switch (cmd.quiet) {
+             .no => resp,
+             .ok => if (resp.ok()) null else resp,
+@@ -111,6 +119,11 @@ fn transmit(
+     // After the image is added, set the ID in case it changed
+     result.id = img.id;
+ 
++    // If this is a transmit_and_display then the display part needs the image ID
++    if (cmd.control == .transmit_and_display) {
++        cmd.control.transmit_and_display.display.image_id = img.id;
++    }
++
+     return result;
+ }
+ 
+@@ -173,6 +186,11 @@ fn transmitAndDisplay(
+ ) Response {
+     const resp = transmit(alloc, terminal, cmd);
+     if (!resp.ok()) return resp;
++
++    // If the transmission is chunked, we defer the display
++    const t = cmd.transmission().?;
++    if (t.more_chunks) return resp;
++
+     return display(alloc, terminal, cmd);
+ }
+ 
+@@ -181,20 +199,51 @@ fn loadAndAddImage(
+     terminal: *Terminal,
+     cmd: *Command,
+ ) !Image {
+-    // Load the image
+-    var img = try Image.load(alloc, cmd);
++    const t = cmd.transmission().?;
++    const storage = &terminal.screen.kitty_images;
++
++    // Determine our image. This also handles chunking and early exit.
++    var img = if (storage.chunk) |chunk| img: {
++        try chunk.data.appendSlice(alloc, cmd.data);
++        _ = cmd.toOwnedData();
++
++        // If we have more then we're done
++        if (t.more_chunks) return chunk.image;
++
++        // We have no more chunks. Complete and validate the image.
++        // At this point no matter what we want to clear out our chunked
++        // state. If we hit a validation error or something we don't want
++        // the chunked image hanging around in-memory.
++        defer {
++            chunk.destroy(alloc);
++            storage.chunk = null;
++        }
++
++        break :img try chunk.complete(alloc);
++    } else try Image.load(alloc, cmd);
+     errdefer img.deinit(alloc);
+ 
+     // If the image has no ID, we assign one
+-    const storage = &terminal.screen.kitty_images;
+     if (img.id == 0) {
+         img.id = storage.next_id;
+         storage.next_id +%= 1;
+     }
+ 
+-    // Store our image
+-    try storage.addImage(alloc, img);
++    // If this is chunked, this is the beginning of a new chunked transmission.
++    // (We checked for an in-progress chunk above.)
++    if (t.more_chunks) {
++        // We allocate the chunk on the heap because its rare and we
++        // don't want to always pay the memory cost to keep it around.
++        const chunk_ptr = try alloc.create(ChunkedImage);
++        errdefer alloc.destroy(chunk_ptr);
++        chunk_ptr.* = try ChunkedImage.init(alloc, img);
++        storage.chunk = chunk_ptr;
++        return img;
++    }
+ 
++    // Validate and store our image
++    try img.validate();
++    try storage.addImage(alloc, img);
+     return img;
+ }
+ 
+@@ -206,6 +255,7 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+         error.OutOfMemory => r.message = "ENOMEM: out of memory",
+         error.InvalidData => r.message = "EINVAL: invalid data",
+         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
++        error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
+         error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
+     }
+
+commit 6ed3fcbfb02b4328a8cfdaeaba4ee99e73c93e76
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 19:40:35 2023 -0700
+
+    terminal/kitty-gfx: fix big chunked load memory leak
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 115e26e9..b1e23745 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -204,8 +204,9 @@ fn loadAndAddImage(
+ 
+     // Determine our image. This also handles chunking and early exit.
+     var img = if (storage.chunk) |chunk| img: {
++        // Note: we do NOT want to call "cmd.toOwnedData" here because
++        // we're _copying_ the data. We want the command data to be freed.
+         try chunk.data.appendSlice(alloc, cmd.data);
+-        _ = cmd.toOwnedData();
+ 
+         // If we have more then we're done
+         if (t.more_chunks) return chunk.image;
+
+commit 03e0ba90817e4cacb4dd564e373bb2d8caf6e924
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 19:56:11 2023 -0700
+
+    terminal/kitty-gfx: zlib decompression for data validation
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index b1e23745..fe9e6e51 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -243,7 +243,7 @@ fn loadAndAddImage(
+     }
+ 
+     // Validate and store our image
+-    try img.validate();
++    try img.validate(alloc);
+     try storage.addImage(alloc, img);
+     return img;
+ }
+@@ -255,6 +255,7 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+     switch (err) {
+         error.OutOfMemory => r.message = "ENOMEM: out of memory",
+         error.InvalidData => r.message = "EINVAL: invalid data",
++        error.DecompressionFailed => r.message = "EINVAL: decompression failed",
+         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
+         error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
+
+commit 59dcb85ad4c57b11dfe134fea56e3785354431aa
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 19:58:49 2023 -0700
+
+    terminal/kitty-gfx: loading non-chunked image takes data slice ownership
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index fe9e6e51..0cf81033 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -221,7 +221,11 @@ fn loadAndAddImage(
+         }
+ 
+         break :img try chunk.complete(alloc);
+-    } else try Image.load(alloc, cmd);
++    } else img: {
++        const img = try Image.load(alloc, cmd);
++        _ = cmd.toOwnedData();
++        break :img img;
++    };
+     errdefer img.deinit(alloc);
+ 
+     // If the image has no ID, we assign one
+
+commit 89dfe85740bc14cbd46c081d5e23c22135000515
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Aug 20 21:50:05 2023 -0700
+
+    terminal/kitty-gfx: the data is base64 encoded!
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 0cf81033..8daaf899 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -247,7 +247,7 @@ fn loadAndAddImage(
+     }
+ 
+     // Validate and store our image
+-    try img.validate(alloc);
++    try img.complete(alloc);
+     try storage.addImage(alloc, img);
+     return img;
+ }
+
+commit b2432a672f931042d98bb87630c0908d2c762d2d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 08:28:20 2023 -0700
+
+    terminal/kitty-gfx: add debug function to dump image data
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 8daaf899..6b0e6778 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -28,10 +28,8 @@ const log = std.log.scoped(.kitty_gfx);
+ pub fn execute(
+     alloc: Allocator,
+     terminal: *Terminal,
+-    buf: []u8,
+     cmd: *Command,
+ ) ?Response {
+-    _ = buf;
+     log.debug("executing kitty graphics command: {}", .{cmd.control});
+ 
+     const resp_: ?Response = switch (cmd.control) {
+@@ -246,6 +244,9 @@ fn loadAndAddImage(
+         return img;
+     }
+ 
++    // Dump the image data before it is decompressed
++    // img.debugDump() catch unreachable;
++
+     // Validate and store our image
+     try img.complete(alloc);
+     try storage.addImage(alloc, img);
+
+commit e56bc01c7e9a4a0a62a8134f073b28c71e50b993
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 11:19:22 2023 -0700
+
+    terminal/kitty-gfx: base64 decode data as it comes in
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 6b0e6778..c8478d5f 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -204,7 +204,7 @@ fn loadAndAddImage(
+     var img = if (storage.chunk) |chunk| img: {
+         // Note: we do NOT want to call "cmd.toOwnedData" here because
+         // we're _copying_ the data. We want the command data to be freed.
+-        try chunk.data.appendSlice(alloc, cmd.data);
++        try chunk.addData(alloc, cmd.data);
+ 
+         // If we have more then we're done
+         if (t.more_chunks) return chunk.image;
+
+commit fe79bd5cc914f2a3b1d15043d1c835477715349a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 11:40:03 2023 -0700
+
+    terminal/kitty-gfx: centralize all image loading on LoadingImage
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index c8478d5f..ab39d2b9 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -8,7 +8,7 @@ const command = @import("graphics_command.zig");
+ const image = @import("graphics_image.zig");
+ const Command = command.Command;
+ const Response = command.Response;
+-const ChunkedImage = image.ChunkedImage;
++const LoadingImage = image.LoadingImage;
+ const Image = image.Image;
+ 
+ const log = std.log.scoped(.kitty_gfx);
+@@ -83,11 +83,11 @@ fn query(alloc: Allocator, cmd: *Command) Response {
+     };
+ 
+     // Attempt to load the image. If we cannot, then set an appropriate error.
+-    var img = Image.load(alloc, cmd) catch |err| {
++    var loading = LoadingImage.init(alloc, cmd) catch |err| {
+         encodeError(&result, err);
+         return result;
+     };
+-    img.deinit(alloc);
++    loading.deinit(alloc);
+ 
+     return result;
+ }
+@@ -201,55 +201,60 @@ fn loadAndAddImage(
+     const storage = &terminal.screen.kitty_images;
+ 
+     // Determine our image. This also handles chunking and early exit.
+-    var img = if (storage.chunk) |chunk| img: {
++    var loading: LoadingImage = if (storage.loading) |loading| loading: {
+         // Note: we do NOT want to call "cmd.toOwnedData" here because
+         // we're _copying_ the data. We want the command data to be freed.
+-        try chunk.addData(alloc, cmd.data);
++        try loading.addData(alloc, cmd.data);
+ 
+         // If we have more then we're done
+-        if (t.more_chunks) return chunk.image;
++        if (t.more_chunks) return loading.image;
+ 
+-        // We have no more chunks. Complete and validate the image.
+-        // At this point no matter what we want to clear out our chunked
+-        // state. If we hit a validation error or something we don't want
+-        // the chunked image hanging around in-memory.
++        // We have no more chunks. We're going to be completing the
++        // image so we want to destroy the pointer to the loading
++        // image and copy it out.
+         defer {
+-            chunk.destroy(alloc);
+-            storage.chunk = null;
++            alloc.destroy(loading);
++            storage.loading = null;
+         }
+ 
+-        break :img try chunk.complete(alloc);
+-    } else img: {
+-        const img = try Image.load(alloc, cmd);
+-        _ = cmd.toOwnedData();
+-        break :img img;
+-    };
+-    errdefer img.deinit(alloc);
++        break :loading loading.*;
++    } else try LoadingImage.init(alloc, cmd);
++
++    // We only want to deinit on error. If we're chunking, then we don't
++    // want to deinit at all. If we're not chunking, then we'll deinit
++    // after we've copied the image out.
++    errdefer loading.deinit(alloc);
+ 
+     // If the image has no ID, we assign one
+-    if (img.id == 0) {
+-        img.id = storage.next_id;
++    if (loading.image.id == 0) {
++        loading.image.id = storage.next_id;
+         storage.next_id +%= 1;
+     }
+ 
+     // If this is chunked, this is the beginning of a new chunked transmission.
+     // (We checked for an in-progress chunk above.)
+     if (t.more_chunks) {
+-        // We allocate the chunk on the heap because its rare and we
++        // We allocate the pointer on the heap because its rare and we
+         // don't want to always pay the memory cost to keep it around.
+-        const chunk_ptr = try alloc.create(ChunkedImage);
+-        errdefer alloc.destroy(chunk_ptr);
+-        chunk_ptr.* = try ChunkedImage.init(alloc, img);
+-        storage.chunk = chunk_ptr;
+-        return img;
++        const loading_ptr = try alloc.create(LoadingImage);
++        errdefer alloc.destroy(loading_ptr);
++        loading_ptr.* = loading;
++        storage.loading = loading_ptr;
++        return loading.image;
+     }
+ 
+     // Dump the image data before it is decompressed
+     // img.debugDump() catch unreachable;
+ 
+     // Validate and store our image
+-    try img.complete(alloc);
++    var img = try loading.complete(alloc);
++    errdefer img.deinit(alloc);
+     try storage.addImage(alloc, img);
++
++    // Ensure we deinit the loading state because we're done. The image
++    // won't be deinit because of "complete" above.
++    loading.deinit(alloc);
++
+     return img;
+ }
+ 
+
+commit 5bb99efb84cad21303217b57cdd45cbf13df716a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 14:28:28 2023 -0700
+
+    terminal/kitty-gfx: temporary file medium
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index ab39d2b9..c2e861d8 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -266,6 +266,8 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+         error.OutOfMemory => r.message = "ENOMEM: out of memory",
+         error.InvalidData => r.message = "EINVAL: invalid data",
+         error.DecompressionFailed => r.message = "EINVAL: decompression failed",
++        error.FilePathTooLong => r.message = "EINVAL: file path too long",
++        error.TemporaryFileNotInTempDir => r.message = "EINVAL: temporary file not in temp dir",
+         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
+         error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
+
+commit a02fa4e705991f7940b1daae1c38ad331dbb235d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 15:09:42 2023 -0700
+
+    terminal/kitty-gfx: png decoding
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index c2e861d8..8af16a8a 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -15,7 +15,7 @@ const log = std.log.scoped(.kitty_gfx);
+ 
+ // TODO:
+ // - delete
+-// - zlib deflate compression
++// - shared memory transmit
+ // (not exhaustive, almost every op is ignoring additional config)
+ 
+ /// Execute a Kitty graphics command against the given terminal. This
+@@ -244,7 +244,7 @@ fn loadAndAddImage(
+     }
+ 
+     // Dump the image data before it is decompressed
+-    // img.debugDump() catch unreachable;
++    // loading.debugDump() catch unreachable;
+ 
+     // Validate and store our image
+     var img = try loading.complete(alloc);
+@@ -270,6 +270,7 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+         error.TemporaryFileNotInTempDir => r.message = "EINVAL: temporary file not in temp dir",
+         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
+         error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
++        error.UnsupportedDepth => r.message = "EINVAL: unsupported pixel depth",
+         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
+         error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
+     }
+
+commit 660faf3ac353dc254cd8ee9d31294147c7aabf12
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 15:34:46 2023 -0700
+
+    terminal: clear screen, alt screen, etc. clear all kitty graphics
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 8af16a8a..562765a4 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -16,6 +16,8 @@ const log = std.log.scoped(.kitty_gfx);
+ // TODO:
+ // - delete
+ // - shared memory transmit
++// - terminal state around deleting images (i.e. CSI J)
++// - terminal state around deleting placements (i.e. scrolling)
+ // (not exhaustive, almost every op is ignoring additional config)
+ 
+ /// Execute a Kitty graphics command against the given terminal. This
+
+commit 20257c7a87ab3cfa9a29cdb3fa23215d2a08fad7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Aug 21 21:40:57 2023 -0700
+
+    renderer/metal: images required by placements become textures
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 562765a4..277d808b 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -114,7 +114,7 @@ fn transmit(
+         encodeError(&result, err);
+         return result;
+     };
+-    img.deinit(alloc);
++    errdefer img.deinit(alloc);
+ 
+     // After the image is added, set the ID in case it changed
+     result.id = img.id;
+
+commit 71f1f35cfcd90ff5c48c9751895fcd632fd63398
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 12:15:51 2023 -0700
+
+    terminal/kitty-gfx: move cursor after image placement
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 277d808b..380205b8 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -19,7 +19,6 @@ const log = std.log.scoped(.kitty_gfx);
+ // - terminal state around deleting images (i.e. CSI J)
+ // - terminal state around deleting placements (i.e. scrolling)
+ // (not exhaustive, almost every op is ignoring additional config)
+-
+ /// Execute a Kitty graphics command against the given terminal. This
+ /// will never fail, but the response may indicate an error and the
+ /// terminal state may not be updated to reflect the command. This will
+@@ -175,6 +174,58 @@ fn display(
+         return result;
+     };
+ 
++    // Cursor needs to move after placement
++    switch (d.cursor_movement) {
++        .none => {},
++        .after => {
++            // Determine the rectangle of the image in grid cells
++            const image_grid_size: struct {
++                columns: u32,
++                rows: u32,
++            } = grid_size: {
++                // Calculate our cell size.
++                const terminal_width_f64: f64 = @floatFromInt(terminal.width_px);
++                const terminal_height_f64: f64 = @floatFromInt(terminal.height_px);
++                const grid_columns_f64: f64 = @floatFromInt(terminal.cols);
++                const grid_rows_f64: f64 = @floatFromInt(terminal.rows);
++                const cell_width_f64 = terminal_width_f64 / grid_columns_f64;
++                const cell_height_f64 = terminal_height_f64 / grid_rows_f64;
++
++                // Calculate our image size in grid cells
++                const width_f64: f64 = @floatFromInt(img.width);
++                const height_f64: f64 = @floatFromInt(img.height);
++                const width_cells: u32 = @intFromFloat(@ceil(width_f64 / cell_width_f64));
++                const height_cells: u32 = @intFromFloat(@ceil(height_f64 / cell_height_f64));
++
++                break :grid_size .{ .columns = width_cells, .rows = height_cells };
++            };
++            log.warn("terminal width={} height={} image_grid={}", .{
++                terminal.width_px,
++                terminal.height_px,
++                image_grid_size,
++            });
++
++            // If we are moving beneath the screen we need to scroll.
++            // TODO: handle scroll regions
++            var new_y = terminal.screen.cursor.y + image_grid_size.rows;
++            if (new_y >= terminal.rows) {
++                const scroll_amount = (new_y + 1) - terminal.rows;
++                terminal.screen.scroll(.{ .screen = @intCast(scroll_amount) }) catch |err| {
++                    // If this failed we just warn, the screen will just be in a
++                    // weird state but nothing fatal.
++                    log.warn("scroll for image failed: {}", .{err});
++                };
++                new_y = terminal.rows - 1;
++            }
++
++            // Move the cursor
++            terminal.setCursorPos(
++                terminal.screen.cursor.x + image_grid_size.columns,
++                new_y,
++            );
++        },
++    }
++
+     return result;
+ }
+ 
+
+commit 3c513ccbcf668d091efe0d7580ca6f1a80e5970b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 12:20:29 2023 -0700
+
+    terminal/kitty-gfx: cursor pos x/y were flipped
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 380205b8..ae36a74c 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -199,11 +199,6 @@ fn display(
+ 
+                 break :grid_size .{ .columns = width_cells, .rows = height_cells };
+             };
+-            log.warn("terminal width={} height={} image_grid={}", .{
+-                terminal.width_px,
+-                terminal.height_px,
+-                image_grid_size,
+-            });
+ 
+             // If we are moving beneath the screen we need to scroll.
+             // TODO: handle scroll regions
+@@ -220,8 +215,8 @@ fn display(
+ 
+             // Move the cursor
+             terminal.setCursorPos(
+-                terminal.screen.cursor.x + image_grid_size.columns,
+                 new_y,
++                terminal.screen.cursor.x + image_grid_size.columns,
+             );
+         },
+     }
+
+commit 65df9f46188d72d9bda12cef5f1643b096922977
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 12:23:27 2023 -0700
+
+    terminal/kitty-gfx: down movement off by one
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index ae36a74c..a221e4e6 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -202,7 +202,7 @@ fn display(
+ 
+             // If we are moving beneath the screen we need to scroll.
+             // TODO: handle scroll regions
+-            var new_y = terminal.screen.cursor.y + image_grid_size.rows;
++            var new_y = terminal.screen.cursor.y + image_grid_size.rows + 1;
+             if (new_y >= terminal.rows) {
+                 const scroll_amount = (new_y + 1) - terminal.rows;
+                 terminal.screen.scroll(.{ .screen = @intCast(scroll_amount) }) catch |err| {
+
+commit e6155b7f195dbd1c9d764e04ba1fb196cdd205e1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 13:15:00 2023 -0700
+
+    terminal/kitty-gfx: add placement function get selection
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index a221e4e6..aeb25073 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -10,15 +10,16 @@ const Command = command.Command;
+ const Response = command.Response;
+ const LoadingImage = image.LoadingImage;
+ const Image = image.Image;
++const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+ 
+ const log = std.log.scoped(.kitty_gfx);
+ 
+ // TODO:
+ // - delete
+ // - shared memory transmit
+-// - terminal state around deleting images (i.e. CSI J)
+ // - terminal state around deleting placements (i.e. scrolling)
+ // (not exhaustive, almost every op is ignoring additional config)
++
+ /// Execute a Kitty graphics command against the given terminal. This
+ /// will never fail, but the response may indicate an error and the
+ /// terminal state may not be updated to reflect the command. This will
+@@ -167,9 +168,8 @@ fn display(
+     }).toScreen(&terminal.screen);
+ 
+     // Add the placement
+-    storage.addPlacement(alloc, img.id, d.placement_id, .{
+-        .point = placement_point,
+-    }) catch |err| {
++    const p: ImageStorage.Placement = .{ .point = placement_point };
++    storage.addPlacement(alloc, img.id, d.placement_id, p) catch |err| {
+         encodeError(&result, err);
+         return result;
+     };
+@@ -178,31 +178,11 @@ fn display(
+     switch (d.cursor_movement) {
+         .none => {},
+         .after => {
+-            // Determine the rectangle of the image in grid cells
+-            const image_grid_size: struct {
+-                columns: u32,
+-                rows: u32,
+-            } = grid_size: {
+-                // Calculate our cell size.
+-                const terminal_width_f64: f64 = @floatFromInt(terminal.width_px);
+-                const terminal_height_f64: f64 = @floatFromInt(terminal.height_px);
+-                const grid_columns_f64: f64 = @floatFromInt(terminal.cols);
+-                const grid_rows_f64: f64 = @floatFromInt(terminal.rows);
+-                const cell_width_f64 = terminal_width_f64 / grid_columns_f64;
+-                const cell_height_f64 = terminal_height_f64 / grid_rows_f64;
+-
+-                // Calculate our image size in grid cells
+-                const width_f64: f64 = @floatFromInt(img.width);
+-                const height_f64: f64 = @floatFromInt(img.height);
+-                const width_cells: u32 = @intFromFloat(@ceil(width_f64 / cell_width_f64));
+-                const height_cells: u32 = @intFromFloat(@ceil(height_f64 / cell_height_f64));
+-
+-                break :grid_size .{ .columns = width_cells, .rows = height_cells };
+-            };
++            const p_sel = p.selection(img, terminal);
+ 
+             // If we are moving beneath the screen we need to scroll.
+             // TODO: handle scroll regions
+-            var new_y = terminal.screen.cursor.y + image_grid_size.rows + 1;
++            var new_y = p_sel.end.y + 1;
+             if (new_y >= terminal.rows) {
+                 const scroll_amount = (new_y + 1) - terminal.rows;
+                 terminal.screen.scroll(.{ .screen = @intCast(scroll_amount) }) catch |err| {
+@@ -216,7 +196,7 @@ fn display(
+             // Move the cursor
+             terminal.setCursorPos(
+                 new_y,
+-                terminal.screen.cursor.x + image_grid_size.columns,
++                p_sel.end.x,
+             );
+         },
+     }
+
+commit 84c72bbe463179e420838c4201d67982cc03a8d6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 13:28:40 2023 -0700
+
+    renderer/metal: honor cell offset graphics command
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index aeb25073..c37ee2f5 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -168,7 +168,11 @@ fn display(
+     }).toScreen(&terminal.screen);
+ 
+     // Add the placement
+-    const p: ImageStorage.Placement = .{ .point = placement_point };
++    const p: ImageStorage.Placement = .{
++        .point = placement_point,
++        .x_offset = d.x_offset,
++        .y_offset = d.y_offset,
++    };
+     storage.addPlacement(alloc, img.id, d.placement_id, p) catch |err| {
+         encodeError(&result, err);
+         return result;
+
+commit 3bbfee676b1d88cdcd1ae86db0d43613f37509e1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 14:33:41 2023 -0700
+
+    terminal/kitty-gfx: process source rectangle display params
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index c37ee2f5..cddf6385 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -172,6 +172,10 @@ fn display(
+         .point = placement_point,
+         .x_offset = d.x_offset,
+         .y_offset = d.y_offset,
++        .source_x = d.x,
++        .source_y = d.y,
++        .source_width = d.width,
++        .source_height = d.height,
+     };
+     storage.addPlacement(alloc, img.id, d.placement_id, p) catch |err| {
+         encodeError(&result, err);
+@@ -184,23 +188,17 @@ fn display(
+         .after => {
+             const p_sel = p.selection(img, terminal);
+ 
+-            // If we are moving beneath the screen we need to scroll.
+-            // TODO: handle scroll regions
+-            var new_y = p_sel.end.y + 1;
+-            if (new_y >= terminal.rows) {
+-                const scroll_amount = (new_y + 1) - terminal.rows;
+-                terminal.screen.scroll(.{ .screen = @intCast(scroll_amount) }) catch |err| {
+-                    // If this failed we just warn, the screen will just be in a
+-                    // weird state but nothing fatal.
+-                    log.warn("scroll for image failed: {}", .{err});
+-                };
+-                new_y = terminal.rows - 1;
+-            }
+-
+-            // Move the cursor
++            // We can do better by doing this with pure internal screen state
++            // but this handles scroll regions.
++            const height = p_sel.end.y - p_sel.start.y + 1;
++            for (0..height) |_| terminal.index() catch |err| {
++                log.warn("failed to move cursor: {}", .{err});
++                break;
++            };
++
+             terminal.setCursorPos(
+-                new_y,
+-                p_sel.end.x,
++                terminal.screen.cursor.y + 1,
++                p_sel.end.x + 1,
+             );
+         },
+     }
+
+commit 7ff76ca00d555bcec0fc74aff04e5850c4e1e69f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Aug 22 14:43:50 2023 -0700
+
+    terminal/kitty-gfx: respect display c/r params
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index cddf6385..38c0f581 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -176,6 +176,8 @@ fn display(
+         .source_y = d.y,
+         .source_width = d.width,
+         .source_height = d.height,
++        .columns = d.columns,
++        .rows = d.rows,
+     };
+     storage.addPlacement(alloc, img.id, d.placement_id, p) catch |err| {
+         encodeError(&result, err);
+
+commit 4b38fb96db37784a3b3a8a542e08e55b9a4e81be
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 09:55:13 2023 -0700
+
+    terminal/kitty-gfx: honor "z" setting
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 38c0f581..4dd63828 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -178,6 +178,7 @@ fn display(
+         .source_height = d.height,
+         .columns = d.columns,
+         .rows = d.rows,
++        .z = d.z,
+     };
+     storage.addPlacement(alloc, img.id, d.placement_id, p) catch |err| {
+         encodeError(&result, err);
+
+commit c0b58802bae0f75381251e5303cfd338374d7ba0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 11:17:58 2023 -0700
+
+    terminal/kitty-gfx: images store transmit time
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 4dd63828..e340a8cc 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -297,6 +297,7 @@ const EncodeableError = Image.Error || Allocator.Error;
+ fn encodeError(r: *Response, err: EncodeableError) void {
+     switch (err) {
+         error.OutOfMemory => r.message = "ENOMEM: out of memory",
++        error.InternalError => r.message = "EINVAL: internal error",
+         error.InvalidData => r.message = "EINVAL: invalid data",
+         error.DecompressionFailed => r.message = "EINVAL: decompression failed",
+         error.FilePathTooLong => r.message = "EINVAL: file path too long",
+
+commit de3ef0f78ccbcf2115b95009bf7e14823cc8bb4e
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 11:37:14 2023 -0700
+
+    terminal/kitty-gfx: hook up delete
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index e340a8cc..55483dd9 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -39,8 +39,8 @@ pub fn execute(
+         .transmit => transmit(alloc, terminal, cmd),
+         .transmit_and_display => transmitAndDisplay(alloc, terminal, cmd),
+         .display => display(alloc, terminal, cmd),
++        .delete => delete(alloc, terminal, cmd),
+ 
+-        .delete,
+         .transmit_animation_frame,
+         .control_animation,
+         .compose_animation,
+@@ -225,6 +225,17 @@ fn transmitAndDisplay(
+     return display(alloc, terminal, cmd);
+ }
+ 
++/// Display a previously transmitted image.
++fn delete(
++    alloc: Allocator,
++    terminal: *Terminal,
++    cmd: *Command,
++) Response {
++    const storage = &terminal.screen.kitty_images;
++    storage.delete(alloc, terminal, cmd.control.delete);
++    return .{};
++}
++
+ fn loadAndAddImage(
+     alloc: Allocator,
+     terminal: *Terminal,
+
+commit 135250018ecb535793bb0258b3c901292360798f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 11:41:49 2023 -0700
+
+    terminal/kitty-gfx: get rid of selection
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 55483dd9..ce03a185 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -189,11 +189,11 @@ fn display(
+     switch (d.cursor_movement) {
+         .none => {},
+         .after => {
+-            const p_sel = p.selection(img, terminal);
++            const rect = p.rect(img, terminal);
+ 
+             // We can do better by doing this with pure internal screen state
+             // but this handles scroll regions.
+-            const height = p_sel.end.y - p_sel.start.y + 1;
++            const height = rect.bottom_right.y - rect.top_left.y + 1;
+             for (0..height) |_| terminal.index() catch |err| {
+                 log.warn("failed to move cursor: {}", .{err});
+                 break;
+@@ -201,7 +201,7 @@ fn display(
+ 
+             terminal.setCursorPos(
+                 terminal.screen.cursor.y + 1,
+-                p_sel.end.x + 1,
++                rect.bottom_right.x + 1,
+             );
+         },
+     }
+
+commit 79ea2ff2db9ca428d6aa68b629bf277563c187e3
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 16:45:23 2023 -0700
+
+    terminal/kitty-gfx: update todo
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index ce03a185..d5b62bdc 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -14,12 +14,6 @@ const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+ 
+ const log = std.log.scoped(.kitty_gfx);
+ 
+-// TODO:
+-// - delete
+-// - shared memory transmit
+-// - terminal state around deleting placements (i.e. scrolling)
+-// (not exhaustive, almost every op is ignoring additional config)
+-
+ /// Execute a Kitty graphics command against the given terminal. This
+ /// will never fail, but the response may indicate an error and the
+ /// terminal state may not be updated to reflect the command. This will
+
+commit 46ba3189f6ddac3f21282650f243c81f17c80265
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 16:58:16 2023 -0700
+
+    config: image-storage-limit to set maximum image memory per terminal
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index d5b62bdc..5172f779 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -26,6 +26,11 @@ pub fn execute(
+     terminal: *Terminal,
+     cmd: *Command,
+ ) ?Response {
++    // If storage is disabled then we disable the full protocol. This means
++    // we don't even respond to queries so the terminal completely acts as
++    // if this feature is not supported.
++    if (!terminal.screen.kitty_images.enabled()) return null;
++
+     log.debug("executing kitty graphics command: {}", .{cmd.control});
+ 
+     const resp_: ?Response = switch (cmd.control) {
+
+commit 23c7d95ee1122dcf85199c1bf483322626dfda80
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 17:07:50 2023 -0700
+
+    terminal/kitty-gfx: only enable on Metal for now
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 5172f779..b6f00f12 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -2,6 +2,7 @@ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+ 
++const renderer = @import("../../renderer.zig");
+ const point = @import("../point.zig");
+ const Terminal = @import("../Terminal.zig");
+ const command = @import("graphics_command.zig");
+@@ -31,6 +32,9 @@ pub fn execute(
+     // if this feature is not supported.
+     if (!terminal.screen.kitty_images.enabled()) return null;
+ 
++    // Only Metal supports rendering the images, right now.
++    if (comptime renderer.Renderer != renderer.Metal) return null;
++
+     log.debug("executing kitty graphics command: {}", .{cmd.control});
+ 
+     const resp_: ?Response = switch (cmd.control) {
+
+commit 53452bab78355811c13686bd6e621e9b3e69d06d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 17:55:41 2023 -0700
+
+    terminal/kitty-gfx: chunked transmit and display
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index b6f00f12..759cf14b 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -30,17 +30,22 @@ pub fn execute(
+     // If storage is disabled then we disable the full protocol. This means
+     // we don't even respond to queries so the terminal completely acts as
+     // if this feature is not supported.
+-    if (!terminal.screen.kitty_images.enabled()) return null;
++    if (!terminal.screen.kitty_images.enabled()) {
++        log.debug("kitty graphics requested but disabled", .{});
++        return null;
++    }
+ 
+     // Only Metal supports rendering the images, right now.
+-    if (comptime renderer.Renderer != renderer.Metal) return null;
++    if (comptime renderer.Renderer != renderer.Metal) {
++        log.warn("kitty graphics not supported on this renderer", .{});
++        return null;
++    }
+ 
+     log.debug("executing kitty graphics command: {}", .{cmd.control});
+ 
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
+-        .transmit => transmit(alloc, terminal, cmd),
+-        .transmit_and_display => transmitAndDisplay(alloc, terminal, cmd),
++        .transmit, .transmit_and_display => transmit(alloc, terminal, cmd),
+         .display => display(alloc, terminal, cmd),
+         .delete => delete(alloc, terminal, cmd),
+ 
+@@ -113,19 +118,26 @@ fn transmit(
+         .placement_id = t.placement_id,
+     };
+ 
+-    var img = loadAndAddImage(alloc, terminal, cmd) catch |err| {
++    const load = loadAndAddImage(alloc, terminal, cmd) catch |err| {
+         encodeError(&result, err);
+         return result;
+     };
+-    errdefer img.deinit(alloc);
++    errdefer load.image.deinit(alloc);
++
++    // If we're also displaying, then do that now. This function does
++    // both transmit and transmit and display. The display might also be
++    // deferred if it is multi-chunk.
++    if (load.display) |d| {
++        var d_copy = d;
++        d_copy.image_id = load.image.id;
++        return display(alloc, terminal, &.{
++            .control = .{ .display = d_copy },
++            .quiet = cmd.quiet,
++        });
++    }
+ 
+     // After the image is added, set the ID in case it changed
+-    result.id = img.id;
+-
+-    // If this is a transmit_and_display then the display part needs the image ID
+-    if (cmd.control == .transmit_and_display) {
+-        cmd.control.transmit_and_display.display.image_id = img.id;
+-    }
++    result.id = load.image.id;
+ 
+     return result;
+ }
+@@ -134,7 +146,7 @@ fn transmit(
+ fn display(
+     alloc: Allocator,
+     terminal: *Terminal,
+-    cmd: *Command,
++    cmd: *const Command,
+ ) Response {
+     const d = cmd.display().?;
+ 
+@@ -212,22 +224,6 @@ fn display(
+     return result;
+ }
+ 
+-/// A combination of transmit and display. Nothing special.
+-fn transmitAndDisplay(
+-    alloc: Allocator,
+-    terminal: *Terminal,
+-    cmd: *Command,
+-) Response {
+-    const resp = transmit(alloc, terminal, cmd);
+-    if (!resp.ok()) return resp;
+-
+-    // If the transmission is chunked, we defer the display
+-    const t = cmd.transmission().?;
+-    if (t.more_chunks) return resp;
+-
+-    return display(alloc, terminal, cmd);
+-}
+-
+ /// Display a previously transmitted image.
+ fn delete(
+     alloc: Allocator,
+@@ -243,7 +239,10 @@ fn loadAndAddImage(
+     alloc: Allocator,
+     terminal: *Terminal,
+     cmd: *Command,
+-) !Image {
++) !struct {
++    image: Image,
++    display: ?command.Display = null,
++} {
+     const t = cmd.transmission().?;
+     const storage = &terminal.screen.kitty_images;
+ 
+@@ -254,7 +253,7 @@ fn loadAndAddImage(
+         try loading.addData(alloc, cmd.data);
+ 
+         // If we have more then we're done
+-        if (t.more_chunks) return loading.image;
++        if (t.more_chunks) return .{ .image = loading.image };
+ 
+         // We have no more chunks. We're going to be completing the
+         // image so we want to destroy the pointer to the loading
+@@ -287,7 +286,7 @@ fn loadAndAddImage(
+         errdefer alloc.destroy(loading_ptr);
+         loading_ptr.* = loading;
+         storage.loading = loading_ptr;
+-        return loading.image;
++        return .{ .image = loading.image };
+     }
+ 
+     // Dump the image data before it is decompressed
+@@ -298,11 +297,14 @@ fn loadAndAddImage(
+     errdefer img.deinit(alloc);
+     try storage.addImage(alloc, img);
+ 
++    // Get our display settings
++    const display_ = loading.display;
++
+     // Ensure we deinit the loading state because we're done. The image
+     // won't be deinit because of "complete" above.
+     loading.deinit(alloc);
+ 
+-    return img;
++    return .{ .image = img, .display = display_ };
+ }
+ 
+ const EncodeableError = Image.Error || Allocator.Error;
+
+commit bf7054eeb6dbabd7036e26545bf93b2af48f8e73
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 21:52:50 2023 -0700
+
+    terminal/kitty-gfx: ignore extra base64 padding
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 759cf14b..7a7913ad 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -41,7 +41,11 @@ pub fn execute(
+         return null;
+     }
+ 
+-    log.debug("executing kitty graphics command: {}", .{cmd.control});
++    log.debug("executing kitty graphics command: {}", .{cmd: {
++        var copy = cmd.*;
++        copy.data = "";
++        break :cmd copy;
++    }});
+ 
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
+
+commit 35f1a9a478bb37e86e35d0797778b3d1e227af4d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 22:01:21 2023 -0700
+
+    terminal/kitty-gfx: transmission only sends response when no more chunks
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 7a7913ad..5abe4abb 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -41,11 +41,10 @@ pub fn execute(
+         return null;
+     }
+ 
+-    log.debug("executing kitty graphics command: {}", .{cmd: {
+-        var copy = cmd.*;
+-        copy.data = "";
+-        break :cmd copy;
+-    }});
++    log.debug("executing kitty graphics command: quiet={} control={}", .{
++        cmd.quiet,
++        cmd.control,
++    });
+ 
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
+@@ -132,6 +131,7 @@ fn transmit(
+     // both transmit and transmit and display. The display might also be
+     // deferred if it is multi-chunk.
+     if (load.display) |d| {
++        assert(!load.more);
+         var d_copy = d;
+         d_copy.image_id = load.image.id;
+         return display(alloc, terminal, &.{
+@@ -140,6 +140,9 @@ fn transmit(
+         });
+     }
+ 
++    // If there are more chunks expected we do not respond.
++    if (load.more) return .{};
++
+     // After the image is added, set the ID in case it changed
+     result.id = load.image.id;
+ 
+@@ -245,6 +248,7 @@ fn loadAndAddImage(
+     cmd: *Command,
+ ) !struct {
+     image: Image,
++    more: bool = false,
+     display: ?command.Display = null,
+ } {
+     const t = cmd.transmission().?;
+@@ -257,7 +261,7 @@ fn loadAndAddImage(
+         try loading.addData(alloc, cmd.data);
+ 
+         // If we have more then we're done
+-        if (t.more_chunks) return .{ .image = loading.image };
++        if (t.more_chunks) return .{ .image = loading.image, .more = true };
+ 
+         // We have no more chunks. We're going to be completing the
+         // image so we want to destroy the pointer to the loading
+@@ -290,7 +294,7 @@ fn loadAndAddImage(
+         errdefer alloc.destroy(loading_ptr);
+         loading_ptr.* = loading;
+         storage.loading = loading_ptr;
+-        return .{ .image = loading.image };
++        return .{ .image = loading.image, .more = true };
+     }
+ 
+     // Dump the image data before it is decompressed
+
+commit ec5dcf0850a1fa3a319cb10bee9cb526f4ad0add
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Aug 23 22:37:01 2023 -0700
+
+    terminal/kitty-gfx: do not send response on transmit/display unless I
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 5abe4abb..fb6b835f 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -146,6 +146,10 @@ fn transmit(
+     // After the image is added, set the ID in case it changed
+     result.id = load.image.id;
+ 
++    // If the original request had an image number, then we respond.
++    // Otherwise, we don't respond.
++    if (load.image.number == 0) return .{};
++
+     return result;
+ }
+ 
+@@ -228,7 +232,8 @@ fn display(
+         },
+     }
+ 
+-    return result;
++    // Display does not result in a response on success
++    return .{};
+ }
+ 
+ /// Display a previously transmitted image.
+
+commit c962bd0abffa04c19e32ed824bfe4bb5b515fb0d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Aug 24 08:33:58 2023 -0700
+
+    terminal/kitty-gfx: add error if both image id and num is set
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index fb6b835f..5b3454f9 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -120,6 +120,9 @@ fn transmit(
+         .image_number = t.image_number,
+         .placement_id = t.placement_id,
+     };
++    if (t.image_id > 0 and t.image_number > 0) {
++        return .{ .message = "EINVAL: image ID and number are mutually exclusive" };
++    }
+ 
+     const load = loadAndAddImage(alloc, terminal, cmd) catch |err| {
+         encodeError(&result, err);
+@@ -244,6 +247,8 @@ fn delete(
+ ) Response {
+     const storage = &terminal.screen.kitty_images;
+     storage.delete(alloc, terminal, cmd.control.delete);
++
++    // Delete never responds on success
+     return .{};
+ }
+ 
+
+commit f2f2b1eaf16502dc4d38aec3cb4bb45058e5cccc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Thu Aug 24 08:45:32 2023 -0700
+
+    termio/exec: initial subprocess screen size should be sub padding
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 5b3454f9..0415722b 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -222,14 +222,14 @@ fn display(
+ 
+             // We can do better by doing this with pure internal screen state
+             // but this handles scroll regions.
+-            const height = rect.bottom_right.y - rect.top_left.y + 1;
++            const height = rect.bottom_right.y - rect.top_left.y;
+             for (0..height) |_| terminal.index() catch |err| {
+                 log.warn("failed to move cursor: {}", .{err});
+                 break;
+             };
+ 
+             terminal.setCursorPos(
+-                terminal.screen.cursor.y + 1,
++                terminal.screen.cursor.y,
+                 rect.bottom_right.x + 1,
+             );
+         },
+
+commit 553d81afd16c12e687c1c84f9f1f7266c962d8a0
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Nov 19 21:39:30 2023 -0800
+
+    terminal: enable kitty graphics commands on OpenGL
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 0415722b..70c63db7 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -35,12 +35,6 @@ pub fn execute(
+         return null;
+     }
+ 
+-    // Only Metal supports rendering the images, right now.
+-    if (comptime renderer.Renderer != renderer.Metal) {
+-        log.warn("kitty graphics not supported on this renderer", .{});
+-        return null;
+-    }
+-
+     log.debug("executing kitty graphics command: quiet={} control={}", .{
+         cmd.quiet,
+         cmd.control,
+
+commit 46dd6e6caf7f8d2a1c08b620bcf60cd6835b5803
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Mon Jan 22 15:51:30 2024 -0800
+
+    kitty graphics: assign automatic placement ID if p==0
+    
+    Fixes #1356
+    
+    As stated in the code, the specification itself doesn't explicitly
+    specify this behavior (as far as I can tell), but testing in Kitty
+    results in this working and I believe this is how they do it.
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 70c63db7..92efe00d 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -170,6 +170,16 @@ fn display(
+         .placement_id = d.placement_id,
+     };
+ 
++    // If the placement has no ID, we assign one. This is not in the spec
++    // but Kitty appears to support the behavior where specifying multiple
++    // placements with ID 0 creates new placements rather than replacing
++    // the existing placement.
++    if (result.placement_id == 0) {
++        const storage = &terminal.screen.kitty_images;
++        result.placement_id = storage.next_id;
++        storage.next_id +%= 1;
++    }
++
+     // Verify the requested image exists if we have an ID
+     const storage = &terminal.screen.kitty_images;
+     const img_: ?Image = if (d.image_id != 0)
+@@ -203,7 +213,12 @@ fn display(
+         .rows = d.rows,
+         .z = d.z,
+     };
+-    storage.addPlacement(alloc, img.id, d.placement_id, p) catch |err| {
++    storage.addPlacement(
++        alloc,
++        img.id,
++        result.placement_id,
++        p,
++    ) catch |err| {
+         encodeError(&result, err);
+         return result;
+     };
+
+commit 238361698b46ee75fb99b3d68d2c5b7153e79016
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Jan 24 22:15:39 2024 -0800
+
+    kitty graphics: use internal ID for placements with ID 0
+    
+    Fixes #1356 correctly.
+    
+    This was previously fixed by #1360 which just assigned a random
+    placement ID. I asked the Kitty maintainer about this and this is not
+    the correct logic and the spec has been updated.
+    
+    When a placement ID of zero is sent, we allow multiple placements but
+    use an internal, non-addressable placement ID. The issue with my
+    previous approach was someone with knowledge of internals (or luck)
+    could technically address the placement. This isn't allowed.
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 92efe00d..b4047c1d 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -170,16 +170,6 @@ fn display(
+         .placement_id = d.placement_id,
+     };
+ 
+-    // If the placement has no ID, we assign one. This is not in the spec
+-    // but Kitty appears to support the behavior where specifying multiple
+-    // placements with ID 0 creates new placements rather than replacing
+-    // the existing placement.
+-    if (result.placement_id == 0) {
+-        const storage = &terminal.screen.kitty_images;
+-        result.placement_id = storage.next_id;
+-        storage.next_id +%= 1;
+-    }
+-
+     // Verify the requested image exists if we have an ID
+     const storage = &terminal.screen.kitty_images;
+     const img_: ?Image = if (d.image_id != 0)
+@@ -300,8 +290,8 @@ fn loadAndAddImage(
+ 
+     // If the image has no ID, we assign one
+     if (loading.image.id == 0) {
+-        loading.image.id = storage.next_id;
+-        storage.next_id +%= 1;
++        loading.image.id = storage.next_image_id;
++        storage.next_image_id +%= 1;
+     }
+ 
+     // If this is chunked, this is the beginning of a new chunked transmission.
+
+commit 4c4d5f5a890a9ba34883b665976d7107278048bc
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Mar 8 20:52:14 2024 -0800
+
+    terminal/kitty: graphics exec ported
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index b4047c1d..65c7f5bf 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -184,15 +184,19 @@ fn display(
+     // Make sure our response has the image id in case we looked up by number
+     result.id = img.id;
+ 
+-    // Determine the screen point for the placement.
+-    const placement_point = (point.Viewport{
+-        .x = terminal.screen.cursor.x,
+-        .y = terminal.screen.cursor.y,
+-    }).toScreen(&terminal.screen);
++    // Track a new pin for our cursor. The cursor is always tracked but we
++    // don't want this one to move with the cursor.
++    const placement_pin = terminal.screen.pages.trackPin(
++        terminal.screen.cursor.page_pin.*,
++    ) catch |err| {
++        log.warn("failed to create pin for Kitty graphics err={}", .{err});
++        result.message = "EINVAL: failed to prepare terminal state";
++        return result;
++    };
+ 
+     // Add the placement
+     const p: ImageStorage.Placement = .{
+-        .point = placement_point,
++        .pin = placement_pin,
+         .x_offset = d.x_offset,
+         .y_offset = d.y_offset,
+         .source_x = d.x,
+@@ -209,6 +213,7 @@ fn display(
+         result.placement_id,
+         p,
+     ) catch |err| {
++        p.deinit(&terminal.screen);
+         encodeError(&result, err);
+         return result;
+     };
+
+commit d7ee705a7a6c3e9a39a70fbc9d4500d0dcd1eb18
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Mar 13 10:27:19 2024 -0700
+
+    terminal/kitty: calculate cell height more efficiently
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 65c7f5bf..0ea08479 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -222,19 +222,16 @@ fn display(
+     switch (d.cursor_movement) {
+         .none => {},
+         .after => {
+-            const rect = p.rect(img, terminal);
+-
+-            // We can do better by doing this with pure internal screen state
+-            // but this handles scroll regions.
+-            const height = rect.bottom_right.y - rect.top_left.y;
+-            for (0..height) |_| terminal.index() catch |err| {
++            // We use terminal.index to properly handle scroll regions.
++            const size = p.gridSize(img, terminal);
++            for (0..size.rows) |_| terminal.index() catch |err| {
+                 log.warn("failed to move cursor: {}", .{err});
+                 break;
+             };
+ 
+             terminal.setCursorPos(
+                 terminal.screen.cursor.y,
+-                rect.bottom_right.x + 1,
++                p.pin.x + size.cols + 1,
+             );
+         },
+     }
+
+commit a5c382633fe2d84c416996c52bc78e00401ff94c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Jul 24 11:38:56 2024 -0700
+
+    terminal/kitty: placements support location enum (only pin for now)
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 0ea08479..1d873c0c 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -196,7 +196,9 @@ fn display(
+ 
+     // Add the placement
+     const p: ImageStorage.Placement = .{
+-        .pin = placement_pin,
++        .location = .{
++            .pin = placement_pin,
++        },
+         .x_offset = d.x_offset,
+         .y_offset = d.y_offset,
+         .source_x = d.x,
+@@ -218,21 +220,23 @@ fn display(
+         return result;
+     };
+ 
+-    // Cursor needs to move after placement
+-    switch (d.cursor_movement) {
+-        .none => {},
+-        .after => {
+-            // We use terminal.index to properly handle scroll regions.
+-            const size = p.gridSize(img, terminal);
+-            for (0..size.rows) |_| terminal.index() catch |err| {
+-                log.warn("failed to move cursor: {}", .{err});
+-                break;
+-            };
+-
+-            terminal.setCursorPos(
+-                terminal.screen.cursor.y,
+-                p.pin.x + size.cols + 1,
+-            );
++    // Apply cursor movement setting. This only applies to pin placements.
++    switch (p.location) {
++        .pin => |pin| switch (d.cursor_movement) {
++            .none => {},
++            .after => {
++                // We use terminal.index to properly handle scroll regions.
++                const size = p.gridSize(img, terminal);
++                for (0..size.rows) |_| terminal.index() catch |err| {
++                    log.warn("failed to move cursor: {}", .{err});
++                    break;
++                };
++
++                terminal.setCursorPos(
++                    terminal.screen.cursor.y,
++                    pin.x + size.cols + 1,
++                );
++            },
+         },
+     }
+ 
+
+commit 7d9e50353b6894b961b99282acef62f575720882
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Jul 24 11:49:42 2024 -0700
+
+    terminal/kitty: add virtual placeholders placements
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 1d873c0c..2859d3f0 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -184,21 +184,26 @@ fn display(
+     // Make sure our response has the image id in case we looked up by number
+     result.id = img.id;
+ 
+-    // Track a new pin for our cursor. The cursor is always tracked but we
+-    // don't want this one to move with the cursor.
+-    const placement_pin = terminal.screen.pages.trackPin(
+-        terminal.screen.cursor.page_pin.*,
+-    ) catch |err| {
+-        log.warn("failed to create pin for Kitty graphics err={}", .{err});
+-        result.message = "EINVAL: failed to prepare terminal state";
+-        return result;
++    // Location where the placement will go.
++    const location: ImageStorage.Placement.Location = location: {
++        // Virtual placements are not tracked
++        if (d.virtual_placement) break :location .{ .virtual = {} };
++
++        // Track a new pin for our cursor. The cursor is always tracked but we
++        // don't want this one to move with the cursor.
++        const pin = terminal.screen.pages.trackPin(
++            terminal.screen.cursor.page_pin.*,
++        ) catch |err| {
++            log.warn("failed to create pin for Kitty graphics err={}", .{err});
++            result.message = "EINVAL: failed to prepare terminal state";
++            return result;
++        };
++        break :location .{ .pin = pin };
+     };
+ 
+     // Add the placement
+     const p: ImageStorage.Placement = .{
+-        .location = .{
+-            .pin = placement_pin,
+-        },
++        .location = location,
+         .x_offset = d.x_offset,
+         .y_offset = d.y_offset,
+         .source_x = d.x,
+@@ -222,6 +227,7 @@ fn display(
+ 
+     // Apply cursor movement setting. This only applies to pin placements.
+     switch (p.location) {
++        .virtual => {},
+         .pin => |pin| switch (d.cursor_movement) {
+             .none => {},
+             .after => {
+
+commit 358b4ca896dd75c76b694c595947ae53988780e6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Jul 24 18:59:01 2024 -0700
+
+    terminal/kitty: parse relative placement fields
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 2859d3f0..b8924d56 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -187,7 +187,14 @@ fn display(
+     // Location where the placement will go.
+     const location: ImageStorage.Placement.Location = location: {
+         // Virtual placements are not tracked
+-        if (d.virtual_placement) break :location .{ .virtual = {} };
++        if (d.virtual_placement) {
++            if (d.parent_id > 0) {
++                result.message = "EINVAL: virtual placement cannot refer to a parent";
++                return result;
++            }
++
++            break :location .{ .virtual = {} };
++        }
+ 
+         // Track a new pin for our cursor. The cursor is always tracked but we
+         // don't want this one to move with the cursor.
+
+commit e9c83a5f64a175b5ee685c6500239d3f04653d7b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Sep 3 10:38:00 2024 -0700
+
+    kitty: ENOENT when image ID not found for placement
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index b8924d56..2288c1ce 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -177,7 +177,7 @@ fn display(
+     else
+         storage.imageByNumber(d.image_number);
+     const img = img_ orelse {
+-        result.message = "EINVAL: image not found";
++        result.message = "ENOENT: image not found";
+         return result;
+     };
+ 
+
+commit 2acd7e8a42f5ae62c38b1b52848657ccd4eac3ed
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Sep 3 11:05:04 2024 -0700
+
+    kitty: respond OK with metadata on display transmissions
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 2288c1ce..d8063795 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -140,12 +140,13 @@ fn transmit(
+     // If there are more chunks expected we do not respond.
+     if (load.more) return .{};
+ 
+-    // After the image is added, set the ID in case it changed
+-    result.id = load.image.id;
++    // If our image has no ID or number, we don't respond at all. Conversely,
++    // if we have either an ID or number, we always respond.
++    if (load.image.id == 0 and load.image.number == 0) return .{};
+ 
+-    // If the original request had an image number, then we respond.
+-    // Otherwise, we don't respond.
+-    if (load.image.number == 0) return .{};
++    // After the image is added, set the ID in case it changed.
++    // The resulting image number and placement ID never change.
++    result.id = load.image.id;
+ 
+     return result;
+ }
+@@ -253,8 +254,7 @@ fn display(
+         },
+     }
+ 
+-    // Display does not result in a response on success
+-    return .{};
++    return result;
+ }
+ 
+ /// Display a previously transmitted image.
+
+commit 761bcfad50e28dcd3b167fd2dd5b45adbab24a1f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Wed Sep 4 10:20:32 2024 -0700
+
+    kitty gfx: handle `q` with chunked transmissions properly
+    
+    Fixes #2190
+    
+    The `q` value with chunk transmissions is a bit complicated. The initial
+    transmission ("start" command) `q` value is used for all subsequent
+    chunks UNLESS a subsequent chunk specifies a `q >= 1`. If a chunk
+    specifies `q >= 1`, then that `q` value is subsequently used for all
+    future chunks unless another chunk specifies `q >= 1`. And so on.
+    
+    This commit importantly also introduces the ability to test a full Kitty
+    command from string request to structured response. This will let us
+    prevent regressions in the future and ensure that we are correctly
+    handling the complex underspecified behavior of Kitty Graphics.
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index d8063795..976f7936 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -25,7 +25,7 @@ const log = std.log.scoped(.kitty_gfx);
+ pub fn execute(
+     alloc: Allocator,
+     terminal: *Terminal,
+-    cmd: *Command,
++    cmd: *const Command,
+ ) ?Response {
+     // If storage is disabled then we disable the full protocol. This means
+     // we don't even respond to queries so the terminal completely acts as
+@@ -40,12 +40,36 @@ pub fn execute(
+         cmd.control,
+     });
+ 
++    // The quiet settings used to control the response. We have to make this
++    // a var because in certain special cases (namely chunked transmissions)
++    // this can change.
++    var quiet = cmd.quiet;
++
+     const resp_: ?Response = switch (cmd.control) {
+         .query => query(alloc, cmd),
+-        .transmit, .transmit_and_display => transmit(alloc, terminal, cmd),
+         .display => display(alloc, terminal, cmd),
+         .delete => delete(alloc, terminal, cmd),
+ 
++        .transmit, .transmit_and_display => resp: {
++            // If we're transmitting, then our `q` setting value is complicated.
++            // The `q` setting inherits the value from the starting command
++            // unless `q` is set >= 1 on this command. If it is, then we save
++            // that as the new `q` setting.
++            const storage = &terminal.screen.kitty_images;
++            if (storage.loading) |loading| switch (cmd.quiet) {
++                // q=0 we use whatever the start command value is
++                .no => quiet = loading.quiet,
++
++                // q>=1 we use the new value, but we should already be set to it
++                inline .ok, .failures => |tag| {
++                    assert(quiet == tag);
++                    loading.quiet = tag;
++                },
++            };
++
++            break :resp transmit(alloc, terminal, cmd);
++        },
++
+         .transmit_animation_frame,
+         .control_animation,
+         .compose_animation,
+@@ -58,8 +82,8 @@ pub fn execute(
+             log.warn("erroneous kitty graphics response: {s}", .{resp.message});
+         }
+ 
+-        return switch (cmd.quiet) {
+-            .no => resp,
++        return switch (quiet) {
++            .no => if (resp.empty()) null else resp,
+             .ok => if (resp.ok()) null else resp,
+             .failures => null,
+         };
+@@ -72,7 +96,7 @@ pub fn execute(
+ /// This command is used to attempt to load an image and respond with
+ /// success/error but does not persist any of the command to the terminal
+ /// state.
+-fn query(alloc: Allocator, cmd: *Command) Response {
++fn query(alloc: Allocator, cmd: *const Command) Response {
+     const t = cmd.control.query;
+ 
+     // Query requires image ID. We can't actually send a response without
+@@ -106,7 +130,7 @@ fn query(alloc: Allocator, cmd: *Command) Response {
+ fn transmit(
+     alloc: Allocator,
+     terminal: *Terminal,
+-    cmd: *Command,
++    cmd: *const Command,
+ ) Response {
+     const t = cmd.transmission().?;
+     var result: Response = .{
+@@ -261,7 +285,7 @@ fn display(
+ fn delete(
+     alloc: Allocator,
+     terminal: *Terminal,
+-    cmd: *Command,
++    cmd: *const Command,
+ ) Response {
+     const storage = &terminal.screen.kitty_images;
+     storage.delete(alloc, terminal, cmd.control.delete);
+@@ -273,7 +297,7 @@ fn delete(
+ fn loadAndAddImage(
+     alloc: Allocator,
+     terminal: *Terminal,
+-    cmd: *Command,
++    cmd: *const Command,
+ ) !struct {
+     image: Image,
+     more: bool = false,
+@@ -361,3 +385,93 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+         error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
+     }
+ }
++
++test "kittygfx more chunks with q=1" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    // Initial chunk has q=1
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "a=T,f=24,t=d,i=1,s=1,v=2,c=10,r=1,m=1,q=1;////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++
++    // Subsequent chunk has no q but should respect initial
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "m=0;////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++}
++
++test "kittygfx more chunks with q=0" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    // Initial chunk has q=0
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "a=t,f=24,t=d,s=1,v=2,c=10,r=1,m=1,i=1,q=0;////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++
++    // Subsequent chunk has no q so should respond OK
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "m=0;////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd).?;
++        try testing.expect(resp.ok());
++    }
++}
++
++test "kittygfx more chunks with chunk increasing q" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    // Initial chunk has q=0
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "a=t,f=24,t=d,s=1,v=2,c=10,r=1,m=1,i=1,q=0;////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++
++    // Subsequent chunk sets q=1 so should not respond
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "m=0,q=1;////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++}
+
+commit 723d79c9dead1710e3ea5fc2a687942d08234e31
+Author: Tim Culverhouse <tim@timculverhouse.com>
+Date:   Tue Sep 10 11:42:00 2024 -0500
+
+    graphics: set default transmission format as .rgba
+    
+    The default format for transmission is defined as RGBA (f=32) in the
+    Kitty Graphics specification. When no format is specified, this can
+    result in an error for length checking.
+    
+    Fixes: #2212
+    Reference: https://sw.kovidgoyal.net/kitty/graphics-protocol/#control-data-reference
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 976f7936..c43bbbb9 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -475,3 +475,23 @@ test "kittygfx more chunks with chunk increasing q" {
+         try testing.expect(resp == null);
+     }
+ }
++
++test "kittygfx default format is rgba" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    const cmd = try command.Parser.parseString(
++        alloc,
++        "a=t,t=d,i=1,s=1,v=2,c=10,r=1;///////////",
++    );
++    defer cmd.deinit(alloc);
++    const resp = execute(alloc, &t, &cmd).?;
++    try testing.expect(resp.ok());
++
++    const storage = &t.screen.kitty_images;
++    const img = storage.imageById(1).?;
++    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
++}
+
+commit 861531a1fd510081195a64ca213b9ca26ddfdb01
+Author: Chris Marchesi <chrism@vancluevertech.com>
+Date:   Wed Sep 25 09:01:39 2024 -0700
+
+    terminal/kitty: increase value buffer, make 'H' and 'V' i32
+    
+    This commit increases the value buffer to 11 characters - this is
+    technically what it should be to allow for large negative integers
+    (i.e., 2.4 billion plus the sign character).
+    
+    Additionally corrected the types for 'H' (horizontal offset) and 'V'
+    (vertical offset) - these are supposed to be i32 versus u32.
+    
+    Added some extra tests to test all of this stuff as well.
+    
+    I've also added a few more tests to help track these cases.
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index c43bbbb9..42f12ea0 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -495,3 +495,37 @@ test "kittygfx default format is rgba" {
+     const img = storage.imageById(1).?;
+     try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+ }
++
++test "kittygfx test valid u32 (expect invalid image ID)" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    const cmd = try command.Parser.parseString(
++        alloc,
++        "a=p,i=4294967295",
++    );
++    defer cmd.deinit(alloc);
++    const resp = execute(alloc, &t, &cmd).?;
++    try testing.expect(!resp.ok());
++    try testing.expectEqual(resp.message, "ENOENT: image not found");
++}
++
++test "kittygfx test valid i32 (expect invalid image ID)" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    const cmd = try command.Parser.parseString(
++        alloc,
++        "a=p,i=1,z=-2147483648",
++    );
++    defer cmd.deinit(alloc);
++    const resp = execute(alloc, &t, &cmd).?;
++    try testing.expect(!resp.ok());
++    try testing.expectEqual(resp.message, "ENOENT: image not found");
++}
+
+commit 2f31e1b7fa2b324ae10366e0c91f0aa0fbfcce75
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Tue Dec 10 14:30:59 2024 -0500
+
+    fix(kittygfx): don't respond to T commands with no i or I
+    
+    If a transmit and display command does not specify an ID or a number,
+    then it should not be responded to. We currently automatically assign
+    IDs in this situation, which isn't ideal since collisions can happen
+    which shouldn't, but this at least fixes the glaring observable issue
+    where transmit-and-display commands yield unexpected OK responses.
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 42f12ea0..057f2806 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -164,9 +164,9 @@ fn transmit(
+     // If there are more chunks expected we do not respond.
+     if (load.more) return .{};
+ 
+-    // If our image has no ID or number, we don't respond at all. Conversely,
+-    // if we have either an ID or number, we always respond.
+-    if (load.image.id == 0 and load.image.number == 0) return .{};
++    // If the loaded image was assigned its ID automatically, not based
++    // on a number or explicitly specified ID, then we don't respond.
++    if (load.image.implicit_id) return .{};
+ 
+     // After the image is added, set the ID in case it changed.
+     // The resulting image number and placement ID never change.
+@@ -335,6 +335,10 @@ fn loadAndAddImage(
+     if (loading.image.id == 0) {
+         loading.image.id = storage.next_image_id;
+         storage.next_image_id +%= 1;
++
++        // If the image also has no number then its auto-ID is "implicit".
++        // See the doc comment on the Image.implicit_id field for more detail.
++        if (loading.image.number == 0) loading.image.implicit_id = true;
+     }
+ 
+     // If this is chunked, this is the beginning of a new chunked transmission.
+@@ -529,3 +533,21 @@ test "kittygfx test valid i32 (expect invalid image ID)" {
+     try testing.expect(!resp.ok());
+     try testing.expectEqual(resp.message, "ENOENT: image not found");
+ }
++
++test "kittygfx no response with no image ID or number" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "a=t,f=24,t=d,s=1,v=2,c=10,r=1,i=0,I=0;////////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++}
+
+commit 536ed60db148a837d8bef26b678994b1fcaeeeee
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Thu Dec 12 15:30:37 2024 -0500
+
+    fix(kittygfx): load & display command shouldn't respond to i=0,I=0
+    
+    Load and display (`T`) was responding even with implicit IDs, because
+    the display was achieved with an early return in the transmit function
+    that bypassed the logic to silence implicit ID responses- by making it
+    not an early return we fix this.
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 057f2806..cc87d6c9 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -155,7 +155,7 @@ fn transmit(
+         assert(!load.more);
+         var d_copy = d;
+         d_copy.image_id = load.image.id;
+-        return display(alloc, terminal, &.{
++        result = display(alloc, terminal, &.{
+             .control = .{ .display = d_copy },
+             .quiet = cmd.quiet,
+         });
+@@ -551,3 +551,21 @@ test "kittygfx no response with no image ID or number" {
+         try testing.expect(resp == null);
+     }
+ }
++
++test "kittygfx no response with no image ID or number load and display" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    {
++        const cmd = try command.Parser.parseString(
++            alloc,
++            "a=T,f=24,t=d,s=1,v=2,c=10,r=1,i=0,I=0;////////",
++        );
++        defer cmd.deinit(alloc);
++        const resp = execute(alloc, &t, &cmd);
++        try testing.expect(resp == null);
++    }
++}
+
+commit c9dfcd27811303b71ffb689917dfe13c19333004
+Author: David Leadbeater <dgl@dgl.cx>
+Date:   Fri Jan 3 11:12:33 2025 +1100
+
+    kittygfx: Ensure temporary files are named per spec
+    
+    Temporary files used with Kitty graphics must have
+    "tty-graphics-protocol" somewhere in their full path.
+    
+    https://sw.kovidgoyal.net/kitty/graphics-protocol/#the-transmission-medium
+
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index cc87d6c9..25c819b1 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -382,6 +382,7 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+         error.DecompressionFailed => r.message = "EINVAL: decompression failed",
+         error.FilePathTooLong => r.message = "EINVAL: file path too long",
+         error.TemporaryFileNotInTempDir => r.message = "EINVAL: temporary file not in temp dir",
++        error.TemporaryFileNotNamedCorrectly => r.message = "EINVAL: temporary file not named correctly",
+         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
+         error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+         error.UnsupportedDepth => r.message = "EINVAL: unsupported pixel depth",
+
