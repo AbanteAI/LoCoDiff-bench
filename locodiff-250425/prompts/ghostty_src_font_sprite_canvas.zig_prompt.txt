@@ -1,0 +1,2606 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- src/font/sprite/canvas.zig
+
+commit b21e18a9e6896b05b47dff21552d620d76452021
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 16:16:56 2022 -0800
+
+    font: start converting Box font to our abstract canvas interface
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+new file mode 100644
+index 00000000..09117eab
+--- /dev/null
++++ b/src/font/sprite/canvas.zig
+@@ -0,0 +1,288 @@
++//! This exposes primitives to draw 2D graphics and export the graphic to
++//! a font atlas.
++const std = @import("std");
++const assert = std.debug.assert;
++const Allocator = std.mem.Allocator;
++const pixman = @import("pixman");
++const font = @import("../main.zig");
++
++pub const Point = struct {
++    x: i32,
++    y: i32,
++};
++
++pub const Line = struct {
++    p1: Point,
++    p2: Point,
++};
++
++pub const Box = struct {
++    x1: i32,
++    y1: i32,
++    x2: i32,
++    y2: i32,
++
++    pub fn rect(self: Box) Rect {
++        const tl_x = @min(self.x1, self.x2);
++        const tl_y = @min(self.y1, self.y2);
++        const br_x = @max(self.x1, self.x2);
++        const br_y = @max(self.y1, self.y2);
++        return .{
++            .x = tl_x,
++            .y = tl_y,
++            .width = @intCast(u32, br_x - tl_x),
++            .height = @intCast(u32, br_y - tl_y),
++        };
++    }
++};
++
++pub const Rect = struct {
++    x: i32,
++    y: i32,
++    width: u32,
++    height: u32,
++};
++
++pub const Triangle = struct {
++    p1: Point,
++    p2: Point,
++    p3: Point,
++};
++
++pub const Trapezoid = struct {
++    top: i32,
++    bottom: i32,
++    left: Line,
++    right: Line,
++};
++
++/// We only use alpha-channel so a pixel can only be "on" or "off".
++pub const Color = enum(u8) {
++    on = 255,
++    off = 0,
++    _,
++
++    fn pixmanColor(self: Color) pixman.Color {
++        // pixman uses u16 for color while our color value is u8 so we
++        // scale it up proportionally.
++        const max = @intToFloat(f32, std.math.maxInt(u8));
++        const max_u16 = @intToFloat(f32, std.math.maxInt(u16));
++        const unscaled = @intToFloat(f32, @enumToInt(self));
++        const scaled = @floatToInt(u16, (unscaled * max_u16) / max);
++        return .{ .red = 0, .green = 0, .blue = 0, .alpha = scaled };
++    }
++};
++
++/// Composition operations that are supported.
++pub const CompositionOp = enum {
++    // Note: more can be added here as needed.
++
++    destination_out,
++
++    fn pixmanOp(self: CompositionOp) pixman.Op {
++        return switch (self) {
++            .destination_out => .out,
++        };
++    }
++};
++
++pub const Canvas = switch (font.options.backend) {
++    .web_canvas => WebCanvasImpl,
++    else => PixmanImpl,
++};
++
++const WebCanvasImpl = struct {};
++
++const PixmanImpl = struct {
++    /// The underlying image.
++    image: *pixman.Image,
++
++    /// The raw data buffer.
++    data: []u32,
++
++    pub fn init(alloc: Allocator, width: u32, height: u32) !Canvas {
++        // Determine the config for our image buffer. The images we draw
++        // for boxes are always 8bpp
++        const format: pixman.FormatCode = .a8;
++        const stride = format.strideForWidth(width);
++        const len = @intCast(usize, stride * @intCast(c_int, height));
++
++        // Allocate our buffer. pixman uses []u32 so we divide our length
++        // by 4 since u32 / u8 = 4.
++        var data = try alloc.alloc(u32, len / 4);
++        errdefer alloc.free(data);
++        std.mem.set(u32, data, 0);
++
++        // Create the image we'll draw to
++        const img = try pixman.Image.createBitsNoClear(
++            format,
++            @intCast(c_int, width),
++            @intCast(c_int, height),
++            data.ptr,
++            stride,
++        );
++        errdefer _ = img.unref();
++
++        return Canvas{
++            .image = img,
++            .data = data,
++        };
++    }
++
++    pub fn deinit(self: *Canvas, alloc: Allocator) void {
++        alloc.free(self.data);
++        _ = self.image.unref();
++        self.* = undefined;
++    }
++
++    /// Write the data in this drawing to the atlas.
++    pub fn writeAtlas(self: *Canvas, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
++        assert(atlas.format == .greyscale);
++
++        const width = @intCast(u32, self.image.getWidth());
++        const height = @intCast(u32, self.image.getHeight());
++        const region = try atlas.reserve(alloc, width, height);
++        if (region.width > 0 and region.height > 0) {
++            const depth = atlas.format.depth();
++
++            // Convert our []u32 to []u8 since we use 8bpp formats
++            const stride = self.image.getStride();
++            const data = @alignCast(
++                @alignOf(u8),
++                @ptrCast([*]u8, self.data.ptr)[0 .. self.data.len * 4],
++            );
++
++            // We can avoid a buffer copy if our atlas width and bitmap
++            // width match and the bitmap pitch is just the width (meaning
++            // the data is tightly packed).
++            const needs_copy = !(width * depth == stride);
++
++            // If we need to copy the data, we copy it into a temporary buffer.
++            const buffer = if (needs_copy) buffer: {
++                var temp = try alloc.alloc(u8, width * height * depth);
++                var dst_ptr = temp;
++                var src_ptr = data.ptr;
++                var i: usize = 0;
++                while (i < height) : (i += 1) {
++                    std.mem.copy(u8, dst_ptr, src_ptr[0 .. width * depth]);
++                    dst_ptr = dst_ptr[width * depth ..];
++                    src_ptr += @intCast(usize, stride);
++                }
++                break :buffer temp;
++            } else data[0..(width * height * depth)];
++            defer if (buffer.ptr != data.ptr) alloc.free(buffer);
++
++            // Write the glyph information into the atlas
++            assert(region.width == width);
++            assert(region.height == height);
++            atlas.set(region, buffer);
++        }
++
++        return region;
++    }
++
++    /// Draw and fill a rectangle. This is the main primitive for drawing
++    /// lines as well (which are just generally skinny rectangles...)
++    pub fn rect(self: *Canvas, v: Rect, color: Color) void {
++        const boxes = &[_]pixman.Box32{
++            .{
++                .x1 = @intCast(i32, v.x),
++                .y1 = @intCast(i32, v.y),
++                .x2 = @intCast(i32, v.x + @intCast(i32, v.width)),
++                .y2 = @intCast(i32, v.y + @intCast(i32, v.height)),
++            },
++        };
++
++        self.image.fillBoxes(.src, color.pixmanColor(), boxes) catch {};
++    }
++
++    /// Draw and fill a trapezoid.
++    pub fn trapezoid(self: *Canvas, t: Trapezoid) void {
++        self.image.rasterizeTrapezoid(.{
++            .top = pixman.Fixed.init(t.top),
++            .bottom = pixman.Fixed.init(t.bottom),
++            .left = .{
++                .p1 = .{
++                    .x = pixman.Fixed.init(t.left.p1.x),
++                    .y = pixman.Fixed.init(t.left.p1.y),
++                },
++                .p2 = .{
++                    .x = pixman.Fixed.init(t.left.p2.x),
++                    .y = pixman.Fixed.init(t.left.p2.y),
++                },
++            },
++            .right = .{
++                .p1 = .{
++                    .x = pixman.Fixed.init(t.right.p1.x),
++                    .y = pixman.Fixed.init(t.right.p1.y),
++                },
++                .p2 = .{
++                    .x = pixman.Fixed.init(t.right.p2.x),
++                    .y = pixman.Fixed.init(t.right.p2.y),
++                },
++            },
++        }, 0, 0);
++    }
++
++    /// Draw and fill a triangle.
++    pub fn triangle(self: *Canvas, t: Triangle, color: Color) void {
++        const tris = &[_]pixman.Triangle{
++            .{
++                .p1 = .{ .x = pixman.Fixed.init(t.p1.x), .y = pixman.Fixed.init(t.p1.y) },
++                .p2 = .{ .x = pixman.Fixed.init(t.p2.x), .y = pixman.Fixed.init(t.p2.y) },
++                .p3 = .{ .x = pixman.Fixed.init(t.p3.x), .y = pixman.Fixed.init(t.p3.y) },
++            },
++        };
++
++        const src = pixman.Image.createSolidFill(color.pixmanColor()) catch return;
++        defer _ = src.unref();
++        self.image.compositeTriangles(.over, src, .a8, 0, 0, 0, 0, tris);
++    }
++
++    /// Composite one image on another.
++    pub fn composite(self: *Canvas, op: CompositionOp, src: *const Canvas, dest: Rect) void {
++        self.image.composite(
++            op.pixmanOp(),
++            src.image,
++            null,
++            0,
++            0,
++            0,
++            0,
++            @intCast(i16, dest.x),
++            @intCast(i16, dest.y),
++            @intCast(u16, dest.width),
++            @intCast(u16, dest.height),
++        );
++    }
++
++    /// Returns a copy of the raw pixel data in A8 format. The returned value
++    /// must be freed by the caller. The returned data always has a stride
++    /// exactly equivalent to the width.
++    pub fn getData(self: *const Canvas, alloc: Allocator) ![]u8 {
++        const width = @intCast(u32, self.image.getWidth());
++        const height = @intCast(u32, self.image.getHeight());
++
++        var result = try alloc.alloc(u8, height * width);
++        errdefer alloc.free(result);
++
++        // We want to convert our []u32 to []u8 since we use an 8bpp format
++        var data_u32 = self.image.getData();
++        const len_u8 = data_u32.len * 4;
++        var real_data = @alignCast(@alignOf(u8), @ptrCast([*]u8, data_u32.ptr)[0..len_u8]);
++        const real_stride = self.image.getStride();
++
++        // Convert our strided data
++        var r: u32 = 0;
++        while (r < height) : (r += 1) {
++            var c: u32 = 0;
++            while (c < width) : (c += 1) {
++                const src = r * @intCast(usize, real_stride) + c;
++                const dst = (r * c) + c;
++                result[dst] = real_data[src];
++            }
++        }
++
++        return result;
++    }
++};
+
+commit ead8610604a77ed406b4bc1fe9dd58a2d96579f1
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 21:08:45 2022 -0800
+
+    font: Box font uses canvas abstraction
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 09117eab..8009f81c 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -262,25 +262,25 @@ const PixmanImpl = struct {
+     pub fn getData(self: *const Canvas, alloc: Allocator) ![]u8 {
+         const width = @intCast(u32, self.image.getWidth());
+         const height = @intCast(u32, self.image.getHeight());
++        const stride = self.image.getStride();
+ 
+         var result = try alloc.alloc(u8, height * width);
+         errdefer alloc.free(result);
+ 
+         // We want to convert our []u32 to []u8 since we use an 8bpp format
+-        var data_u32 = self.image.getData();
+-        const len_u8 = data_u32.len * 4;
+-        var real_data = @alignCast(@alignOf(u8), @ptrCast([*]u8, data_u32.ptr)[0..len_u8]);
+-        const real_stride = self.image.getStride();
++        const data = @alignCast(
++            @alignOf(u8),
++            @ptrCast([*]u8, self.data.ptr)[0 .. self.data.len * 4],
++        );
+ 
+         // Convert our strided data
+-        var r: u32 = 0;
+-        while (r < height) : (r += 1) {
+-            var c: u32 = 0;
+-            while (c < width) : (c += 1) {
+-                const src = r * @intCast(usize, real_stride) + c;
+-                const dst = (r * c) + c;
+-                result[dst] = real_data[src];
+-            }
++        var dst_ptr = result;
++        var src_ptr = data.ptr;
++        var i: usize = 0;
++        while (i < height) : (i += 1) {
++            std.mem.copy(u8, dst_ptr, src_ptr[0..width]);
++            dst_ptr = dst_ptr[width..];
++            src_ptr += @intCast(usize, stride);
+         }
+ 
+         return result;
+
+commit 68e697dcbe52042216e9a02ffc5d1fafb6462c5c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 21:09:09 2022 -0800
+
+    font: remove getData from canvas
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 8009f81c..ef9735a3 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -255,34 +255,4 @@ const PixmanImpl = struct {
+             @intCast(u16, dest.height),
+         );
+     }
+-
+-    /// Returns a copy of the raw pixel data in A8 format. The returned value
+-    /// must be freed by the caller. The returned data always has a stride
+-    /// exactly equivalent to the width.
+-    pub fn getData(self: *const Canvas, alloc: Allocator) ![]u8 {
+-        const width = @intCast(u32, self.image.getWidth());
+-        const height = @intCast(u32, self.image.getHeight());
+-        const stride = self.image.getStride();
+-
+-        var result = try alloc.alloc(u8, height * width);
+-        errdefer alloc.free(result);
+-
+-        // We want to convert our []u32 to []u8 since we use an 8bpp format
+-        const data = @alignCast(
+-            @alignOf(u8),
+-            @ptrCast([*]u8, self.data.ptr)[0 .. self.data.len * 4],
+-        );
+-
+-        // Convert our strided data
+-        var dst_ptr = result;
+-        var src_ptr = data.ptr;
+-        var i: usize = 0;
+-        while (i < height) : (i += 1) {
+-            std.mem.copy(u8, dst_ptr, src_ptr[0..width]);
+-            dst_ptr = dst_ptr[width..];
+-            src_ptr += @intCast(usize, stride);
+-        }
+-
+-        return result;
+-    }
+ };
+
+commit c9755f5fd1a70552bd33d2ee9b5e2ee0c0d9325c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 21:19:40 2022 -0800
+
+    font: mostly empty web canvas sprite renderer, but compiles
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index ef9735a3..00654f96 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
++const js = @import("zig-js");
+ const pixman = @import("pixman");
+ const font = @import("../main.zig");
+ 
+@@ -91,7 +92,70 @@ pub const Canvas = switch (font.options.backend) {
+     else => PixmanImpl,
+ };
+ 
+-const WebCanvasImpl = struct {};
++const WebCanvasImpl = struct {
++    /// The canvas element that is our final image.
++    canvas: js.Object,
++
++    pub fn init(alloc: Allocator, width: u32, height: u32) !WebCanvasImpl {
++        _ = alloc;
++
++        // Create our canvas that we're going to continue to reuse.
++        const doc = try js.global.get(js.Object, "document");
++        defer doc.deinit();
++        const canvas = try doc.call(js.Object, "createElement", .{js.string("canvas")});
++        errdefer canvas.deinit();
++
++        // Set our dimensions.
++        try canvas.set("width", width);
++        try canvas.set("height", height);
++
++        return WebCanvasImpl{
++            .canvas = canvas,
++        };
++    }
++
++    pub fn deinit(self: *WebCanvasImpl, alloc: Allocator) void {
++        _ = alloc;
++        self.canvas.deinit();
++        self.* = undefined;
++    }
++
++    pub fn rect(self: *WebCanvasImpl, v: Rect, color: Color) void {
++        _ = self;
++        _ = v;
++        _ = color;
++    }
++
++    pub fn trapezoid(self: *WebCanvasImpl, t: Trapezoid) void {
++        _ = self;
++        _ = t;
++    }
++
++    pub fn triangle(self: *WebCanvasImpl, t: Triangle, color: Color) void {
++        _ = self;
++        _ = t;
++        _ = color;
++    }
++
++    pub fn composite(
++        self: *WebCanvasImpl,
++        op: CompositionOp,
++        src: *const WebCanvasImpl,
++        dest: Rect,
++    ) void {
++        _ = self;
++        _ = op;
++        _ = src;
++        _ = dest;
++    }
++
++    pub fn writeAtlas(self: *WebCanvasImpl, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
++        _ = self;
++        _ = alloc;
++        _ = atlas;
++        return error.Unimplemented;
++    }
++};
+ 
+ const PixmanImpl = struct {
+     /// The underlying image.
+
+commit b48a0db0403f84dd9ed118ab2a92b451472c79f9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 21:46:33 2022 -0800
+
+    font: web canvas rect sprite func
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 00654f96..8499eb03 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -59,6 +59,8 @@ pub const Trapezoid = struct {
+ 
+ /// We only use alpha-channel so a pixel can only be "on" or "off".
+ pub const Color = enum(u8) {
++    const CSS_BUF_MAX = 24;
++
+     on = 255,
+     off = 0,
+     _,
+@@ -72,6 +74,12 @@ pub const Color = enum(u8) {
+         const scaled = @floatToInt(u16, (unscaled * max_u16) / max);
+         return .{ .red = 0, .green = 0, .blue = 0, .alpha = scaled };
+     }
++
++    fn cssColor(self: Color, buf: []u8) ![]u8 {
++        return try std.fmt.bufPrint(buf, "rgba(0, 0, 0, {:.2})", .{
++            @intToFloat(f32, @enumToInt(self)) / 255,
++        });
++    }
+ };
+ 
+ /// Composition operations that are supported.
+@@ -121,9 +129,14 @@ const WebCanvasImpl = struct {
+     }
+ 
+     pub fn rect(self: *WebCanvasImpl, v: Rect, color: Color) void {
+-        _ = self;
+-        _ = v;
+-        _ = color;
++        const ctx = self.context(color) catch return;
++        defer ctx.deinit();
++        ctx.call(void, "fillRect", .{
++            @intCast(u32, v.x),
++            @intCast(u32, v.y),
++            v.width,
++            v.height,
++        }) catch return;
+     }
+ 
+     pub fn trapezoid(self: *WebCanvasImpl, t: Trapezoid) void {
+@@ -149,6 +162,20 @@ const WebCanvasImpl = struct {
+         _ = dest;
+     }
+ 
++    fn context(self: WebCanvasImpl, fill: ?Color) !js.Object {
++        const ctx = try self.canvas.call(js.Object, "getContext", .{js.string("2d")});
++        errdefer ctx.deinit();
++
++        // Set our fill color
++        if (fill) |c| {
++            var buf: [Color.CSS_BUF_MAX]u8 = undefined;
++            const color = try c.cssColor(&buf);
++            try ctx.set("fillStyle", js.string(color));
++        }
++
++        return ctx;
++    }
++
+     pub fn writeAtlas(self: *WebCanvasImpl, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+         _ = self;
+         _ = alloc;
+
+commit bf054e5b44606394dc36251f18b7ef8a310515d9
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 22:01:13 2022 -0800
+
+    font: web canvas sprite font can write to atlas
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 8499eb03..932f8e4d 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -104,6 +104,10 @@ const WebCanvasImpl = struct {
+     /// The canvas element that is our final image.
+     canvas: js.Object,
+ 
++    /// Store the dimensions for easy access later.
++    width: u32,
++    height: u32,
++
+     pub fn init(alloc: Allocator, width: u32, height: u32) !WebCanvasImpl {
+         _ = alloc;
+ 
+@@ -119,6 +123,8 @@ const WebCanvasImpl = struct {
+ 
+         return WebCanvasImpl{
+             .canvas = canvas,
++            .width = width,
++            .height = height,
+         };
+     }
+ 
+@@ -177,10 +183,81 @@ const WebCanvasImpl = struct {
+     }
+ 
+     pub fn writeAtlas(self: *WebCanvasImpl, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+-        _ = self;
+-        _ = alloc;
+-        _ = atlas;
+-        return error.Unimplemented;
++        assert(atlas.format == .greyscale);
++
++        // Reload our context since we resized the canvas
++        const ctx = try self.context(null);
++        defer ctx.deinit();
++
++        // Set our width/height. Set to vars in case we just query the canvas later.
++        const width = self.width;
++        const height = self.height;
++
++        // Read the image data and get it into a []u8 on our side
++        const bitmap: []u8 = bitmap: {
++            // Read the raw bitmap data and get the "data" value which is a
++            // Uint8ClampedArray.
++            const data = try ctx.call(js.Object, "getImageData", .{ 0, 0, width, height });
++            defer data.deinit();
++            const src_array = try data.get(js.Object, "data");
++            defer src_array.deinit();
++
++            // Allocate our local memory to copy the data to.
++            const len = try src_array.get(u32, "length");
++            var bitmap = try alloc.alloc(u8, @intCast(usize, len));
++            errdefer alloc.free(bitmap);
++
++            // Create our target Uint8Array that we can use to copy from src.
++            const mem_array = mem_array: {
++                // Get our runtime memory
++                const mem = try js.runtime.get(js.Object, "memory");
++                defer mem.deinit();
++                const buf = try mem.get(js.Object, "buffer");
++                defer buf.deinit();
++
++                // Construct our array to peer into our memory
++                const Uint8Array = try js.global.get(js.Object, "Uint8Array");
++                defer Uint8Array.deinit();
++                const mem_array = try Uint8Array.new(.{ buf, bitmap.ptr });
++                errdefer mem_array.deinit();
++
++                break :mem_array mem_array;
++            };
++            defer mem_array.deinit();
++
++            // Copy
++            try mem_array.call(void, "set", .{src_array});
++
++            break :bitmap bitmap;
++        };
++        errdefer alloc.free(bitmap);
++
++        // Convert the format of the bitmap to A8 since the raw canvas data
++        // is in RGBA.
++        // NOTE(mitchellh): do we need a 1px buffer to avoid artifacts?
++        const bitmap_a8: []u8 = a8: {
++            assert(@mod(bitmap.len, 4) == 0);
++            assert(bitmap.len == width * height * 4);
++            var bitmap_a8 = try alloc.alloc(u8, bitmap.len / 4);
++            errdefer alloc.free(bitmap_a8);
++            var i: usize = 0;
++            while (i < bitmap_a8.len) : (i += 1) {
++                bitmap_a8[i] = bitmap[(i * 4) + 3];
++            }
++
++            break :a8 bitmap_a8;
++        };
++        defer alloc.free(bitmap_a8);
++
++        // Write the glyph information into the atlas
++        const region = try atlas.reserve(alloc, width, height);
++        if (region.width > 0 and region.height > 0) {
++            assert(region.width == width);
++            assert(region.height == height);
++            atlas.set(region, bitmap_a8);
++        }
++
++        return region;
+     }
+ };
+ 
+
+commit c391d0f3dee5098b1bff638cf3e0085291460542
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 22:17:27 2022 -0800
+
+    font: web canvas sprite font can composite
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 932f8e4d..68c08e70 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -86,11 +86,17 @@ pub const Color = enum(u8) {
+ pub const CompositionOp = enum {
+     // Note: more can be added here as needed.
+ 
+-    destination_out,
++    source_out,
+ 
+     fn pixmanOp(self: CompositionOp) pixman.Op {
+         return switch (self) {
+-            .destination_out => .out,
++            .source_out => .out,
++        };
++    }
++
++    fn jsOp(self: CompositionOp) js.String {
++        return switch (self) {
++            .source_out => js.string("source-out"),
+         };
+     }
+ };
+@@ -151,9 +157,14 @@ const WebCanvasImpl = struct {
+     }
+ 
+     pub fn triangle(self: *WebCanvasImpl, t: Triangle, color: Color) void {
+-        _ = self;
+-        _ = t;
+-        _ = color;
++        const ctx = self.context(color) catch return;
++        defer ctx.deinit();
++
++        ctx.call(void, "beginPath", .{}) catch return;
++        ctx.call(void, "moveTo", .{ t.p1.x, t.p1.y }) catch return;
++        ctx.call(void, "lineTo", .{ t.p2.x, t.p2.y }) catch return;
++        ctx.call(void, "lineTo", .{ t.p3.x, t.p3.y }) catch return;
++        ctx.call(void, "fill", .{}) catch return;
+     }
+ 
+     pub fn composite(
+@@ -162,16 +173,29 @@ const WebCanvasImpl = struct {
+         src: *const WebCanvasImpl,
+         dest: Rect,
+     ) void {
+-        _ = self;
+-        _ = op;
+-        _ = src;
+-        _ = dest;
++        const ctx = self.context(Color.on) catch return;
++        defer ctx.deinit();
++
++        // Set our compositing operation
++        ctx.set("globalCompositeOperation", op.jsOp()) catch return;
++
++        // Composite
++        ctx.call(void, "drawImage", .{
++            src.canvas,
++            dest.x,
++            dest.y,
++            dest.width,
++            dest.height,
++        }) catch return;
+     }
+ 
+     fn context(self: WebCanvasImpl, fill: ?Color) !js.Object {
+         const ctx = try self.canvas.call(js.Object, "getContext", .{js.string("2d")});
+         errdefer ctx.deinit();
+ 
++        // Reset our composite operation
++        try ctx.set("globalCompositeOperation", js.string("source-over"));
++
+         // Set our fill color
+         if (fill) |c| {
+             var buf: [Color.CSS_BUF_MAX]u8 = undefined;
+
+commit 05a5cfddb5cc1888c134ad3d6307d24f8d5478a6
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Dec 13 22:22:00 2022 -0800
+
+    font: web canvas sprite trapezoid
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 68c08e70..28f17337 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -152,8 +152,15 @@ const WebCanvasImpl = struct {
+     }
+ 
+     pub fn trapezoid(self: *WebCanvasImpl, t: Trapezoid) void {
+-        _ = self;
+-        _ = t;
++        const ctx = self.context(.on) catch return;
++        defer ctx.deinit();
++
++        ctx.call(void, "beginPath", .{}) catch return;
++        ctx.call(void, "moveTo", .{ t.left.p1.x, t.left.p1.y }) catch return;
++        ctx.call(void, "lineTo", .{ t.right.p1.x, t.right.p1.y }) catch return;
++        ctx.call(void, "lineTo", .{ t.right.p2.x, t.right.p2.y }) catch return;
++        ctx.call(void, "lineTo", .{ t.left.p2.x, t.left.p2.y }) catch return;
++        ctx.call(void, "fill", .{}) catch return;
+     }
+ 
+     pub fn triangle(self: *WebCanvasImpl, t: Triangle, color: Color) void {
+
+commit 97d9157d225b2e0e430842cc12b47650ab0de8c7
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun May 7 20:40:05 2023 -0700
+
+    update zig version
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 28f17337..5cc4842d 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -310,7 +310,7 @@ const PixmanImpl = struct {
+         // by 4 since u32 / u8 = 4.
+         var data = try alloc.alloc(u32, len / 4);
+         errdefer alloc.free(data);
+-        std.mem.set(u32, data, 0);
++        @memset(data, 0);
+ 
+         // Create the image we'll draw to
+         const img = try pixman.Image.createBitsNoClear(
+
+commit 56f8e39e5bc4f7c96a5f5c661604d6a10390875f
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Jun 25 11:08:12 2023 -0700
+
+    Update zig, mach, fmt
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 5cc4842d..c9312da9 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -68,16 +68,16 @@ pub const Color = enum(u8) {
+     fn pixmanColor(self: Color) pixman.Color {
+         // pixman uses u16 for color while our color value is u8 so we
+         // scale it up proportionally.
+-        const max = @intToFloat(f32, std.math.maxInt(u8));
+-        const max_u16 = @intToFloat(f32, std.math.maxInt(u16));
+-        const unscaled = @intToFloat(f32, @enumToInt(self));
+-        const scaled = @floatToInt(u16, (unscaled * max_u16) / max);
++        const max = @floatFromInt(f32, std.math.maxInt(u8));
++        const max_u16 = @floatFromInt(f32, std.math.maxInt(u16));
++        const unscaled = @floatFromInt(f32, @intFromEnum(self));
++        const scaled = @intFromFloat(u16, (unscaled * max_u16) / max);
+         return .{ .red = 0, .green = 0, .blue = 0, .alpha = scaled };
+     }
+ 
+     fn cssColor(self: Color, buf: []u8) ![]u8 {
+         return try std.fmt.bufPrint(buf, "rgba(0, 0, 0, {:.2})", .{
+-            @intToFloat(f32, @enumToInt(self)) / 255,
++            @floatFromInt(f32, @intFromEnum(self)) / 255,
+         });
+     }
+ };
+
+commit 314f9287b1854911e38d030ad6ec42bb6cd0a105
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 30 12:15:31 2023 -0700
+
+    Update Zig (#164)
+    
+    * update zig
+    
+    * pkg/fontconfig: clean up @as
+    
+    * pkg/freetype,harfbuzz: clean up @as
+    
+    * pkg/imgui: clean up @as
+    
+    * pkg/macos: clean up @as
+    
+    * pkg/pixman,utf8proc: clean up @as
+    
+    * clean up @as
+    
+    * lots more @as cleanup
+    
+    * undo flatpak changes
+    
+    * clean up @as
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index c9312da9..8603a7ee 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -31,8 +31,8 @@ pub const Box = struct {
+         return .{
+             .x = tl_x,
+             .y = tl_y,
+-            .width = @intCast(u32, br_x - tl_x),
+-            .height = @intCast(u32, br_y - tl_y),
++            .width = @intCast(br_x - tl_x),
++            .height = @intCast(br_y - tl_y),
+         };
+     }
+ };
+@@ -68,16 +68,16 @@ pub const Color = enum(u8) {
+     fn pixmanColor(self: Color) pixman.Color {
+         // pixman uses u16 for color while our color value is u8 so we
+         // scale it up proportionally.
+-        const max = @floatFromInt(f32, std.math.maxInt(u8));
+-        const max_u16 = @floatFromInt(f32, std.math.maxInt(u16));
+-        const unscaled = @floatFromInt(f32, @intFromEnum(self));
+-        const scaled = @intFromFloat(u16, (unscaled * max_u16) / max);
++        const max = @as(f32, @floatFromInt(std.math.maxInt(u8)));
++        const max_u16 = @as(f32, @floatFromInt(std.math.maxInt(u16)));
++        const unscaled = @as(f32, @floatFromInt(@intFromEnum(self)));
++        const scaled = @as(u16, @intFromFloat((unscaled * max_u16) / max));
+         return .{ .red = 0, .green = 0, .blue = 0, .alpha = scaled };
+     }
+ 
+     fn cssColor(self: Color, buf: []u8) ![]u8 {
+         return try std.fmt.bufPrint(buf, "rgba(0, 0, 0, {:.2})", .{
+-            @floatFromInt(f32, @intFromEnum(self)) / 255,
++            @as(f32, @floatFromInt(@intFromEnum(self))) / 255,
+         });
+     }
+ };
+@@ -144,8 +144,8 @@ const WebCanvasImpl = struct {
+         const ctx = self.context(color) catch return;
+         defer ctx.deinit();
+         ctx.call(void, "fillRect", .{
+-            @intCast(u32, v.x),
+-            @intCast(u32, v.y),
++            @as(u32, @intCast(v.x)),
++            @as(u32, @intCast(v.y)),
+             v.width,
+             v.height,
+         }) catch return;
+@@ -235,7 +235,7 @@ const WebCanvasImpl = struct {
+ 
+             // Allocate our local memory to copy the data to.
+             const len = try src_array.get(u32, "length");
+-            var bitmap = try alloc.alloc(u8, @intCast(usize, len));
++            var bitmap = try alloc.alloc(u8, @intCast(len));
+             errdefer alloc.free(bitmap);
+ 
+             // Create our target Uint8Array that we can use to copy from src.
+@@ -304,7 +304,7 @@ const PixmanImpl = struct {
+         // for boxes are always 8bpp
+         const format: pixman.FormatCode = .a8;
+         const stride = format.strideForWidth(width);
+-        const len = @intCast(usize, stride * @intCast(c_int, height));
++        const len = @as(usize, @intCast(stride * @as(c_int, @intCast(height))));
+ 
+         // Allocate our buffer. pixman uses []u32 so we divide our length
+         // by 4 since u32 / u8 = 4.
+@@ -315,8 +315,8 @@ const PixmanImpl = struct {
+         // Create the image we'll draw to
+         const img = try pixman.Image.createBitsNoClear(
+             format,
+-            @intCast(c_int, width),
+-            @intCast(c_int, height),
++            @intCast(width),
++            @intCast(height),
+             data.ptr,
+             stride,
+         );
+@@ -338,18 +338,15 @@ const PixmanImpl = struct {
+     pub fn writeAtlas(self: *Canvas, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+         assert(atlas.format == .greyscale);
+ 
+-        const width = @intCast(u32, self.image.getWidth());
+-        const height = @intCast(u32, self.image.getHeight());
++        const width = @as(u32, @intCast(self.image.getWidth()));
++        const height = @as(u32, @intCast(self.image.getHeight()));
+         const region = try atlas.reserve(alloc, width, height);
+         if (region.width > 0 and region.height > 0) {
+             const depth = atlas.format.depth();
+ 
+             // Convert our []u32 to []u8 since we use 8bpp formats
+             const stride = self.image.getStride();
+-            const data = @alignCast(
+-                @alignOf(u8),
+-                @ptrCast([*]u8, self.data.ptr)[0 .. self.data.len * 4],
+-            );
++            const data = @as([*]u8, @ptrCast(self.data.ptr))[0 .. self.data.len * 4];
+ 
+             // We can avoid a buffer copy if our atlas width and bitmap
+             // width match and the bitmap pitch is just the width (meaning
+@@ -365,7 +362,7 @@ const PixmanImpl = struct {
+                 while (i < height) : (i += 1) {
+                     std.mem.copy(u8, dst_ptr, src_ptr[0 .. width * depth]);
+                     dst_ptr = dst_ptr[width * depth ..];
+-                    src_ptr += @intCast(usize, stride);
++                    src_ptr += @as(usize, @intCast(stride));
+                 }
+                 break :buffer temp;
+             } else data[0..(width * height * depth)];
+@@ -385,10 +382,10 @@ const PixmanImpl = struct {
+     pub fn rect(self: *Canvas, v: Rect, color: Color) void {
+         const boxes = &[_]pixman.Box32{
+             .{
+-                .x1 = @intCast(i32, v.x),
+-                .y1 = @intCast(i32, v.y),
+-                .x2 = @intCast(i32, v.x + @intCast(i32, v.width)),
+-                .y2 = @intCast(i32, v.y + @intCast(i32, v.height)),
++                .x1 = @intCast(v.x),
++                .y1 = @intCast(v.y),
++                .x2 = @intCast(v.x + @as(i32, @intCast(v.width))),
++                .y2 = @intCast(v.y + @as(i32, @intCast(v.height))),
+             },
+         };
+ 
+@@ -448,10 +445,10 @@ const PixmanImpl = struct {
+             0,
+             0,
+             0,
+-            @intCast(i16, dest.x),
+-            @intCast(i16, dest.y),
+-            @intCast(u16, dest.width),
+-            @intCast(u16, dest.height),
++            @intCast(dest.x),
++            @intCast(dest.y),
++            @intCast(dest.width),
++            @intCast(dest.height),
+         );
+     }
+ };
+
+commit 3c5be0726f4e2bb45caa405edef6d995597bde8a
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Fri Jun 30 22:43:09 2023 -0700
+
+    sprite: all rasterized sprites should have a 1px padding
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 8603a7ee..08e80210 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -340,7 +340,31 @@ const PixmanImpl = struct {
+ 
+         const width = @as(u32, @intCast(self.image.getWidth()));
+         const height = @as(u32, @intCast(self.image.getHeight()));
+-        const region = try atlas.reserve(alloc, width, height);
++
++        // Allocate our texture atlas region
++        const region = region: {
++            // We need to add a 1px padding to the font so that we don't
++            // get fuzzy issues when blending textures.
++            const padding = 1;
++
++            // Get the full padded region
++            var region = try atlas.reserve(
++                alloc,
++                width + (padding * 2), // * 2 because left+right
++                height + (padding * 2), // * 2 because top+bottom
++            );
++
++            // Modify the region so that we remove the padding so that
++            // we write to the non-zero location. The data in an Altlas
++            // is always initialized to zero (Atlas.clear) so we don't
++            // need to worry about zero-ing that.
++            region.x += padding;
++            region.y += padding;
++            region.width -= padding * 2;
++            region.height -= padding * 2;
++            break :region region;
++        };
++
+         if (region.width > 0 and region.height > 0) {
+             const depth = atlas.format.depth();
+ 
+
+commit a5eb746cf592d9785eff789022e0cb2a09059a50
+Author: Matthew Winter <33818+wintermi@users.noreply.github.com>
+Date:   Sun Oct 29 02:49:31 2023 +1100
+
+    feat: update undercurl with antialiasing
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 08e80210..93551335 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -140,6 +140,12 @@ const WebCanvasImpl = struct {
+         self.* = undefined;
+     }
+ 
++    pub fn pixel(self: *WebCanvasImpl, x: u32, y: u32, color: Color) void {
++        const ctx = self.context(color) catch return;
++        defer ctx.deinit();
++        ctx.call(void, "fillRect", .{ x, y, 1, 1 }) catch return;
++    }
++
+     pub fn rect(self: *WebCanvasImpl, v: Rect, color: Color) void {
+         const ctx = self.context(color) catch return;
+         defer ctx.deinit();
+@@ -401,6 +407,20 @@ const PixmanImpl = struct {
+         return region;
+     }
+ 
++    /// Draw and fill a single pixel
++    pub fn pixel(self: *Canvas, x: u32, y: u32, color: Color) void {
++        const boxes = &[_]pixman.Box32{
++            .{
++                .x1 = @intCast(x),
++                .y1 = @intCast(y),
++                .x2 = @intCast(x + 1),
++                .y2 = @intCast(y + 1),
++            },
++        };
++
++        self.image.fillBoxes(.src, color.pixmanColor(), boxes) catch {};
++    }
++
+     /// Draw and fill a rectangle. This is the main primitive for drawing
+     /// lines as well (which are just generally skinny rectangles...)
+     pub fn rect(self: *Canvas, v: Rect, color: Color) void {
+
+commit 44a48f62f1f3888d9f91f5592effdfeed9041f9a
+Author: Krzysztof Wolicki <der.teufel.mail@gmail.com>
+Date:   Fri Nov 17 15:40:59 2023 +0100
+
+    change unmodified `var`s to `const`s in anticipation of zig changes
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 93551335..a13e1e50 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -241,7 +241,7 @@ const WebCanvasImpl = struct {
+ 
+             // Allocate our local memory to copy the data to.
+             const len = try src_array.get(u32, "length");
+-            var bitmap = try alloc.alloc(u8, @intCast(len));
++            const bitmap = try alloc.alloc(u8, @intCast(len));
+             errdefer alloc.free(bitmap);
+ 
+             // Create our target Uint8Array that we can use to copy from src.
+@@ -314,7 +314,7 @@ const PixmanImpl = struct {
+ 
+         // Allocate our buffer. pixman uses []u32 so we divide our length
+         // by 4 since u32 / u8 = 4.
+-        var data = try alloc.alloc(u32, len / 4);
++        const data = try alloc.alloc(u32, len / 4);
+         errdefer alloc.free(data);
+         @memset(data, 0);
+ 
+@@ -385,7 +385,7 @@ const PixmanImpl = struct {
+ 
+             // If we need to copy the data, we copy it into a temporary buffer.
+             const buffer = if (needs_copy) buffer: {
+-                var temp = try alloc.alloc(u8, width * height * depth);
++                const temp = try alloc.alloc(u8, width * height * depth);
+                 var dst_ptr = temp;
+                 var src_ptr = data.ptr;
+                 var i: usize = 0;
+
+commit 0750698b62eef62a64b41f0a8c6ec78012882c50
+Author: Krzysztof Wolicki <der.teufel.mail@gmail.com>
+Date:   Thu Nov 30 21:23:28 2023 +0100
+
+    Update to latest master,
+    update libxev dependency,
+    change mach_glfw to an updated fork until upstream updates
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index a13e1e50..83d92400 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -390,7 +390,7 @@ const PixmanImpl = struct {
+                 var src_ptr = data.ptr;
+                 var i: usize = 0;
+                 while (i < height) : (i += 1) {
+-                    std.mem.copy(u8, dst_ptr, src_ptr[0 .. width * depth]);
++                    @memcpy(dst_ptr[0 .. width * depth], src_ptr[0 .. width * depth]);
+                     dst_ptr = dst_ptr[width * depth ..];
+                     src_ptr += @as(usize, @intCast(stride));
+                 }
+
+commit 759c8cddb4f705902762cf8efdbda8522eefc78d
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 24 09:30:04 2024 -0800
+
+    font/sprite: test for thick underline, assertion on x/y for rect
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 83d92400..5f869ae9 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -424,6 +424,9 @@ const PixmanImpl = struct {
+     /// Draw and fill a rectangle. This is the main primitive for drawing
+     /// lines as well (which are just generally skinny rectangles...)
+     pub fn rect(self: *Canvas, v: Rect, color: Color) void {
++        assert(v.x >= 0);
++        assert(v.y >= 0);
++
+         const boxes = &[_]pixman.Box32{
+             .{
+                 .x1 = @intCast(v.x),
+
+commit 796d1312ff2732c53b0872cdefec0ab0eb634000
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sat Feb 24 13:19:49 2024 -0800
+
+    font/sprite: rect must be smaller than canvas dims
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 5f869ae9..e7072f56 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -424,9 +424,6 @@ const PixmanImpl = struct {
+     /// Draw and fill a rectangle. This is the main primitive for drawing
+     /// lines as well (which are just generally skinny rectangles...)
+     pub fn rect(self: *Canvas, v: Rect, color: Color) void {
+-        assert(v.x >= 0);
+-        assert(v.y >= 0);
+-
+         const boxes = &[_]pixman.Box32{
+             .{
+                 .x1 = @intCast(v.x),
+@@ -436,6 +433,10 @@ const PixmanImpl = struct {
+             },
+         };
+ 
++        assert(boxes[0].x1 >= 0);
++        assert(boxes[0].y1 >= 0);
++        assert(boxes[0].x2 <= @as(i32, @intCast(self.image.getWidth())));
++        assert(boxes[0].y2 <= @as(i32, @intCast(self.image.getHeight())));
+         self.image.fillBoxes(.src, color.pixmanColor(), boxes) catch {};
+     }
+ 
+
+commit 10b8ca3c694aa5e0b5cf7eaaae79a4990e3774c3
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Sun Aug 11 18:02:12 2024 -0400
+
+    spelling: normalize grey -> gray
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index e7072f56..10699615 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -220,7 +220,7 @@ const WebCanvasImpl = struct {
+     }
+ 
+     pub fn writeAtlas(self: *WebCanvasImpl, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+-        assert(atlas.format == .greyscale);
++        assert(atlas.format == .grayscale);
+ 
+         // Reload our context since we resized the canvas
+         const ctx = try self.context(null);
+@@ -342,7 +342,7 @@ const PixmanImpl = struct {
+ 
+     /// Write the data in this drawing to the atlas.
+     pub fn writeAtlas(self: *Canvas, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+-        assert(atlas.format == .greyscale);
++        assert(atlas.format == .grayscale);
+ 
+         const width = @as(u32, @intCast(self.image.getWidth()));
+         const height = @as(u32, @intCast(self.image.getHeight()));
+
+commit f67a647a12d6b361342e5fe4df5029fce4009d5c
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Sun Sep 29 09:33:28 2024 -0700
+
+    font/sprite: bounds checking for pixel writes on Pixman
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 10699615..67e213b2 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -409,6 +409,11 @@ const PixmanImpl = struct {
+ 
+     /// Draw and fill a single pixel
+     pub fn pixel(self: *Canvas, x: u32, y: u32, color: Color) void {
++        if (comptime std.debug.runtime_safety) {
++            assert(x < self.image.getWidth());
++            assert(y < self.image.getHeight());
++        }
++
+         const boxes = &[_]pixman.Box32{
+             .{
+                 .x1 = @intCast(x),
+@@ -433,10 +438,13 @@ const PixmanImpl = struct {
+             },
+         };
+ 
+-        assert(boxes[0].x1 >= 0);
+-        assert(boxes[0].y1 >= 0);
+-        assert(boxes[0].x2 <= @as(i32, @intCast(self.image.getWidth())));
+-        assert(boxes[0].y2 <= @as(i32, @intCast(self.image.getHeight())));
++        if (comptime std.debug.runtime_safety) {
++            assert(boxes[0].x1 >= 0);
++            assert(boxes[0].y1 >= 0);
++            assert(boxes[0].x2 <= @as(i32, @intCast(self.image.getWidth())));
++            assert(boxes[0].y2 <= @as(i32, @intCast(self.image.getHeight())));
++        }
++
+         self.image.fillBoxes(.src, color.pixmanColor(), boxes) catch {};
+     }
+ 
+
+commit d38d0f30c4860dfae4091d4e064f9dcc804794b7
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Wed Oct 9 19:31:13 2024 -0400
+
+    font/sprite: replace pixman with z2d, extend Box coverage
+    
+    More complete coverage of the Symbols For Legacy Computing block,
+    including characters from Unicode 16.0.
+    
+    Pixman and the web canvas impl for Canvas have been removed in favor of
+    z2d for drawing, since it has a nicer API with more powerful methods,
+    and is in Zig with no specific platform optimizations so should compile
+    to wasm no problem.
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 67e213b2..a3792fe2 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -3,340 +3,88 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+-const js = @import("zig-js");
+-const pixman = @import("pixman");
++const z2d = @import("z2d");
+ const font = @import("../main.zig");
+ 
+ pub const Point = struct {
+-    x: i32,
+-    y: i32,
++    x: f64,
++    y: f64,
+ };
+ 
+ pub const Line = struct {
++    p0: Point,
+     p1: Point,
+-    p2: Point,
+ };
+ 
+ pub const Box = struct {
+-    x1: i32,
+-    y1: i32,
+-    x2: i32,
+-    y2: i32,
++    p0: Point,
++    p1: Point,
+ 
+     pub fn rect(self: Box) Rect {
+-        const tl_x = @min(self.x1, self.x2);
+-        const tl_y = @min(self.y1, self.y2);
+-        const br_x = @max(self.x1, self.x2);
+-        const br_y = @max(self.y1, self.y2);
++        const tl_x = @min(self.p0.x, self.p1.x);
++        const tl_y = @min(self.p0.y, self.p1.y);
++        const br_x = @max(self.p0.x, self.p1.x);
++        const br_y = @max(self.p0.y, self.p1.y);
+         return .{
+             .x = tl_x,
+             .y = tl_y,
+-            .width = @intCast(br_x - tl_x),
+-            .height = @intCast(br_y - tl_y),
++            .width = br_x - tl_x,
++            .height = br_y - tl_y,
+         };
+     }
+ };
+ 
+ pub const Rect = struct {
+-    x: i32,
+-    y: i32,
+-    width: u32,
+-    height: u32,
++    x: f64,
++    y: f64,
++    width: f64,
++    height: f64,
+ };
+ 
+ pub const Triangle = struct {
++    p0: Point,
+     p1: Point,
+     p2: Point,
+-    p3: Point,
+ };
+ 
+-pub const Trapezoid = struct {
+-    top: i32,
+-    bottom: i32,
+-    left: Line,
+-    right: Line,
++pub const Quad = struct {
++    p0: Point,
++    p1: Point,
++    p2: Point,
++    p3: Point,
+ };
+ 
+ /// We only use alpha-channel so a pixel can only be "on" or "off".
+ pub const Color = enum(u8) {
+-    const CSS_BUF_MAX = 24;
+-
+     on = 255,
+     off = 0,
+     _,
+-
+-    fn pixmanColor(self: Color) pixman.Color {
+-        // pixman uses u16 for color while our color value is u8 so we
+-        // scale it up proportionally.
+-        const max = @as(f32, @floatFromInt(std.math.maxInt(u8)));
+-        const max_u16 = @as(f32, @floatFromInt(std.math.maxInt(u16)));
+-        const unscaled = @as(f32, @floatFromInt(@intFromEnum(self)));
+-        const scaled = @as(u16, @intFromFloat((unscaled * max_u16) / max));
+-        return .{ .red = 0, .green = 0, .blue = 0, .alpha = scaled };
+-    }
+-
+-    fn cssColor(self: Color, buf: []u8) ![]u8 {
+-        return try std.fmt.bufPrint(buf, "rgba(0, 0, 0, {:.2})", .{
+-            @as(f32, @floatFromInt(@intFromEnum(self))) / 255,
+-        });
+-    }
+ };
+ 
+-/// Composition operations that are supported.
+-pub const CompositionOp = enum {
+-    // Note: more can be added here as needed.
+-
+-    source_out,
+-
+-    fn pixmanOp(self: CompositionOp) pixman.Op {
+-        return switch (self) {
+-            .source_out => .out,
+-        };
+-    }
+-
+-    fn jsOp(self: CompositionOp) js.String {
+-        return switch (self) {
+-            .source_out => js.string("source-out"),
+-        };
+-    }
+-};
+-
+-pub const Canvas = switch (font.options.backend) {
+-    .web_canvas => WebCanvasImpl,
+-    else => PixmanImpl,
+-};
+-
+-const WebCanvasImpl = struct {
+-    /// The canvas element that is our final image.
+-    canvas: js.Object,
+-
+-    /// Store the dimensions for easy access later.
+-    width: u32,
+-    height: u32,
+-
+-    pub fn init(alloc: Allocator, width: u32, height: u32) !WebCanvasImpl {
+-        _ = alloc;
++pub const Canvas = struct {
++    /// The underlying z2d surface.
++    sfc: z2d.Surface,
+ 
+-        // Create our canvas that we're going to continue to reuse.
+-        const doc = try js.global.get(js.Object, "document");
+-        defer doc.deinit();
+-        const canvas = try doc.call(js.Object, "createElement", .{js.string("canvas")});
+-        errdefer canvas.deinit();
+-
+-        // Set our dimensions.
+-        try canvas.set("width", width);
+-        try canvas.set("height", height);
+-
+-        return WebCanvasImpl{
+-            .canvas = canvas,
+-            .width = width,
+-            .height = height,
+-        };
+-    }
+-
+-    pub fn deinit(self: *WebCanvasImpl, alloc: Allocator) void {
+-        _ = alloc;
+-        self.canvas.deinit();
+-        self.* = undefined;
+-    }
+-
+-    pub fn pixel(self: *WebCanvasImpl, x: u32, y: u32, color: Color) void {
+-        const ctx = self.context(color) catch return;
+-        defer ctx.deinit();
+-        ctx.call(void, "fillRect", .{ x, y, 1, 1 }) catch return;
+-    }
+-
+-    pub fn rect(self: *WebCanvasImpl, v: Rect, color: Color) void {
+-        const ctx = self.context(color) catch return;
+-        defer ctx.deinit();
+-        ctx.call(void, "fillRect", .{
+-            @as(u32, @intCast(v.x)),
+-            @as(u32, @intCast(v.y)),
+-            v.width,
+-            v.height,
+-        }) catch return;
+-    }
+-
+-    pub fn trapezoid(self: *WebCanvasImpl, t: Trapezoid) void {
+-        const ctx = self.context(.on) catch return;
+-        defer ctx.deinit();
+-
+-        ctx.call(void, "beginPath", .{}) catch return;
+-        ctx.call(void, "moveTo", .{ t.left.p1.x, t.left.p1.y }) catch return;
+-        ctx.call(void, "lineTo", .{ t.right.p1.x, t.right.p1.y }) catch return;
+-        ctx.call(void, "lineTo", .{ t.right.p2.x, t.right.p2.y }) catch return;
+-        ctx.call(void, "lineTo", .{ t.left.p2.x, t.left.p2.y }) catch return;
+-        ctx.call(void, "fill", .{}) catch return;
+-    }
+-
+-    pub fn triangle(self: *WebCanvasImpl, t: Triangle, color: Color) void {
+-        const ctx = self.context(color) catch return;
+-        defer ctx.deinit();
+-
+-        ctx.call(void, "beginPath", .{}) catch return;
+-        ctx.call(void, "moveTo", .{ t.p1.x, t.p1.y }) catch return;
+-        ctx.call(void, "lineTo", .{ t.p2.x, t.p2.y }) catch return;
+-        ctx.call(void, "lineTo", .{ t.p3.x, t.p3.y }) catch return;
+-        ctx.call(void, "fill", .{}) catch return;
+-    }
+-
+-    pub fn composite(
+-        self: *WebCanvasImpl,
+-        op: CompositionOp,
+-        src: *const WebCanvasImpl,
+-        dest: Rect,
+-    ) void {
+-        const ctx = self.context(Color.on) catch return;
+-        defer ctx.deinit();
+-
+-        // Set our compositing operation
+-        ctx.set("globalCompositeOperation", op.jsOp()) catch return;
+-
+-        // Composite
+-        ctx.call(void, "drawImage", .{
+-            src.canvas,
+-            dest.x,
+-            dest.y,
+-            dest.width,
+-            dest.height,
+-        }) catch return;
+-    }
+-
+-    fn context(self: WebCanvasImpl, fill: ?Color) !js.Object {
+-        const ctx = try self.canvas.call(js.Object, "getContext", .{js.string("2d")});
+-        errdefer ctx.deinit();
+-
+-        // Reset our composite operation
+-        try ctx.set("globalCompositeOperation", js.string("source-over"));
+-
+-        // Set our fill color
+-        if (fill) |c| {
+-            var buf: [Color.CSS_BUF_MAX]u8 = undefined;
+-            const color = try c.cssColor(&buf);
+-            try ctx.set("fillStyle", js.string(color));
+-        }
+-
+-        return ctx;
+-    }
+-
+-    pub fn writeAtlas(self: *WebCanvasImpl, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+-        assert(atlas.format == .grayscale);
+-
+-        // Reload our context since we resized the canvas
+-        const ctx = try self.context(null);
+-        defer ctx.deinit();
+-
+-        // Set our width/height. Set to vars in case we just query the canvas later.
+-        const width = self.width;
+-        const height = self.height;
+-
+-        // Read the image data and get it into a []u8 on our side
+-        const bitmap: []u8 = bitmap: {
+-            // Read the raw bitmap data and get the "data" value which is a
+-            // Uint8ClampedArray.
+-            const data = try ctx.call(js.Object, "getImageData", .{ 0, 0, width, height });
+-            defer data.deinit();
+-            const src_array = try data.get(js.Object, "data");
+-            defer src_array.deinit();
+-
+-            // Allocate our local memory to copy the data to.
+-            const len = try src_array.get(u32, "length");
+-            const bitmap = try alloc.alloc(u8, @intCast(len));
+-            errdefer alloc.free(bitmap);
+-
+-            // Create our target Uint8Array that we can use to copy from src.
+-            const mem_array = mem_array: {
+-                // Get our runtime memory
+-                const mem = try js.runtime.get(js.Object, "memory");
+-                defer mem.deinit();
+-                const buf = try mem.get(js.Object, "buffer");
+-                defer buf.deinit();
+-
+-                // Construct our array to peer into our memory
+-                const Uint8Array = try js.global.get(js.Object, "Uint8Array");
+-                defer Uint8Array.deinit();
+-                const mem_array = try Uint8Array.new(.{ buf, bitmap.ptr });
+-                errdefer mem_array.deinit();
+-
+-                break :mem_array mem_array;
+-            };
+-            defer mem_array.deinit();
+-
+-            // Copy
+-            try mem_array.call(void, "set", .{src_array});
+-
+-            break :bitmap bitmap;
+-        };
+-        errdefer alloc.free(bitmap);
+-
+-        // Convert the format of the bitmap to A8 since the raw canvas data
+-        // is in RGBA.
+-        // NOTE(mitchellh): do we need a 1px buffer to avoid artifacts?
+-        const bitmap_a8: []u8 = a8: {
+-            assert(@mod(bitmap.len, 4) == 0);
+-            assert(bitmap.len == width * height * 4);
+-            var bitmap_a8 = try alloc.alloc(u8, bitmap.len / 4);
+-            errdefer alloc.free(bitmap_a8);
+-            var i: usize = 0;
+-            while (i < bitmap_a8.len) : (i += 1) {
+-                bitmap_a8[i] = bitmap[(i * 4) + 3];
+-            }
+-
+-            break :a8 bitmap_a8;
+-        };
+-        defer alloc.free(bitmap_a8);
+-
+-        // Write the glyph information into the atlas
+-        const region = try atlas.reserve(alloc, width, height);
+-        if (region.width > 0 and region.height > 0) {
+-            assert(region.width == width);
+-            assert(region.height == height);
+-            atlas.set(region, bitmap_a8);
+-        }
+-
+-        return region;
+-    }
+-};
+-
+-const PixmanImpl = struct {
+-    /// The underlying image.
+-    image: *pixman.Image,
+-
+-    /// The raw data buffer.
+-    data: []u32,
++    alloc: Allocator,
+ 
+     pub fn init(alloc: Allocator, width: u32, height: u32) !Canvas {
+-        // Determine the config for our image buffer. The images we draw
+-        // for boxes are always 8bpp
+-        const format: pixman.FormatCode = .a8;
+-        const stride = format.strideForWidth(width);
+-        const len = @as(usize, @intCast(stride * @as(c_int, @intCast(height))));
+-
+-        // Allocate our buffer. pixman uses []u32 so we divide our length
+-        // by 4 since u32 / u8 = 4.
+-        const data = try alloc.alloc(u32, len / 4);
+-        errdefer alloc.free(data);
+-        @memset(data, 0);
+-
+-        // Create the image we'll draw to
+-        const img = try pixman.Image.createBitsNoClear(
+-            format,
++        // Create the surface we'll be using.
++        const sfc = try z2d.Surface.initPixel(
++            .{ .alpha8 = .{ .a = 0 } },
++            alloc,
+             @intCast(width),
+             @intCast(height),
+-            data.ptr,
+-            stride,
+         );
+-        errdefer _ = img.unref();
+ 
+-        return Canvas{
+-            .image = img,
+-            .data = data,
++        return .{
++            .sfc = sfc,
++            .alloc = alloc,
+         };
+     }
+ 
+     pub fn deinit(self: *Canvas, alloc: Allocator) void {
+-        alloc.free(self.data);
+-        _ = self.image.unref();
++        _ = alloc;
++        self.sfc.deinit();
+         self.* = undefined;
+     }
+ 
+@@ -344,8 +92,8 @@ const PixmanImpl = struct {
+     pub fn writeAtlas(self: *Canvas, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
+         assert(atlas.format == .grayscale);
+ 
+-        const width = @as(u32, @intCast(self.image.getWidth()));
+-        const height = @as(u32, @intCast(self.image.getHeight()));
++        const width = @as(u32, @intCast(self.sfc.getWidth()));
++        const height = @as(u32, @intCast(self.sfc.getHeight()));
+ 
+         // Allocate our texture atlas region
+         const region = region: {
+@@ -372,31 +120,7 @@ const PixmanImpl = struct {
+         };
+ 
+         if (region.width > 0 and region.height > 0) {
+-            const depth = atlas.format.depth();
+-
+-            // Convert our []u32 to []u8 since we use 8bpp formats
+-            const stride = self.image.getStride();
+-            const data = @as([*]u8, @ptrCast(self.data.ptr))[0 .. self.data.len * 4];
+-
+-            // We can avoid a buffer copy if our atlas width and bitmap
+-            // width match and the bitmap pitch is just the width (meaning
+-            // the data is tightly packed).
+-            const needs_copy = !(width * depth == stride);
+-
+-            // If we need to copy the data, we copy it into a temporary buffer.
+-            const buffer = if (needs_copy) buffer: {
+-                const temp = try alloc.alloc(u8, width * height * depth);
+-                var dst_ptr = temp;
+-                var src_ptr = data.ptr;
+-                var i: usize = 0;
+-                while (i < height) : (i += 1) {
+-                    @memcpy(dst_ptr[0 .. width * depth], src_ptr[0 .. width * depth]);
+-                    dst_ptr = dst_ptr[width * depth ..];
+-                    src_ptr += @as(usize, @intCast(stride));
+-                }
+-                break :buffer temp;
+-            } else data[0..(width * height * depth)];
+-            defer if (buffer.ptr != data.ptr) alloc.free(buffer);
++            const buffer: []u8 = @ptrCast(self.sfc.image_surface_alpha8.buf);
+ 
+             // Write the glyph information into the atlas
+             assert(region.width == width);
+@@ -409,102 +133,105 @@ const PixmanImpl = struct {
+ 
+     /// Draw and fill a single pixel
+     pub fn pixel(self: *Canvas, x: u32, y: u32, color: Color) void {
+-        if (comptime std.debug.runtime_safety) {
+-            assert(x < self.image.getWidth());
+-            assert(y < self.image.getHeight());
+-        }
+-
+-        const boxes = &[_]pixman.Box32{
+-            .{
+-                .x1 = @intCast(x),
+-                .y1 = @intCast(y),
+-                .x2 = @intCast(x + 1),
+-                .y2 = @intCast(y + 1),
+-            },
++        self.sfc.putPixel(
++            @intCast(x),
++            @intCast(y),
++            .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++        ) catch {
++            // If we try to set out of range this will fail.
++            // We just silently ignore that.
+         };
+-
+-        self.image.fillBoxes(.src, color.pixmanColor(), boxes) catch {};
+     }
+ 
+     /// Draw and fill a rectangle. This is the main primitive for drawing
+     /// lines as well (which are just generally skinny rectangles...)
+     pub fn rect(self: *Canvas, v: Rect, color: Color) void {
+-        const boxes = &[_]pixman.Box32{
+-            .{
+-                .x1 = @intCast(v.x),
+-                .y1 = @intCast(v.y),
+-                .x2 = @intCast(v.x + @as(i32, @intCast(v.width))),
+-                .y2 = @intCast(v.y + @as(i32, @intCast(v.height))),
++        const x0: usize = @intFromFloat(v.x);
++        const x1: usize = @intFromFloat(v.x + v.width);
++        const y0: usize = @intFromFloat(v.y);
++        const y1: usize = @intFromFloat(v.y + v.height);
++
++        for (y0..y1) |y| {
++            for (x0..x1) |x| {
++                self.pixel(
++                    @intCast(x),
++                    @intCast(y),
++                    color,
++                );
++            }
++        }
++    }
++
++    /// Draw and fill a quad.
++    pub fn quad(self: *Canvas, q: Quad, color: Color) !void {
++        var ctx: z2d.Context = .{
++            .surface = self.sfc,
++            .pattern = .{
++                .opaque_pattern = .{
++                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++                },
+             },
+         };
+ 
+-        if (comptime std.debug.runtime_safety) {
+-            assert(boxes[0].x1 >= 0);
+-            assert(boxes[0].y1 >= 0);
+-            assert(boxes[0].x2 <= @as(i32, @intCast(self.image.getWidth())));
+-            assert(boxes[0].y2 <= @as(i32, @intCast(self.image.getHeight())));
+-        }
++        var path = z2d.Path.init(self.alloc);
++        defer path.deinit();
++
++        try path.moveTo(q.p0.x, q.p0.y);
++        try path.lineTo(q.p1.x, q.p1.y);
++        try path.lineTo(q.p2.x, q.p2.y);
++        try path.lineTo(q.p3.x, q.p3.y);
++        try path.close();
+ 
+-        self.image.fillBoxes(.src, color.pixmanColor(), boxes) catch {};
++        try ctx.fill(self.alloc, path);
+     }
+ 
+-    /// Draw and fill a trapezoid.
+-    pub fn trapezoid(self: *Canvas, t: Trapezoid) void {
+-        self.image.rasterizeTrapezoid(.{
+-            .top = pixman.Fixed.init(t.top),
+-            .bottom = pixman.Fixed.init(t.bottom),
+-            .left = .{
+-                .p1 = .{
+-                    .x = pixman.Fixed.init(t.left.p1.x),
+-                    .y = pixman.Fixed.init(t.left.p1.y),
+-                },
+-                .p2 = .{
+-                    .x = pixman.Fixed.init(t.left.p2.x),
+-                    .y = pixman.Fixed.init(t.left.p2.y),
+-                },
+-            },
+-            .right = .{
+-                .p1 = .{
+-                    .x = pixman.Fixed.init(t.right.p1.x),
+-                    .y = pixman.Fixed.init(t.right.p1.y),
+-                },
+-                .p2 = .{
+-                    .x = pixman.Fixed.init(t.right.p2.x),
+-                    .y = pixman.Fixed.init(t.right.p2.y),
++    /// Draw and fill a triangle.
++    pub fn triangle(self: *Canvas, t: Triangle, color: Color) !void {
++        var ctx: z2d.Context = .{
++            .surface = self.sfc,
++            .pattern = .{
++                .opaque_pattern = .{
++                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+                 },
+             },
+-        }, 0, 0);
++        };
++
++        var path = z2d.Path.init(self.alloc);
++        defer path.deinit();
++
++        try path.moveTo(t.p0.x, t.p0.y);
++        try path.lineTo(t.p1.x, t.p1.y);
++        try path.lineTo(t.p2.x, t.p2.y);
++        try path.close();
++
++        try ctx.fill(self.alloc, path);
+     }
+ 
+-    /// Draw and fill a triangle.
+-    pub fn triangle(self: *Canvas, t: Triangle, color: Color) void {
+-        const tris = &[_]pixman.Triangle{
+-            .{
+-                .p1 = .{ .x = pixman.Fixed.init(t.p1.x), .y = pixman.Fixed.init(t.p1.y) },
+-                .p2 = .{ .x = pixman.Fixed.init(t.p2.x), .y = pixman.Fixed.init(t.p2.y) },
+-                .p3 = .{ .x = pixman.Fixed.init(t.p3.x), .y = pixman.Fixed.init(t.p3.y) },
++    /// Stroke a line.
++    pub fn line(self: *Canvas, l: Line, thickness: f64, color: Color) !void {
++        var ctx: z2d.Context = .{
++            .surface = self.sfc,
++            .pattern = .{
++                .opaque_pattern = .{
++                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++                },
+             },
++            .line_width = thickness,
++            .line_cap_mode = .round,
+         };
+ 
+-        const src = pixman.Image.createSolidFill(color.pixmanColor()) catch return;
+-        defer _ = src.unref();
+-        self.image.compositeTriangles(.over, src, .a8, 0, 0, 0, 0, tris);
++        var path = z2d.Path.init(self.alloc);
++        defer path.deinit();
++
++        try path.moveTo(l.p0.x, l.p0.y);
++        try path.lineTo(l.p1.x, l.p1.y);
++
++        try ctx.stroke(self.alloc, path);
+     }
+ 
+-    /// Composite one image on another.
+-    pub fn composite(self: *Canvas, op: CompositionOp, src: *const Canvas, dest: Rect) void {
+-        self.image.composite(
+-            op.pixmanOp(),
+-            src.image,
+-            null,
+-            0,
+-            0,
+-            0,
+-            0,
+-            @intCast(dest.x),
+-            @intCast(dest.y),
+-            @intCast(dest.width),
+-            @intCast(dest.height),
+-        );
++    pub fn invert(self: *Canvas) void {
++        for (std.mem.sliceAsBytes(self.sfc.image_surface_alpha8.buf)) |*v| {
++            v.* = 255 - v.*;
++        }
+     }
+ };
+
+commit c66042d6e06aeb004f346255bb5587b2b2af865f
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Tue Oct 15 11:59:52 2024 -0400
+
+    font/sprite: address PR review feedback
+    
+    - Make canvas geometry primitives generic, use `Rect(u32)` for `rect`
+    function, so that we don't have to worry about negatives or rounding.
+    - Make `Quads` struct packed just in case it gets non-comptime use in
+    the future.
+    - Clarify comment on why we're discarding out of range pixels + runtime
+    unreachable for any other type of error which we shouldn't ever see.
+    - Move z2d import above in-tree imports.
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index a3792fe2..14caddea 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -6,53 +6,66 @@ const Allocator = std.mem.Allocator;
+ const z2d = @import("z2d");
+ const font = @import("../main.zig");
+ 
+-pub const Point = struct {
+-    x: f64,
+-    y: f64,
+-};
+-
+-pub const Line = struct {
+-    p0: Point,
+-    p1: Point,
+-};
+-
+-pub const Box = struct {
+-    p0: Point,
+-    p1: Point,
+-
+-    pub fn rect(self: Box) Rect {
+-        const tl_x = @min(self.p0.x, self.p1.x);
+-        const tl_y = @min(self.p0.y, self.p1.y);
+-        const br_x = @max(self.p0.x, self.p1.x);
+-        const br_y = @max(self.p0.y, self.p1.y);
+-        return .{
+-            .x = tl_x,
+-            .y = tl_y,
+-            .width = br_x - tl_x,
+-            .height = br_y - tl_y,
+-        };
+-    }
+-};
+-
+-pub const Rect = struct {
+-    x: f64,
+-    y: f64,
+-    width: f64,
+-    height: f64,
+-};
+-
+-pub const Triangle = struct {
+-    p0: Point,
+-    p1: Point,
+-    p2: Point,
+-};
+-
+-pub const Quad = struct {
+-    p0: Point,
+-    p1: Point,
+-    p2: Point,
+-    p3: Point,
+-};
++pub fn Point(comptime T: type) type {
++    return struct {
++        x: T,
++        y: T,
++    };
++}
++
++pub fn Line(comptime T: type) type {
++    return struct {
++        p0: Point(T),
++        p1: Point(T),
++    };
++}
++
++pub fn Box(comptime T: type) type {
++    return struct {
++        p0: Point(T),
++        p1: Point(T),
++
++        pub fn rect(self: Box(T)) Rect(T) {
++            const tl_x = @min(self.p0.x, self.p1.x);
++            const tl_y = @min(self.p0.y, self.p1.y);
++            const br_x = @max(self.p0.x, self.p1.x);
++            const br_y = @max(self.p0.y, self.p1.y);
++
++            return .{
++                .x = tl_x,
++                .y = tl_y,
++                .width = br_x - tl_x,
++                .height = br_y - tl_y,
++            };
++        }
++    };
++}
++
++pub fn Rect(comptime T: type) type {
++    return struct {
++        x: T,
++        y: T,
++        width: T,
++        height: T,
++    };
++}
++
++pub fn Triangle(comptime T: type) type {
++    return struct {
++        p0: Point(T),
++        p1: Point(T),
++        p2: Point(T),
++    };
++}
++
++pub fn Quad(comptime T: type) type {
++    return struct {
++        p0: Point(T),
++        p1: Point(T),
++        p2: Point(T),
++        p3: Point(T),
++    };
++}
+ 
+ /// We only use alpha-channel so a pixel can only be "on" or "off".
+ pub const Color = enum(u8) {
+@@ -137,19 +150,26 @@ pub const Canvas = struct {
+             @intCast(x),
+             @intCast(y),
+             .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+-        ) catch {
+-            // If we try to set out of range this will fail.
+-            // We just silently ignore that.
++        ) catch |e| switch (e) {
++            error.OutOfRange => {
++                // If we try to set out of range this will fail. We just silently
++                // ignore it, so that this method (and `rect` which uses it) have
++                // implicit bounds clipping.
++            },
++            else => {
++                std.log.err("Wtf? err={}", .{e});
++                unreachable; // This shouldn't be possible.
++            },
+         };
+     }
+ 
+     /// Draw and fill a rectangle. This is the main primitive for drawing
+     /// lines as well (which are just generally skinny rectangles...)
+-    pub fn rect(self: *Canvas, v: Rect, color: Color) void {
+-        const x0: usize = @intFromFloat(v.x);
+-        const x1: usize = @intFromFloat(v.x + v.width);
+-        const y0: usize = @intFromFloat(v.y);
+-        const y1: usize = @intFromFloat(v.y + v.height);
++    pub fn rect(self: *Canvas, v: Rect(u32), color: Color) void {
++        const x0 = v.x;
++        const x1 = v.x + v.width;
++        const y0 = v.y;
++        const y1 = v.y + v.height;
+ 
+         for (y0..y1) |y| {
+             for (x0..x1) |x| {
+@@ -163,7 +183,7 @@ pub const Canvas = struct {
+     }
+ 
+     /// Draw and fill a quad.
+-    pub fn quad(self: *Canvas, q: Quad, color: Color) !void {
++    pub fn quad(self: *Canvas, q: Quad(f64), color: Color) !void {
+         var ctx: z2d.Context = .{
+             .surface = self.sfc,
+             .pattern = .{
+@@ -186,7 +206,7 @@ pub const Canvas = struct {
+     }
+ 
+     /// Draw and fill a triangle.
+-    pub fn triangle(self: *Canvas, t: Triangle, color: Color) !void {
++    pub fn triangle(self: *Canvas, t: Triangle(f64), color: Color) !void {
+         var ctx: z2d.Context = .{
+             .surface = self.sfc,
+             .pattern = .{
+@@ -208,7 +228,7 @@ pub const Canvas = struct {
+     }
+ 
+     /// Stroke a line.
+-    pub fn line(self: *Canvas, l: Line, thickness: f64, color: Color) !void {
++    pub fn line(self: *Canvas, l: Line(f64), thickness: f64, color: Color) !void {
+         var ctx: z2d.Context = .{
+             .surface = self.sfc,
+             .pattern = .{
+
+commit bb2c8e479d22a6a81bd05f6756beb0c57a054bce
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 15 09:30:47 2024 -0700
+
+    font/sprite: clarify log
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 14caddea..8e04c402 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -156,8 +156,12 @@ pub const Canvas = struct {
+                 // ignore it, so that this method (and `rect` which uses it) have
+                 // implicit bounds clipping.
+             },
+-            else => {
+-                std.log.err("Wtf? err={}", .{e});
++
++            error.InvalidHeight,
++            error.InvalidWidth,
++            error.InvalidPixelFormat,
++            => {
++                std.log.err("unexpected (considered impossible) error err={}", .{e});
+                 unreachable; // This shouldn't be possible.
+             },
+         };
+
+commit 8a38c87d90a4dd2d6db3bcab06cbb92495e2627b
+Author: Mitchell Hashimoto <m@mitchellh.com>
+Date:   Tue Oct 15 09:37:44 2024 -0700
+
+    font: use explicit error sets where we can
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 8e04c402..81f9095b 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -102,7 +102,11 @@ pub const Canvas = struct {
+     }
+ 
+     /// Write the data in this drawing to the atlas.
+-    pub fn writeAtlas(self: *Canvas, alloc: Allocator, atlas: *font.Atlas) !font.Atlas.Region {
++    pub fn writeAtlas(
++        self: *Canvas,
++        alloc: Allocator,
++        atlas: *font.Atlas,
++    ) (Allocator.Error || font.Atlas.Error)!font.Atlas.Region {
+         assert(atlas.format == .grayscale);
+ 
+         const width = @as(u32, @intCast(self.sfc.getWidth()));
+
+commit df4a6f2161eed1dfc4d2652f3cc6fca54d158e84
+Author: Mike Hartington <mikehartington@gmail.com>
+Date:   Fri Nov 29 14:23:28 2024 -0500
+
+    font/sprite: add missing chevron powerline fonts
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 81f9095b..3d472538 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -231,10 +231,35 @@ pub const Canvas = struct {
+         try path.lineTo(t.p1.x, t.p1.y);
+         try path.lineTo(t.p2.x, t.p2.y);
+         try path.close();
+-
++    
+         try ctx.fill(self.alloc, path);
+     }
+ 
++    pub fn triangle_outline(self: *Canvas, t: Triangle(f64), thickness: f64, color: Color) !void {
++        var ctx: z2d.Context = .{
++            .surface = self.sfc,
++            .pattern = .{
++                .opaque_pattern = .{
++                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++                },
++            },
++            .line_width = thickness,
++            .line_cap_mode = .round,
++        };
++
++        var path = z2d.Path.init(self.alloc);
++        defer path.deinit();
++
++        try path.moveTo(t.p0.x, t.p0.y);
++        try path.lineTo(t.p1.x, t.p1.y);
++        try path.lineTo(t.p2.x, t.p2.y);
++        // try path.close();
++
++        try ctx.stroke(self.alloc, path);
++        // try ctx.fill(self.alloc, path);
++
++    }
++
+     /// Stroke a line.
+     pub fn line(self: *Canvas, l: Line(f64), thickness: f64, color: Color) !void {
+         var ctx: z2d.Context = .{
+
+commit b920352c397c274985420ffc68ab7b3e425f45b6
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Sun Dec 22 15:57:07 2024 -0500
+
+    deps: update z2d to v0.4.0
+    
+    Introduces static path methods and a reworked context API that makes
+    things generally cleaner.
+    
+    This update incidentally fixed a bug we had before where the corner
+    triangle shade characters were drawn solid rather than medium shade.
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 3d472538..be7bdf8c 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -74,6 +74,9 @@ pub const Color = enum(u8) {
+     _,
+ };
+ 
++/// This is a managed struct, it keeps a reference to the allocator that is
++/// used to initialize it, and the same allocator is used for any further
++/// necessary allocations when drawing.
+ pub const Canvas = struct {
+     /// The underlying z2d surface.
+     sfc: z2d.Surface,
+@@ -88,16 +91,13 @@ pub const Canvas = struct {
+             @intCast(width),
+             @intCast(height),
+         );
++        errdefer sfc.deinit(alloc);
+ 
+-        return .{
+-            .sfc = sfc,
+-            .alloc = alloc,
+-        };
++        return .{ .sfc = sfc, .alloc = alloc };
+     }
+ 
+-    pub fn deinit(self: *Canvas, alloc: Allocator) void {
+-        _ = alloc;
+-        self.sfc.deinit();
++    pub fn deinit(self: *Canvas) void {
++        self.sfc.deinit(self.alloc);
+         self.* = undefined;
+     }
+ 
+@@ -148,27 +148,18 @@ pub const Canvas = struct {
+         return region;
+     }
+ 
++    /// Acquires a z2d drawing context, caller MUST deinit context.
++    pub fn getContext(self: *Canvas) Allocator.Error!z2d.Context {
++        return try z2d.Context.init(self.alloc, &self.sfc);
++    }
++
+     /// Draw and fill a single pixel
+     pub fn pixel(self: *Canvas, x: u32, y: u32, color: Color) void {
+         self.sfc.putPixel(
+             @intCast(x),
+             @intCast(y),
+             .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+-        ) catch |e| switch (e) {
+-            error.OutOfRange => {
+-                // If we try to set out of range this will fail. We just silently
+-                // ignore it, so that this method (and `rect` which uses it) have
+-                // implicit bounds clipping.
+-            },
+-
+-            error.InvalidHeight,
+-            error.InvalidWidth,
+-            error.InvalidPixelFormat,
+-            => {
+-                std.log.err("unexpected (considered impossible) error err={}", .{e});
+-                unreachable; // This shouldn't be possible.
+-            },
+-        };
++        );
+     }
+ 
+     /// Draw and fill a rectangle. This is the main primitive for drawing
+@@ -192,94 +183,89 @@ pub const Canvas = struct {
+ 
+     /// Draw and fill a quad.
+     pub fn quad(self: *Canvas, q: Quad(f64), color: Color) !void {
+-        var ctx: z2d.Context = .{
+-            .surface = self.sfc,
+-            .pattern = .{
+-                .opaque_pattern = .{
+-                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+-                },
+-            },
+-        };
+-
+-        var path = z2d.Path.init(self.alloc);
+-        defer path.deinit();
+-
+-        try path.moveTo(q.p0.x, q.p0.y);
+-        try path.lineTo(q.p1.x, q.p1.y);
+-        try path.lineTo(q.p2.x, q.p2.y);
+-        try path.lineTo(q.p3.x, q.p3.y);
+-        try path.close();
+-
+-        try ctx.fill(self.alloc, path);
++        var path: z2d.StaticPath(6) = .{};
++        path.init();
++
++        path.moveTo(q.p0.x, q.p0.y);
++        path.lineTo(q.p1.x, q.p1.y);
++        path.lineTo(q.p2.x, q.p2.y);
++        path.lineTo(q.p3.x, q.p3.y);
++        path.close();
++
++        try z2d.painter.fill(
++            self.alloc,
++            &self.sfc,
++            &.{ .opaque_pattern = .{
++                .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++            } },
++            &path.nodes,
++            .{},
++        );
+     }
+ 
+     /// Draw and fill a triangle.
+     pub fn triangle(self: *Canvas, t: Triangle(f64), color: Color) !void {
+-        var ctx: z2d.Context = .{
+-            .surface = self.sfc,
+-            .pattern = .{
+-                .opaque_pattern = .{
+-                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+-                },
+-            },
+-        };
+-
+-        var path = z2d.Path.init(self.alloc);
+-        defer path.deinit();
+-
+-        try path.moveTo(t.p0.x, t.p0.y);
+-        try path.lineTo(t.p1.x, t.p1.y);
+-        try path.lineTo(t.p2.x, t.p2.y);
+-        try path.close();
+-    
+-        try ctx.fill(self.alloc, path);
++        var path: z2d.StaticPath(5) = .{};
++        path.init();
++
++        path.moveTo(t.p0.x, t.p0.y);
++        path.lineTo(t.p1.x, t.p1.y);
++        path.lineTo(t.p2.x, t.p2.y);
++        path.close();
++
++        try z2d.painter.fill(
++            self.alloc,
++            &self.sfc,
++            &.{ .opaque_pattern = .{
++                .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++            } },
++            &path.nodes,
++            .{},
++        );
+     }
+ 
+     pub fn triangle_outline(self: *Canvas, t: Triangle(f64), thickness: f64, color: Color) !void {
+-        var ctx: z2d.Context = .{
+-            .surface = self.sfc,
+-            .pattern = .{
+-                .opaque_pattern = .{
+-                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+-                },
++        var path: z2d.StaticPath(5) = .{};
++        path.init();
++
++        path.moveTo(t.p0.x, t.p0.y);
++        path.lineTo(t.p1.x, t.p1.y);
++        path.lineTo(t.p2.x, t.p2.y);
++
++        try z2d.painter.stroke(
++            self.alloc,
++            &self.sfc,
++            &.{ .opaque_pattern = .{
++                .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++            } },
++            &path.nodes,
++            .{
++                .line_cap_mode = .round,
++                .line_width = thickness,
+             },
+-            .line_width = thickness,
+-            .line_cap_mode = .round,
+-        };
+-
+-        var path = z2d.Path.init(self.alloc);
+-        defer path.deinit();
+-
+-        try path.moveTo(t.p0.x, t.p0.y);
+-        try path.lineTo(t.p1.x, t.p1.y);
+-        try path.lineTo(t.p2.x, t.p2.y);
+-        // try path.close();
+-
+-        try ctx.stroke(self.alloc, path);
+-        // try ctx.fill(self.alloc, path);
+-
++        );
+     }
+ 
+     /// Stroke a line.
+     pub fn line(self: *Canvas, l: Line(f64), thickness: f64, color: Color) !void {
+-        var ctx: z2d.Context = .{
+-            .surface = self.sfc,
+-            .pattern = .{
+-                .opaque_pattern = .{
+-                    .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+-                },
++        var path: z2d.StaticPath(3) = .{};
++        path.init();
++
++        path.moveTo(l.p0.x, l.p0.y);
++        path.lineTo(l.p1.x, l.p1.y);
++
++        try z2d.painter.stroke(
++            self.alloc,
++            &self.sfc,
++            &.{ .opaque_pattern = .{
++                .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
++            } },
++            &path.nodes,
++            .{
++                .line_cap_mode = .round,
++                .line_width = thickness,
+             },
+-            .line_width = thickness,
+-            .line_cap_mode = .round,
+-        };
+-
+-        var path = z2d.Path.init(self.alloc);
+-        defer path.deinit();
+-
+-        try path.moveTo(l.p0.x, l.p0.y);
+-        try path.lineTo(l.p1.x, l.p1.y);
+-
+-        try ctx.stroke(self.alloc, path);
++        );
+     }
+ 
+     pub fn invert(self: *Canvas) void {
+
+commit 9f4d9dc36e4bebfe805d3e28c9e9622c7fe83b97
+Author: Qwerasd <qwerasd205@users.noreply.github.com>
+Date:   Mon Dec 23 04:21:33 2024 -0500
+
+    font/sprite: fix z2d StaticPath accounting + undefined use
+    
+    Annotate the node count of all uses of z2d `StaticPath` to verify
+    correctness, adjusted the size of a couple which were oversized, and
+    changed all painter calls that take node slices from `StaticPath`s to
+    use the slice from the wrapped `ArrayList` so that we don't include any
+    potentially `undefined` nodes at the end of the list, which I think was
+    causing a crash before.
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index be7bdf8c..072e5bd4 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -184,13 +184,13 @@ pub const Canvas = struct {
+     /// Draw and fill a quad.
+     pub fn quad(self: *Canvas, q: Quad(f64), color: Color) !void {
+         var path: z2d.StaticPath(6) = .{};
+-        path.init();
++        path.init(); // nodes.len = 0
+ 
+-        path.moveTo(q.p0.x, q.p0.y);
+-        path.lineTo(q.p1.x, q.p1.y);
+-        path.lineTo(q.p2.x, q.p2.y);
+-        path.lineTo(q.p3.x, q.p3.y);
+-        path.close();
++        path.moveTo(q.p0.x, q.p0.y); // +1, nodes.len = 1
++        path.lineTo(q.p1.x, q.p1.y); // +1, nodes.len = 2
++        path.lineTo(q.p2.x, q.p2.y); // +1, nodes.len = 3
++        path.lineTo(q.p3.x, q.p3.y); // +1, nodes.len = 4
++        path.close(); // +2, nodes.len = 6
+ 
+         try z2d.painter.fill(
+             self.alloc,
+@@ -198,7 +198,7 @@ pub const Canvas = struct {
+             &.{ .opaque_pattern = .{
+                 .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+             } },
+-            &path.nodes,
++            path.wrapped_path.nodes.items,
+             .{},
+         );
+     }
+@@ -206,12 +206,12 @@ pub const Canvas = struct {
+     /// Draw and fill a triangle.
+     pub fn triangle(self: *Canvas, t: Triangle(f64), color: Color) !void {
+         var path: z2d.StaticPath(5) = .{};
+-        path.init();
++        path.init(); // nodes.len = 0
+ 
+-        path.moveTo(t.p0.x, t.p0.y);
+-        path.lineTo(t.p1.x, t.p1.y);
+-        path.lineTo(t.p2.x, t.p2.y);
+-        path.close();
++        path.moveTo(t.p0.x, t.p0.y); // +1, nodes.len = 1
++        path.lineTo(t.p1.x, t.p1.y); // +1, nodes.len = 2
++        path.lineTo(t.p2.x, t.p2.y); // +1, nodes.len = 3
++        path.close(); // +2, nodes.len = 5
+ 
+         try z2d.painter.fill(
+             self.alloc,
+@@ -219,18 +219,18 @@ pub const Canvas = struct {
+             &.{ .opaque_pattern = .{
+                 .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+             } },
+-            &path.nodes,
++            path.wrapped_path.nodes.items,
+             .{},
+         );
+     }
+ 
+     pub fn triangle_outline(self: *Canvas, t: Triangle(f64), thickness: f64, color: Color) !void {
+-        var path: z2d.StaticPath(5) = .{};
+-        path.init();
++        var path: z2d.StaticPath(3) = .{};
++        path.init(); // nodes.len = 0
+ 
+-        path.moveTo(t.p0.x, t.p0.y);
+-        path.lineTo(t.p1.x, t.p1.y);
+-        path.lineTo(t.p2.x, t.p2.y);
++        path.moveTo(t.p0.x, t.p0.y); // +1, nodes.len = 1
++        path.lineTo(t.p1.x, t.p1.y); // +1, nodes.len = 2
++        path.lineTo(t.p2.x, t.p2.y); // +1, nodes.len = 3
+ 
+         try z2d.painter.stroke(
+             self.alloc,
+@@ -238,7 +238,7 @@ pub const Canvas = struct {
+             &.{ .opaque_pattern = .{
+                 .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+             } },
+-            &path.nodes,
++            path.wrapped_path.nodes.items,
+             .{
+                 .line_cap_mode = .round,
+                 .line_width = thickness,
+@@ -248,11 +248,11 @@ pub const Canvas = struct {
+ 
+     /// Stroke a line.
+     pub fn line(self: *Canvas, l: Line(f64), thickness: f64, color: Color) !void {
+-        var path: z2d.StaticPath(3) = .{};
+-        path.init();
++        var path: z2d.StaticPath(2) = .{};
++        path.init(); // nodes.len = 0
+ 
+-        path.moveTo(l.p0.x, l.p0.y);
+-        path.lineTo(l.p1.x, l.p1.y);
++        path.moveTo(l.p0.x, l.p0.y); // +1, nodes.len = 1
++        path.lineTo(l.p1.x, l.p1.y); // +1, nodes.len = 2
+ 
+         try z2d.painter.stroke(
+             self.alloc,
+@@ -260,7 +260,7 @@ pub const Canvas = struct {
+             &.{ .opaque_pattern = .{
+                 .pixel = .{ .alpha8 = .{ .a = @intFromEnum(color) } },
+             } },
+-            &path.nodes,
++            path.wrapped_path.nodes.items,
+             .{
+                 .line_cap_mode = .round,
+                 .line_width = thickness,
+
+commit bbbe81efc5b4059db54bd41a30b5b27f308695cf
+Author: rhodes-b <59537185+rhodes-b@users.noreply.github.com>
+Date:   Sat Apr 26 23:51:04 2025 -0500
+
+    z2d context no longer has err return
+
+diff --git a/src/font/sprite/canvas.zig b/src/font/sprite/canvas.zig
+index 072e5bd4..ed00aef1 100644
+--- a/src/font/sprite/canvas.zig
++++ b/src/font/sprite/canvas.zig
+@@ -149,8 +149,8 @@ pub const Canvas = struct {
+     }
+ 
+     /// Acquires a z2d drawing context, caller MUST deinit context.
+-    pub fn getContext(self: *Canvas) Allocator.Error!z2d.Context {
+-        return try z2d.Context.init(self.alloc, &self.sfc);
++    pub fn getContext(self: *Canvas) z2d.Context {
++        return z2d.Context.init(self.alloc, &self.sfc);
+     }
+ 
+     /// Draw and fill a single pixel
+
