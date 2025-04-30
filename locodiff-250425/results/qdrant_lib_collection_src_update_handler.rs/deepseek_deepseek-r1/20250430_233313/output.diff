@@ -1,0 +1,147 @@
+--- qdrant_lib_collection_src_update_handler.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_update_handler.rs_extracted.txt (actual)@@ -1,8 +1,8 @@ use std::cmp::min;
+ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ 
+ use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+@@ -16,10 +16,10 @@ use segment::types::SeqNumberType;
+ use tokio::runtime::Handle;
+ use tokio::sync::mpsc::{self, Receiver, Sender};
+-use tokio::sync::{Mutex as TokioMutex, oneshot};
++use tokio::sync::{oneshot, Mutex as TokioMutex};
+ use tokio::task::{self, JoinHandle};
+ use tokio::time::error::Elapsed;
+-use tokio::time::{Duration, timeout};
++use tokio::time::{timeout, Duration};
+ 
+ use crate::collection::payload_index_schema::PayloadIndexSchema;
+ use crate::collection_manager::collection_updater::CollectionUpdater;
+@@ -28,11 +28,11 @@     OptimizerThresholds, SegmentOptimizer,
+ };
+ use crate::collection_manager::optimizers::{Tracker, TrackerLog, TrackerStatus};
+-use crate::common::stoppable_task::{StoppableTaskHandle, spawn_stoppable};
++use crate::common::stoppable_task::{spawn_stoppable, StoppableTaskHandle};
+ use crate::config::CollectionParams;
+-use crate::operations::CollectionUpdateOperations;
+ use crate::operations::shared_storage_config::SharedStorageConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
++use crate::operations::CollectionUpdateOperations;
+ use crate::save_on_disk::SaveOnDisk;
+ use crate::shards::local_shard::LocalShardClocks;
+ use crate::wal::WalError;
+@@ -111,9 +111,9 @@     runtime_handle: Handle,
+     /// WAL, required for operations
+     wal: LockedWal,
+-    /// Always keep this WAL version and later and prevent acknowledging/truncating from the WAL.
+-    /// This is used when other bits of code still depend on information in the WAL, such as the
+-    /// queue proxy shard.
++    /// Maximum version to acknowledge to WAL to prevent truncating too early
++    /// This is used when another part still relies on part of the WAL, such as the queue proxy
++    /// shard.
+     /// Defaults to `u64::MAX` to allow acknowledging all confirmed versions.
+     pub(super) wal_keep_from: Arc<AtomicU64>,
+     optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
+@@ -187,7 +187,7 @@         self.update_worker = Some(self.runtime_handle.spawn(Self::update_worker_fn(
+             update_receiver,
+             tx,
+-            self.wal.clone(),
++            self.payload_index_schema.clone(),
+             self.segments.clone(),
+         )));
+         let (flush_tx, flush_rx) = oneshot::channel();
+@@ -333,7 +333,6 @@                 let segments = segments.clone();
+                 let nsi = nonoptimal_segment_ids.clone();
+                 scheduled_segment_ids.extend(&nsi);
+-                let callback = callback.clone();
+ 
+                 let handle = spawn_stoppable(
+                     // Stoppable task
+@@ -372,6 +371,8 @@                                         false
+                                     }
+                                     _ => {
++                                        // Save only the first error
++                                        // If is more likely to be the real cause of all further problems
+                                         segments.write().report_optimizer_error(error.clone());
+ 
+                                         // Error of the optimization can not be handled by API user
+@@ -409,7 +410,6 @@                 handles.push(handle);
+             }
+         }
+-
+         handles
+     }
+ 
+@@ -505,6 +505,7 @@         );
+         let mut handles = optimization_handles.lock().await;
+         handles.append(&mut new_handles);
++        handles.retain(|h| !h.is_finished())
+     }
+ 
+     /// Cleanup finalized optimization task handles
+@@ -679,7 +680,7 @@     async fn update_worker_fn(
+         mut receiver: Receiver<UpdateSignal>,
+         optimize_sender: Sender<OptimizerSignal>,
+-        wal: LockedWal,
++        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+         segments: LockedSegmentHolder,
+     ) {
+         while let Some(signal) = receiver.recv().await {
+@@ -692,9 +693,10 @@                     hw_measurements,
+                 }) => {
+                     let flush_res = if wait {
+-                        wal.lock().await.flush().map_err(|err| {
++                        segments.read().flush_all(false, false).map_err(|err| {
+                             CollectionError::service_error(format!(
+-                                "Can't flush WAL before operation {op_num} - {err}"
++                                "Can't flush segments before operation {} - {}",
++                                op_num, err
+                             ))
+                         })
+                     } else {
+@@ -754,6 +756,7 @@             .unwrap_or_else(|_| debug!("Optimizer already stopped"));
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
+     async fn flush_worker(
+         segments: LockedSegmentHolder,
+         wal: LockedWal,
+@@ -772,7 +775,7 @@                     debug!("Stopping flush worker for shard {}", shard_path.display());
+                     return;
+                 }
+-            }
++            };
+ 
+             trace!("Attempting flushing");
+             let wal_flash_job = wal.lock().await.flush_async();
+@@ -811,7 +814,7 @@ 
+             let ack = confirmed_version.min(keep_from.saturating_sub(1));
+ 
+-            if let Err(err) = clocks.store_if_changed(&shard_path).await {
++            if let Err(err) = clocks.store(&shard_path).await {
+                 log::warn!("Failed to store clock maps to disk: {err}");
+                 segments.write().report_optimizer_error(err);
+             }
+@@ -837,7 +840,7 @@     }
+ }
+ 
+-/// Trigger optimizers when CPU budget is available
++/// Trigger optimizers when resource budget is available
+ fn trigger_optimizers_on_resource_budget(
+     optimizer_resource_budget: ResourceBudget,
+     desired_cpus: usize,
+@@ -845,11 +848,11 @@     sender: Sender<OptimizerSignal>,
+ ) -> JoinHandle<()> {
+     task::spawn(async move {
+-        log::trace!("Skipping optimization checks, waiting for CPU budget to be available");
++        log::trace!("Skipping optimization checks, waiting for resource budget to be available");
+         optimizer_resource_budget
+             .notify_on_budget_available(desired_cpus, desired_io)
+             .await;
+-        log::trace!("Continue optimization checks, new CPU budget available");
++        log::trace!("Continue optimization checks, new resource budget available");
+ 
+         // Trigger optimizers with Nop operation
+         sender.send(OptimizerSignal::Nop).await.unwrap_or_else(|_| {

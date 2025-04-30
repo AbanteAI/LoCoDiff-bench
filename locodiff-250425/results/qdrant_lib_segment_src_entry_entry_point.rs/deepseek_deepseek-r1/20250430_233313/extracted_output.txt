@@ -1,0 +1,359 @@
+use std::backtrace::Backtrace;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Error as IoError, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use atomicwrites::Error as AtomicIoError;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::tar_ext;
+use common::types::{PayloadKeyType, PayloadKeyTypeRef, PointIdType, TelemetryDetail, VectorName, VectorNameBuf};
+use thiserror::Error;
+
+use crate::common::file_operations::FileStorageError;
+use crate::common::mmap_type::Error as MmapError;
+use crate::data_types::facets::{FacetParams, FacetValue};
+use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::order_by::{OrderBy, OrderValue};
+use crate::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
+use crate::data_types::vectors::{QueryVector, VectorInternal};
+use crate::entry::snapshot_entry::SnapshotEntry;
+use crate::index::field_index::{CardinalityEstimation, FieldIndex};
+use crate::json_path::JsonPath;
+use crate::telemetry::SegmentTelemetry;
+use crate::types::{
+    Filter, Payload, PayloadFieldSchema, ScoredPoint, SearchParams, SegmentConfig, SegmentInfo,
+    SegmentType, SeqNumberType, WithPayload, WithVector,
+};
+
+pub const PROCESS_CANCELLED_BY_SERVICE_MESSAGE: &str = "process cancelled by service";
+
+#[derive(Error, Debug, Clone)]
+#[error("{0}")]
+pub enum OperationError {
+    #[error("Vector inserting error: expected dim: {expected_dim}, got {received_dim}")]
+    WrongVector {
+        expected_dim: usize,
+        received_dim: usize,
+    },
+    #[error("Not existing vector name error: {received_name}")]
+    VectorNameNotExists { received_name: String },
+    #[error("Missed vector name error: {received_name}")]
+    MissedVectorName { received_name: String },
+    #[error("No point with id {missed_point_id}")]
+    PointIdError { missed_point_id: PointIdType },
+    #[error("Payload type does not match with previously given for field {field_name}. Expected: {expected_type}")]
+    TypeError {
+        field_name: PayloadKeyType,
+        expected_type: String,
+    },
+    #[error("Unable to infer type for the field '{field_name}'. Please specify `field_type`")]
+    TypeInferenceError { field_name: PayloadKeyType },
+    /// Service Error prevents further update of the collection until it is fixed.
+    /// Should only be used for hardware, data corruption, IO, or other unexpected internal errors.
+    #[error("Service runtime error: {description}")]
+    ServiceError {
+        description: String,
+        backtrace: Option<String>,
+    },
+    #[error("Inconsistent storage: {description}")]
+    InconsistentStorage { description: String },
+    #[error("Out of memory, free: {free}, {description}")]
+    OutOfMemory { description: String, free: u64 },
+    #[error("Operation cancelled: {description}")]
+    Cancelled { description: String },
+}
+
+impl From<FileStorageError> for OperationError {
+    fn from(err: FileStorageError) -> Self {
+        Self::service_error(err.to_string())
+    }
+}
+
+impl From<MmapError> for OperationError {
+    fn from(err: MmapError) -> Self {
+        Self::service_error(err.to_string())
+    }
+}
+
+impl From<serde_cbor::Error> for OperationError {
+    fn from(err: serde_cbor::Error) -> Self {
+        OperationError::service_error(format!("Failed to parse data: {}", err))
+    }
+}
+
+impl<E> From<AtomicIoError<E>> for OperationError {
+    fn from(err: AtomicIoError<E>) -> Self {
+        match err {
+            AtomicIoError::Internal(io_err) => OperationError::from(io_err),
+            AtomicIoError::User(_user_err) => OperationError::service_error("Unknown atomic write error"),
+        }
+    }
+}
+
+impl From<IoError> for OperationError {
+    fn from(err: IoError) -> Self {
+        match err.kind() {
+            ErrorKind::OutOfMemory => {
+                let free_memory = common::utils::mem::Mem::new().available_memory_bytes();
+                OperationError::OutOfMemory {
+                    description: format!("IO Error: {}", err),
+                    free: free_memory,
+                }
+            }
+            _ => OperationError::service_error(format!("IO Error: {}", err)),
+        }
+    }
+}
+
+impl From<serde_json::Error> for OperationError {
+    fn from(err: serde_json::Error) -> Self {
+        OperationError::service_error(format!("Json error: {}", err))
+    }
+}
+
+impl From<fs_extra::error::Error> for OperationError {
+    fn from(err: fs_extra::error::Error) -> Self {
+        OperationError::service_error(format!("File system error: {}", err))
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for OperationError {
+    fn from(err: std::sync::PoisonError<T>) -> Self {
+        OperationError::service_error(format!("Lock poison error: {}", err))
+    }
+}
+
+impl From<quantization::EncodingError> for OperationError {
+    fn from(err: quantization::EncodingError) -> Self {
+        match err {
+            quantization::EncodingError::IOError(err)
+            | quantization::EncodingError::EncodingError(err)
+            | quantization::EncodingError::ArgumentsError(err) => {
+                OperationError::service_error(format!("Quantization encoding error: {}", err))
+            }
+            quantization::EncodingError::Stopped => OperationError::Cancelled {
+                description: PROCESS_CANCELLED_BY_SERVICE_MESSAGE.to_string(),
+            },
+        }
+    }
+}
+
+pub type OperationResult<T> = result::Result<T, OperationError>;
+
+#[derive(Debug, Clone)]
+pub struct SegmentFailedState {
+    pub version: SeqNumberType,
+    pub point_id: Option<PointIdType>,
+    pub error: OperationError,
+}
+
+pub trait SegmentEntry: SnapshotEntry {
+    fn version(&self) -> SeqNumberType;
+    
+    fn point_version(&self, point_id: PointIdType) -> Option<SeqNumberType>;
+
+    fn search_batch(
+        &self,
+        vector_name: &VectorName,
+        query_vectors: &[&QueryVector],
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        filter: Option<&Filter>,
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &SegmentQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPoint>>>;
+
+    fn rescore_with_formula(
+        &self,
+        formula_ctx: Arc<FormulaContext>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPoint>>;
+
+    fn has_point(&self, point_id: PointIdType) -> bool;
+
+    fn estimate_point_count<'a>(
+        &'a self,
+        filter: Option<&'a Filter>,
+        hw_counter: &HardwareCounterCell,
+    ) -> CardinalityEstimation;
+
+    fn vector_names(&self) -> HashSet<VectorNameBuf>;
+
+    fn available_vectors_size_in_bytes(&self, vector_name: &VectorName) -> OperationResult<usize>;
+
+    fn max_available_vectors_size_in_bytes(&self) -> OperationResult<usize> {
+        self.vector_names()
+            .into_iter()
+            .map(|vector_name| self.available_vectors_size_in_bytes(&vector_name))
+            .collect::<OperationResult<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().max().unwrap_or_default())
+    }
+
+    fn segment_type(&self) -> SegmentType;
+
+    fn info(&self) -> SegmentInfo;
+
+    fn config(&self) -> &SegmentConfig;
+
+    fn is_appendable(&self) -> bool;
+
+    fn flush(&self, sync: bool, force: bool) -> OperationResult<SeqNumberType>;
+
+    fn drop_data(self) -> OperationResult<()>;
+
+    fn data_path(&self) -> PathBuf;
+
+    fn delete_field_index(
+        &mut self,
+        op_num: SeqNumberType,
+        key: PayloadKeyTypeRef,
+    ) -> OperationResult<bool>;
+
+    fn create_field_index(
+        &mut self,
+        op_num: SeqNumberType,
+        key: PayloadKeyTypeRef,
+        field_schema: Option<&PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn get_indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema>;
+
+    fn check_error(&self) -> Option<SegmentFailedState>;
+
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry;
+
+    fn fill_query_context(&self, query_context: &mut QueryContext);
+
+    fn upsert_point(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn delete_point(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn update_vectors(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn delete_vector(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vector_name: &VectorName,
+    ) -> OperationResult<bool>;
+
+    fn set_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        payload: &Payload,
+        key: &Option<JsonPath>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn set_full_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        full_payload: &Payload,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn delete_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        key: PayloadKeyTypeRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn clear_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn vector(
+        &self,
+        vector_name: &VectorName,
+        point_id: PointIdType,
+    ) -> OperationResult<Option<VectorInternal>>;
+
+    fn all_vectors(&self, point_id: PointIdType) -> OperationResult<NamedVectors>;
+
+    fn payload(
+        &self,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload>;
+
+    fn iter_points(&self) -> Box<dyn Iterator<Item = PointIdType> + '_>;
+
+    fn read_filtered<'a>(
+        &'a self,
+        offset: Option<PointIdType>,
+        limit: Option<usize>,
+        filter: Option<&'a Filter>,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Vec<PointIdType>;
+
+    fn read_ordered_filtered<'a>(
+        &'a self,
+        limit: Option<usize>,
+        filter: Option<&'a Filter>,
+        order_by: &'a OrderBy,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<(OrderValue, PointIdType)>>;
+
+    fn read_random_filtered(
+        &self,
+        limit: usize,
+        filter: Option<&Filter>,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Vec<PointIdType>;
+
+    fn unique_values(
+        &self,
+        key: &JsonPath,
+        filter: Option<&Filter>,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<BTreeSet<FacetValue>>;
+
+    fn facet(
+        &self,
+        request: &FacetParams,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<HashMap<FacetValue, usize>>;
+
+    fn read_range(&self, from: Option<PointIdType>, to: Option<PointIdType>) -> Vec<PointIdType>;
+
+    fn delete_filtered<'a>(
+        &'a mut self,
+        op_num: SeqNumberType,
+        filter: &'a Filter,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<usize>;
+}

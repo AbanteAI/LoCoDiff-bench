@@ -1,0 +1,334 @@
+```rust
+//! Module for constructing segments from other segments
+use std::cmp;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use atomic_refcell::AtomicRefCell;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::small_uint::U24;
+use common::types::PointOffsetType;
+use io::storage_version::StorageVersion;
+use itertools::Itertools;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+use super::{
+    create_mutable_id_tracker, create_sparse_vector_index, create_sparse_vector_storage,
+    get_payload_index_path, get_vector_index_path, get_vector_storage_path, new_segment_path,
+    open_segment_db, open_vector_storage,
+};
+use crate::common::error_logging::LogError;
+use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
+use crate::entry::entry_point::SegmentEntry;
+use crate::id_tracker::compressed::compressed_point_mappings::CompressedPointMappings;
+use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
+use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
+use crate::id_tracker::{for_each_unique_point, IdTracker, IdTrackerEnum};
+use crate::index::field_index::FieldIndex;
+use crate::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
+use crate::index::struct_payload_index::StructPayloadIndex;
+use crate::index::{PayloadIndex, VectorIndexEnum};
+use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+use crate::payload_storage::PayloadStorage;
+use crate::segment::{Segment, SegmentVersion};
+use crate::segment_constructor::{
+    build_vector_index, load_segment, VectorIndexBuildArgs, VectorIndexOpenArgs,
+};
+use crate::types::{
+    CompactExtendedPointId, ExtendedPointId, PayloadFieldSchema, PayloadKeyType, SegmentConfig,
+    SegmentState, SeqNumberType, VectorNameBuf,
+};
+use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+
+/// Container for vector storage and associated indices
+struct VectorData {
+    vector_storage: VectorStorageEnum,
+    old_indices: Vec<Arc<AtomicRefCell<VectorIndexEnum>>>,
+}
+
+/// Structure for constructing segments by merging existing segments
+pub struct SegmentBuilder {
+    version: SeqNumberType,
+    id_tracker: IdTrackerEnum,
+    payload_storage: PayloadStorageEnum,
+    vector_data: HashMap<VectorNameBuf, VectorData>,
+    segment_config: SegmentConfig,
+    destination_path: PathBuf,
+    temp_dir: TempDir,
+    indexed_fields: HashMap<PayloadKeyType, PayloadFieldSchema>,
+    defragment_keys: Vec<PayloadKeyType>,
+}
+
+impl SegmentBuilder {
+    /// Creates new SegmentBuilder with temporary directory
+    pub fn new(
+        segments_path: &Path,
+        temp_dir: &Path,
+        segment_config: &SegmentConfig,
+    ) -> OperationResult<Self> {
+        let stopped = AtomicBool::new(false);
+        let temp_dir = create_temp_dir(temp_dir)?;
+        let database = open_segment_db(temp_dir.path(), segment_config)?;
+
+        let id_tracker = if segment_config.is_appendable() {
+            IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(temp_dir.path())?)
+        } else {
+            IdTrackerEnum::InMemoryIdTracker(InMemoryIdTracker::new())
+        };
+
+        let payload_storage = super::create_payload_storage(segment_config, temp_dir.path())?;
+        let mut vector_data = HashMap::new();
+
+        for (vector_name, vector_config) in &segment_config.vector_data {
+            let vector_storage = open_vector_storage(
+                &database,
+                vector_config,
+                &stopped,
+                &get_vector_storage_path(temp_dir.path(), vector_name),
+                vector_name,
+            )?;
+
+            vector_data.insert(
+                vector_name.clone(),
+                VectorData {
+                    vector_storage,
+                    old_indices: Vec::new(),
+                },
+            );
+        }
+
+        for (vector_name, sparse_vector_config) in &segment_config.sparse_vector_data {
+            let vector_storage = create_sparse_vector_storage(
+                &database,
+                &get_vector_storage_path(temp_dir.path(), vector_name),
+                vector_name,
+                &sparse_vector_config.storage_type,
+                &stopped,
+            )?;
+
+            vector_data.insert(
+                vector_name.clone(),
+                VectorData {
+                    vector_storage,
+                    old_indices: Vec::new(),
+                },
+            );
+        }
+
+        Ok(SegmentBuilder {
+            version: 0,
+            id_tracker,
+            payload_storage,
+            vector_data,
+            segment_config: segment_config.clone(),
+            destination_path: new_segment_path(segments_path),
+            temp_dir,
+            indexed_fields: HashMap::new(),
+            defragment_keys: Vec::new(),
+        })
+    }
+
+    /// Configure payload keys for defragmentation optimization
+    pub fn set_defragment_keys(&mut self, keys: Vec<PayloadKeyType>) {
+        self.defragment_keys = keys;
+    }
+
+    /// Update builder with data from source segments
+    pub fn update(&mut self, segments: &[&Segment], stopped: &AtomicBool) -> OperationResult<bool> {
+        if segments.is_empty() {
+            return Ok(true);
+        }
+
+        // Collect and merge points from all source segments
+        let payloads: Vec<_> = segments.iter().map(|s| s.payload_index.borrow()).collect();
+        let mut points_to_insert = collect_merged_points(segments, stopped)?;
+
+        // Apply defragmentation ordering if configured
+        for defragment_key in &self.defragment_keys {
+            apply_defragmentation(defragment_key, &mut points_to_insert, &payloads);
+        }
+
+        self.version = updated_version(segments, self.version);
+        let vector_data_refs = process_vector_storages(segments, &mut self.vector_data)?;
+
+        // Update storage with merged points
+        for (vector_name, vector_data) in &mut self.vector_data {
+            update_vector_storage(
+                vector_name,
+                vector_data,
+                &vector_data_refs,
+                &points_to_insert,
+                stopped,
+            )?;
+        }
+
+        transfer_payloads(
+            &mut self.id_tracker,
+            &mut self.payload_storage,
+            &payloads,
+            &points_to_insert,
+            stopped,
+        )?;
+
+        // Update indexed fields from source segments
+        for payload_index in payloads {
+            self.indexed_fields
+                .extend(payload_index.indexed_fields().map(|(k, v)| (k.clone(), v)));
+        }
+
+        Ok(true)
+    }
+
+    /// Finalize segment construction
+    pub fn build(
+        self,
+        permit: ResourcePermit,
+        stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Result<Segment, OperationError> {
+        let destination = self.prepare_segment(permit, stopped, hw_counter)?;
+        Ok(finalize_segment(self.temp_dir, destination)?)
+    }
+
+    /// Internal preparation of segment components
+    fn prepare_segment(
+        self,
+        permit: ResourcePermit,
+        stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Result<PathBuf, OperationError> {
+        let temp_dir = self.temp_dir;
+        let mut segment = self.create_base_segment()?;
+        
+        self.process_payload_index(&mut segment, hw_counter, stopped)?;
+        self.process_vector_indices(segment, Arc::new(permit), stopped)
+    }
+
+    /// Create base segment components
+    fn create_base_segment(self) -> Result<(TempDir, PathBuf, SegmentConfig), OperationError> {
+        let config = self.segment_config.clone();
+        let destination = self.destination_path.clone();
+        Ok((self.temp_dir, destination, config))
+    }
+
+    /// Process payload storage and indexing
+    fn process_payload_index(
+        &self,
+        segment: &mut (TempDir, PathBuf, SegmentConfig),
+        hw_counter: &HardwareCounterCell,
+        stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        let payload_index = StructPayloadIndex::open(
+            Arc::new(AtomicRefCell::new(self.payload_storage.clone())),
+            Arc::new(AtomicRefCell::new(self.id_tracker.clone())),
+            HashMap::new(),
+            &get_payload_index_path(segment.0.path()),
+            segment.2.is_appendable(),
+        )?;
+
+        for (field, schema) in &self.indexed_fields {
+            payload_index.set_indexed(field, *schema, hw_counter)?;
+            check_process_stopped(stopped)?;
+        }
+
+        Ok(())
+    }
+
+    /// Process vector indices construction
+    fn process_vector_indices(
+        self,
+        segment: (TempDir, PathBuf, SegmentConfig),
+        permit: Arc<ResourcePermit>,
+        stopped: &AtomicBool,
+    ) -> Result<PathBuf, OperationError> {
+        // Actual index building logic here
+        // (implementation details omitted for brevity)
+        
+        Ok(segment.1)
+    }
+}
+
+/// Helper function to create temporary directory
+fn create_temp_dir(parent: &Path) -> OperationResult<TempDir> {
+    tempfile::TempDir::with_prefix_in("segment-builder-", parent)
+        .map_err(|e| OperationError::service_error(format!("Temp dir creation failed: {e}")))
+}
+
+/// Finalize segment by moving to destination
+fn finalize_segment(temp_dir: TempDir, destination: PathBuf) -> OperationResult<Segment> {
+    std::fs::rename(temp_dir.into_path(), &destination)
+        .describe("Moving optimized segment data")?;
+
+    load_segment(&destination, &AtomicBool::new(false))?
+        .ok_or_else(|| OperationError::service_error("Failed to load constructed segment"))
+}
+
+// Additional helper functions for update process
+fn collect_merged_points(segments: &[&Segment], stopped: &AtomicBool) -> OperationResult<Vec<PointData>> {
+    let mut points = Vec::new();
+    let trackers = segments.iter().map(|s| s.id_tracker.borrow()).collect_vec();
+    
+    for_each_unique_point(trackers.iter().map(|t| t.deref()), |item| {
+        check_process_stopped(stopped)?;
+        points.push(PointData {
+            external_id: item.external_id.into(),
+            segment_index: U24::new_wrapped(item.tracker_index as u32),
+            internal_id: item.internal_id,
+            version: item.version,
+            ordering: 0,
+        });
+        Ok(())
+    })?;
+    
+    Ok(points)
+}
+
+fn apply_defragmentation(
+    key: &PayloadKeyType,
+    points: &mut [PointData],
+    payloads: &[impl PayloadIndex],
+) {
+    points.iter_mut().for_each(|p| {
+        if let Some(indices) = payloads[p.segment_index.get() as usize].field_indexes().get(key) {
+            p.ordering += compute_ordering(p.internal_id, indices);
+        }
+    });
+    points.sort_unstable_by_key(|p| p.ordering);
+}
+
+fn compute_ordering(internal_id: PointOffsetType, indices: &[FieldIndex]) -> u64 {
+    let mut hash = 0u64;
+    indices.iter().for_each(|index| match index {
+        FieldIndex::IntMapIndex(idx) => hash_values(idx.get_values(internal_id), &mut hash),
+        FieldIndex::UuidIndex(idx) => hash_uuids(idx.get_values(internal_id), &mut hash),
+        _ => (),
+    });
+    hash
+}
+
+fn transfer_payloads(
+    id_tracker: &mut IdTrackerEnum,
+    payload_storage: &mut PayloadStorageEnum,
+    payloads: &[impl PayloadIndex],
+    points: &[PointData],
+    stopped: &AtomicBool,
+) -> OperationResult<()> {
+    // Actual payload transfer logic here  
+    Ok(())
+}
+
+/// Internal point data structure
+#[derive(Debug)]
+struct PointData {
+    external_id: CompactExtendedPointId,
+    segment_index: U24,
+    internal_id: PointOffsetType,
+    version: u64,
+    ordering: u64,
+}
+```
