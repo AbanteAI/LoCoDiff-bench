@@ -1918,6 +1918,10 @@ def generate_case_page(
                 <p><strong>Status:</strong> <span class="{status_class}">{status_text}</span></p>
                 <p><strong>Prompt Tokens:</strong> {case_metadata.get("prompt_tokens", "N/A")}</p>
                 <p><strong>Output Tokens:</strong> {result_metadata.get("output_tokens", "N/A")}</p>
+                <p><strong>Native Prompt Tokens:</strong> {result_metadata.get("native_prompt_tokens", "N/A")}</p>
+                <p><strong>Native Completion Tokens:</strong> {result_metadata.get("native_completion_tokens", "N/A")}</p>
+                <p><strong>Native Tokens Reasoning:</strong> {result_metadata.get("native_tokens_reasoning", "N/A")}</p>
+                <p><strong>Native Finish Reason:</strong> {result_metadata.get("native_finish_reason", "N/A")}</p>
                 <p><strong>Runtime:</strong> {result_metadata.get("runtime_seconds", "N/A")}s</p>
                 <p><strong>Cost:</strong> ${result_metadata.get("cost_usd", "N/A")}</p>
             </div>
