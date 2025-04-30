@@ -1,0 +1,403 @@
+```zig
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+const inputpkg = @import("input.zig");
+const terminal = @import("terminal/main.zig");
+const internal_os = @import("os/main.zig");
+const cli_args = @import("cli_args.zig");
+
+const log = std.log.scoped(.config);
+
+/// Used on Unixes for some defaults.
+const c = @cImport({
+    @cInclude("unistd.h");
+});
+
+/// Config is the main config struct. These fields map directly to the
+/// CLI flag names hence we use a lot of `@""` syntax to support hyphens.
+pub const Config = struct {
+    /// The font families to use.
+    @"font-family": ?[:0]const u8 = null,
+    @"font-family-bold": ?[:0]const u8 = null,
+    @"font-family-italic": ?[:0]const u8 = null,
+    @"font-family-bold-italic": ?[:0]const u8 = null,
+
+    /// Apply a font feature. This can be repeated multiple times to enable
+    /// multiple font features. You can NOT set multiple font features with
+    /// a single value (yet).
+    ///
+    /// The font feature will apply to all fonts rendered by Ghostty. A
+    /// future enhancement will allow targeting specific faces.
+    ///
+    /// A valid value is the name of a feature. Prefix the feature with a
+    /// "-" to explicitly disable it. Example: "ss20" or "-ss20".
+    @"font-feature": RepeatableString = .{},
+
+    /// Font size in points
+    @"font-size": u8 = switch (builtin.os.tag) {
+        // On Mac we default a little bigger since this tends to look better.
+        // This is purely subjective but this is easy to modify.
+        .macos => 13,
+        else => 12,
+    },
+
+    /// A repeatable configuration to set one or more font variations values
+    /// for a variable font. A variable font is a single font, usually
+    /// with a filename ending in "-VF.ttf" or "-VF.otf" that contains
+    /// one or more configurable axes for things such as weight, slant,
+    /// etc. Not all fonts support variations; only fonts that explicitly
+    /// state they are variable fonts will work.
+    ///
+    /// The format of this is "id=value" where "id" is the axis identifier.
+    /// An axis identifier is always a 4 character string, such as "wght".
+    /// To get the list of supported axes, look at your font documentation
+    /// or use a font inspection tool.
+    ///
+    /// Invalid ids and values are usually ignored. For example, if a font
+    /// only supports weights from 100 to 700, setting "wght=800" will
+    /// do nothing (it will not be clamped to 700). You must consult your
+    /// font's documentation to see what values are supported.
+    ///
+    /// Common axes are: "wght" (weight), "slnt" (slant), "ital" (italic),
+    /// "opsz" (optical size), "wdth" (width), "GRAD" (gradient), etc.
+    @"font-variation": RepeatableFontVariation = .{},
+    @"font-variation-bold": RepeatableFontVariation = .{},
+    @"font-variation-italic": RepeatableFontVariation = .{},
+    @"font-variation-bold-italic": RepeatableFontVariation = .{},
+
+    /// Draw fonts with a thicker stroke, if supported. This is only supported
+    /// currently on macOS.
+    @"font-thicken": bool = false,
+
+    /// Background color for the window.
+    background: Color = .{ .r = 0x28, .g = 0x2C, .b = 0x34 },
+
+    /// Foreground color for the window.
+    foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
+
+    /// The foreground and background color for selection. If this is not
+    /// set, then the selection color is just the inverted window background
+    /// and foreground (note: not to be confused with the cell bg/fg).
+    @"selection-foreground": ?Color = null,
+    @"selection-background": ?Color = null,
+
+    /// Color palette for the 256 color form that many terminal applications
+    /// use. The syntax of this configuration is "N=HEXCODE" where "n"
+    /// is 0 to 255 (for the 256 colors) and HEXCODE is a typical RGB
+    /// color code such as "#AABBCC". The 0 to 255 correspond to the
+    /// terminal color table.
+    ///
+    /// For definitions on all the codes:
+    /// https://www.ditig.com/256-colors-cheat-sheet
+    palette: Palette = .{},
+
+    /// The color of the cursor. If this is not set, a default will be chosen.
+    @"cursor-color": ?Color = null,
+
+    /// The style of the cursor. This sets the default style. A running
+    /// programn can still request an explicit cursor style using escape
+    /// sequences (such as CSI q). Shell configurations will often request
+    /// specific cursor styles.
+    ///
+    /// Caveat: Shell integration currently defaults to always be a bar
+    /// In order to fix it, we probably would want to add something similar to Kitty's
+    /// shell integration options (no-cursor). For more information see:
+    /// https://sw.kovidgoyal.net/kitty/conf/#opt-kitty.shell_integration
+    @"cursor-style": terminal.Cursor.Style = .bar,
+
+    /// Whether the cursor shall blink
+    @"cursor-style-blink": bool = true,
+
+    /// The color of the text under the cursor. If this is not set, a default
+    /// will be chosen.
+    @"cursor-text": ?Color = null,
+
+    /// The opacity level (opposite of transparency) of the background.
+    /// A value of 1 is fully opaque and a value of 0 is fully transparent.
+    /// A value less than 0 or greater than 1 will be clamped to the nearest
+    /// valid value.
+    ///
+    /// Changing this value at runtime (and reloading config) will only
+    /// affect new windows, tabs, and splits.
+    @"background-opacity": f64 = 1.0,
+
+    /// A positive value enables blurring of the background when
+    /// background-opacity is less than 1. The value is the blur radius to
+    /// apply. A value of 20 is reasonable for a good looking blur.
+    /// Higher values will cause strange rendering issues as well as
+    /// performance issues.
+    ///
+    /// This is only supported on macOS.
+    @"background-blur-radius": u8 = 0,
+
+    /// The command to run, usually a shell. If this is not an absolute path,
+    /// it'll be looked up in the PATH. If this is not set, a default will
+    /// be looked up from your system. The rules for the default lookup are:
+    ///
+    ///   - SHELL environment variable
+    ///   - passwd entry (user information)
+    command: Command = .{ .kind = .default },
+
+    /// The directory to change to after starting the command.
+    ///
+    /// The default is "inherit" except in special scenarios listed next.
+    /// If ghostty can detect it is launched on macOS from launchd
+    /// (double-clicked), then it defaults to "home".
+    ///
+    /// The value of this must be an absolute value or one of the special
+    /// values below:
+    ///
+    ///   - "home" - The home directory of the executing user.
+    ///   - "inherit" - The working directory of the launching process.
+    ///
+    @"working-directory": ?[]const u8 = null,
+
+    /// Key bindings. The format is "trigger=action". Duplicate triggers
+    /// will overwrite previously set values.
+    ///
+    /// Trigger: "+"-separated list of keys and modifiers. Example:
+    /// "ctrl+a", "ctrl+shift+b", "up". Some notes:
+    ///
+    ///   - modifiers cannot repeat, "ctrl+ctrl+a" is invalid.
+    ///   - modifiers and key scan be in any order, "shift+a+ctrl" is weird,
+    ///     but valid.
+    ///   - only a single key input is allowed, "ctrl+a+b" is invalid.
+    ///
+    /// Action is the action to take when the trigger is satisfied. It takes
+    /// the format "action" or "action:param". The latter form is only valid
+    /// if the action requires a parameter.
+    ///
+    ///   - "ignore" - Do nothing, ignore the key input. This can be used to
+    ///     black hole certain inputs to have no effect.
+    ///   - "unbind" - Remove the binding. This makes it so the previous action
+    ///     is removed, and the key will be sent through to the child command
+    ///     if it is printable.
+    ///   - "csi:text" - Send a CSI sequence. i.e. "csi:A" sends "cursor up".
+    ///
+    /// Some notes for the action:
+    ///
+    ///   - The parameter is taken as-is after the ":". Double quotes or
+    ///     other mechanisms are included and NOT parsed. If you want to
+    ///     send a string value that includes spaces, wrap the entire
+    ///     trigger/action in double quotes. Example: --keybind="up=csi:A B"
+    ///
+    keybind: Keybinds = .{},
+
+    /// Window padding. This applies padding between the terminal cells and
+    /// the window border. The "x" option applies to the left and right
+    /// padding and the "y" option is top and bottom. The value is in points,
+    /// meaning that it will be scaled appropriately for screen DPI.
+    ///
+    /// If this value is set too large, the screen will render nothing, because
+    /// the grid will be completely squished by the padding. It is up to you
+    /// as the user to pick a reasonable value. If you pick an unreasonable
+    /// value, a warning will appear in the logs.
+    @"window-padding-x": u32 = 2,
+    @"window-padding-y": u32 = 2,
+
+    /// The viewport dimensions are usually not perfectly divisible by
+    /// the cell size. In this case, some extra padding on the end of a
+    /// column and the bottom of the final row may exist. If this is true,
+    /// then this extra padding is automatically balanced between all four
+    /// edges to minimize imbalance on one side. If this is false, the top
+    /// left grid cell will always hug the edge with zero padding other than
+    /// what may be specified with the other "window-padding" options.
+    ///
+    /// If other "window-padding" fields are set and this is true, this will
+    /// still apply. The other padding is applied first and may affect how
+    /// many grid cells actually exist, and this is applied last in order
+    /// to balance the padding given a certain viewport size and grid cell size.
+    @"window-padding-balance": bool = false,
+
+    /// If true, new windows and tabs will inherit the font size of the previously
+    /// focused window. If no window was previously focused, the default
+    /// font size will be used. If this is false, the default font size
+    /// specified in the configuration "font-size" will be used.
+    @"window-inherit-font-size": bool = true,
+
+    /// If false, windows won't have native decorations, i.e. titlebar and
+    /// borders.
+    /// Currently only supported with GTK.
+    @"window-decoration": bool = true,
+
+    /// Whether to allow programs running in the terminal to read/write to
+    /// the system clipboard (OSC 52, for googling). The default is to
+    /// disallow clipboard reading but allow writing.
+    @"clipboard-read": bool = false,
+    @"clipboard-write": bool = true,
+
+    /// Trims trailing whitespace on data that is copied to the clipboard.
+    /// This does not affect data sent to the clipboard via "clipboard-write".
+    @"clipboard-trim-trailing-spaces": bool = true,
+
+    /// The total amount of bytes that can be used for image data (i.e.
+    /// the Kitty image protocol) per terminal scren. The maximum value
+    /// is 4,294,967,295 (4GB). The default is 320MB. If this is set to zero,
+    /// then all image protocols will be disabled.
+    ///
+    /// This value is separate for primary and alternate screens so the
+    /// effective limit per surface is double.
+    @"image-storage-limit": u32 = 320 * 1000 * 1000,
+
+    /// Whether to automatically copy selected text to the clipboard. "true"
+    /// will only copy on systems that support a selection clipboard.
+    ///
+    /// The value "clipboard" will copy to the system clipboard, making this
+    /// work on macOS. Note that middle-click will also paste from the system
+    /// clipboard in this case.
+    ///
+    /// Note that if this is disabled, middle-click paste will also be
+    /// disabled.
+    @"copy-on-select": CopyOnSelect = .true,
+
+    /// The time in milliseconds between clicks to consider a click a repeat
+    /// (double, triple, etc.) or an entirely new single click. A value of
+    /// zero will use a platform-specific default. The default on macOS
+    /// is determined by the OS settings. On every other platform it is 500ms.
+    @"click-repeat-interval": u32 = 0,
+
+    /// Additional configuration files to read.
+    @"config-file": RepeatableString = .{},
+
+    /// Confirms that a surface should be closed before closing it. This defaults
+    /// to true. If set to false, surfaces will close without any confirmation.
+    @"confirm-close-surface": ConfirmCloseSurface = .surface_has_processes,
+
+    /// Whether to enable shell integration auto-injection or not. Shell
+    /// integration greatly enhances the terminal experience by enabling
+    /// a number of features:
+    ///
+    ///   * Working directory reporting so new tabs, splits inherit the
+    ///     previous terminal's working directory.
+    ///   * Prompt marking that enables the "scroll_to_prompt" keybinding.
+    ///   * If you're sitting at a prompt, closing a terminal will not ask
+    ///     for confirmation.
+    ///   * Resizing the window with a complex prompt usually paints much
+    ///     better.
+    ///
+    /// Allowable values are:
+    ///
+    ///   * "none" - Do not do any automatic injection. You can still manually
+    ///     configure your shell to enable the integration.
+    ///   * "detect" - Detect the shell based on the filename.
+    ///   * "fish", "zsh" - Use this specific shell injection scheme.
+    ///
+    /// The default value is "detect".
+    @"shell-integration": ShellIntegration = .detect,
+
+    /// If anything other than false, fullscreen mode on macOS will not use the
+    /// native fullscreen, but make the window fullscreen without animations and
+    /// using a new space. It's faster than the native fullscreen mode since it
+    /// doesn't use animations.
+    ///
+    /// Allowable values are:
+    ///
+    ///   * "visible-menu" - Use non-native macOS fullscreen, keep the menu bar visible
+    ///   * "true" - Use non-native macOS fullscreen, hide the menu bar
+    ///   * "false" - Use native macOS fullscreeen
+    @"macos-non-native-fullscreen": NonNativeFullscreen = .false,
+
+    /// If true, the Option key will be treated as Alt. This makes terminal
+    /// sequences expecting Alt to work properly, but will break Unicode
+    /// input sequences on macOS if you use them via the alt key. You may
+    /// set this to false to restore the macOS alt-key unicode sequences
+    /// but this will break terminal sequences expecting Alt to work.
+    ///
+    /// Note that if an Option-sequence doesn't produce a printable
+    /// character, it will be treated as Alt regardless of this setting.
+    /// (i.e. alt+ctrl+a).
+    ///
+    /// This does not work with GLFW builds.
+    @"macos-option-as-alt": OptionAsAlt = .false,
+
+    /// If true (default), then the Ghostty GTK application will run in
+    /// single-instance mode: each new `ghostty` process launched will result
+    /// in a new window, if there is already a running process.
+    ///
+    /// If false, each new ghostty process will launch a separate application.
+    ///
+    /// Debug builds of Ghostty have a separate single-instance ID.
+    @"gtk-single-instance": bool = true,
+
+    /// Dynamic library compatibility override for Mac Catalyst
+    /// This should only be necessary if you're testing Catalyst builds
+    @"macos-force-catalyst": bool = false,
+
+    /// Internal set of custom shader program paths to load
+    @"custom-shaders": RepeatablePath = .{},
+
+    /// When to activate custom shader animations. When set to "focused" (default),
+    /// animations are only active when the terminal is focused. When set to "always",
+    /// animations remain active even when unfocused.
+    @"custom-shader-animation": CustomShaderAnimation = .focused,
+
+    /// Captures mouse events even when shifted (i.e. with capslock enabled)
+    /// allowing e.g. copy-on-select using mouse while capslock is active
+    @"mouse-shift-capture": MouseShiftCapture = .clipboard_only,
+
+    /// Font feature toggles for synthetic styles (bold, italic)
+    @"font-synthetic-style": FontSyntheticStyle = .all,
+
+    /// Controlling how we load fonts using FreeType
+    @"freetype-load-flags": FreetypeLoadFlags = .{},
+
+    /// Configuration for optional logical palette
+    @"palette-logical": RepeatableCodepointMap = .{},
+    
+    /// Window padding color configuration (defaults to using background)
+    @"window-padding-color": WindowPaddingColor = .background,
+
+    /// This is set by the CLI parser for deinit.
+    _arena: ?ArenaAllocator = null,
+
+    /// Key is an enum of all the available configuration keys.
+    pub const Key = @import("config/key.zig").Key;
+
+    pub fn deinit(self: *Config) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
+        var result: Config = .{
+            ._arena = ArenaAllocator.init(alloc_gpa),
+        };
+        errdefer result.deinit();
+        const alloc = result._arena.?.allocator();
+
+        try result.keybind.set.put(
+            alloc,
+            .{ .key = .space, .mods = .{ .super = true, .alt = true, .ctrl = true } },
+            .{ .reload_config = {} },
+        );
+
+        // Copy/paste bindings
+        {
+            const mods: inputpkg.Mods = if (builtin.target.os.tag == .macos)
+                .{ .super = true }
+            else
+                .{ .ctrl = true, .shift = true };
+
+            try result.keybind.set.put(
+                alloc,
+                .{ .key = .c, .mods = mods },
+                .{ .copy_to_clipboard = {} },
+            );
+            try result.keybind.set.put(
+                alloc,
+                .{ .key = .v, .mods = mods },
+                .{ .paste_from_clipboard = {} },
+            );
+        }
+
+        // Font size adjustments
+        try result.keybind.set.put(
+            alloc,
+            .{ .key = .equal, .mods = ctrlOrSuper(.{}) },
+            .{ .increase_font_size = 1 },
+        );
+        try result.keybind.set.put(
+            alloc,
+   
