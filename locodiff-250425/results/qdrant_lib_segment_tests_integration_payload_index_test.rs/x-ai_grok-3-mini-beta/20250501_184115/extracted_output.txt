@@ -1,0 +1,471 @@
+use std::collections::HashMap;
+use std::fs::create_dir;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use anyhow::{Context, Result};
+use atomic_refcell::AtomicRefCell;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::PointOffsetType;
+use fnv::FnvBuildHasher;
+use indexmap::IndexSet;
+use itertools::Itertools;
+use rand::prelude::StdRng;
+use rand::{rng, Rng};
+use rand::{Rng, SeedableRng};
+use segment::data_types::facets::{FacetParams, FacetValue};
+use segment::data_types::index::{
+    FloatIndexParams, FloatIndexType, IntegerIndexParams, IntegerIndexType, KeywordIndexParams,
+    KeywordIndexType, TextIndexParams, TextIndexType,
+};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
+use segment::entry::entry_point::SegmentEntry;
+use segment::fixtures::payload_context_fixture::FixtureIdTracker;
+use segment::fixtures::payload_fixtures::{
+    FLICKING_KEY, FLT_KEY, GEO_KEY, INT_KEY, INT_KEY_2, INT_KEY_3, LAT_RANGE, LON_RANGE, STR_KEY,
+    STR_PROJ_KEY, STR_ROOT_PROJ_KEY, TEXT_KEY, generate_diverse_nested_payload,
+    generate_diverse_payload, random_filter, random_nested_filter, random_vector,
+};
+use segment::index::field_index::{FieldIndex, PrimaryCondition};
+use segment::index::struct_payload_index::StructPayloadIndex;
+use segment::index::PayloadIndex;
+use segment::json_path::JsonPath;
+use segment::payload_json;
+use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
+use segment::payload_storage::PayloadStorage;
+use segment::segment::Segment;
+use segment::segment_constructor::build_segment;
+use segment::segment_constructor::segment_builder::SegmentBuilder;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
+use segment::types::PayloadFieldSchema::{FieldParams, FieldType};
+use segment::types::PayloadSchemaType::{Integer, Keyword};
+use segment::types::{
+    AnyVariants, Condition, Distance, FieldCondition, Filter, GeoBoundingBox, GeoLineString,
+    GeoPoint, GeoPolygon, GeoRadius, HnswConfig, Indexes, IsEmptyCondition, IsNullCondition, Match,
+    Payload, PayloadField, PayloadSchemaParams, PayloadSchemaType, Range, SegmentConfig,
+    VectorDataConfig, VectorStorageType, WithPayload,
+};
+use segment::utils::scored_point_ties::ScoredPointTies;
+use serde_json::json;
+use tempfile::{Builder, TempDir};
+
+const DIM: usize = 5;
+const ATTEMPTS: usize = 20;
+
+macro_rules! here {
+    () => {
+        format!("at {}:{}", file!(), line!())
+    };
+}
+
+macro_rules! ensure {
+    ($($arg:tt)*) => {
+        (|| Ok(anyhow::ensure!($($arg)*)))().map_err(|e| {
+            e.context(here!())
+        })?
+    };
+}
+
+struct TestSegments {
+    _base_dir: TempDir,
+    struct_segment: Segment,
+    plain_segment: Segment,
+    mmap_segment: Segment,
+}
+
+impl TestSegments {
+    fn new() -> Self {
+        let base_dir = Builder::new().prefix("test_segments").tempdir().unwrap();
+
+        let mut rnd = StdRng::seed_from_u64(42);
+
+        let config = Self::make_simple_config(true);
+
+        let mut plain_segment =
+            build_segment(&base_dir.path().join("plain"), &config, true).unwrap();
+        let mut struct_segment =
+            build_segment(&base_dir.path().join("struct"), &config, true).unwrap();
+
+        let num_points = 3000;
+        let points_to_delete = 500;
+        let points_to_clear = 500;
+
+        let mut opnum = 0;
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(INT_KEY_2),
+                Some(&Integer.into()),
+                &hw_counter,
+            )
+            .unwrap();
+
+        opnum += 1;
+        for n in 0..num_points {
+            let idx = n.into();
+            let vector = random_vector(&mut rnd, DIM);
+            let payload: Payload = generate_diverse_payload(&mut rnd);
+
+            plain_segment
+                .upsert_point(opnum, idx, only_default_vector(&vector), &hw_counter)
+                .unwrap();
+            struct_segment
+                .upsert_point(opnum, idx, only_default_vector(&vector), &hw_counter)
+                .unwrap();
+            plain_segment
+                .set_full_payload(opnum, idx, &payload, &hw_counter)
+                .unwrap();
+            struct_segment
+                .set_full_payload(opnum, idx, &payload, &hw_counter)
+                .unwrap();
+
+            opnum += 1;
+        }
+
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(STR_KEY),
+                Some(&Keyword.into()),
+                &hw_counter,
+            )
+            .unwrap();
+        struct_segment
+            .create_field_index(opnum, &JsonPath::new(INT_KEY), None, &hw_counter)
+            .unwrap();
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(INT_KEY_2),
+                Some(&FieldParams(PayloadSchemaParams::Integer(
+                    IntegerIndexParams {
+                        r#type: IntegerIndexType::Integer,
+                        lookup: Some(true),
+                        range: Some(false),
+                        is_principal: None,
+                        on_disk: None,
+                    },
+                ))),
+                &hw_counter,
+            )
+            .unwrap();
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(INT_KEY_3),
+                Some(&FieldParams(PayloadSchemaParams::Integer(
+                    IntegerIndexParams {
+                        r#type: IntegerIndexType::Integer,
+                        lookup: Some(false),
+                        range: Some(true),
+                        is_principal: None,
+                        on_disk: None,
+                    },
+                ))),
+                &hw_counter,
+            )
+            .unwrap();
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(GEO_KEY),
+                Some(&PayloadSchemaType::Geo.into()),
+                &hw_counter,
+            )
+            .unwrap();
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(TEXT_KEY),
+                Some(&PayloadSchemaType::Text.into()),
+                &hw_counter,
+            )
+            .unwrap();
+        struct_segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(FLICKING_KEY),
+                Some(&Integer.into()),
+                &hw_counter,
+            )
+            .unwrap();
+
+        // Make mmap segment after inserting the points, but before deleting some of them
+        let mut mmap_segment =
+            Self::make_mmap_segment(&base_dir.path().join("mmap"), &plain_segment);
+
+        for _ in 0..points_to_clear {
+            opnum += 1;
+            let idx_to_remove = rnd.gen_range(0..num_points);
+            plain_segment
+                .clear_payload(opnum, idx_to_remove.into(), &hw_counter)
+                .unwrap();
+            struct_segment
+                .clear_payload(opnum, idx_to_remove.into(), &hw_counter)
+                .unwrap();
+            mmap_segment
+                .clear_payload(opnum, idx_to_remove.into(), &hw_counter)
+                .unwrap();
+        }
+
+        for _ in 0..points_to_delete {
+            opnum += 1;
+            let idx_to_remove = rnd.gen_range(0..num_points);
+            plain_segment
+                .delete_point(opnum, idx_to_remove.into(), &hw_counter)
+                .unwrap();
+            struct_segment
+                .delete_point(opnum, idx_to_remove.into(), &hw_counter)
+                .unwrap();
+            mmap_segment
+                .delete_point(opnum, idx_to_remove.into(), &hw_counter)
+                .unwrap();
+        }
+
+        for (field, indexes) in struct_segment.payload_index.borrow().field_indexes.iter() {
+            for index in indexes {
+                ensure!(index.count_indexed_points() <= num_points as usize);
+                if field.to_string() != FLICKING_KEY {
+                    ensure!(
+                        index.count_indexed_points()
+                            >= (num_points as usize - points_to_delete - points_to_clear)
+                    );
+                }
+            }
+        }
+
+        Self {
+            _base_dir,
+            struct_segment,
+            plain_segment,
+            mmap_segment,
+        }
+    }
+
+    fn make_mmap_segment(path: &Path, plain_segment: &Segment) -> Segment {
+        let stopped = AtomicBool::new(false);
+
+        create_dir(path).unwrap();
+
+        let mut builder = SegmentBuilder::new(
+            path,
+            &path.with_extension("tmp"),
+            &Self::make_simple_config(false),
+            &stopped,
+        ).unwrap();
+        builder.update(&[plain_segment], &stopped).unwrap();
+        let permit = ResourcePermit::dummy(1);
+        let hw_counter = HardwareCounterCell::new();
+
+        let mut segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+        let opnum = segment.version() + 1;
+
+        segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(STR_KEY),
+                Some(&FieldParams(PayloadSchemaParams::Keyword(
+                    KeywordIndexParams {
+                        r#type: KeywordIndexType::Keyword,
+                        is_tenant: None,
+                        on_disk: Some(true),
+                    },
+                ))),
+                &hw_counter,
+            )
+            .unwrap();
+        segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(INT_KEY),
+                Some(&FieldParams(PayloadSchemaParams::Integer(
+                    IntegerIndexParams {
+                        r#type: IntegerIndexType::Integer,
+                        lookup: Some(true),
+                        range: Some(true),
+                        is_principal: None,
+                        on_disk: Some(true),
+                    },
+                ))),
+                &hw_counter,
+            )
+            .unwrap();
+        segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(INT_KEY_2),
+                Some(&FieldParams(PayloadSchemaParams::Integer(
+                    IntegerIndexParams {
+                        r#type: IntegerIndexType::Integer,
+                        lookup: Some(true),
+                        range: Some(false),
+                        is_principal: None,
+                        on_disk: Some(true),
+                    },
+                ))),
+                &hw_counter,
+            )
+            .unwrap();
+        segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(INT_KEY_3),
+                Some(&FieldParams(PayloadSchemaParams::Integer(
+                    IntegerIndexParams {
+                        r#type: IntegerIndexType::Integer,
+                        lookup: Some(false),
+                        range: Some(true),
+                        is_principal: None,
+                        on_disk: Some(true),
+                    },
+                ))),
+                &hw_counter,
+            )
+            .unwrap();
+        segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(FLT_KEY),
+                Some(&FieldParams(PayloadSchemaParams::Float(FloatIndexParams {
+                    r#type: FloatIndexType::Float,
+                    is_principal: None,
+                    on_disk: Some(true),
+                }))),
+                &hw_counter,
+            )
+            .unwrap();
+        segment
+            .create_field_index(
+                opnum,
+                &JsonPath::new(TEXT_KEY),
+                Some(&FieldParams(PayloadSchemaParams::Text(TextIndexParams {
+                    r#type: TextIndexType::Text,
+                    on_disk: Some(true),
+                    ..Default::default()
+                }))),
+                &hw_counter,
+            )
+            .unwrap();
+
+        segment
+    }
+}
+
+fn build_test_segments_nested_payload(path_struct: &Path, path_plain: &Path) -> (Segment, Segment) {
+    let mut rnd = StdRng::seed_from_u64(42);
+
+    let mut plain_segment = build_simple_segment(path_plain, DIM, Distance::Dot).unwrap();
+    let mut struct_segment = build_simple_segment(path_struct, DIM, Distance::Dot).unwrap();
+
+    let num_points = 3000;
+    let points_to_delete = 500;
+    let points_to_clear = 500;
+
+    // Nested payload keys
+    let nested_str_key =
+        JsonPath::new(&format!("{}.{}.{}", STR_KEY, "nested_1", "nested_2"));
+    let nested_str_proj_key =
+        JsonPath::new(&format!("{}.{}[].{}", STR_PROJ_KEY, "nested_1", "nested_2"));
+    let deep_nested_str_proj_key =
+        JsonPath::new(&format!("{}[].{}[].{}", STR_ROOT_PROJ_KEY, "nested_1", "nested_2"));
+
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut opnum = 0;
+    struct_segment
+        .create_field_index(opnum, &nested_str_key, Some(&Keyword.into()), &hw_counter)
+        .unwrap();
+
+    struct_segment
+        .create_field_index(
+            opnum,
+            &nested_str_proj_key,
+            Some(&Keyword.into()),
+            &hw_counter,
+        )
+        .unwrap();
+
+    struct_segment
+        .create_field_index(
+            opnum,
+            &deep_nested_str_proj_key,
+            Some(&Keyword.into()),
+            &hw_counter,
+        )
+        .unwrap();
+
+    eprintln!("{deep_nested_str_proj_key}");
+
+    opnum += 1;
+    for n in 0..num_points {
+        let idx = n.into();
+        let vector = random_vector(&mut rnd, DIM);
+        let payload: Payload = generate_diverse_nested_payload(&mut rnd);
+
+        plain_segment
+            .upsert_point(opnum, idx, only_default_vector(&vector), &hw_counter)
+            .unwrap();
+        struct_segment
+            .upsert_point(opnum, idx, only_default_vector(&vector), &hw_counter)
+            .unwrap();
+        plain_segment
+            .set_full_payload(opnum, idx, &payload, &hw_counter)
+            .unwrap();
+        struct_segment
+            .set_full_payload(opnum, idx, &payload, &hw_counter)
+            .unwrap();
+
+        opnum += 1;
+    }
+
+    for _ in 0..points_to_clear {
+        opnum += 1;
+        let idx_to_remove = rnd.gen_range(0..num_queryset);
+        plain_segment
+            .clear_payload(opnum, idx_to_remove.into(), &hw_counter)
+            .unwrap();
+        struct_segment
+            .clear_payload(opnum, idx_to_remove.into(), &hw_counter)
+            .unwrap();
+    }
+
+    for _ in 0..points_to_delete {
+        opnum += 1;
+        let idx_to_remove = rnd.gen_range(0..num_points);
+        plain_segment
+            .delete_point(opnum, idx_to_remove.into(), &hw_counter)
+            .unwrap();
+        struct_segment
+            .delete_point(opnum, idx_to_remove.into(), &hw_counter)
+            .unwrap();
+    }
+
+    for (_field, indexes) in struct_segment.payload_index.borrow().field_indexes.iter() {
+        for index in indexes {
+            ensure!(index.count_indexed_points() <= num_points as usize);
+            // NO assert here as it would not be exact for nested fields
+        }
+    }
+
+    (struct_segment, plain_segment)
+}
+
+fn validate_geo_filter(test_segments: &TestSegments, query_filter: Filter) -> Result<()> {
+    let mut rnd = rand::rng();
+
+    for _i in 0..ATTEMPTS {
+        let query = random_vector(&mut rnd, DIM).into();
+        let plain_result = test_segments
+            .plain_segment
+            .search(
+                DEFAULT_VECTOR_NAME,
+                &query,
+                &WithPayload::default(),
+                &false.into(),
+                Some(&query_filter),
+                5,
+                None,
+            )
+            .unwrap();
