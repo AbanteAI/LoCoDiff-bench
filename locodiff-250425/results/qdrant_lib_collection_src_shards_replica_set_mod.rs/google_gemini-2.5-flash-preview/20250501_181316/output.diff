@@ -1,0 +1,406 @@
+--- qdrant_lib_collection_src_shards_replica_set_mod.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_shards_replica_set_mod.rs_extracted.txt (actual)@@ -1,4 +1,4 @@-pub mod clock_set;
++mod clock_set;
+ mod execute_read_operation;
+ mod locally_disabled_peers;
+ mod read_ops;
+@@ -16,6 +16,7 @@ use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::rate_limiting::RateLimiter;
++use common::types::TelemetryDetail;
+ use schemars::JsonSchema;
+ use segment::common::anonymize::Anonymize;
+ use segment::types::{ExtendedPointId, Filter, ShardKey};
+@@ -77,6 +78,7 @@ //    │       └────────────────────────────┘    │
+ //    │                                         │
+ //    └─────────────────────────────────────────┘
++//
+ //
+ 
+ /// A set of shard replicas.
+@@ -188,6 +190,7 @@         // Save shard config as the last step, to ensure that the file state is consistent
+         // Presence of shard config indicates that the shard is ready to be used
+         let replica_set_shard_config = ShardConfig::new_replica_set();
++        // Shard key is needed for building, so we persist it
+         replica_set_shard_config.save(&shard_path)?;
+ 
+         // Initialize the write rate limiter
+@@ -208,8 +211,8 @@             replica_state: replica_state.into(),
+             locally_disabled_peers: Default::default(),
+             shard_path,
++            notify_peer_failure_cb: on_peer_failure,
+             abort_shard_transfer_cb: abort_shard_transfer,
+-            notify_peer_failure_cb: on_peer_failure,
+             channel_service,
+             collection_id,
+             collection_config,
+@@ -389,17 +392,17 @@ 
+     pub async fn is_local(&self) -> bool {
+         let local_read = self.local.read().await;
+-        matches!(*local_read, Some(Shard::Local(_) | Shard::Dummy(_)))
++        matches!(&*local_read, Some(Shard::Local(_) | Shard::Dummy(_)))
+     }
+ 
+     pub async fn is_queue_proxy(&self) -> bool {
+         let local_read = self.local.read().await;
+-        matches!(*local_read, Some(Shard::QueueProxy(_)))
++        matches!(&*local_read, Some(Shard::QueueProxy(_)))
+     }
+ 
+     pub async fn is_dummy(&self) -> bool {
+         let local_read = self.local.read().await;
+-        matches!(*local_read, Some(Shard::Dummy(_)))
++        matches!(&*local_read, Some(Shard::Dummy(_)))
+     }
+ 
+     pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
+@@ -444,14 +447,6 @@     pub async fn wait_for_local(&self, timeout: Duration) -> CollectionResult<()> {
+         self.wait_for(|replica_set_state| replica_set_state.is_local, timeout)
+             .await
+-    }
+-
+-    pub fn wait_for_state_condition_sync<F>(&self, check: F, timeout: Duration) -> bool
+-    where
+-        F: Fn(&ReplicaSetState) -> bool,
+-    {
+-        let replica_state = self.replica_state.clone();
+-        replica_state.wait_for(check, timeout)
+     }
+ 
+     /// Wait for a local shard to get into `state`
+@@ -560,6 +555,7 @@         }
+     }
+ 
++    /// Sets the local shard to the given shard and updates the replica state.
+     pub async fn set_local(
+         &self,
+         local: LocalShard,
+@@ -579,6 +575,12 @@         Ok(old_shard)
+     }
+ 
++    /// Removes the local shard and updates the replica state.
++    /// Also removes the shard from disk.
++    ///
++    /// # Cancel safety
++    ///
++    /// This method is NOT cancel safe.
+     pub async fn remove_local(&self) -> CollectionResult<()> {
+         // TODO: Ensure cancel safety!
+ 
+@@ -603,6 +605,7 @@         Ok(())
+     }
+ 
++    /// Adds a remote shard to the replica set and updates the replica state.
+     pub async fn add_remote(&self, peer_id: PeerId, state: ReplicaState) -> CollectionResult<()> {
+         debug_assert!(peer_id != self.this_peer_id());
+ 
+@@ -629,6 +632,7 @@         Ok(())
+     }
+ 
++    /// Removes a remote shard from the replica set and updates the replica state.
+     pub async fn remove_remote(&self, peer_id: PeerId) -> CollectionResult<()> {
+         self.replica_state.write(|rs| {
+             rs.remove_peer_state(peer_id);
+@@ -657,6 +661,7 @@         Ok(())
+     }
+ 
++    /// Sets the replica state of the peer and updates the replica state locally.
+     pub fn set_replica_state(&self, peer_id: PeerId, state: ReplicaState) -> CollectionResult<()> {
+         log::debug!(
+             "Changing local shard {}:{} state from {:?} to {state:?}",
+@@ -675,6 +680,7 @@         Ok(())
+     }
+ 
++    /// Removes the peer from the replica set.
+     pub async fn remove_peer(&self, peer_id: PeerId) -> CollectionResult<()> {
+         if self.this_peer_id() == peer_id {
+             self.remove_local().await?;
+@@ -684,6 +690,9 @@         Ok(())
+     }
+ 
++    /// Applies the given state to the replica set.
++    /// This method is called by the consensus every time the state of the replica set changes.
++    /// It is responsible for adding and removing replicas from the set.
+     pub async fn apply_state(
+         &mut self,
+         replicas: HashMap<PeerId, ReplicaState>,
+@@ -771,7 +780,7 @@         Ok(())
+     }
+ 
+-    pub(crate) async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
++    pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
+         let read_local = self.local.read().await;
+         if let Some(shard) = &*read_local {
+             shard.on_optimizer_config_update().await
+@@ -862,7 +871,7 @@         Ok(())
+     }
+ 
+-    pub(crate) async fn health_check(&self, peer_id: PeerId) -> CollectionResult<()> {
++    pub async fn health_check(&self, peer_id: PeerId) -> CollectionResult<()> {
+         let remotes = self.remotes.read().await;
+ 
+         let Some(remote) = remotes.iter().find(|remote| remote.peer_id == peer_id) else {
+@@ -874,79 +883,6 @@         remote.health_check().await?;
+ 
+         Ok(())
+-    }
+-
+-    pub async fn delete_local_points(
+-        &self,
+-        filter: Filter,
+-        hw_measurement_acc: HwMeasurementAcc,
+-        force: bool,
+-    ) -> CollectionResult<UpdateResult> {
+-        let local_shard_guard = self.local.read().await;
+-
+-        let Some(local_shard) = local_shard_guard.deref() else {
+-            return Err(CollectionError::NotFound {
+-                what: format!("local shard {}:{}", self.collection_id, self.shard_id),
+-            });
+-        };
+-
+-        let mut next_offset = Some(ExtendedPointId::NumId(0));
+-        let mut ids = Vec::new();
+-
+-        while let Some(current_offset) = next_offset {
+-            const BATCH_SIZE: usize = 1000;
+-
+-            let mut points = local_shard
+-                .get()
+-                .scroll_by(
+-                    Some(current_offset),
+-                    BATCH_SIZE + 1,
+-                    &false.into(),
+-                    &false.into(),
+-                    Some(&filter),
+-                    &self.search_runtime,
+-                    None,
+-                    None,
+-                    hw_measurement_acc.clone(),
+-                )
+-                .await?;
+-
+-            if points.len() > BATCH_SIZE {
+-                next_offset = points.pop().map(|points| points.id);
+-            } else {
+-                next_offset = None;
+-            }
+-
+-            ids.extend(points.into_iter().map(|points| points.id));
+-        }
+-
+-        if ids.is_empty() {
+-            return Ok(UpdateResult {
+-                operation_id: None,
+-                status: UpdateStatus::Completed,
+-                clock_tag: None,
+-            });
+-        }
+-
+-        drop(local_shard_guard);
+-
+-        let op =
+-            CollectionUpdateOperations::PointOperation(point_ops::PointOperations::DeletePoints {
+-                ids,
+-            });
+-
+-        // TODO(resharding): Assign clock tag to the operation!? 🤔
+-        let result = self
+-            .update_local(op.into(), true, hw_measurement_acc, force)
+-            .await?
+-            .ok_or_else(|| {
+-                CollectionError::bad_request(format!(
+-                    "local shard {}:{} does not exist or is unavailable",
+-                    self.collection_id, self.shard_id,
+-                ))
+-            })?;
+-
+-        Ok(result)
+     }
+ 
+     fn init_remote_shards(
+@@ -1021,13 +957,11 @@         let mut locally_disabled_peers_guard = self.locally_disabled_peers.upgradable_read();
+ 
+         // Prevent disabling last peer in consensus
++        if !locally_disabled_peers_guard.is_disabled(peer_id)
++            && locally_disabled_peers_guard.is_all_disabled(other_peers)
+         {
+-            if !locally_disabled_peers_guard.is_disabled(peer_id)
+-                && locally_disabled_peers_guard.is_all_disabled(other_peers)
+-            {
+-                log::warn!("Cannot locally disable last active peer {peer_id} for replica");
+-                return;
+-            }
++            log::warn!("Cannot locally disable last active peer {peer_id} for replica");
++            return;
+         }
+ 
+         locally_disabled_peers_guard.with_upgraded(|locally_disabled_peers| {
+@@ -1116,38 +1050,114 @@             .read()
+             .await
+             .as_ref()
+-            .map(|i| match i {
+-                Shard::Local(local) => {
+-                    let mut total_vector_size = 0;
+-                    let mut total_payload_size = 0;
+-                    let mut total_points = 0;
+-
+-                    for segment in local.segments.read().iter() {
+-                        let size_info = segment.1.get().read().size_info();
+-                        total_vector_size += size_info.vectors_size_bytes;
+-                        total_payload_size += size_info.payloads_size_bytes;
+-                        total_points += size_info.num_points;
++            .map(|i| {
++                match i {
++                    Shard::Local(local) => {
++                        let mut total_vector_size = 0;
++                        let mut total_payload_size = 0;
++                        let mut total_points = 0;
++
++                        for segment in local.segments.read().iter() {
++                            let size_info = segment.1.get().read().size_info();
++                            total_vector_size += size_info.vectors_size_bytes;
++                            total_payload_size += size_info.payloads_size_bytes;
++                            total_points += size_info.num_points;
++                        }
++
++                        Some(CollectionSizeStats {
++                            vector_storage_size: total_vector_size,
++                            payload_storage_size: total_payload_size,
++                            points_count: total_points,
++                        })
+                     }
+-
+-                    Some(CollectionSizeStats {
+-                        vector_storage_size: total_vector_size,
+-                        payload_storage_size: total_payload_size,
+-                        points_count: total_points,
+-                    })
++                    Shard::Proxy(_)
++                    | Shard::ForwardProxy(_)
++                    | Shard::QueueProxy(_)
++                    | Shard::Dummy(_) => None,
+                 }
+-                Shard::Proxy(_)
+-                | Shard::ForwardProxy(_)
+-                | Shard::QueueProxy(_)
+-                | Shard::Dummy(_) => None,
+             })
+             .unwrap_or_default()
+     }
++
++    pub async fn delete_local_points(
++        &self,
++        filter: Filter,
++        hw_measurement_acc: HwMeasurementAcc,
++        force: bool,
++    ) -> CollectionResult<UpdateResult> {
++        let local_shard_guard = self.local.read().await;
++
++        let Some(local_shard) = local_shard_guard.deref() else {
++            return Err(CollectionError::NotFound {
++                what: format!("local shard {}:{}", self.collection_id, self.shard_id),
++            });
++        };
++
++        let mut next_offset = Some(ExtendedPointId::NumId(0));
++        let mut ids = Vec::new();
++
++        while let Some(current_offset) = next_offset {
++            const BATCH_SIZE: usize = 1000;
++
++            let mut points = local_shard
++                .get()
++                .scroll_by(
++                    Some(current_offset),
++                    BATCH_SIZE + 1,
++                    &false.into(),
++                    &false.into(),
++                    Some(&filter),
++                    &self.search_runtime,
++                    None,
++                    None,
++                    hw_measurement_acc.clone(),
++                )
++                .await?;
++
++            if points.len() > BATCH_SIZE {
++                next_offset = points.pop().map(|points| points.id);
++            } else {
++                next_offset = None;
++            }
++
++            ids.extend(points.into_iter().map(|points| points.id));
++        }
++
++        if ids.is_empty() {
++            return Ok(UpdateResult {
++                operation_id: None,
++                status: UpdateStatus::Completed,
++                clock_tag: None,
++            });
++        }
++
++        drop(local_shard_guard);
++
++        let op =
++            CollectionUpdateOperations::PointOperation(point_ops::PointOperations::DeletePoints {
++                ids,
++            });
++
++        // TODO(resharding): Assign clock tag to the operation!? 🤔
++        let result = self
++            .update_local(op.into(), true, hw_measurement_acc, force)
++            .await?
++            .ok_or_else(|| {
++                CollectionError::bad_request(format!(
++                    "local shard {}:{} does not exist or is unavailable",
++                    self.collection_id, self.shard_id,
++                ))
++            })?;
++
++        Ok(result)
++    }
+ }
+ 
+ /// Represents a replica set state
+-#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Clone)]
++#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Clone, Anonymize)]
+ pub struct ReplicaSetState {
+     pub is_local: bool,
++    #[schemars(skip)] // No need to expose this in the API
+     pub this_peer_id: PeerId,
+     peers: HashMap<PeerId, ReplicaState>,
+ }
+@@ -1165,6 +1175,7 @@         self.peers.remove(&peer_id)
+     }
+ 
++    #[cfg(test)] // Used in tests
+     pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
+         self.peers.clone()
+     }
+@@ -1199,9 +1210,7 @@ }
+ 
+ /// State of the single shard within a replica set.
+-#[derive(
+-    Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Eq, Hash, Clone, Copy, Anonymize,
+-)]
++#[derive(Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Eq, Hash, Clone, Copy, Anonymize)]
+ pub enum ReplicaState {
+     // Active and sound
+     #[default]
+@@ -1215,8 +1224,6 @@     // A shard which receives data, but is not used for search
+     // Useful for backup shards
+     Listener,
+-    // Deprecated since Qdrant 1.9.0, used in Qdrant 1.7.0 and 1.8.0
+-    //
+     // Snapshot shard transfer is in progress, updates aren't sent to the shard
+     // Normally rejects updates. Since 1.8 it allows updates if force is true.
+     PartialSnapshot,
+@@ -1299,7 +1306,7 @@ }
+ 
+ /// Represents a change in replica set, due to scaling of `replication_factor`
+-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
++#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone, Anonymize)]
+ pub enum Change {
+     Remove(ShardId, PeerId),
+ }

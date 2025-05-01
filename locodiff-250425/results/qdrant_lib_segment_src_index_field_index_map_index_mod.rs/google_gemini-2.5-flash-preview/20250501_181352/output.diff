@@ -1,0 +1,435 @@
+--- qdrant_lib_segment_src_index_field_index_map_index_mod.rs_expectedoutput.txt (expected)+++ qdrant_lib_segment_src_index_field_index_map_index_mod.rs_extracted.txt (actual)@@ -3,17 +3,18 @@ use std::fmt::{Debug, Display};
+ use std::hash::{BuildHasher, Hash};
+ use std::iter;
++use std::mem::size_of_val;
+ use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+ use std::sync::Arc;
+ 
+ use ahash::HashMap;
++use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::mmap_hashmap::Key;
+ use common::types::PointOffsetType;
+ use indexmap::IndexSet;
+ use itertools::Itertools;
+-use mmap_map_index::MmapMapIndex;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ use serde_json::Value;
+@@ -22,11 +23,11 @@ 
+ use self::immutable_map_index::ImmutableMapIndex;
+ use self::mutable_map_index::MutableMapIndex;
+-use super::FieldIndexBuilderTrait;
+ use super::facet_index::FacetIndex;
+ use super::mmap_point_to_values::MmapValue;
++use super::FieldIndexBuilderTrait;
++use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::common::Flusher;
+-use crate::common::operation_error::{OperationError, OperationResult};
+ use crate::data_types::facets::{FacetHit, FacetValueRef};
+ use crate::index::field_index::stat_tools::number_of_selected_points;
+ use crate::index::field_index::{
+@@ -135,6 +136,7 @@     pub fn get_values(
+         &self,
+         idx: PointOffsetType,
++        _hw_counter: &HardwareCounterCell,
+     ) -> Option<Box<dyn Iterator<Item = N::Referenced<'_>> + '_>> {
+         match self {
+             MapIndex::Mutable(index) => Some(Box::new(
+@@ -155,7 +157,7 @@         }
+     }
+ 
+-    fn get_indexed_points(&self) -> usize {
++    pub fn get_indexed_points(&self) -> usize {
+         match self {
+             MapIndex::Mutable(index) => index.get_indexed_points(),
+             MapIndex::Immutable(index) => index.get_indexed_points(),
+@@ -163,7 +165,7 @@         }
+     }
+ 
+-    fn get_values_count(&self) -> usize {
++    pub fn get_values_count(&self) -> usize {
+         match self {
+             MapIndex::Mutable(index) => index.get_values_count(),
+             MapIndex::Immutable(index) => index.get_values_count(),
+@@ -279,11 +281,19 @@         Ok((value, idx))
+     }
+ 
++    pub fn values_count(&self, idx: PointOffsetType) -> usize {
++        match self {
++            MapIndex::Mutable(index) => index.values_count(idx).unwrap_or_default(),
++            MapIndex::Immutable(index) => index.values_count(idx).unwrap_or_default(),
++            MapIndex::Mmap(index) => index.values_count(idx).unwrap_or_default(),
++        }
++    }
++
+     pub fn values_is_empty(&self, idx: PointOffsetType) -> bool {
+         self.values_count(idx) == 0
+     }
+ 
+-    fn clear(self) -> OperationResult<()> {
++    fn cleanup(self) -> OperationResult<()> {
+         match self {
+             MapIndex::Mutable(index) => index.get_db_wrapper().recreate_column_family(),
+             MapIndex::Immutable(index) => index.get_db_wrapper().recreate_column_family(),
+@@ -302,23 +312,6 @@         }
+     }
+ 
+-    fn files(&self) -> Vec<PathBuf> {
+-        match self {
+-            MapIndex::Mutable(_) => Vec::new(),
+-            MapIndex::Immutable(_) => Vec::new(),
+-            MapIndex::Mmap(index) => index.files(),
+-        }
+-    }
+-
+-    /// Estimates cardinality for `except` clause
+-    ///
+-    /// # Arguments
+-    ///
+-    /// * 'excluded' - values, which are not considered as matching
+-    ///
+-    /// # Returns
+-    ///
+-    /// * `CardinalityEstimation` - estimation of cardinality
+     fn except_cardinality<'a>(
+         &'a self,
+         excluded: impl Iterator<Item = &'a N>,
+@@ -576,7 +569,7 @@     }
+ 
+     fn cleanup(self) -> OperationResult<()> {
+-        self.clear()
++        self.cleanup()
+     }
+ 
+     fn flusher(&self) -> Flusher {
+@@ -700,7 +693,7 @@     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
+         Box::new(
+             self.iter_values()
+-                .map(|value| {
++                .map(move |value| {
+                     (
+                         value,
+                         self.get_count_for_value(value, &HardwareCounterCell::disposable()) // Payload_blocks only used in HNSW building, which is unmeasured.
+@@ -726,7 +719,7 @@     }
+ 
+     fn cleanup(self) -> OperationResult<()> {
+-        self.clear()
++        self.cleanup()
+     }
+ 
+     fn flusher(&self) -> Flusher {
+@@ -785,6 +778,7 @@                         .collect();
+ 
+                     let excluded_uuids = uuids.ok()?;
++
+                     let exclude_iter = self
+                         .iter_values()
+                         .filter(move |key| !excluded_uuids.contains(*key))
+@@ -891,7 +885,7 @@                 .map(move |value| {
+                     (
+                         value,
+-                        self.get_count_for_value(value, &HardwareCounterCell::disposable()) // payload_blocks only used in HNSW building, which is unmeasured.
++                        self.get_count_for_value(value, &HardwareCounterCell::disposable()) // Only used in HNSW building so no measurement needed here.
+                             .unwrap_or(0),
+                     )
+                 })
+@@ -917,7 +911,7 @@     }
+ 
+     fn cleanup(self) -> OperationResult<()> {
+-        self.clear()
++        self.cleanup()
+     }
+ 
+     fn flusher(&self) -> Flusher {
+@@ -1064,8 +1058,9 @@     fn get_point_values(
+         &self,
+         point_id: PointOffsetType,
++        hw_counter: &HardwareCounterCell,
+     ) -> impl Iterator<Item = FacetValueRef> + '_ {
+-        MapIndex::get_values(self, point_id)
++        MapIndex::get_values(self, point_id, hw_counter)
+             .into_iter()
+             .flatten()
+             .map(Into::into)
+@@ -1084,6 +1079,7 @@     }
+ 
+     fn iter_counts_per_value(&self) -> impl Iterator<Item = FacetHit<FacetValueRef<'_>>> + '_ {
++        let hw_counter = &HardwareCounterCell::disposable(); // Only used in `facets`/`count` interface
+         self.iter_counts_per_value().map(|(value, count)| FacetHit {
+             value: value.into(),
+             count,
+@@ -1111,15 +1107,48 @@         }
+     }
+ 
+-    fn get_value(value: &Value) -> Option<String> {
+-        if let Value::String(keyword) = value {
+-            return Some(keyword.to_owned());
+-        }
+-        None
++    fn get_values(value: &Value) -> Option<Cow<[Self::ValueType]>> {
++        match value {
++            Value::String(keyword) => Some([keyword.to_string()].into()),
++            Value::Array(values) => {
++                let strings: Vec<String> = values
++                    .iter()
++                    .filter_map(|value| match value {
++                        Value::String(keyword) => Some(keyword.to_string()),
++                        _ => None,
++                    })
++                    .collect();
++                if strings.is_empty() {
++                    None
++                } else {
++                    Some(strings.into())
++                }
++            }
++            _ => None,
++        }
+     }
+ 
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+         self.remove_point(id)
++    }
++
++    fn add_point(
++        &mut self,
++        id: PointOffsetType,
++        values: &[&Value],
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
++        match self {
++            MapIndex::Mutable(index) => {
++                index.add_point(id, values.iter().copied(), hw_counter)
++            }
++            MapIndex::Immutable(index) => {
++                index.add_point(id, values.iter().copied(), hw_counter)
++            }
++            MapIndex::Mmap(_) => Err(OperationError::service_error(
++                "Cannot add points to mmap index",
++            )),
++        }
+     }
+ }
+ 
+@@ -1143,15 +1172,58 @@         }
+     }
+ 
+-    fn get_value(value: &Value) -> Option<IntPayloadType> {
+-        if let Value::Number(num) = value {
+-            return num.as_i64();
+-        }
+-        None
++    fn get_values(value: &Value) -> Option<Cow<[Self::ValueType]>> {
++        match value {
++            Value::Number(num) => num.as_i64().map(|x| Cow::Owned(vec![x])),
++            Value::Array(values) => {
++                let integers: Vec<IntPayloadType> = values
++                    .iter()
++                    .filter_map(|value| match value {
++                        Value::Number(num) => num.as_i64(),
++                        _ => None,
++                    })
++                    .collect();
++                if integers.is_empty() {
++                    None
++                } else {
++                    Some(integers.into())
++                }
++            }
++            _ => None,
++        }
+     }
+ 
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+         self.remove_point(id)
++    }
++
++    fn add_point(
++        &mut self,
++        id: PointOffsetType,
++        values: &[&Value],
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
++        match self {
++            MapIndex::Mutable(index) => index.add_point(
++                id,
++                values.iter().copied().map(|v| {
++                    v.as_i64()
++                        .ok_or_else(|| OperationError::ColorIncompatibility)?
++                }),
++                hw_counter,
++            ),
++            MapIndex::Immutable(index) => index.add_point(
++                id,
++                values.iter().copied().map(|v| {
++                    v.as_i64()
++                        .ok_or_else(|| OperationError::ColorIncompatibility)?
++                }),
++                hw_counter,
++            ),
++            MapIndex::Mmap(_) => Err(OperationError::service_error(
++                "Cannot add points to mmap index",
++            )),
++        }
+     }
+ }
+ 
+@@ -1175,22 +1247,76 @@         }
+     }
+ 
+-    fn get_value(value: &Value) -> Option<Self::ValueType> {
+-        Some(Uuid::parse_str(value.as_str()?).ok()?.as_u128())
++    fn get_values(value: &Value) -> Option<Cow<[Self::ValueType]>> {
++        match value {
++            Value::String(uuid_string) => {
++                Uuid::parse_str(uuid_string).ok().map(|x| Cow::Owned(vec![x.as_u128()]))
++            }
++            Value::Array(values) => {
++                let uuids: Vec<UuidIntType> = values
++                    .iter()
++                    .filter_map(|value| match value {
++                        Value::String(uuid_string) => Uuid::parse_str(uuid_string).ok().map(|x| x.as_u128()),
++                        _ => None,
++                    })
++                    .collect();
++                if uuids.is_empty() {
++                    None
++                } else {
++                    Some(uuids.into())
++                }
++            }
++            _ => None,
++        }
+     }
+ 
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+         self.remove_point(id)
+     }
++
++    fn add_point(
++        &mut self,
++        id: PointOffsetType,
++        values: &[&Value],
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
++        match self {
++            MapIndex::Mutable(index) => index.add_point(
++                id,
++                values.iter().copied().map(|v| {
++                    Uuid::parse_str(v.as_str().ok_or_else(|| OperationError::ColorIncompatibility)?)
++                        .ok()
++                        .ok_or_else(|| OperationError::ColorIncompatibility)?
++                        .as_u128()
++                }),
++                hw_counter,
++            ),
++            MapIndex::Immutable(index) => index.add_point(
++                id,
++                values.iter().copied().map(|v| {
++                    Uuid::parse_str(v.as_str().ok_or_else(|| OperationError::ColorIncompatibility)?)
++                        .ok()
++                        .ok_or_else(|| OperationError::ColorIncompatibility)?
++                        .as_u128()
++                }),
++                hw_counter,
++            ),
++            MapIndex::Mmap(_) => Err(OperationError::service_error(
++                "Cannot add points to mmap index",
++            )),
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::borrow::Borrow;
+     use std::collections::HashSet;
+     use std::path::Path;
+ 
+     use rstest::rstest;
+     use tempfile::Builder;
++    use uuid::Uuid;
+ 
+     use super::*;
+     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+@@ -1262,9 +1388,10 @@             IndexType::Mmap => MapIndex::<N>::new_mmap(path, false).unwrap(),
+         };
+         index.load_from_db().unwrap();
++        let hw_counter = HardwareCounterCell::disposable();
+         for (idx, values) in data.iter().enumerate() {
+             let index_values: HashSet<N::Owned> = index
+-                .get_values(idx as PointOffsetType)
++                .get_values(idx as PointOffsetType, &hw_counter)
+                 .unwrap()
+                 .map(|v| N::to_owned(N::from_referenced(&v)))
+                 .collect();
+@@ -1295,9 +1422,10 @@         }
+ 
+         let index = builder.finalize().unwrap();
++        let hw_counter = HardwareCounterCell::disposable();
+         for (idx, values) in data.iter().enumerate().rev() {
+             let res: Vec<_> = index
+-                .get_values(idx as u32)
++                .get_values(idx as u32, &hw_counter)
+                 .unwrap()
+                 .map(|i| *i as i32)
+                 .collect();
+@@ -1395,4 +1523,57 @@                 .equals_min_exp_max(&CardinalityEstimation::exact(0)),
+         );
+     }
+-}+
++    #[rstest]
++    #[case(IndexType::Mutable)]
++    #[case(IndexType::Immutable)]
++    #[case(IndexType::Mmap)]
++    fn test_uuid_index(#[case] index_type: IndexType) {
++        let u1 = Uuid::new_v4();
++        let u2 = Uuid::new_v4();
++        let u3 = Uuid::new_v4();
++        let u4 = Uuid::new_v4();
++        let u5 = Uuid::new_v4();
++        let u6 = Uuid::new_v4();
++        let u7 = Uuid::new_v4();
++        let u8 = Uuid::new_v4();
++        let u9 = Uuid::new_v4();
++        let u10 = Uuid::new_v4();
++
++        let data: Vec<Vec<UuidIntType>> = vec![
++            vec![u1.as_u128(), u2.as_u128()],
++            vec![u3.as_u128(), u4.as_u128()],
++            vec![u5.as_u128(), u6.as_u128()],
++            vec![u7.as_u128(), u8.as_u128()],
++            vec![u9.as_u128(), u10.as_u128()],
++            vec![u1.as_u128()],
++        ];
++
++        let temp_dir = Builder::new().prefix("store_dir").tempdir().unwrap();
++        save_map_index::<UuidIntType>(&data, temp_dir.path(), index_type, |v| {
++            Uuid::from_u128(*v).to_string().into()
++        });
++        let index = load_map_index::<UuidIntType>(&data, temp_dir.path(), index_type);
++
++        let hw_counter = HardwareCounterCell::new();
++
++        assert_eq!(
++            index.get_count_for_value(&u1.as_u128(), &hw_counter),
++            Some(2)
++        );
++        assert_eq!(index.get_count_for_value(&u2.as_u128(), &hw_counter), Some(1));
++        // Check non existing value
++        assert_eq!(
++            index.get_count_for_value(&Uuid::new_v4().as_u128(), &hw_counter),
++            Some(0)
++        );
++
++        assert!(
++            !index
++                .except_cardinality(vec![].into_iter(), &hw_counter)
++                .equals_min_exp_max(&CardinalityEstimation::exact(0)),
++        );
++    }
++}
++
++use std::borrow::Cow;

@@ -1,0 +1,365 @@
+--- qdrant_lib_segment_src_segment_constructor_segment_constructor_base.rs_expectedoutput.txt (expected)+++ qdrant_lib_segment_src_segment_constructor_segment_constructor_base.rs_extracted.txt (actual)@@ -2,8 +2,8 @@ use std::fs::File;
+ use std::io::Read;
+ use std::path::{Path, PathBuf};
++use std::sync::atomic::AtomicBool;
+ use std::sync::Arc;
+-use std::sync::atomic::AtomicBool;
+ 
+ use atomic_refcell::AtomicRefCell;
+ use common::budget::ResourcePermit;
+@@ -15,8 +15,8 @@ use serde::Deserialize;
+ use uuid::Uuid;
+ 
+-use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+-use crate::common::rocksdb_wrapper::{DB_MAPPING_CF, DB_VECTOR_CF, open_db};
++use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
++use crate::common::rocksdb_wrapper::{open_db, DB_MAPPING_CF, DB_VECTOR_CF};
+ use crate::data_types::vectors::DEFAULT_VECTOR_NAME;
+ use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
+ use crate::id_tracker::mutable_id_tracker::MutableIdTracker;
+@@ -35,11 +35,10 @@ use crate::payload_storage::on_disk_payload_storage::OnDiskPayloadStorage;
+ use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+ use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
+-use crate::segment::{SEGMENT_STATE_FILE, Segment, SegmentVersion, VectorData};
++use crate::segment::{Segment, SegmentVersion, VectorData, SEGMENT_STATE_FILE};
+ use crate::types::{
+     Distance, Indexes, PayloadStorageType, SegmentConfig, SegmentState, SegmentType, SeqNumberType,
+-    SparseVectorStorageType, VectorDataConfig, VectorName, VectorStorageDatatype,
+-    VectorStorageType,
++    SparseVectorStorageType, VectorDataConfig, VectorName, VectorStorageDatatype, VectorStorageType,
+ };
+ use crate::vector_storage::dense::appendable_dense_vector_storage::{
+     open_appendable_in_ram_vector_storage, open_appendable_in_ram_vector_storage_byte,
+@@ -210,7 +209,6 @@                 }
+             }
+         }
+-        // Chunked mmap on disk, appendable
+         VectorStorageType::ChunkedMmap => {
+             if let Some(multi_vec_config) = &vector_config.multivector_config {
+                 match storage_element_type {
+@@ -304,6 +302,11 @@             }
+         }
+     }
++    .map_err(|err| {
++        OperationError::service_error(format!(
++            "Failed to open vector storage for vector {vector_name}: {err}"
++        ))
++    })
+ }
+ 
+ pub(crate) fn open_segment_db(
+@@ -327,7 +330,7 @@                 .map(|(vector_name, _)| get_vector_name_with_prefix(DB_VECTOR_CF, vector_name)),
+         )
+         .collect();
+-    open_db(segment_path, &vector_db_names)
++    open_db(segment_path, vector_db_names.iter().map(String::as_str))
+         .map_err(|err| OperationError::service_error(format!("RocksDB open error: {err}")))
+ }
+ 
+@@ -358,12 +361,6 @@     database: Arc<RwLock<DB>>,
+ ) -> OperationResult<SimpleIdTracker> {
+     SimpleIdTracker::open(database)
+-}
+-
+-pub(crate) fn create_immutable_id_tracker(
+-    segment_path: &Path,
+-) -> OperationResult<ImmutableIdTracker> {
+-    ImmutableIdTracker::open(segment_path)
+ }
+ 
+ pub(crate) fn get_payload_index_path(segment_path: &Path) -> PathBuf {
+@@ -458,7 +455,7 @@ pub(crate) fn create_sparse_vector_index(
+     args: SparseVectorIndexOpenArgs<impl FnMut()>,
+ ) -> OperationResult<VectorIndexEnum> {
+-    let vector_index = match (
++    match (
+         args.config.index_type,
+         args.config.datatype.unwrap_or_default(),
+         sparse_vector_index::USE_COMPRESSED,
+@@ -466,7 +463,7 @@         (_, a @ (VectorStorageDatatype::Float16 | VectorStorageDatatype::Uint8), false) => {
+             Err(OperationError::ValidationError {
+                 description: format!("{a:?} datatype is not supported"),
+-            })?
++            })
+         }
+ 
+         (SparseIndexType::MutableRam, _, _) => {
+@@ -500,9 +497,7 @@         (SparseIndexType::Mmap, VectorStorageDatatype::Uint8, true) => {
+             VectorIndexEnum::SparseCompressedMmapU8(SparseVectorIndex::open(args)?)
+         }
+-    };
+-
+-    Ok(vector_index)
++    }
+ }
+ 
+ pub(crate) fn create_sparse_vector_storage(
+@@ -581,8 +576,18 @@         ))
+     };
+ 
+-    let mut vector_storages = HashMap::new();
+-
++    let payload_index_path = get_payload_index_path(segment_path);
++    let payload_index: Arc<AtomicRefCell<StructPayloadIndex>> = sp(StructPayloadIndex::open(
++        payload_storage.clone(),
++        id_tracker.clone(),
++        HashMap::with_capacity(config.vector_data.len() + config.sparse_vector_data.len()),
++        &payload_index_path,
++        appendable_flag,
++    )?);
++
++    let mut vector_storages = HashMap::with_capacity(
++        config.vector_data.len() + config.sparse_vector_data.len(),
++    );
+     for (vector_name, vector_config) in &config.vector_data {
+         let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
+ 
+@@ -595,7 +600,7 @@             vector_name,
+         )?);
+ 
+-        vector_storages.insert(vector_name.to_owned(), vector_storage);
++        vector_storages.insert(vector_name.clone(), vector_storage);
+     }
+ 
+     for (vector_name, sparse_config) in config.sparse_vector_data.iter() {
+@@ -610,11 +615,13 @@             stopped,
+         )?);
+ 
+-        vector_storages.insert(vector_name.to_owned(), vector_storage);
+-    }
+-
+-    let payload_index_path = get_payload_index_path(segment_path);
+-    let payload_index: Arc<AtomicRefCell<StructPayloadIndex>> = sp(StructPayloadIndex::open(
++        vector_storages.insert(vector_name.clone(), vector_storage);
++    }
++
++    let mut vector_data =
++        HashMap::with_capacity(config.vector_data.len() + config.sparse_vector_data.len());
++
++    let payload_index = sp(StructPayloadIndex::open(
+         payload_storage.clone(),
+         id_tracker.clone(),
+         vector_storages.clone(),
+@@ -622,24 +629,14 @@         appendable_flag,
+     )?);
+ 
+-    let mut vector_data = HashMap::new();
+     for (vector_name, vector_config) in &config.vector_data {
+-        let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
+-        let vector_storage = vector_storages.remove(vector_name).unwrap();
++        let vector_storage = vector_storages
++            .remove(vector_name)
++            .unwrap_or_else(|| panic!("Failed to find vector storage for vector {vector_name}"));
+ 
+         let vector_index_path = get_vector_index_path(segment_path, vector_name);
+-        // Warn when number of points between ID tracker and storage differs
+-        let point_count = id_tracker.borrow().total_point_count();
+-        let vector_count = vector_storage.borrow().total_vector_count();
+-        if vector_count != point_count {
+-            log::debug!(
+-                "Mismatch of point and vector counts ({point_count} != {vector_count}, storage: {})",
+-                vector_storage_path.display(),
+-            );
+-        }
+-
+-        let quantized_vectors = sp(if config.quantization_config(vector_name).is_some() {
+-            let quantized_data_path = vector_storage_path;
++        let quantized_vectors = sp(if vector_config.quantization_config.is_some() {
++            let quantized_data_path = get_vector_storage_path(segment_path, vector_name);
+             if QuantizedVectors::config_exists(&quantized_data_path) {
+                 let quantized_vectors =
+                     QuantizedVectors::load(&vector_storage.borrow(), &quantized_data_path)?;
+@@ -665,7 +662,7 @@         check_process_stopped(stopped)?;
+ 
+         vector_data.insert(
+-            vector_name.to_owned(),
++            vector_name.clone(),
+             VectorData {
+                 vector_index,
+                 vector_storage,
+@@ -675,41 +672,38 @@     }
+ 
+     for (vector_name, sparse_vector_config) in &config.sparse_vector_data {
+-        let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
++        let vector_storage = vector_storages
++            .remove(vector_name)
++            .unwrap_or_else(|| panic!("Failed to find vector storage for vector {vector_name}"));
++
+         let vector_index_path = get_vector_index_path(segment_path, vector_name);
+-        let vector_storage = vector_storages.remove(vector_name).unwrap();
+-
+-        // Warn when number of points between ID tracker and storage differs
+-        let point_count = id_tracker.borrow().total_point_count();
+-        let vector_count = vector_storage.borrow().total_vector_count();
+-        if vector_count != point_count {
+-            log::debug!(
+-                "Mismatch of point and vector counts ({point_count} != {vector_count}, storage: {})",
+-                vector_storage_path.display(),
+-            );
+-        }
+-
+-        let vector_index = sp(create_sparse_vector_index(SparseVectorIndexOpenArgs {
+-            config: sparse_vector_config.index,
+-            id_tracker: id_tracker.clone(),
+-            vector_storage: vector_storage.clone(),
+-            payload_index: payload_index.clone(),
+-            path: &vector_index_path,
+-            stopped,
+-            tick_progress: || (),
+-        })?);
++
++        let vector_index: Arc<AtomicRefCell<VectorIndexEnum>> = sp(create_sparse_vector_index(
++            SparseVectorIndexOpenArgs {
++                config: sparse_vector_config.index,
++                id_tracker: id_tracker.clone(),
++                vector_storage: vector_storage.clone(),
++                payload_index: payload_index.clone(),
++                path: &vector_index_path,
++                stopped,
++                tick_progress: || (),
++            },
++        )?);
+ 
+         check_process_stopped(stopped)?;
+ 
+         vector_data.insert(
+-            vector_name.to_owned(),
++            vector_name.clone(),
+             VectorData {
++                vector_index,
+                 vector_storage,
+-                vector_index,
+                 quantized_vectors: sp(None),
+             },
+         );
+     }
++
++    // All elements from vector_storages must be consumed
++    debug_assert!(vector_storages.is_empty());
+ 
+     let segment_type = if config.is_any_vector_indexed() {
+         SegmentType::Indexed
+@@ -731,6 +725,7 @@         error_status: None,
+         database,
+         flush_thread: Mutex::new(None),
++        is_modified: Arc::new(AtomicBool::new(false)),
+     })
+ }
+ 
+@@ -738,8 +733,7 @@     if path
+         .extension()
+         .and_then(|ext| ext.to_str())
+-        .map(|ext| ext == "deleted")
+-        .unwrap_or(false)
++        .is_some_and(|ext| ext == "deleted")
+     {
+         log::warn!("Segment is marked as deleted, skipping: {}", path.display());
+         // Skip deleted segments
+@@ -774,15 +768,12 @@             )));
+         }
+ 
+-        if stored_version.major == 0 && stored_version.minor == 3 {
+-            let segment_state = load_segment_state_v3(path)?;
+-            Segment::save_state(&segment_state, path)?;
+-        } else if stored_version.major == 0 && stored_version.minor <= 5 {
++        if stored_version.major == 0 && stored_version.minor <= 5 {
+             let segment_state = load_segment_state_v5(path)?;
+             Segment::save_state(&segment_state, path)?;
+         }
+ 
+-        SegmentVersion::save(path)?
++        SegmentVersion::save(path)?;
+     }
+ 
+     let segment_state = Segment::load_state(path)?;
+@@ -819,6 +810,16 @@ 
+     let segment = create_segment(None, &segment_path, config, &AtomicBool::new(false))?;
+     segment.save_current_state()?;
++    segment.id_tracker.borrow().flush()?;
++    segment.payload_storage.borrow().flush()?;
++
++    for vector_data in segment.vector_data.values() {
++        vector_data.vector_index.borrow().flush()?;
++        vector_data.vector_storage.borrow().flush()?;
++        if let Some(quantized_vectors) = vector_data.quantized_vectors.borrow().as_ref() {
++            quantized_vectors.flush()?;
++        }
++    }
+ 
+     // Version is the last file to save, as it will be used to check if segment was built correctly.
+     // If it is not saved, segment will be skipped.
+@@ -827,75 +828,6 @@     }
+ 
+     Ok(segment)
+-}
+-
+-/// Load v0.3.* segment data and migrate to current version
+-#[allow(deprecated)]
+-fn load_segment_state_v3(segment_path: &Path) -> OperationResult<SegmentState> {
+-    use crate::compat::{SegmentConfigV5, StorageTypeV5, VectorDataConfigV5};
+-
+-    #[derive(Deserialize)]
+-    #[serde(rename_all = "snake_case")]
+-    #[deprecated]
+-    pub struct SegmentStateV3 {
+-        pub version: SeqNumberType,
+-        pub config: SegmentConfigV3,
+-    }
+-
+-    #[derive(Deserialize)]
+-    #[serde(rename_all = "snake_case")]
+-    #[deprecated]
+-    pub struct SegmentConfigV3 {
+-        /// Size of a vectors used
+-        pub vector_size: usize,
+-        /// Type of distance function used for measuring distance between vectors
+-        pub distance: Distance,
+-        /// Type of index used for search
+-        pub index: Indexes,
+-        /// Type of vector storage
+-        pub storage_type: StorageTypeV5,
+-        /// Defines payload storage type
+-        #[serde(default)]
+-        pub payload_storage_type: PayloadStorageType,
+-    }
+-
+-    let path = segment_path.join(SEGMENT_STATE_FILE);
+-
+-    let mut contents = String::new();
+-
+-    let mut file = File::open(&path)?;
+-    file.read_to_string(&mut contents)?;
+-
+-    serde_json::from_str::<SegmentStateV3>(&contents)
+-        .map(|state| {
+-            // Construct V5 version, then convert into current
+-            let vector_data = VectorDataConfigV5 {
+-                size: state.config.vector_size,
+-                distance: state.config.distance,
+-                hnsw_config: None,
+-                quantization_config: None,
+-                on_disk: None,
+-            };
+-            let segment_config = SegmentConfigV5 {
+-                vector_data: HashMap::from([(DEFAULT_VECTOR_NAME.to_owned(), vector_data)]),
+-                index: state.config.index,
+-                storage_type: state.config.storage_type,
+-                payload_storage_type: state.config.payload_storage_type,
+-                quantization_config: None,
+-            };
+-
+-            SegmentState {
+-                version: Some(state.version),
+-                config: segment_config.into(),
+-            }
+-        })
+-        .map_err(|err| {
+-            OperationError::service_error(format!(
+-                "Failed to read segment {}. Error: {}",
+-                path.to_str().unwrap(),
+-                err
+-            ))
+-        })
+ }
+ 
+ /// Load v0.5.0 segment data and migrate to current version
