@@ -1,0 +1,260 @@
+--- tldraw_apps_dotcom_client_src_tla_app_TldrawApp.ts_expectedoutput.txt (expected)+++ tldraw_apps_dotcom_client_src_tla_app_TldrawApp.ts_extracted.txt (actual)@@ -8,14 +8,15 @@ 	LOCAL_FILE_PREFIX,
+ 	MAX_NUMBER_OF_FILES,
+ 	TlaFile,
++	TlaFilePartial,
+ 	TlaFileState,
+ 	TlaMutators,
+ 	TlaSchema,
+ 	TlaUser,
+ 	UserPreferencesKeys,
+-	Z_PROTOCOL_VERSION,
+ 	schema as zeroSchema,
+ 	ZErrorCode,
++	Z_PROTOCOL_VERSION,
+ } from '@tldraw/dotcom-shared'
+ import {
+ 	assert,
+@@ -39,6 +40,7 @@ 	dataUrlToFile,
+ 	defaultUserPreferences,
+ 	getUserPreferences,
++	isDocument,
+ 	objectMapFromEntries,
+ 	objectMapKeys,
+ 	parseTldrawJsonFile,
+@@ -115,8 +117,6 @@ 		})
+ 		return val$
+ 	}
+-
+-	toasts: TLUiToastsContextType | null = null
+ 
+ 	private constructor(
+ 		public readonly userId: string,
+@@ -174,7 +174,7 @@ 
+ 	async preload(initialUserData: TlaUser) {
+ 		let didCreate = false
+-		await this.userQuery().preload().complete
++		await this.z.query.user.where('id', '=', this.userId).preload().complete
+ 		await this.changesFlushed
+ 		if (!this.user$.get()) {
+ 			didCreate = true
+@@ -247,6 +247,8 @@ 		return msg
+ 	}
+ 
++	toasts: TLUiToastsContextType | null = null
++
+ 	showMutationRejectionToast = throttle((errorCode: ZErrorCode) => {
+ 		const descriptor = this.getMessage(errorCode)
+ 		this.toasts?.addToast({
+@@ -254,11 +256,6 @@ 			description: this.getIntl().formatMessage(descriptor),
+ 		})
+ 	}, 3000)
+-
+-	dispose() {
+-		this.disposables.forEach((d) => d())
+-		// this.store.dispose()
+-	}
+ 
+ 	getUser() {
+ 		return assertExists(this.user$.get(), 'no user')
+@@ -285,6 +282,14 @@ 			})
+ 		},
+ 	})
++
++	getAll<T extends keyof TlaSchema['tables']>(
++		typeName: T
++	): TlaSchema['tables'][T]['Row'][] {
++		// @ts-expect-error
++		// @ts-ignore
++		return this.z.query[typeName].run?.() ?? []
++	}
+ 
+ 	getUserOwnFiles() {
+ 		const fileStates = this.getUserFileStates()
+@@ -358,7 +363,6 @@ 			new Set(
+ 				this.getUserFileStates()
+ 					.map((s) => {
+-						// skip files where the owner is the current user
+ 						if (s.file!.ownerId === this.userId) return
+ 						return s.file
+ 					})
+@@ -388,12 +392,14 @@ 			return Result.err('max number of files reached')
+ 		}
+ 
++		const user = this.getUser()
++
+ 		const file: TlaFile = {
+ 			id: typeof fileOrId === 'string' ? fileOrId : uniqueId(),
+ 			ownerId: this.userId,
+ 			// these two owner properties are overridden by postgres triggers
+-			ownerAvatar: this.getUser().avatar,
+-			ownerName: this.getUser().name,
++			ownerAvatar: user.avatar,
++			ownerName: user.name,
+ 			isEmpty: true,
+ 			createdAt: Date.now(),
+ 			lastPublished: 0,
+@@ -468,10 +474,13 @@ 		return
+ 	}
+ 
+-	async slurpFile() {
+-		return await this.createFile({
+-			createSource: `${LOCAL_FILE_PREFIX}/${getScratchPersistenceKey()}`,
+-		})
++	claimTemporaryFile(fileId: string) {
++		this.createFile(fileId)
++	}
++
++	getFile(fileId?: string): TlaFile | null {
++		if (!fileId) return null
++		return this.getUserOwnFiles().find((f) => f.id === fileId) ?? null
+ 	}
+ 
+ 	getFilePk(fileId: string) {
+@@ -489,6 +498,56 @@ 			id: fileId,
+ 			shared: !file.shared,
+ 		})
++	}
++
++	setFilePublished(fileId: string, value: boolean) {
++		const file = this.getFile(fileId)
++		if (!file) throw Error(`No file with that id`)
++		if (file.ownerId !== this.userId) throw Error('user cannot edit that file')
++		if (value === file.published) return
++		this.z.mutate.file.update({ id: fileId, published: value, lastPublished: Date.now() })
++	}
++
++	updateFileLastPublished(fileId: string) {
++		const file = this.getFile(fileId)
++		if (!file) throw Error(`No file with that id`)
++		if (file.ownerId !== this.userId) throw Error('user cannot edit that file')
++		this.z.mutate.file.update({ id: fileId, lastPublished: Date.now() })
++	}
++
++	setFileSharedLinkType(fileId: string, sharedLinkType: TlaFile['sharedLinkType'] | 'no-access') {
++		const file = this.requireFile(fileId)
++
++		if (this.userId !== file.ownerId) {
++			throw Error('user cannot edit that file')
++		}
++
++		if (sharedLinkType === 'no-access') {
++			this.z.mutate.file.update({ id: fileId, shared: false })
++			return
++		}
++		this.z.mutate.file.update({ id: fileId, shared: true, sharedLinkType })
++	}
++
++	async pinOrUnpinFile(fileId: string) {
++		const fileState = this.getFileState(fileId)
++
++		if (!fileState) return
++
++		return this.z.mutate.file_state.update({
++			fileId,
++			userId: this.userId,
++			isPinned: !fileState.isPinned,
++		})
++	}
++
++	isFileOwner(fileId: string) {
++		const file = this.getFile(fileId)
++		return file && file.ownerId === this.userId
++	}
++
++	requireFile(fileId: string): TlaFile {
++		return assertExists(this.getFile(fileId), 'no file with id ' + fileId)
+ 	}
+ 
+ 	/**
+@@ -498,8 +557,7 @@ 	 * @returns A result indicating success or failure.
+ 	 */
+ 	publishFile(fileId: string) {
+-		const file = this.getUserOwnFiles().find((f) => f.id === fileId)
+-		if (!file) throw Error(`No file with that id`)
++		const file = this.requireFile(fileId)
+ 		if (file.ownerId !== this.userId) throw Error('user cannot publish that file')
+ 
+ 		// We're going to bake the name of the file, if it's undefined
+@@ -512,20 +570,6 @@ 			published: true,
+ 			lastPublished: Date.now(),
+ 		})
+-	}
+-
+-	getFile(fileId?: string): TlaFile | null {
+-		if (!fileId) return null
+-		return this.getUserOwnFiles().find((f) => f.id === fileId) ?? null
+-	}
+-
+-	isFileOwner(fileId: string) {
+-		const file = this.getFile(fileId)
+-		return file && file.ownerId === this.userId
+-	}
+-
+-	requireFile(fileId: string): TlaFile {
+-		return assertExists(this.getFile(fileId), 'no file with id ' + fileId)
+ 	}
+ 
+ 	/**
+@@ -535,7 +579,8 @@ 	 * @returns A result indicating success or failure.
+ 	 */
+ 	unpublishFile(fileId: string) {
+-		const file = this.requireFile(fileId)
++		const file = this.getFile(fileId)
++		if (!file) throw Error(`No file with that id`)
+ 		if (file.ownerId !== this.userId) throw Error('user cannot edit that file')
+ 
+ 		if (!file.published) return Result.ok('success')
+@@ -560,37 +605,6 @@ 
+ 		// Optimistic update, remove file and file states
+ 		await this.z.mutate.file.deleteOrForget(file)
+-	}
+-
+-	/**
+-	 * Pin a file (or unpin it if it's already pinned).
+-	 *
+-	 * @param fileId - The file id.
+-	 */
+-	async pinOrUnpinFile(fileId: string) {
+-		const fileState = this.getFileState(fileId)
+-
+-		if (!fileState) return
+-
+-		return this.z.mutate.file_state.update({
+-			fileId,
+-			userId: this.userId,
+-			isPinned: !fileState.isPinned,
+-		})
+-	}
+-
+-	setFileSharedLinkType(fileId: string, sharedLinkType: TlaFile['sharedLinkType'] | 'no-access') {
+-		const file = this.requireFile(fileId)
+-
+-		if (this.userId !== file.ownerId) {
+-			throw Error('user cannot edit that file')
+-		}
+-
+-		if (sharedLinkType === 'no-access') {
+-			this.z.mutate.file.update({ id: fileId, shared: false })
+-			return
+-		}
+-		this.z.mutate.file.update({ id: fileId, shared: true, sharedLinkType })
+ 	}
+ 
+ 	updateUser(partial: Partial<TlaUser>) {
+@@ -620,7 +634,6 @@ 				lastEditAt: null,
+ 				lastSessionState: null,
+ 				lastVisitAt: null,
+-				isPinned: false,
+ 				// doesn't really matter what this is because it is
+ 				// overwritten by postgres
+ 				isFileOwner: this.isFileOwner(fileId),
+@@ -883,8 +896,8 @@ 		}
+ 		const id = response.slugs[0]
+ 		const name =
+-			file.name?.replace(/\.tldr$/, '') ??
+-			Object.values(snapshot.store).find((d): d is TLDocument => d.typeName === 'document')?.name ??
++			file.name?.replace(/\.tldr$/, '') ||
++			Object.values(snapshot.store).find((d): d is TLDocument => d.typeName === 'document')?.name ||
+ 			''
+ 
+ 		return this.createFile({ id, name })
