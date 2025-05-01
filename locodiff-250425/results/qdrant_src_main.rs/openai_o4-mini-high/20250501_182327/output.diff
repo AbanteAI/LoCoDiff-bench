@@ -1,0 +1,530 @@
+--- qdrant_src_main.rs_expectedoutput.txt (expected)+++ qdrant_src_main.rs_extracted.txt (actual)@@ -9,7 +9,6 @@ mod snapshots;
+ mod startup;
+ mod tonic;
+-mod tracing;
+ 
+ use std::io::Error;
+ use std::sync::Arc;
+@@ -17,41 +16,25 @@ use std::thread::JoinHandle;
+ use std::time::Duration;
+ 
+-use ::common::budget::{ResourceBudget, get_io_budget};
++use ::common::budget::{get_io_budget, ResourceBudget};
+ use ::common::cpu::get_cpu_budget;
+ use ::common::flags::{feature_flags, init_feature_flags};
+ use ::tonic::transport::Uri;
+ use api::grpc::transport_channel_pool::TransportChannelPool;
+ use clap::Parser;
+-use collection::shards::channel_service::ChannelService;
+-use consensus::Consensus;
+-use slog::Drain;
+-use startup::setup_panic_hook;
+ use storage::content_manager::consensus::operation_sender::OperationSender;
+ use storage::content_manager::consensus::persistent::Persistent;
+ use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
++use storage::content_manager::toc::dispatcher::TocDispatcher;
+ use storage::content_manager::toc::TableOfContent;
+-use storage::content_manager::toc::dispatcher::TocDispatcher;
+ use storage::dispatcher::Dispatcher;
+ use storage::rbac::Access;
++
+ #[cfg(all(
+     not(target_env = "msvc"),
+     any(target_arch = "x86_64", target_arch = "aarch64")
+ ))]
+ use tikv_jemallocator::Jemalloc;
+-
+-use crate::common::helpers::{
+-    create_general_purpose_runtime, create_search_runtime, create_update_runtime,
+-    load_tls_client_config,
+-};
+-use crate::common::inference::service::InferenceService;
+-use crate::common::telemetry::TelemetryCollector;
+-use crate::common::telemetry_reporting::TelemetryReporter;
+-use crate::greeting::welcome;
+-use crate::migrations::single_to_cluster::handle_existing_collections;
+-use crate::settings::Settings;
+-use crate::snapshots::{recover_full_snapshot, recover_snapshots};
+-use crate::startup::{remove_started_file_indicator, touch_started_file_indicator};
+ 
+ #[cfg(all(
+     not(target_env = "msvc"),
+@@ -63,23 +46,22 @@ const FULL_ACCESS: Access = Access::full("For main");
+ 
+ /// Qdrant (read: quadrant ) is a vector similarity search engine.
+-/// It provides a production-ready service with a convenient API to store, search, and manage points - vectors with an additional payload.
+-///
+-/// This CLI starts a Qdrant peer/server.
++/// It provides a production-ready service with a convenient API to store,
++/// search, and manage points - vectors with an additional payload.
+ #[derive(Parser, Debug)]
+-#[command(version, about)]
+ struct Args {
+     /// Uri of the peer to bootstrap from in case of multi-peer deployment.
+     /// If not specified - this peer will be considered as a first in a new deployment.
+     #[arg(long, value_parser, value_name = "URI", env = "QDRANT_BOOTSTRAP")]
+     bootstrap: Option<Uri>,
++
+     /// Uri of this peer.
+     /// Other peers should be able to reach it by this uri.
+     ///
+-    /// This value has to be supplied if this is the first peer in a new deployment.
+-    ///
++    /// In case this is the first peer in a new deployment this value must be supplied.
+     /// In case this is not the first peer and it bootstraps the value is optional.
+-    /// If not supplied then qdrant will take internal grpc port from config and derive the IP address of this peer on bootstrap peer (receiving side)
++    /// If not supplied then qdrant will take internal grpc port from config and derive
++    /// the IP address of this peer on bootstrap peer (receiving side)
+     #[arg(long, value_parser, value_name = "URI", env = "QDRANT_URI")]
+     uri: Option<Uri>,
+ 
+@@ -92,7 +74,8 @@     /// List of paths to snapshot files.
+     /// Format: <snapshot_file_path>:<target_collection_name>
+     ///
+-    /// WARN: Do not use this option if you are recovering collection in existing distributed cluster.
++    /// WARN: Do not use this option if you are recovering collection in
++    /// existing distributed cluster.
+     /// Use `/collections/<collection-name>/snapshots/recover` API instead.
+     #[arg(long, value_name = "PATH:NAME", alias = "collection-snapshot")]
+     snapshot: Option<Vec<String>>,
+@@ -100,7 +83,8 @@     /// Path to snapshot of multiple collections.
+     /// Format: <snapshot_file_path>
+     ///
+-    /// WARN: Do not use this option if you are recovering collection in existing distributed cluster.
++    /// WARN: Do not use this option if you are recovering collection in
++    /// existing distributed cluster.
+     /// Use `/collections/<collection-name>/snapshots/recover` API instead.
+     #[arg(long, value_name = "PATH")]
+     storage_snapshot: Option<String>,
+@@ -112,7 +96,7 @@     #[arg(long, value_name = "PATH")]
+     config_path: Option<String>,
+ 
+-    /// Disable telemetry sending to developers
++    /// Disable telemetry sending to developers.
+     /// If provided - telemetry collection will be disabled.
+     /// Read more: <https://qdrant.tech/documentation/guides/telemetry>
+     #[arg(long, action, default_value_t = false)]
+@@ -136,23 +120,12 @@ 
+ fn main() -> anyhow::Result<()> {
+     let args = Args::parse();
+-
+-    // Run backtrace collector, expected to used by `rstack` crate
+-    if args.stacktrace {
+-        #[cfg(all(target_os = "linux", feature = "stacktrace"))]
+-        {
+-            let _ = rstack_self::child();
+-        }
+-        return Ok(());
+-    }
+-
+     let settings = Settings::new(args.config_path)?;
+ 
+     // Set global feature flags, sourced from configuration
+     init_feature_flags(settings.feature_flags);
+ 
+     let reporting_enabled = !settings.telemetry_disabled && !args.disable_telemetry;
+-
+     let reporting_id = TelemetryCollector::generate_id();
+ 
+     // Setup logging (no logging before this point)
+@@ -163,7 +136,6 @@     )?;
+ 
+     remove_started_file_indicator();
+-
+     setup_panic_hook(reporting_enabled, reporting_id.to_string());
+ 
+     memory::madvise::set_global(settings.storage.mmap_advice);
+@@ -177,42 +149,12 @@ 
+     welcome(&settings);
+ 
+-    #[cfg(feature = "gpu")]
+-    if let Some(settings_gpu) = &settings.gpu {
+-        use segment::index::hnsw_index::gpu::*;
+-
+-        // initialize GPU devices manager.
+-        if settings_gpu.indexing {
+-            set_gpu_force_half_precision(settings_gpu.force_half_precision);
+-            set_gpu_groups_count(settings_gpu.groups_count);
+-
+-            let mut gpu_device_manager = GPU_DEVICES_MANAGER.write();
+-            *gpu_device_manager = match gpu_devices_manager::GpuDevicesMaganer::new(
+-                &settings_gpu.device_filter,
+-                settings_gpu.devices.as_deref(),
+-                settings_gpu.allow_integrated,
+-                settings_gpu.allow_emulated,
+-                true, // Currently we always wait for the free gpu device.
+-                settings_gpu.parallel_indexes.unwrap_or(1),
+-            ) {
+-                Ok(gpu_device_manager) => Some(gpu_device_manager),
+-                Err(err) => {
+-                    log::error!("Can't initialize GPU devices manager: {err}");
+-                    None
+-                }
+-            }
+-        }
+-    }
+-
+     if let Some(recovery_warning) = &settings.storage.recovery_mode {
+         log::warn!("Qdrant is loaded in recovery mode: {recovery_warning}");
+         log::warn!(
+             "Read more: https://qdrant.tech/documentation/guides/administration/#recovery-mode"
+         );
+     }
+-
+-    // Validate as soon as possible, but we must initialize logging first
+-    settings.validate_and_warn();
+ 
+     // Report feature flags that are enabled for easier debugging
+     let flags = feature_flags();
+@@ -240,73 +182,15 @@ 
+     let is_distributed_deployment = settings.cluster.enabled;
+ 
+-    let temp_path = settings.storage.temp_path.as_deref();
+-
+-    let restored_collections = if let Some(full_snapshot) = args.storage_snapshot {
+-        recover_full_snapshot(
+-            temp_path,
+-            &full_snapshot,
+-            &settings.storage.storage_path,
+-            args.force_snapshot,
+-            persistent_consensus_state.this_peer_id(),
+-            is_distributed_deployment,
+-        )
+-    } else if let Some(snapshots) = args.snapshot {
+-        // recover from snapshots
+-        recover_snapshots(
+-            &snapshots,
+-            args.force_snapshot,
+-            temp_path,
+-            &settings.storage.storage_path,
+-            persistent_consensus_state.this_peer_id(),
+-            is_distributed_deployment,
+-        )
+-    } else {
+-        vec![]
+-    };
+-
+-    // Create and own search runtime out of the scope of async context to ensure correct
+-    // destruction of it
+-    let search_runtime = create_search_runtime(settings.storage.performance.max_search_threads)
+-        .expect("Can't search create runtime.");
+-
+-    let update_runtime =
+-        create_update_runtime(settings.storage.performance.max_optimization_threads)
+-            .expect("Can't optimizer create runtime.");
+-
+-    let general_runtime =
+-        create_general_purpose_runtime().expect("Can't optimizer general purpose runtime.");
+-    let runtime_handle = general_runtime.handle().clone();
+-
+-    // Use global CPU budget for optimizations based on settings
+-    let cpu_budget = get_cpu_budget(settings.storage.performance.optimizer_cpu_budget);
+-    let io_budget = get_io_budget(settings.storage.performance.optimizer_io_budget, cpu_budget);
+-    let optimizer_resource_budget = ResourceBudget::new(cpu_budget, io_budget);
+-
+-    // Create a signal sender and receiver. It is used to communicate with the consensus thread.
+-    let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
+-
+-    let propose_operation_sender = if settings.cluster.enabled {
+-        // High-level channel which could be used to send User-space consensus operations
+-        Some(OperationSender::new(propose_sender))
+-    } else {
+-        // We don't need sender for the single-node mode
+-        None
+-    };
+-
+     // Channel service is used to manage connections between peers.
+     // It allocates required number of channels and manages proper reconnection handling
+     let mut channel_service =
+         ChannelService::new(settings.service.http_port, settings.service.api_key.clone());
+ 
+     if is_distributed_deployment {
+-        // We only need channel_service in case if cluster is enabled.
+-        // So we initialize it with real values here
+         let p2p_grpc_timeout = Duration::from_millis(settings.cluster.grpc_timeout_ms);
+         let connection_timeout = Duration::from_millis(settings.cluster.connection_timeout_ms);
+-
+         let tls_config = load_tls_client_config(&settings)?;
+-
+         channel_service.channel_pool = Arc::new(TransportChannelPool::new(
+             p2p_grpc_timeout,
+             connection_timeout,
+@@ -317,17 +201,43 @@         channel_service.id_to_metadata = persistent_consensus_state.peer_metadata_by_id.clone();
+     }
+ 
++    // Use global CPU & IO budget for optimizations based on settings
++    let cpu_budget = get_cpu_budget(settings.storage.performance.optimizer_cpu_budget);
++    let io_budget = get_io_budget(settings.storage.performance.optimizer_io_budget, cpu_budget);
++    let optimizer_resource_budget = ResourceBudget::new(cpu_budget, io_budget);
++
++    // Create a signal sender and receiver. It is used to communicate with the consensus thread.
++    let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
++
++    let propose_operation_sender = if settings.cluster.enabled {
++        // High-level channel which could be used to send User-space consensus operations
++        Some(OperationSender::new(propose_sender))
++    } else {
++        // We don't need sender for the single-node mode
++        None
++    };
++
+     // Table of content manages the list of collections.
+     // It is a main entry point for the storage.
++    let general_runtime =
++        create_general_purpose_runtime().expect("Can't create general purpose runtime.");
++    let search_runtime =
++        create_search_runtime(settings.storage.performance.max_search_threads)
++            .expect("Can't create search runtime.");
++    let update_runtime =
++        create_update_runtime(settings.storage.performance.max_optimization_threads)
++            .expect("Can't create update runtime.");
++    let runtime_handle = general_runtime.handle().clone();
++
+     let toc = TableOfContent::new(
+         &settings.storage,
+-        search_runtime,
+-        update_runtime,
+-        general_runtime,
+-        optimizer_resource_budget,
++        search_runtime.handle().clone(),
++        update_runtime.handle().clone(),
++        general_runtime.handle().clone(),
+         channel_service.clone(),
+         persistent_consensus_state.this_peer_id(),
+         propose_operation_sender.clone(),
++        optimizer_resource_budget,
+     );
+ 
+     toc.clear_all_tmp_directories()?;
+@@ -340,9 +250,6 @@     });
+ 
+     let toc_arc = Arc::new(toc);
+-    let storage_path = toc_arc.storage_path();
+-
+-    // Holder for all actively running threads of the service: web, gPRC, consensus, etc.
+     let mut handles: Vec<JoinHandle<Result<(), Error>>> = vec![];
+ 
+     // Router for external queries.
+@@ -354,15 +261,17 @@             persistent_consensus_state,
+             toc_arc.clone(),
+             propose_operation_sender.unwrap(),
+-            storage_path,
++            general_runtime.handle().clone(),
+         )
+         .into();
+-        let is_new_deployment = consensus_state.is_new_deployment();
+-
+-        dispatcher =
+-            dispatcher.with_consensus(consensus_state.clone(), settings.cluster.resharding_enabled);
+-
+-        let toc_dispatcher = TocDispatcher::new(Arc::downgrade(&toc_arc), consensus_state.clone());
++
++        dispatcher = dispatcher.with_consensus(
++            consensus_state.clone(),
++            settings.cluster.resharding_enabled,
++        );
++
++        let toc_dispatcher =
++            TocDispatcher::new(Arc::downgrade(&toc_arc), consensus_state.clone());
+         toc_arc.with_toc_dispatcher(toc_dispatcher);
+ 
+         let dispatcher_arc = Arc::new(dispatcher);
+@@ -372,12 +281,25 @@             TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
+         let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
+ 
+-        // `raft` crate uses `slog` crate so it is needed to use `slog_stdlog::StdLog` to forward
+-        // logs from it to `log` crate
+-        let slog_logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), slog::o!());
+-
+-        // Runs raft consensus in a separate thread.
+-        // Create a pipe `message_sender` to communicate with the consensus
++        //
++        // Inference Service
++        //
++        if let Some(inference_config) = settings.inference.clone() {
++            match InferenceService::init_global(inference_config) {
++                Ok(_) => {
++                    log::info!("Inference service is configured.");
++                }
++                Err(err) => {
++                    log::error!("{err}");
++                }
++            }
++        } else {
++            log::info!("Inference service is not configured.");
++        }
++
++        //
++        // Consensus (raft) thread
++        //
+         let health_checker = Arc::new(common::health::HealthChecker::spawn(
+             toc_arc.clone(),
+             consensus_state.clone(),
+@@ -387,7 +309,7 @@         ));
+ 
+         let handle = Consensus::run(
+-            &slog_logger,
++            &slog::Logger::root(slog_stdlog::StdLog.fuse(), slog::o!()),
+             consensus_state.clone(),
+             bootstrap,
+             args.uri.map(|uri| uri.to_string()),
+@@ -396,13 +318,13 @@             propose_receiver,
+             tonic_telemetry_collector,
+             toc_arc.clone(),
+-            runtime_handle.clone(),
++            &runtime_handle,
+             args.reinit,
+         )
+         .expect("Can't initialize consensus");
+-
+         handles.push(handle);
+ 
++        // Cancel all related transfers on restart
+         let toc_arc_clone = toc_arc.clone();
+         let consensus_state_clone = consensus_state.clone();
+         let _cancel_transfer_handle = runtime_handle.spawn(async move {
+@@ -420,13 +342,8 @@             }
+         });
+ 
+-        // TODO(resharding): Remove resharding driver?
+-        //
+-        // runtime_handle.block_on(async {
+-        //     toc_arc.resume_resharding_tasks().await;
+-        // });
+-
+-        let collections_to_recover_in_consensus = if is_new_deployment {
++        // Recover existing collections in consensus on startup
++        let collections_to_recover_in_consensus = if consensus_state.is_new_deployment() {
+             let existing_collections =
+                 runtime_handle.block_on(toc_arc.all_collections(&FULL_ACCESS));
+             existing_collections
+@@ -434,7 +351,7 @@                 .map(|pass| pass.name().to_string())
+                 .collect()
+         } else {
+-            restored_collections
++            vec![]
+         };
+ 
+         if !collections_to_recover_in_consensus.is_empty() {
+@@ -455,6 +372,7 @@         // Monitoring and telemetry.
+         let telemetry_collector =
+             TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
++
+         (telemetry_collector, dispatcher_arc, None)
+     };
+ 
+@@ -463,24 +381,13 @@     //
+     // Telemetry reporting
+     //
+-
+-    let reporting_id = telemetry_collector.reporting_id();
+     let telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry_collector));
+-
+     if reporting_enabled {
+         log::info!("Telemetry reporting enabled, id: {reporting_id}");
+-
+         runtime_handle.spawn(TelemetryReporter::run(telemetry_collector.clone()));
+     } else {
+         log::info!("Telemetry reporting disabled");
+     }
+-
+-    if settings.service.hardware_reporting == Some(true) {
+-        log::info!("Hardware reporting enabled");
+-    }
+-
+-    // Setup subscribers to listen for issue-able events
+-    issues_setup::setup_subscribers(&settings);
+ 
+     // Helper to better log start errors
+     let log_err_if_any = |server_name, result| match result {
+@@ -492,41 +399,18 @@     };
+ 
+     //
+-    // Inference Service
+-    //
+-    if let Some(inference_config) = settings.inference.clone() {
+-        match InferenceService::init_global(inference_config) {
+-            Ok(_) => {
+-                log::info!("Inference service is configured.");
+-            }
+-            Err(err) => {
+-                log::error!("{err}");
+-            }
+-        }
+-    } else {
+-        log::info!("Inference service is not configured.");
+-    }
+-
+-    //
+     // REST API server
+     //
+-
+-    #[cfg(feature = "web")]
+     {
+         let dispatcher_arc = dispatcher_arc.clone();
++        let telemetry_collector = telemetry_collector.clone();
+         let settings = settings.clone();
+         let handle = thread::Builder::new()
+             .name("web".to_string())
+             .spawn(move || {
+                 log_err_if_any(
+                     "REST",
+-                    actix::init(
+-                        dispatcher_arc.clone(),
+-                        telemetry_collector,
+-                        health_checker,
+-                        settings,
+-                        logger_handle,
+-                    ),
++                    actix::init(dispatcher_arc.clone(), telemetry_collector, health_checker, settings, logger_handle.clone()),
+                 )
+             })
+             .unwrap();
+@@ -536,21 +420,18 @@     //
+     // gRPC server
+     //
+-
+     if let Some(grpc_port) = settings.service.grpc_port {
+         let settings = settings.clone();
++        let dispatcher_arc = dispatcher_arc.clone();
++        let tonic_telemetry_collector = tonic_telemetry_collector.clone();
++        let runtime_handle = runtime_handle.clone();
++        let logger_handle = logger_handle.clone();
+         let handle = thread::Builder::new()
+             .name("grpc".to_string())
+             .spawn(move || {
+                 log_err_if_any(
+                     "gRPC",
+-                    tonic::init(
+-                        dispatcher_arc,
+-                        tonic_telemetry_collector,
+-                        settings,
+-                        grpc_port,
+-                        runtime_handle,
+-                    ),
++                    tonic::init(dispatcher_arc, tonic_telemetry_collector, settings, grpc_port, runtime_handle, logger_handle),
+                 )
+             })
+             .unwrap();
+@@ -559,12 +440,12 @@         log::info!("gRPC endpoint disabled");
+     }
+ 
++    //
++    // Deadlock checker (service_debug feature)
++    //
+     #[cfg(feature = "service_debug")]
+     {
+-        use std::fmt::Write;
+-
+         use parking_lot::deadlock;
+-
+         const DEADLOCK_CHECK_PERIOD: Duration = Duration::from_secs(10);
+ 
+         thread::Builder::new()
+@@ -576,7 +457,6 @@                     if deadlocks.is_empty() {
+                         continue;
+                     }
+-
+                     let mut error = format!("{} deadlocks detected\n", deadlocks.len());
+                     for (i, threads) in deadlocks.iter().enumerate() {
+                         writeln!(error, "Deadlock #{i}").expect("fail to writeln!");

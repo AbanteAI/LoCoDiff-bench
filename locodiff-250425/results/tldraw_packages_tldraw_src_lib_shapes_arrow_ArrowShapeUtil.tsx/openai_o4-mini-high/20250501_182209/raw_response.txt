@@ -1,0 +1,678 @@
+```typescript
+import {
+  Arc2d,
+  Box,
+  EMPTY_ARRAY,
+  Edge2d,
+  Editor,
+  Geometry2d,
+  Group2d,
+  Rectangle2d,
+  SVGContainer,
+  ShapeUtil,
+  SvgExportContext,
+  TLArrowBinding,
+  TLArrowShape,
+  TLArrowShapeProps,
+  TLHandle,
+  TLHandleDragInfo,
+  TLResizeInfo,
+  TLShapePartial,
+  TLShapeUtilCanBeLaidOutOpts,
+  TLShapeUtilCanBindOpts,
+  TLShapeUtilCanvasSvgDef,
+  Vec,
+  WeakCache,
+  arrowShapeMigrations,
+  arrowShapeProps,
+  debugFlags,
+  getDefaultColorTheme,
+  getPerfectDashProps,
+  lerp,
+  mapObjectMapValues,
+  maybeSnapToGrid,
+  structuredClone,
+  toDomPrecision,
+  track,
+  useEditor,
+  useIsEditing,
+  useSharedSafeId,
+  useValue,
+} from '@tldraw/editor'
+import React from 'react'
+import { updateArrowTerminal } from '../../bindings/arrow/ArrowBindingUtil'
+import { PlainTextLabel } from '../shared/PlainTextLabel'
+import { ShapeFill } from '../shared/ShapeFill'
+import { SvgTextLabel } from '../shared/SvgTextLabel'
+import { ARROW_LABEL_PADDING, STROKE_SIZES, TEXT_PROPS } from '../shared/default-shape-constants'
+import { DefaultFontFaces } from '../shared/defaultFonts'
+import { getFillDefForCanvas, getFillDefForExport } from '../shared/defaultStyleDefs'
+import { useDefaultColorTheme } from '../shared/useDefaultColorTheme'
+import { getArrowLabelFontSize, getArrowLabelPosition } from './arrowLabel'
+import { getArrowheadPathForType } from './arrowheads'
+import {
+  getCurvedArrowHandlePath,
+  getSolidCurvedArrowPath,
+  getSolidStraightArrowPath,
+  getStraightArrowHandlePath,
+} from './arrowpaths'
+import { getArrowBindings, getArrowInfo, getArrowTerminalsInArrowSpace } from './shared'
+
+enum ARROW_HANDLES {
+  START = 'start',
+  MIDDLE = 'middle',
+  END = 'end',
+}
+
+/** @public */
+export class ArrowShapeUtil extends ShapeUtil<TLArrowShape> {
+  static override type = 'arrow' as const
+  static override props = arrowShapeProps
+  static override migrations = arrowShapeMigrations
+
+  override canEdit() {
+    return true
+  }
+  override canBind({ toShapeType }: TLShapeUtilCanBindOpts<TLArrowShape>): boolean {
+    // bindings can go from arrows to shapes, but not from shapes to arrows
+    return toShapeType !== 'arrow'
+  }
+  override canSnap() {
+    return false
+  }
+  override hideResizeHandles() {
+    return true
+  }
+  override hideRotateHandle() {
+    return true
+  }
+  override hideSelectionBoundsBg() {
+    return true
+  }
+  override hideSelectionBoundsFg() {
+    return true
+  }
+
+  override canBeLaidOut(shape: TLArrowShape, info: TLShapeUtilCanBeLaidOutOpts) {
+    if (info.type === 'flip') {
+      // Prevent non-idempotent flips when arrow is bound
+      const bindings = getArrowBindings(this.editor, shape)
+      const { start, end } = bindings
+      const { shapes = [] } = info
+      if (start && !shapes.find((s) => s.id === start.toId)) return false
+      if (end && !shapes.find((s) => s.id === end.toId)) return false
+    }
+    return true
+  }
+
+  override getDefaultProps(): TLArrowShape['props'] {
+    return {
+      dash: 'draw',
+      size: 'm',
+      fill: 'none',
+      color: 'black',
+      labelColor: 'black',
+      bend: 0,
+      start: { x: 0, y: 0 },
+      end: { x: 2, y: 0 },
+      arrowheadStart: 'none',
+      arrowheadEnd: 'arrow',
+      text: '',
+      labelPosition: 0.5,
+      font: 'draw',
+      scale: 1,
+    }
+  }
+
+  override getFontFaces(shape: TLArrowShape) {
+    if (!shape.props.text) return EMPTY_ARRAY
+    return [DefaultFontFaces[`tldraw_${shape.props.font}`].normal.normal]
+  }
+
+  getGeometry(shape: TLArrowShape) {
+    const info = getArrowInfo(this.editor, shape)!
+
+    const debugGeom: Geometry2d[] = []
+
+    const bodyGeom = info.isStraight
+      ? new Edge2d({
+          start: Vec.From(info.start.point),
+          end: Vec.From(info.end.point),
+        })
+      : new Arc2d({
+          center: Vec.Cast(info.handleArc.center),
+          start: Vec.Cast(info.start.point),
+          end: Vec.Cast(info.end.point),
+          sweepFlag: info.bodyArc.sweepFlag,
+          largeArcFlag: info.bodyArc.largeArcFlag,
+        })
+
+    if (shape.props.text.trim()) {
+      const labelPosition = getArrowLabelPosition(this.editor, shape)
+      if (debugFlags.debugGeometry.get()) debugGeom.push(...labelPosition.debugGeom)
+      const box = labelPosition.box
+      debugGeom.push(
+        new Rectangle2d({
+          x: box.x,
+          y: box.y,
+          width: box.w,
+          height: box.h,
+          isFilled: true,
+          isLabel: true,
+        })
+      )
+    }
+
+    return new Group2d({
+      children: [bodyGeom, ...debugGeom],
+    })
+  }
+
+  private readonly _resizeInitialBindings = new WeakCache<TLArrowShape, ReturnType<typeof getArrowBindings>>()
+
+  override onResize(shape: TLArrowShape, info: TLResizeInfo<TLArrowShape>) {
+    const { scaleX, scaleY } = info
+
+    const bindings = this._resizeInitialBindings.get(shape, () => getArrowBindings(this.editor, shape))
+    const terminals = getArrowTerminalsInArrowSpace(this.editor, shape, bindings)
+
+    const { start, end } = structuredClone<TLArrowShape['props']>(shape.props)
+    let bend = shape.props.bend
+
+    // Rescale start handle if it's not bound
+    if (!bindings.start) {
+      start.x = terminals.start.x * scaleX
+      start.y = terminals.start.y * scaleY
+    }
+    if (!bindings.end) {
+      end.x = terminals.end.x * scaleX
+      end.y = terminals.end.y * scaleY
+    }
+
+    const mx = Math.abs(scaleX)
+    const my = Math.abs(scaleY)
+
+    const startAnchor = bindings.start ? Vec.From(bindings.start.props.normalizedAnchor) : null
+    const endAnchor = bindings.end ? Vec.From(bindings.end.props.normalizedAnchor) : null
+
+    if (scaleX < 0 && scaleY >= 0) {
+      if (bend !== 0) {
+        bend *= -1
+        bend *= Math.max(mx, my)
+      }
+      if (startAnchor) startAnchor.x = 1 - startAnchor.x
+      if (endAnchor) endAnchor.x = 1 - endAnchor.x
+    } else if (scaleX >= 0 && scaleY < 0) {
+      if (bend !== 0) {
+        bend *= -1
+        bend *= Math.max(mx, my)
+      }
+      if (startAnchor) startAnchor.y = 1 - startAnchor.y
+      if (endAnchor) endAnchor.y = 1 - endAnchor.y
+    } else if (scaleX < 0 && scaleY < 0) {
+      if (bend !== 0) {
+        bend *= Math.max(mx, my)
+      }
+      if (startAnchor) {
+        startAnchor.x = 1 - startAnchor.x
+        startAnchor.y = 1 - startAnchor.y
+      }
+      if (endAnchor) {
+        endAnchor.x = 1 - endAnchor.x
+        endAnchor.y = 1 - endAnchor.y
+      }
+    } else {
+      if (bend !== 0) {
+        bend *= Math.max(mx, my)
+      }
+    }
+
+    if (bindings.start && startAnchor) {
+      createOrUpdateArrowBinding(this.editor, shape, bindings.start.toId, {
+        ...bindings.start.props,
+        normalizedAnchor: startAnchor.toJson(),
+      })
+    }
+    if (bindings.end && endAnchor) {
+      createOrUpdateArrowBinding(this.editor, shape, bindings.end.toId, {
+        ...bindings.end.props,
+        normalizedAnchor: endAnchor.toJson(),
+      })
+    }
+
+    return {
+      props: {
+        start,
+        end,
+        bend,
+      },
+    }
+  }
+
+  override onHandleDrag(shape: TLArrowShape, { handle, isPrecise }: TLHandleDragInfo<TLArrowShape>) {
+    const handleId = handle.id as ARROW_HANDLES
+    const bindings = getArrowBindings(this.editor, shape)
+
+    if (handleId === ARROW_HANDLES.MIDDLE) {
+      // Bend
+      const { start, end } = getArrowTerminalsInArrowSpace(this.editor, shape, bindings)
+      const delta = Vec.Sub(end, start)
+      const v = Vec.Per(delta)
+      const med = Vec.Med(end, start)
+      const A = Vec.Sub(med, v)
+      const B = Vec.Add(med, v)
+      const point = Vec.NearestPointOnLineSegment(A, B, handle, false)
+      let bend = Vec.Dist(point, med)
+      if (Vec.Clockwise(point, end, med)) bend *= -1
+      return { id: shape.id, type: shape.type, props: { bend } }
+    }
+
+    // Point handle (start/end)
+    const update: TLShapePartial<TLArrowShape> = { id: shape.id, type: 'arrow', props: {} }
+    const currentBinding = bindings[handleId]
+    const otherHandleId = handleId === ARROW_HANDLES.START ? ARROW_HANDLES.END : ARROW_HANDLES.START
+    const otherBinding = bindings[otherHandleId]
+
+    if (this.editor.inputs.ctrlKey) {
+      // Skip binding
+      removeArrowBinding(this.editor, shape, handleId)
+      update.props![handleId] = {
+        x: handle.x,
+        y: handle.y,
+      }
+      return update
+    }
+
+    const point = this.editor.getShapePageTransform(shape.id)!.applyToPoint(handle)
+    const target = this.editor.getShapeAtPoint(point, {
+      hitInside: true,
+      hitFrameInside: true,
+      margin: 0,
+      filter: (targetShape) => {
+        return (
+          !targetShape.isLocked &&
+          this.editor.canBindShapes({ fromShape: shape, toShape: targetShape, binding: 'arrow' })
+        )
+      },
+    })
+
+    if (!target) {
+      removeArrowBinding(this.editor, shape, handleId)
+      const newPoint = maybeSnapToGrid(new Vec(handle.x, handle.y), this.editor)
+      update.props![handleId] = {
+        x: newPoint.x,
+        y: newPoint.y,
+      }
+      return update
+    }
+
+    // Bind to shape
+    const targetBounds = Box.ZeroFix(this.editor.getShapeGeometry(target).bounds)
+    const pointInTargetSpace = this.editor.getPointInShapeSpace(target, point)
+    let precise = isPrecise
+
+    if (!precise) {
+      if (!currentBinding || target.id !== currentBinding.toId) {
+        precise = this.editor.inputs.pointerVelocity.len() < 0.5
+      }
+    }
+
+    if (!isPrecise && !this.editor.getShapeGeometry(target).isClosed) {
+      precise = true
+    }
+
+    const normalizedAnchor = {
+      x: (pointInTargetSpace.x - targetBounds.minX) / targetBounds.width,
+      y: (pointInTargetSpace.y - targetBounds.minY) / targetBounds.height,
+    }
+
+    createOrUpdateArrowBinding(this.editor, shape, target.id, {
+      terminal: handleId,
+      normalizedAnchor,
+      isPrecise: precise,
+      isExact: this.editor.inputs.altKey,
+    })
+
+    this.editor.setHintingShapes([target.id])
+    const newBindings = getArrowBindings(this.editor, shape)
+    if (newBindings.start && newBindings.end && newBindings.start.toId === newBindings.end.toId) {
+      const both = newBindings.start
+      if (Vec.Equals(both.props.normalizedAnchor, newBindings.end.props.normalizedAnchor)) {
+        createOrUpdateArrowBinding(this.editor, shape, both.toId, {
+          ...both.props,
+          normalizedAnchor: {
+            x: both.props.normalizedAnchor.x + 0.05,
+            y: both.props.normalizedAnchor.y,
+          },
+        })
+      }
+    }
+
+    return update
+  }
+
+  override onTranslateStart(shape: TLArrowShape) {
+    const bindings = getArrowBindings(this.editor, shape)
+    const terminals = getArrowTerminalsInArrowSpace(this.editor, shape, bindings)
+    const selectedShapeIds = this.editor.getSelectedShapeIds()
+
+    if (
+      (bindings.start &&
+        (selectedShapeIds.includes(bindings.start.toId) ||
+          this.editor.isAncestorSelected(bindings.start.toId))) ||
+      (bindings.end &&
+        (selectedShapeIds.includes(bindings.end.toId) ||
+          this.editor.isAncestorSelected(bindings.end.toId)))
+    ) {
+      return
+    }
+
+    this.editor.setHintingShapes([])
+
+    shapeAtTranslationStart.set(shape, {
+      pagePosition: this.editor.getShapePageTransform(shape.id)!.applyToPoint(shape),
+      terminalBindings: mapObjectMapValues(terminals, (tn) => {
+        const b = bindings[tn]
+        if (!b) return null
+        const pt = terminals[tn]
+        return { binding: b, shapePosition: pt, pagePosition: this.editor.getShapePageTransform(shape.id)!.applyToPoint(pt) }
+      }),
+    })
+
+    // Set precise
+    for (const tn of ['start', 'end'] as const) {
+      const b = bindings[tn]
+      if (!b) continue
+      this.editor.updateBinding({ ...b, props: { ...b.props, isPrecise: true } })
+    }
+  }
+
+  override onTranslate(initialShape: TLArrowShape, shape: TLArrowShape) {
+    const at = shapeAtTranslationStart.get(initialShape)
+    if (!at) return
+    const delta = Vec.Sub(
+      this.editor.getShapePageTransform(shape.id)!.applyToPoint(shape),
+      at.pagePosition
+    )
+    for (const tb of Object.values(at.terminalBindings)) {
+      if (!tb) continue
+      const newPoint = Vec.Add(tb.pagePosition, Vec.Mul(delta, 0.5))
+      const target = this.editor.getShapeAtPoint(newPoint, {
+        hitInside: true,
+        hitFrameInside: true,
+        margin: 0,
+        filter: (ts) => !ts.isLocked && this.editor.canBindShapes({ fromShape: shape, toShape: ts, binding: 'arrow' }),
+      })
+      if (target?.id === tb.binding.toId) {
+        const tbounds = Box.ZeroFix(this.editor.getShapeGeometry(target).bounds)
+        const pt = this.editor.getPointInShapeSpace(target, newPoint)
+        const na = { x: (pt.x - tbounds.minX) / tbounds.width, y: (pt.y - tbounds.minY) / tbounds.height }
+        createOrUpdateArrowBinding(this.editor, shape, target.id, { ...tb.binding.props, normalizedAnchor: na, isPrecise: true })
+      } else {
+        removeArrowBinding(this.editor, shape, tb.binding.props.terminal)
+      }
+    }
+  }
+
+  override onDoubleClickHandle(shape: TLArrowShape, handle: TLHandle) {
+    switch (handle.id) {
+      case ARROW_HANDLES.START:
+        return {
+          id: shape.id,
+          type: shape.type,
+          props: { arrowheadStart: shape.props.arrowheadStart === 'none' ? 'arrow' : 'none' },
+        }
+      case ARROW_HANDLES.END:
+        return {
+          id: shape.id,
+          type: shape.type,
+          props: { arrowheadEnd: shape.props.arrowheadEnd === 'none' ? 'arrow' : 'none' },
+        }
+    }
+  }
+
+  override getHandles(shape: TLArrowShape): TLHandle[] {
+    const info = getArrowInfo(this.editor, shape)!
+    return [
+      {
+        id: ARROW_HANDLES.START,
+        type: 'vertex',
+        index: 'a0',
+        x: info.start.handle.x,
+        y: info.start.handle.y,
+        canBind: true,
+      },
+      {
+        id: ARROW_HANDLES.MIDDLE,
+        type: 'virtual',
+        index: 'a2',
+        x: info.middle.x,
+        y: info.middle.y,
+        canBind: false,
+      },
+      {
+        id: ARROW_HANDLES.END,
+        type: 'vertex',
+        index: 'a3',
+        x: info.end.handle.x,
+        y: info.end.handle.y,
+        canBind: true,
+      },
+    ]
+  }
+
+  override getBounds(shape: TLArrowShape) {
+    return Box.FromPoints(
+      ...getArrowTerminalsInArrowSpace(this.editor, shape, getArrowBindings(this.editor, shape)).map((p) => Vec.From(p))
+    )
+  }
+
+  component(shape: TLArrowShape) {
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    const theme = useDefaultColorTheme()
+    const onlySelected = this.editor.getOnlySelectedShape()
+    const shouldHandles =
+      this.editor.isInAny('select.idle', 'select.pointing_handle', 'select.dragging_handle', 'select.translating', 'arrow.dragging') &&
+      !this.editor.getIsReadonly()
+    const info = getArrowInfo(this.editor, shape)
+    const isEditing = useIsEditing(shape.id)
+    if (!info?.isValid) return null
+
+    const bindings = getArrowBindings(this.editor, shape)
+    const updateTerminals = () => {
+      if (bindings.start) updateArrowTerminal({ editor: this.editor, arrow: shape, terminal: 'start', useHandle: true })
+      if (bindings.end) updateArrowTerminal({ editor: this.editor, arrow: shape, terminal: 'end', useHandle: true })
+    }
+    const labelPosition = getArrowLabelPosition(this.editor, shape)
+    const isSelected = onlySelected?.id === shape.id
+    const showLabel = isEditing || !!shape.props.text
+
+    return (
+      <>
+        <SVGContainer style={{ minWidth: 50, minHeight: 50 }}>
+          <ArrowSvg shape={shape} shouldDisplayHandles={shouldHandles && isSelected} onUpdate={updateTerminals} />
+        </SVGContainer>
+        {showLabel && (
+          <PlainTextLabel
+            shapeId={shape.id}
+            classNamePrefix="tl-arrow"
+            type="arrow"
+            font={shape.props.font}
+            fontSize={getArrowLabelFontSize(shape)}
+            lineHeight={TEXT_PROPS.lineHeight}
+            align="middle"
+            verticalAlign="middle"
+            text={shape.props.text}
+            labelColor={theme[shape.props.labelColor].solid}
+            textWidth={labelPosition.box.w - ARROW_LABEL_PADDING * 2 * shape.props.scale}
+            isSelected={isSelected}
+            padding={0}
+            style={{
+              transform: `translate(${labelPosition.box.center.x}px, ${labelPosition.box.center.y}px)`,
+            }}
+          />
+        )}
+      </>
+    )
+  }
+
+  override toSvg(shape: TLArrowShape, ctx: SvgExportContext) {
+    ctx.addExportDef(getFillDefForExport(shape.props.fill))
+    const theme = getDefaultColorTheme(ctx)
+    const scaleFactor = 1 / shape.props.scale
+
+    return (
+      <g transform={`scale(${scaleFactor})`}>
+        <ArrowSvg shape={shape} shouldDisplayHandles={false} />
+        <SvgTextLabel
+          fontSize={getArrowLabelFontSize(shape)}
+          font={shape.props.font}
+          align="middle"
+          verticalAlign="middle"
+          text={shape.props.text}
+          labelColor={theme[shape.props.labelColor].solid}
+          bounds={getArrowLabelPosition(this.editor, shape).box.clone().expandBy(-ARROW_LABEL_PADDING * shape.props.scale)}
+          padding={4 * shape.props.scale}
+        />
+      </g>
+    )
+  }
+
+  override getCanvasSvgDefs(): TLShapeUtilCanvasSvgDef[] {
+    return [getFillDefForCanvas()]
+  }
+
+  override canTabTo(shape: TLArrowShape) {
+    const bindings = getArrowBindings(this.editor, shape)
+    return !!(bindings.start || bindings.end || shape.props.text)
+  }
+
+  override hideResizeHandles() {
+    return true
+  }
+
+  override hideRotateHandle() {
+    return true
+  }
+}
+
+const ArrowSvg = track(function ArrowSvg({
+  shape,
+  shouldDisplayHandles,
+  onUpdate,
+}: {
+  shape: TLArrowShape
+  shouldDisplayHandles: boolean
+  onUpdate?: () => void
+}) {
+  const editor = useEditor()
+  const theme = useDefaultColorTheme()
+  const info = getArrowInfo(editor, shape)
+  const bounds = Box.ZeroFix(editor.getShapeGeometry(shape).bounds)
+  const bindings = getArrowBindings(editor, shape)
+
+  const isForceSolid = useValue('force solid', () => editor.getZoomLevel() < 0.2, [editor])
+
+  if (!info?.isValid) return null
+
+  const strokeWidth = STROKE_SIZES[shape.props.size] * shape.props.scale
+
+  const as = info.start.arrowhead && getArrowheadPathForType(info, 'start', strokeWidth)
+  const ae = info.end.arrowhead && getArrowheadPathForType(info, 'end', strokeWidth)
+  const path = info.isStraight ? getSolidStraightArrowPath(info) : getSolidCurvedArrowPath(info)
+
+  let handlePath: null | JSX.Element = null
+  if (shouldDisplayHandles) {
+    const sw = 2 / editor.getZoomLevel()
+    const { strokeDasharray, strokeDashoffset } = getPerfectDashProps(getArrowInfo(editor, shape)!.length, sw, {
+      end: 'skip',
+      start: 'skip',
+      lengthRatio: 2.5,
+    })
+    handlePath = (bindings.start || bindings.end) ? (
+      <path
+        className="tl-arrow-hint"
+        d={info.isStraight ? getStraightArrowHandlePath(info) : getCurvedArrowHandlePath(info)}
+        strokeDasharray={strokeDasharray}
+        strokeDashoffset={strokeDashoffset}
+        strokeWidth={sw}
+        markerStart={
+          bindings.start
+            ? bindings.start.props.isExact
+              ? ''
+              : bindings.start.props.isPrecise
+                ? `url(#${useSharedSafeId('arrowhead-cross')})`
+                : `url(#${useSharedSafeId('arrowhead-dot')})`
+            : ''
+        }
+        markerEnd={
+          bindings.end
+            ? bindings.end.props.isExact
+              ? ''
+              : bindings.end.props.isPrecise
+                ? `url(#${useSharedSafeId('arrowhead-cross')})`
+                : `url(#${useSharedSafeId('arrowhead-dot')})`
+            : ''
+        }
+        opacity={0.16}
+      />
+    ) : null
+  }
+
+  const forceSolid = isForceSolid
+  const { strokeDasharray, strokeDashoffset } = getPerfectDashProps(info.isStraight ? info.length : Math.abs(info.bodyArc.length), strokeWidth, {
+    style: shape.props.dash,
+    forceSolid,
+  })
+
+  const clipPathId = useSharedSafeId(shape.id + '_clip')
+  const clipStartArrowhead = !(info.start.arrowhead === 'none' || info.start.arrowhead === 'arrow')
+  const clipEndArrowhead = !(info.end.arrowhead === 'none' || info.end.arrowhead === 'arrow')
+
+  return (
+    <>
+      <defs>
+        <clipPath id={clipPathId}>
+          <path
+            d={[
+              `M${toDomPrecision(bounds.minX - 100)},${toDomPrecision(bounds.minY - 100)}`,
+              `h${bounds.width + 200}`,
+              `v${bounds.height + 200}`,
+              `h-${bounds.width + 200}`,
+              'Z',
+              shape.props.text.trim()
+                ? `M${toDomPrecision(bounds.minX)},${toDomPrecision(bounds.minY)} v${bounds.height / 2} h${bounds.width} v-${bounds.height / 2} Z`
+                : '',
+              as && clipStartArrowhead ? as : '',
+              ae && clipEndArrowhead ? ae : '',
+            ].join(' ')}
+          />
+        </clipPath>
+      </defs>
+      <g fill="none" stroke={theme[shape.props.color].solid} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" pointerEvents="none">
+        {handlePath}
+        <g style={{ clipPath: `url(#${clipPathId})`, WebkitClipPath: `url(#${clipPathId})` }}>
+          <rect x={toDomPrecision(bounds.minX - 100)} y={toDomPrecision(bounds.minY - 100)} width={toDomPrecision(bounds.width + 200)} height={toDomPrecision(bounds.height + 200)} opacity={0} />
+          <path d={path} strokeDasharray={strokeDasharray} strokeDashoffset={strokeDashoffset} />
+        </g>
+        {as && clipStartArrowhead && shape.props.fill !== 'none' && <ShapeFill theme={theme} d={as} color={shape.props.color} fill={shape.props.fill} scale={shape.props.scale} />}
+        {ae && clipEndArrowhead && shape.props.fill !== 'none' && <ShapeFill theme={theme} d={ae} color={shape.props.color} fill={shape.props.fill} scale={shape.props.scale} />}
+        {as && <path d={as} />}
+        {ae && <path d={ae} />}
+      </g>
+      {onUpdate && <React.Fragment key="update" ref={onUpdate} />}
+    </>
+  )
+})
+
+const shapeAtTranslationStart = new WeakMap<
+  TLArrowShape,
+  {
+    pagePosition: Vec
+    terminalBindings: {
+      start: { binding: TLArrowBinding; shapePosition: Vec; pagePosition: Vec } | null
+      end: { binding: TLArrowBinding; shapePosition: Vec; pagePosition: Vec } | null
+    }
+  }
+>()
+```

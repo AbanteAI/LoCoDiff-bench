@@ -1,0 +1,646 @@
+```zig
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const macos = @import("macos");
+const harfbuzz = @import("harfbuzz");
+const font = @import("../main.zig");
+const opentype = @import("../opentype.zig");
+const quirks = @import("../../quirks.zig");
+
+const log = std.log.scoped(.font_face);
+
+pub const Face = struct {
+    /// Our font face
+    font: *macos.text.Font,
+
+    /// Harfbuzz font corresponding to this face. We only use this
+    /// if we're using Harfbuzz.
+    hb_font: if (harfbuzz_shaper) harfbuzz.Font else void,
+
+    /// Metrics for this font face. These are useful for renderers.
+    metrics: font.Metrics,
+
+    /// Set quirks.disableDefaultFontFeatures
+    quirks_disable_default_font_features: bool = false,
+
+    /// True if our build is using Harfbuzz. If we're not, we can avoid
+    /// some Harfbuzz-specific code paths.
+    const harfbuzz_shaper = font.options.backend.hasHarfbuzz();
+
+    /// If the face can possibly be colored, then this is the state
+    /// used to check for color information. This is null if the font
+    /// can't possibly be colored (i.e. doesn't have SVG, sbix, etc
+    /// tables).
+    color: ?ColorState = null,
+
+    /// True if this font face should be rasterized with a synthetic bold
+    /// effect. This is used for fonts that don't have a bold variant.
+    synthetic_bold: ?f64 = null,
+
+    /// The matrix applied to a regular font to auto-italicize it.
+    pub const italic_skew = macos.graphics.AffineTransform{
+        .a = 1,
+        .b = 0,
+        .c = 0.267949, // approx. tan(15)
+        .d = 1,
+        .tx = 0,
+        .ty = 0,
+    };
+
+    /// Initialize a CoreText-based font from a TTF/TTC in memory.
+    pub fn init(
+        lib: font.Library,
+        source: [:0]const u8,
+        opts: font.face.Options,
+    ) !Face {
+        _ = lib;
+
+        const data = try macos.foundation.Data.createWithBytesNoCopy(source);
+        defer data.release();
+
+        const desc = macos.text.createFontDescriptorFromData(data) orelse
+            return error.FontInitFailure;
+        defer desc.release();
+
+        const ct_font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+        defer ct_font.release();
+
+        return try initFont(ct_font, opts);
+    }
+
+    /// Initialize a CoreText-based face from another initialized font face
+    /// but with a new size.
+    pub fn initFontCopy(
+        base: *macos.text.Font,
+        opts: font.face.Options,
+    ) !Face {
+        // Create a copy. The copyWithAttributes docs say the size is in points,
+        // but we need to scale the points by the DPI and to do that we use our
+        // function called "pixels".
+        const ct_font = try base.copyWithAttributes(
+            @floatFromInt(opts.size.pixels()),
+            null,
+            null,
+        );
+        errdefer ct_font.release();
+
+        return try initFont(ct_font, opts);
+    }
+
+    /// Initialize a face with a CTFont. This will take ownership over
+    /// the CTFont. This does NOT copy or retain the CTFont.
+    pub fn initFont(
+        ct_font: *macos.text.Font,
+        opts: font.face.Options,
+    ) !Face {
+        const traits = ct_font.getSymbolicTraits();
+
+        var hb_font = if (comptime harfbuzz_shaper) font: {
+            var f = try harfbuzz.coretext.createFont(ct_font);
+            f.setScale(opts.size.pixels(), opts.size.pixels());
+            break :font f;
+        } else {};
+        errdefer if (comptime harfbuzz_shaper) hb_font.destroy();
+
+        const color: ?ColorState = if (traits.color_glyphs)
+            try ColorState.init(ct_font)
+        else
+            null;
+        errdefer if (color) |v| v.deinit();
+
+        var result: Face = .{
+            .font = ct_font,
+            .hb_font = hb_font,
+            .metrics = undefined, // filled below
+            .quirks_disable_default_font_features = false,
+            .color = color,
+            .synthetic_bold = null,
+        };
+        result.quirks_disable_default_font_features = quirks.disableDefaultFontFeatures(&result);
+
+        // In debug mode, we output information about available variation axes,
+        // if they exist.
+        if (comptime builtin.mode == .Debug) {
+            if (ct_font.copyAttribute(.variation_axes)) |axes| {
+                defer axes.release();
+                var buf: [1024]u8 = undefined;
+                log.debug("variation axes font={s}", .{try result.name(&buf)});
+                const len = axes.getCount();
+                for (0..len) |i| {
+                    const dict = axes.getValueAtIndex(macos.foundation.Dictionary, i);
+                    const Key = macos.text.FontVariationAxisKey;
+                    const cf_name = dict.getValue(Key.name.Value(), Key.name.key()).?;
+                    const cf_id = dict.getValue(Key.identifier.Value(), Key.identifier.key()).?;
+                    const cf_min = dict.getValue(Key.minimum_value.Value(), Key.minimum_value.key()).?;
+                    const cf_max = dict.getValue(Key.maximum_value.Value(), Key.maximum_value.key()).?;
+                    const cf_def = dict.getValue(Key.default_value.Value(), Key.default_value.key()).?;
+
+                    const namestr = cf_name.cstring(&buf, .utf8) orelse "";
+                    var id_raw: c_int = 0;
+                    _ = cf_id.getValue(.int, &id_raw);
+                    const id: font.face.Variation.Id = @bitCast(id_raw);
+
+                    var min: f64 = 0;  _ = cf_min.getValue(.double, &min);
+                    var max: f64 = 0;  _ = cf_max.getValue(.double, &max);
+                    var def: f64 = 0;  _ = cf_def.getValue(.double, &def);
+
+                    log.debug("variation axis: name={s} id={s} min={} max={} def={}", .{
+                        namestr, id.str(), min, max, def
+                    });
+                }
+            }
+        }
+
+        // Calculate and store metrics now that CTFont is ready
+        result.metrics = calcMetrics(ct_font) catch |err| switch (err) {
+            CalcMetricsError.CopyTableError => unreachable,
+            CalcMetricsError.InvalidHeadTable => unreachable,
+            CalcMetricsError.InvalidPostTable => unreachable,
+            CalcMetricsError.InvalidHheaTable => unreachable,
+        };
+
+        return result;
+    }
+
+    pub fn deinit(self: *Face) void {
+        self.font.release();
+        if (comptime harfbuzz_shaper) self.hb_font.destroy();
+        if (self.color) |v| v.deinit();
+        self.* = undefined;
+    }
+
+    /// Returns true if the face has any glyphs that are colorized.
+    pub fn hasColor(self: *const Face) bool {
+        return self.color != null;
+    }
+
+    /// Returns true if the given glyph ID is colorized.
+    pub fn isColorGlyph(self: *const Face, glyph_id: u32) bool {
+        const c = self.color orelse return false;
+        return c.isColorGlyph(glyph_id);
+    }
+
+    /// Returns the glyph index for the given Unicode code point. If this
+    /// face doesn't support this glyph, null is returned.
+    pub fn glyphIndex(self: Face, cp: u32) ?u32 {
+        var unichars: [2]u16 = undefined;
+        const pair = macos.foundation.stringGetSurrogatePairForLongCharacter(cp, &unichars);
+        const len: usize = if (pair) 2 else 1;
+        var glyphs = [_]macos.graphics.Glyph{0, 0};
+        if (!self.font.getGlyphsForCharacters(unichars[0..len], glyphs[0..len]))
+            return null;
+        if (pair) assert(glyphs[1] == 0);
+        return @intCast(glyphs[0]);
+    }
+
+    /// Render a glyph using the glyph index. The rendered glyph is stored in the
+    /// given texture atlas.
+    pub fn renderGlyph(
+        self: Face,
+        alloc: Allocator,
+        atlas: *font.Atlas,
+        glyph_index: u32,
+        opts: font.face.RenderOptions,
+    ) !font.Glyph {
+        // We add a 1px margin around all glyphs in the atlas to prevent
+        // filtering artifacts. We reserve on the right and bottom edges only.
+        const padding = 1;
+
+        var glyphs = [_]macos.graphics.Glyph{@intCast(glyph_index)};
+
+        // Get the bounding rect for rendering this glyph.
+        var rect = self.font.getBoundingRectsForGlyphs(.horizontal, &glyphs, null);
+
+        // Synthetic bold adjustment
+        if (self.synthetic_bold) |line_width| {
+            rect.size.width += line_width;
+            rect.size.height += line_width;
+            rect.origin.x -= line_width / 2.0;
+            rect.origin.y -= line_width / 2.0;
+        }
+
+        // Simple margin for antialiasing
+        const sbix = self.color != null and self.color.?.sbix;
+        if (opts.thicken and !sbix) {
+            rect.size.width += 2.0;
+            rect.size.height += 2.0;
+            rect.origin.x -= 1.0;
+            rect.origin.y -= 1.0;
+        }
+
+        // Compute integer bounds
+        const x0 = @intFromFloat(@floor(rect.origin.x));
+        const x1 = @intFromFloat(@ceil(rect.origin.x + rect.size.width));
+        const y0 = @intFromFloat(@floor(rect.origin.y));
+        const y1 = @intFromFloat(@ceil(rect.origin.y + rect.size.height));
+
+        const width = @intCast(x1 - x0);
+        const height = @intCast(y1 - y0);
+        if (x1 <= x0 or y1 <= y0) {
+            return font.Glyph{
+                .width = 0,
+                .height = 0,
+                .offset_x = 0,
+                .offset_y = 0,
+                .atlas_x = 0,
+                .atlas_y = 0,
+                .advance_x = 0,
+            };
+        }
+
+        // Color vs grayscale context
+        const cfg = if (!self.isColorGlyph(glyph_index)) .{
+            .color = false,
+            .depth = 1,
+            .space = try macos.graphics.ColorSpace.createNamed(.linearGray),
+            .context_opts = @intFromEnum(macos.graphics.ImageAlphaInfo.only),
+        } else .{
+            .color = true,
+            .depth = 4,
+            .space = try macos.graphics.ColorSpace.createNamed(.displayP3),
+            .context_opts = @intFromEnum(macos.graphics.BitmapInfo.byte_order_32_little) |
+                            @intFromEnum(macos.graphics.ImageAlphaInfo.premultiplied_first),
+        };
+        defer cfg.space.release();
+
+        const buf = try alloc.alloc(u8, width * height * cfg.depth);
+        defer alloc.free(buf);
+        @memset(buf, 0);
+
+        const context = macos.graphics.BitmapContext.context;
+        const ctx = try macos.graphics.BitmapContext.create(
+            buf,
+            width,
+            height,
+            8,
+            width * cfg.depth,
+            cfg.space,
+            cfg.context_opts,
+        );
+        defer context.release(ctx);
+
+        // Initial fill
+        if (cfg.color)
+            context.setRGBFillColor(ctx, 1, 1, 1, 0);
+        else
+            context.setGrayFillColor(ctx, 1, 0);
+        context.fillRect(ctx, .{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = .{
+                .width = @floatFromInt(width),
+                .height = @floatFromInt(height),
+            },
+        });
+
+        // Drawing settings
+        context.setAllowsFontSmoothing(ctx, true);
+        context.setShouldSmoothFonts(ctx, opts.thicken);
+        context.setAllowsFontSubpixelQuantization(ctx, true);
+        context.setShouldSubpixelQuantizeFonts(ctx, true);
+        context.setAllowsFontSubpixelPositioning(ctx, true);
+        context.setShouldSubpixelPositionFonts(ctx, true);
+        context.setAllowsAntialiasing(ctx, true);
+        context.setShouldAntialias(ctx, true);
+
+        // Fill/stroke color
+        if (cfg.color) {
+            context.setRGBFillColor(ctx, 1, 1, 1, 1);
+            context.setRGBStrokeColor(ctx, 1, 1, 1, 1);
+        } else {
+            const strength: f64 = @floatFromInt(opts.thicken_strength);
+            context.setGrayFillColor(ctx, strength / 255.0, 1);
+            context.setGrayStrokeColor(ctx, strength / 255.0, 1);
+        }
+
+        // Synthetic bold stroke
+        if (self.synthetic_bold) |line_width| {
+            context.setTextDrawingMode(ctx, .fill_stroke);
+            context.setLineWidth(ctx, line_width);
+        }
+
+        // Render
+        self.font.drawGlyphs(&glyphs, &.{
+            .{ .x = @floatFromInt(-x0), .y = @floatFromInt(-y0) },
+        }, ctx);
+
+        // Reserve in atlas with 1px spacing
+        var region = try atlas.reserve(alloc, width + padding, height + padding);
+        region.width -= padding;
+        region.height -= padding;
+        atlas.set(region, buf);
+
+        // Offsets
+        const cell = opts.grid_metrics;
+        const off_y = cell.?.cell_baseline orelse y1;
+        const before = @intCast(cell.?.cell_width orelse width);
+        const after = @intCast(cell.?.cell_width orelse width);
+        const off_x = x0 + ((after - before) / 2);
+
+        // Get our advance
+        var advances: [glyphs.len]macos.graphics.Size = undefined;
+        _ = self.font.getAdvancesForGlyphs(.horizontal, &glyphs, &advances);
+
+        return font.Glyph{
+            .width = width,
+            .height = height,
+            .offset_x = off_x,
+            .offset_y = off_y,
+            .atlas_x = region.x,
+            .atlas_y = region.y,
+            .advance_x = @floatCast(advances[0].width),
+        };
+    }
+
+    /// Resize the font in-place.
+    pub fn setSize(self: *Face, opts: font.face.Options) !void {
+        const face = try initFont(self.font, opts);
+        self.deinit();
+        self.* = face;
+    }
+
+    /// Return a new face that is the same as this but has a transformation
+    /// matrix applied to italicize it.
+    pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
+        const ct_font = try self.font.copyWithAttributes(0.0, &italic_skew, null);
+        errdefer ct_font.release();
+        return try initFont(ct_font, opts);
+    }
+
+    /// Return a new face that is the same as this but applies a synthetic
+    /// bold effect to it.
+    pub fn syntheticBold(self: *const Face, opts: font.face.Options) !Face {
+        const ct_font = try self.font.copyWithAttributes(0.0, null, null);
+        errdefer ct_font.release();
+        var face = try initFont(ct_font, opts);
+
+        const points_f64: f64 = @floatCast(opts.size.points);
+        const line_width = @max(points_f64 / 14.0, 1);
+        face.synthetic_bold = line_width;
+
+        return face;
+    }
+
+    /// Returns the font name.
+    pub fn name(self: *const Face, buf: []u8) Allocator.Error![]const u8 {
+        const family_name = self.font.copyFamilyName();
+        if (family_name.cstringPtr(.utf8)) |str| return str;
+        return family_name.cstring(buf, .utf8) orelse error.OutOfMemory;
+    }
+
+    /// Returns a copy of the font table data, if present.
+    pub fn copyTable(
+        self: Face,
+        alloc: Allocator,
+        tag: *const [4]u8,
+    ) Allocator.Error!?[]u8 {
+        const data = self.font.copyTable(macos.text.FontTableTag.init(tag)) orelse return null;
+        defer data.release();
+        const buf = try alloc.alloc(u8, data.getLength());
+        errdefer alloc.free(buf);
+        const ptr = data.getPointer();
+        @memcpy(buf, ptr[0..buf.len]);
+        return buf;
+    }
+
+    /// Returns the metrics for this face.
+    pub fn getMetrics(self: *Face) GetMetricsError!font.Metrics.FaceMetrics {
+        return calcMetrics(self.font);
+    }
+};
+
+const ColorState = struct {
+    sbix: bool,
+    svg: ?opentype.SVG,
+    svg_data: ?*macos.foundation.Data,
+
+    pub const Error = error{InvalidSVGTable};
+
+    pub fn init(f: *macos.text.Font) Error!ColorState {
+        // sbix detection
+        const sbix: bool = sbix: {
+            const tag = macos.text.FontTableTag.init("sbix");
+            const data = f.copyTable(tag) orelse break :sbix false;
+            data.release();
+            break :sbix data.getLength() > 0;
+        };
+
+        // SVG parsing
+        const svg: ?struct {
+            svg: opentype.SVG,
+            data: *macos.foundation.Data,
+        } = svg: {
+            const tag = macos.text.FontTableTag.init("SVG ");
+            const data = f.copyTable(tag) orelse break :svg null;
+            errdefer data.release();
+            const ptr = data.getPointer();
+            const len = data.getLength();
+            const parsed = opentype.SVG.init(ptr[0..len]) catch |err| return Error.InvalidSVGTable;
+            break :svg .{ .svg = parsed, .data = data };
+        };
+
+        return .{ .sbix = sbix, .svg = svg.? .svg orelse null, .svg_data = svg.? .data orelse null };
+    }
+
+    pub fn deinit(self: *const ColorState) void {
+        if (self.svg_data) |v| v.release();
+    }
+
+    pub fn isColorGlyph(self: *const ColorState, glyph_id: u32) bool {
+        const glyph_u16 = std.math.cast(u16, glyph_id) orelse return false;
+        if (self.sbix) return true;
+        if (self.svg and self.svg.hasGlyph(glyph_u16)) return true;
+        return false;
+    }
+};
+
+const CalcMetricsError = error{
+    CopyTableError,
+    InvalidHeadTable,
+    InvalidPostTable,
+    InvalidHheaTable,
+};
+
+fn calcMetrics(ct_font: *macos.text.Font) CalcMetricsError!font.Metrics.FaceMetrics {
+    // head / bhed
+    const head: opentype.Head = head: {
+        const head_tag = macos.text.FontTableTag.init("head");
+        const bhed_tag = macos.text.FontTableTag.init("bhed");
+        const data =
+            ct_font.copyTable(head_tag) orelse
+            ct_font.copyTable(bhed_tag) orelse
+            return error.CopyTableError;
+        defer data.release();
+        const ptr = data.getPointer();
+        const len = data.getLength();
+        break :head opentype.Head.init(ptr[0..len]) catch |_| return error.InvalidHeadTable;
+    };
+
+    // post
+    const post: opentype.Post = post: {
+        const tag = macos.text.FontTableTag.init("post");
+        const data = ct_font.copyTable(tag) orelse return error.CopyTableError;
+        defer data.release();
+        const ptr = data.getPointer();
+        const len = data.getLength();
+        break :post opentype.Post.init(ptr[0..len]) catch |_| return error.InvalidPostTable;
+    };
+
+    // hhea
+    const hhea: opentype.Hhea = hhea: {
+        const tag = macos.text.FontTableTag.init("hhea");
+        const data = ct_font.copyTable(tag) orelse return error.CopyTableError;
+        defer data.release();
+        const ptr = data.getPointer();
+        const len = data.getLength();
+        break :hhea opentype.Hhea.init(ptr[0..len]) catch |_| return error.InvalidHheaTable;
+    };
+
+    // OS/2 optional
+    const os2_: ?opentype.OS2 = os2: {
+        const tag = macos.text.FontTableTag.init("OS/2");
+        const data = ct_font.copyTable(tag) orelse break :os2 null;
+        defer data.release();
+        const ptr = data.getPointer();
+        const len = data.getLength();
+        break :os2 (opentype.OS2.init(ptr[0..len]) catch |err| {
+            log.warn("error parsing OS/2 table: {}", .{err});
+            break :os2 null;
+        });
+    };
+
+    const units_per_em: f64 = @floatFromInt(head.unitsPerEm);
+    const px_per_em: f64 = ct_font.getSize();
+    const px_per_unit: f64 = px_per_em / units_per_em;
+
+    const ascent: f64, descent: f64, line_gap: f64 = vertical_metrics: {
+        const hhea_ascent: f64 = @floatFromInt(hhea.ascender);
+        const hhea_descent: f64 = @floatFromInt(hhea.descender);
+        const hhea_line_gap: f64 = @floatFromInt(hhea.lineGap);
+
+        if (os2_) |os2| {
+            const os2_ascent: f64 = @floatFromInt(os2.sTypoAscender);
+            const os2_descent: f64 = @floatFromInt(os2.sTypoDescender);
+            const os2_line_gap: f64 = @floatFromInt(os2.sTypoLineGap);
+            if (os2.fsSelection.use_typo_metrics) break :vertical_metrics .{
+                os2_ascent * px_per_unit,
+                os2_descent * px_per_unit,
+                os2_line_gap * px_per_unit,
+            };
+        }
+
+        if (hhea.ascender != 0 or hhea.descender != 0) break :vertical_metrics .{
+            hhea_ascent * px_per_unit,
+            hhea_descent * px_per_unit,
+            hhea_line_gap * px_per_unit,
+        };
+
+        if (os2_) |os2| {
+            const os2_ascent: f64 = @floatFromInt(os2.sTypoAscender);
+            const os2_descent: f64 = @floatFromInt(os2.sTypoDescender);
+            const os2_line_gap: f64 = @floatFromInt(os2.sTypoLineGap);
+            if (os2_ascent != 0 or os2_descent != 0) break :vertical_metrics .{
+                os2_ascent * px_per_unit,
+                os2_descent * px_per_unit,
+                os2_line_gap * px_per_unit,
+            };
+        }
+
+        // usWinDescent is positive -> down, flip its sign
+        if (os2_) |os2| {
+            const win_ascent: f64 = @floatFromInt(os2.usWinAscent);
+            const win_descent: f64 = -@floatFromInt(os2.usWinDescent);
+            break :vertical_metrics .{
+                win_ascent * px_per_unit,
+                win_descent * px_per_unit,
+                0.0,
+            };
+        }
+
+        // fallback to hhea
+        break :vertical_metrics .{
+            hhea_ascent * px_per_unit,
+            hhea_descent * px_per_unit,
+            hhea_line_gap * px_per_unit,
+        };
+    };
+
+    const has_broken_underline = post.underlineThickness == 0;
+    const underline_position: ?f64 = if (has_broken_underline and post.underlinePosition == 0)
+        null
+    else
+        @floatFromInt(post.underlinePosition) * px_per_unit;
+    const underline_thickness: ?f64 = if (has_broken_underline)
+        null
+    else
+        @floatFromInt(post.underlineThickness) * px_per_unit;
+
+    const strikethrough_position, strikethrough_thickness = st: {
+        if (os2_) |os2| {
+            const broken = os2.yStrikeoutSize == 0;
+            const pos: ?f64 = if (broken and os2.yStrikeoutPosition == 0)
+                null
+            else
+                @floatFromInt(os2.yStrikeoutPosition) * px_per_unit;
+            const thick: ?f64 = if (broken)
+                null
+            else
+                @floatFromInt(os2.yStrikeoutSize) * px_per_unit;
+            break :st .{pos, thick};
+        }
+        break :st .{null, null};
+    };
+
+    const cap_height: f64, ex_height: f64 = heights: {
+        if (os2_) |os2| {
+            break :heights .{
+                if (os2.sCapHeight) |ch| @floatFromInt(ch) * px_per_unit else ct_font.getCapHeight(),
+                if (os2.sxHeight) |xh| @floatFromInt(xh) * px_per_unit else ct_font.getXHeight(),
+            };
+        }
+        break :heights .{ct_font.getCapHeight(), ct_font.getXHeight()};
+    };
+
+    // Cell width: max advance of visible ASCII
+    const cell_width: f64 = cell_width: {
+        const unichars = comptime {
+            const len = 127 - 32;
+            var result: [len]u16 = undefined;
+            var i: u16 = 32;
+            while (i < 127) : (i += 1) result[i - 32] = i;
+            result
+        };
+        var glyphs: [unichars.len]macos.graphics.Glyph = undefined;
+        _ = ct_font.getGlyphsForCharacters(&unichars, &glyphs);
+        var advances: [unichars.len]macos.graphics.Size = undefined;
+        _ = ct_font.getAdvancesForGlyphs(.horizontal, &glyphs, &advances);
+        var max: f64 = 0;
+        var i: usize = 0;
+        while (i < advances.len) : (i += 1) {
+            max = @max(advances[i].width, max);
+        }
+        break :cell_width max;
+    };
+
+    return .{
+        .cell_width = @intFromFloat(@ceil(cell_width)),
+        .ascent = @floatCast(ascent),
+        .descent = @floatCast(descent),
+        .line_gap = @floatCast(line_gap),
+        .underline_position = @intFromFloat(underline_position orelse ascent),
+        .underline_thickness = @intFromFloat(underline_thickness orelse 1),
+        .strikethrough_position = @intFromFloat(strikethrough_position orelse (ex_height * 0.5)),
+        .strikethrough_thickness = @intFromFloat(strikethrough_thickness orelse 1),
+        .cap_height = @floatCast(cap_height),
+        .ex_height = @floatCast(ex_height),
+        .overline_position = 0,
+        .overline_thickness = 1,
+        .box_thickness = 1,
+        .cursor_height = @ceil(ascent - descent + line_gap),
+    };
+}
+
+// Tests omitted for brevity...
+```
+(Note: This is the final state of `src/font/face/coretext.zig` after all applied commits.)
