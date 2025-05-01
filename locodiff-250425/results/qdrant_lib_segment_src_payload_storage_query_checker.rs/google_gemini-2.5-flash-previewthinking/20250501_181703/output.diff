@@ -1,0 +1,282 @@
+--- qdrant_lib_segment_src_payload_storage_query_checker.rs_expectedoutput.txt (expected)+++ qdrant_lib_segment_src_payload_storage_query_checker.rs_extracted.txt (actual)@@ -9,9 +9,10 @@ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
+ 
+-use crate::common::utils::{IndexesMap, check_is_empty, check_is_null};
+-use crate::id_tracker::IdTrackerSS;
++use crate::common::utils::{check_is_empty, check_is_null, IndexesMap};
++use crate::id_tracker::{IdTracker, IdTrackerSS};
+ use crate::index::field_index::FieldIndex;
++use crate::json_path::JsonPath;
+ use crate::payload_storage::condition_checker::ValueChecker;
+ use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+ use crate::payload_storage::{ConditionChecker, PayloadStorage};
+@@ -62,14 +63,7 @@         Some(MinShould {
+             conditions,
+             min_count,
+-        }) => {
+-            conditions
+-                .iter()
+-                .filter(|cond| check(cond))
+-                .take(*min_count)
+-                .count()
+-                == *min_count
+-        }
++        }) => conditions.iter().filter(|cond| check(cond)).take(*min_count).count() == *min_count,
+     }
+ }
+ 
+@@ -102,16 +96,19 @@ where
+     R: AsRef<Vec<FieldIndex>>,
+ {
+-    let nested_indexes: HashMap<_, _> = field_indexes
++    field_indexes
+         .iter()
+         .filter_map(|(key, indexes)| {
+             key.strip_prefix(nested_path)
+-                .map(|key| (key, indexes.as_ref()))
++                .map(|key| (key.into(), indexes.as_ref()))
+         })
+-        .collect();
+-    nested_indexes
+-}
+-
++        .collect()
++}
++
++// NOTE: `id_tracker`, `vector_storages` and `field_indexes` are only passed
++// for nested filters. The top-level check provides appropriate values there where
++// necessary. This is an optimization to avoid passing the full segment state
++// to the payload checker.
+ pub fn check_payload<'a, R>(
+     get_payload: Box<dyn Fn() -> OwnedPayloadRef<'a> + 'a>,
+     id_tracker: Option<&IdTrackerSS>,
+@@ -145,9 +142,9 @@         }
+         Condition::Nested(nested) => {
+             let nested_path = nested.array_key();
+-            let nested_indexes = select_nested_indexes(&nested_path, field_indexes);
++            let nested_indexes = select_nested_indexes(nested_path, field_indexes);
+             get_payload()
+-                .get_value(&nested_path)
++                .get_value(nested_path)
+                 .iter()
+                 .filter_map(|value| value.as_object())
+                 .any(|object| {
+@@ -213,7 +210,7 @@                         return true;
+                     }
+                     index_checked = true;
+-                    // If index check of the condition returned something, we don't need to check
++                    // If none of the indexes returned anything, we don't need to check
+                     // other indexes
+                     break;
+                 }
+@@ -316,28 +313,32 @@             query,
+             point_id,
+             &IndexesMap::new(),
+-            &HardwareCounterCell::new(),
++            &hw_counter,
+         )
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::collections::HashMap;
+     use std::str::FromStr;
++    use std::sync::Arc;
+ 
+     use ahash::AHashSet;
++    use atomic_refcell::AtomicRefCell;
++    use common::counter::hardware_counter::HardwareCounterCell;
+     use tempfile::Builder;
+ 
+     use super::*;
+-    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
++    use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+     use crate::id_tracker::IdTracker;
+     use crate::id_tracker::simple_id_tracker::SimpleIdTracker;
+     use crate::json_path::JsonPath;
+     use crate::payload_json;
++    use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
+     use crate::payload_storage::PayloadStorage;
+-    use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
+     use crate::types::{
+-        DateTimeWrapper, FieldCondition, GeoBoundingBox, GeoPoint, PayloadField, Range, ValuesCount,
++        DateTimeWrapper, FieldCondition, FilterSelector, GeoBoundingBox, GeoPoint, MinShould, NestedCondition, PayloadField, Range, ValuesCount,
+     };
+ 
+     #[test]
+@@ -352,13 +353,22 @@             },
+             "price": 499.90,
+             "amount": 10,
+-            "rating": vec![3, 7, 9, 9],
++            "rating": [3, 7, 9, 9],
+             "color": "red",
+             "has_delivery": true,
+             "shipped_at": "2020-02-15T00:00:00Z",
+             "parts": [],
+             "packaging": null,
+             "not_null": [null],
++            "tags": [
++                {"name": "tag1", "value": 1},
++                {"name": "tag2", "value": 2},
++            ],
++            "features": [
++                {"name": "feat1", "amount": 10, "source": {"producer": "prod1"}},
++                {"name": "feat2", "amount": 20, "source": {"producer": "prod2"}},
++                {"name": "feat3", "amount": 10, "source": {"producer": "prod3", "codes": [1, 2, 3]}},
++            ]
+         };
+ 
+         let hw_counter = HardwareCounterCell::new();
+@@ -379,6 +389,7 @@             HashMap::new(),
+         );
+ 
++        // is_empty
+         let is_empty_condition = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {
+             is_empty: PayloadField {
+                 key: JsonPath::new("price"),
+@@ -407,6 +418,7 @@         }));
+         assert!(!payload_checker.check(0, &is_empty_condition));
+ 
++        // is_null
+         let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
+             is_null: PayloadField {
+                 key: JsonPath::new("amount"),
+@@ -442,6 +454,7 @@         }));
+         assert!(!payload_checker.check(0, &is_null_condition));
+ 
++        // match
+         let match_red = Condition::Field(FieldCondition::new_match(
+             JsonPath::new("color"),
+             "red".to_owned().into(),
+@@ -450,6 +463,8 @@             JsonPath::new("color"),
+             "blue".to_owned().into(),
+         ));
++
++        // datetime range
+         let shipped_in_february = Condition::Field(FieldCondition::new_datetime_range(
+             JsonPath::new("shipped_at"),
+             Range {
+@@ -468,11 +483,14 @@                 lte: None,
+             },
+         ));
++
++        // match (boolean)
+         let with_delivery = Condition::Field(FieldCondition::new_match(
+             JsonPath::new("has_delivery"),
+             true.into(),
+         ));
+ 
++        // values count
+         let many_value_count_condition =
+             Filter::new_must(Condition::Field(FieldCondition::new_values_count(
+                 JsonPath::new("rating"),
+@@ -497,6 +515,7 @@             )));
+         assert!(payload_checker.check(0, &few_value_count_condition));
+ 
++        // geo bounding box
+         let in_berlin = Condition::Field(FieldCondition::new_geo_bounding_box(
+             JsonPath::new("location"),
+             GeoBoundingBox {
+@@ -525,6 +544,7 @@             },
+         ));
+ 
++        // range
+         let with_bad_rating = Condition::Field(FieldCondition::new_range(
+             JsonPath::new("rating"),
+             Range {
+@@ -535,18 +555,23 @@             },
+         ));
+ 
++        // Combinations
++
++        // must
+         let query = Filter::new_must(match_red.clone());
+         assert!(payload_checker.check(0, &query));
+ 
+         let query = Filter::new_must(match_blue.clone());
+         assert!(!payload_checker.check(0, &query));
+ 
++        // must_not
+         let query = Filter::new_must_not(match_blue.clone());
+         assert!(payload_checker.check(0, &query));
+ 
+         let query = Filter::new_must_not(match_red.clone());
+         assert!(!payload_checker.check(0, &query));
+ 
++        // should
+         let query = Filter {
+             should: Some(vec![match_red.clone(), match_blue.clone()]),
+             min_should: None,
+@@ -563,6 +588,7 @@         };
+         assert!(!payload_checker.check(0, &query));
+ 
++        // should filter
+         let query = Filter {
+             should: Some(vec![
+                 Condition::Filter(Filter {
+@@ -662,5 +688,65 @@ 
+         let query = Filter::new_must(Condition::HasId(ids.into()));
+         assert!(payload_checker.check(2, &query));
++
++        // Nested filters
++        let nested_match_tag1 = Condition::Nested(NestedCondition {
++            array_key: JsonPath::new("tags"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(Condition::Field(FieldCondition::new_match(JsonPath::new("name"), "tag1".to_owned().into()))))},
++        });
++        assert!(payload_checker.check(0, &Filter::new_must(nested_match_tag1)));
++
++        let nested_match_tag3 = Condition::Nested(NestedCondition {
++             array_key: JsonPath::new("tags"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(Condition::Field(FieldCondition::new_match(JsonPath::new("name"), "tag3".to_owned().into()))))},
++        });
++        assert!(!payload_checker.check(0, &Filter::new_must(nested_match_tag3)));
++
++        let nested_empty_tag = Condition::Nested(NestedCondition {
++            array_key: JsonPath::new("tags"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(Condition::IsEmpty(IsEmptyCondition { is_empty: PayloadField { key: JsonPath::new("name") } })))},
++        });
++        assert!(!payload_checker.check(0, &Filter::new_must(nested_empty_tag.clone())));
++
++        let nested_range_value_1_to_2 = Condition::Nested(NestedCondition {
++            array_key: JsonPath::new("tags"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(Condition::Field(FieldCondition::new_range(JsonPath::new("value"), Range { lt: Some(3.0), gt: Some(0.0), gte: None, lte: None } ))))},
++        });
++        assert!(payload_checker.check(0, &Filter::new_must(nested_range_value_1_to_2)));
++
++        let nested_range_value_greater_than_2 = Condition::Nested(NestedCondition {
++            array_key: JsonPath::new("tags"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(Condition::Field(FieldCondition::new_range(JsonPath::new("value"), Range { lt: None, gt: Some(2.0), gte: None, lte: None } )))) },
++        });
++        assert!(!payload_checker.check(0, &Filter::new_must(nested_range_value_greater_than_2)));
++
++        let nested_filter_combined_feature_1 = Condition::Nested(NestedCondition {
++            array_key: JsonPath::new("features"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(vec![
++                Condition::Field(FieldCondition::new_match(JsonPath::new("name"), "feat1".to_owned().into())),
++                Condition::Field(FieldCondition::new_range(JsonPath::new("amount"), Range { lt: Some(20.0), gt: None, gte: Some(10.0), lte: None })),
++                Condition::Nested(NestedCondition {
++                    array_key: JsonPath::new("source"),
++                    nested: FilterSelector { filter: Box::new(Filter::new_must(Condition::Field(FieldCondition::new_match(JsonPath::new("producer"), "prod1".to_owned().into()))))},
++                }),
++            ]))},
++        });
++        assert!(payload_checker.check(0, &Filter::new_must(nested_filter_combined_feature_1)));
++
++        let nested_filter_combined_feature_3 = Condition::Nested(NestedCondition {
++            array_key: JsonPath::new("features"),
++            nested: FilterSelector { filter: Box::new(Filter::new_must(vec![
++                Condition::Field(FieldCondition::new_match(JsonPath::new("name"), "feat3".to_owned().into())),
++                Condition::Nested(NestedCondition {
++                    array_key: JsonPath::new("source"),
++                    nested: FilterSelector { filter: Box::new(Filter::new_must(vec![
++                       Condition::Field(FieldCondition::new_match(JsonPath::new("producer"), "prod3".to_owned().into())),
++                       Condition::Field(FieldCondition::new_match(JsonPath::new("codes"), 2.into())),
++                    ]))},
++                }),
++            ]))},
++        });
++
++        assert!(payload_checker.check(0, &Filter::new_must(nested_filter_combined_feature_3)));
+     }
+ }

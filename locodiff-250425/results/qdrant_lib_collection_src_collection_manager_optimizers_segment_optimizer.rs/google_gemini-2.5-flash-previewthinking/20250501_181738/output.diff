@@ -1,0 +1,142 @@
+--- qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_extracted.txt (actual)@@ -1,8 +1,8 @@ use std::collections::{HashMap, HashSet};
+ use std::ops::Deref;
+ use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use common::budget::{ResourceBudget, ResourcePermit};
+ use common::counter::hardware_counter::HardwareCounterCell;
+@@ -10,7 +10,7 @@ use io::storage_version::StorageVersion;
+ use itertools::Itertools;
+ use parking_lot::{Mutex, RwLockUpgradableReadGuard};
+-use segment::common::operation_error::{OperationResult, check_process_stopped};
++use segment::common::operation_error::{check_process_stopped, OperationResult};
+ use segment::common::operation_time_statistics::{
+     OperationDurationsAggregator, ScopeDurationMeasurer,
+ };
+@@ -19,14 +19,16 @@ use segment::segment::{Segment, SegmentVersion};
+ use segment::segment_constructor::build_segment;
+ use segment::segment_constructor::segment_builder::SegmentBuilder;
+-use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentConfig, VectorStorageType};
++use segment::types::{
++    HnswConfig, Indexes, PayloadFieldSchema, PayloadKeyType, PointIdType, QuantizationConfig,
++    SegmentConfig, SeqNumberType, VectorStorageType,
++};
+ 
+ use crate::collection_manager::holders::proxy_segment::{self, ProxyIndexChange, ProxySegment};
+ use crate::collection_manager::holders::segment_holder::{
+     LockedSegment, LockedSegmentHolder, SegmentId,
+ };
+ use crate::config::CollectionParams;
+-use crate::operations::config_diff::DiffConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
+ 
+ const BYTES_IN_KB: usize = 1024;
+@@ -97,21 +99,8 @@         &self,
+         optimizing_segments: &[LockedSegment],
+     ) -> CollectionResult<SegmentBuilder> {
+-        // Example:
+-        //
+-        // S1: {
+-        //     text_vectors: 10000,
+-        //     image_vectors: 100
+-        // }
+-        // S2: {
+-        //     text_vectors: 200,
+-        //     image_vectors: 10000
+-        // }
+-
+-        // Example: bytes_count_by_vector_name = {
+-        //     text_vectors: 10200 * dim * VECTOR_ELEMENT_SIZE
+-        //     image_vectors: 10100 * dim * VECTOR_ELEMENT_SIZE
+-        // }
++        // Calculate total vector data size in bytes for threshold checks
++        // Use AVAILABLE vectors count, because deleted vectors are not stored in the new segment
+         let mut bytes_count_by_vector_name = HashMap::new();
+ 
+         // Counting up how much space do the segments being optimized actually take on the fs.
+@@ -152,7 +141,6 @@         let space_needed = space_occupied.map(|x| 2 * x);
+ 
+         // Ensure temp_path exists
+-
+         if !self.temp_path().exists() {
+             std::fs::create_dir_all(self.temp_path()).map_err(|err| {
+                 CollectionError::service_error(format!(
+@@ -341,12 +329,7 @@ 
+     /// Checks if optimization cancellation is requested.
+     fn check_cancellation(&self, stopped: &AtomicBool) -> CollectionResult<()> {
+-        if stopped.load(Ordering::Relaxed) {
+-            return Err(CollectionError::Cancelled {
+-                description: "optimization cancelled by service".to_string(),
+-            });
+-        }
+-        Ok(())
++        check_process_stopped(stopped).map_err(CollectionError::from)
+     }
+ 
+     /// Unwraps proxy, adds temp segment into collection and returns a `Cancelled` error.
+@@ -514,12 +497,10 @@ 
+         // Apply index changes before point deletions
+         // Point deletions bump the segment version, can cause index changes to be ignored
+-        let old_optimized_segment_version = optimized_segment.version();
+         for (field_name, change) in proxy_changed_indexes.read().iter_ordered() {
+-            debug_assert!(
+-                change.version() >= old_optimized_segment_version,
+-                "proxied index change should have newer version than segment",
+-            );
++            // Warn: change version might be lower than the segment version,
++            // because we might already applied the change earlier in optimization.
++            // Applied optimizations are not removed from `proxy_index_changes`.
+             match change {
+                 ProxyIndexChange::Create(schema, version) => {
+                     optimized_segment.create_field_index(
+@@ -554,11 +535,6 @@     /// * `segments` - segments holder
+     /// * `ids` - list of segment ids to perform optimization on. All segments will be merged into single one
+     /// * `stopped` - flag for early stopping of the optimization. If appears to be `true` - optimization process should be cancelled, all segments unwrapped.
+-    ///
+-    /// # Result
+-    ///
+-    /// New optimized segment should be added into `segments`.
+-    /// If there were any record changes during the optimization - an additional plain segment will be created.
+     ///
+     /// Returns id of the created optimized segment. If no optimization was done - returns None
+     fn optimize(
+@@ -602,13 +578,12 @@ 
+         check_process_stopped(stopped)?;
+ 
+-        let hw_counter = HardwareCounterCell::disposable(); // Internal operation, no measurement needed!
+-
+         let tmp_segment = self.temp_segment(false)?;
+         let proxy_deleted_points = proxy_segment::LockedRmSet::default();
+         let proxy_index_changes = proxy_segment::LockedIndexChanges::default();
+ 
+         let mut proxies = Vec::new();
++        let hw_counter = HardwareCounterCell::disposable(); // Internal operation, no measurement needed!
+         for sg in optimizing_segments.iter() {
+             let mut proxy = ProxySegment::new(
+                 sg.clone(),
+@@ -618,7 +593,7 @@             );
+             // Wrapped segment is fresh, so it has no operations
+             // Operation with number 0 will be applied
+-            proxy.replicate_field_indexes(0, &hw_counter)?;
++            proxy.replicate_field_indexes(0, &hw_counter)?; // Slow only in case the index is change in the gap between two calls
+             proxies.push(proxy);
+         }
+ 
+@@ -684,8 +659,6 @@             }
+             all_removed_points
+         };
+-
+-        // ---- SLOW PART ENDS HERE -----
+ 
+         if let Err(e) = check_process_stopped(stopped) {
+             self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
+@@ -735,6 +708,8 @@                     .unwrap();
+             }
+ 
++            optimized_segment.prefault_mmap_pages();
++
+             let point_count = optimized_segment.available_point_count();
+ 
+             let (_, proxies) = write_segments_guard.swap_new(optimized_segment, &proxy_ids);
