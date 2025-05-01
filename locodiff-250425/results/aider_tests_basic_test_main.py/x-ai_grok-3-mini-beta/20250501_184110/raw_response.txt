@@ -1,0 +1,1346 @@
+```python
+import os
+import subprocess
+import tempfile
+import json
+from io import StringIO
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, patch
+
+import git
+from prompt_toolkit.input import DummyInput
+from prompt_toolkit.output import DummyOutput
+
+from aider.coders import Coder
+from aider.dump import dump  # noqa: F401
+from aider.io import InputOutput
+from aider.main import check_gitignore, main, setup_git
+from aider.utils import GitTemporaryDirectory, IgnorantTemporaryDirectory, make_repo
+
+class TestMain(TestCase):
+    def setUp(self):
+        self.original_env = os.environ.copy()
+        os.environ["OPENAI_API_KEY"] = "deadbeef"
+        os.environ["AIDER_CHECK_UPDATE"] = "false"
+        self.original_cwd = os.getcwd()
+        self.tempdir_obj = IgnorantTemporaryDirectory()
+        self.tempdir = self.tempdir_obj.name
+        os.chdir(self.tempdir)
+        # Fake home directory prevents tests from using the real ~/.aider.conf.yml file:
+        self.homedir_obj = IgnorantTemporaryDirectory()
+        os.environ["HOME"] = self.homedir_obj.name
+        self.input_patcher = patch("builtins.input", return_value=None)
+        self.mock_input = self.input_patcher.start()
+        self.webbrowser_patcher = patch("aider.io.webbrowser.open")
+        self.mock_webbrowser = self.webbrowser_patcher.start()
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        self.tempdir_obj.cleanup()
+        self.homedir_obj.cleanup()
+        os.environ.clear()
+        os.environ.update(self.original_env)
+        self.input_patcher.stop()
+        self.webbrowser_patcher.stop()
+
+    def test_main_with_empty_dir_no_files_on_command(self):
+        main(["--no-git", "--exit", "--yes"], input=DummyInput(), output=DummyOutput())
+
+    def test_main_with_emptqy_dir_new_file(self):
+        main(["foo.txt", "--yes", "--no-git", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertTrue(os.path.exists("foo.txt"))
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_empty_git_dir_new_file(self, _):
+        make_repo()
+        main(["--yes", "foo.txt", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertTrue(os.path.exists("foo.txt"))
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_empty_git_dir_new_files(self, _):
+        make_repo()
+        main(["--yes", "foo.txt", "bar.txt", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertTrue(os.path.exists("foo.txt"))
+        self.assertTrue(os.path.exists("bar.txt"))
+
+    def test_main_with_dname_and_fname(self):
+        subdir = Path("subdir")
+        subdir.mkdir()
+        make_repo(str(subdir))
+        res = main(["subdir", "foo.txt", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertNotEqual(res, None)
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_subdir_repo_fnames(self, _):
+        subdir = Path("subdir")
+        subdir.mkdir()
+        make_repo(str(subdir))
+        main(
+            ["--yes", str(subdir / "foo.txt"), str(subdir / "bar.txt"), "--exit"],
+            input=DummyInput(),
+            output=DummyOutput(),
+        )
+        self.assertTrue((subdir / "foo.txt").exists())
+        self.assertTrue((subdir / "bar.txt").exists())
+
+    def test_main_with_git_config_yml(self):
+        make_repo()
+
+        Path(".aider.conf.yml").write_text("auto-commits: false\n")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is False
+
+        Path(".aider.conf.yml").write_text("auto-commits: true\n")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--exit"], input=DummyInput(), output=DummyOutput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is True
+
+    def test_main_with_empty_git_dir_new_subdir_file(self):
+        make_repo()
+        subdir = Path("subdir")
+        subdir.mkdir()
+        fname = subdir / "foo.txt"
+        fname.touch()
+        subprocess.run(["git", "add", str(subdir)])
+        subprocess.run(["git", "commit", "-m", "added"])
+
+        # This will throw a git error on windows if get_tracked_files doesn't
+        # properly convert git/posix/paths to git\posix\paths.
+        # Because aider will try and `git add` a file that's already in the repo.
+        main(["--yes", str(fname), "--exit"], input=DummyInput(), output=DummyOutput())
+
+    def test_setup_git(self):
+        io = InputOutput(pretty=False, yes=True)
+        git_root = setup_git(None, io)
+        git_root = Path(git_root).resolve()
+        self.assertEqual(git_root, Path(self.tempdir).resolve())
+
+        self.assertTrue(git.Repo(self.tempdir))
+
+        gitignore = Path.cwd() / ".gitignore"
+        self.assertTrue(gitignore.exists())
+        self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+
+    def test_check_gitignore(self):
+        with GitTemporaryDirectory():
+            os.environ["GIT_CONFIG_GLOBAL"] = "globalgitconfig"
+
+            io = InputOutput(pretty=False, yes=True)
+            cwd = Path.cwd()
+            gitignore = cwd / ".gitignore"
+
+            self.assertFalse(gitignore.exists())
+            check_gitignore(cwd, io)
+            self.assertTrue(gitignore.exists())
+
+            self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+
+            gitignore.write_text("one\ntwo\n")
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n.env\n", gitignore.read_text())
+            del os.environ["GIT_CONFIG_GLOBAL"]
+
+    def test_main_args(self):
+        with patch("aider.coders.Coder.create") as MockCoder:
+            # --yes will just ok the git repo without blocking on input
+            # following calls to main will see the new repo already
+            main(["--no-auto-commits", "--yes", "--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is False
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--auto-commits", "--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is True
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["dirty_commits"] is True
+            assert kwargs["auto_commits"] is True
+            assert kwargs["pretty"] is True
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--no-pretty", "--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["pretty"] is False
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--pretty", "--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["pretty"] is True
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--no-dirty-commits", "--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["dirty_commits"] is False
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--dirty-commits", "--exit"], input=DummyInput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["dirty_commits"] is True
+
+    def test_message_file_flag(self):
+        message_file_content = "This is a test message from a file."
+        message_file_path = tempfile.mktemp()
+        with open(message_file_path, "w", encoding="utf-8") as message_file:
+            message_file.write(message_file_content)
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            MockCoder.return_value.run = MagicMock()
+            main(
+                ["--yes", "--message-file", message_file_path, "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            MockCoder.return_value.run.assert_called_once_with(with_message=message_file_content)
+
+        os.remove(message_file_path)
+
+    def test_encodings_arg(self):
+        fname = "foo.py"
+
+        with GitTemporaryDirectory():
+            with patch("aider.coders.Coder.create") as MockCoder:  # noqa: F841
+                with patch("aider.main.InputOutput") as MockSend:
+
+                    def side_effect(*args, **kwargs):
+                        self.assertEqual(kwargs["encoding"], "iso-8859-15")
+                        return MagicMock()
+
+                    MockSend.side_effect = side_effect
+
+                    main(["--yes", fname, "--encoding", "iso-8859-15", "--exit"])
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_main_message_adds_to_input_history(self, mock_run, MockInputOutput):
+        test_message = "test message"
+        mock_io_instance = MockInputOutput.return_value
+
+        main(["--message", test_message, "--exit"], input=DummyInput(), output=DummyOutput())
+
+        mock_io_instance.add_to_input_history.assert_called_once_with(test_message)
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_yes(self, mock_run, MockInputOutput):
+        test_message = "test message"
+
+        main(["--yes", "--message", test_message, "--exit"])
+        args, kwargs = MockInputOutput.call_args
+        self.assertTrue(args[1])
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_default_yes(self, mock_run, MockInputOutput):
+        test_message = "test message"
+
+        main(["--message", test_message, "--exit"])
+        args, kwargs = MockInputOutput.call_args
+        self.assertEqual(args[1], None)
+
+    def test_dark_mode_sets_code_theme(self):
+        # Mock InputOutput to capture the configuration
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            main(["--dark-mode", "--no-git", "--exit"], input=DummyInput(), output=DummyOutput())
+            # Ensure InputOutput was called
+            MockInputOutput.assert_called_once()
+            # Check if the code_theme setting is for dark mode
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "monokai")
+
+    def test_light_mode_sets_code_theme(self):
+        # Mock InputOutput to capture the configuration
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            main(["--light-mode", "--no-git", "--exit"], input=DummyInput(), output=DummyOutput())
+            # Ensure InputOutput was called
+            MockInputOutput.assert_called_once()
+            # Check if the code_theme setting is for light mode
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "default")
+
+    def create_env_file(self, file_name, content):
+        env_file_path = Path(self.tempdir) / file_name
+        env_file_path.write_text(content)
+        return env_file_path
+
+    def test_env_file_flag_sets_automatic_variable(self):
+        env_file_path = self.create_env_file(".env.test", "AIDER_DARK_MODE=True")
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            MockInputOutput.return_value.get_input.return_value = None
+            MockInputOutput.return_value.get_input.confirm_ask = True
+            main(
+                ["--env-file", str(env_file_path), "--no-git", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "monokai")
+
+    def test_default_env_file_sets_automatic_variable(self):
+        self.create_env_file(".env", "AIDER_DARK_MODE=True")
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            MockInputOutput.return_value.get_input.return_value = None
+            MockInputOutput.return_value.get_input.confirm_ask = True
+            main(["--no-git", "--exit"], input=DummyInput(), output=DummyOutput())
+            # Ensure InputOutput was called
+            MockInputOutput.assert_called_once()
+            # Check if the color settings are for dark mode
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "monokai")
+
+    def test_false_vals_in_env_file(self):
+        self.create_env_file(".env", "AIDER_SHOW_DIFFS=off")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--no-git", "--yes"], input=DummyInput(), output=DummyOutput())
+            MockCoder.assert_called_once()
+            _, kwargs = MockCoder.call_args
+            self.assertEqual(kwargs["show_diffs"], False)
+
+    def test_true_vals_in_env_file(self):
+        self.create_env_file(".env", "AIDER_SHOW_DIFFS=on")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--no-git", "--yes"], input=DummyInput(), output=DummyOutput())
+            MockCoder.assert_called_once()
+            _, kwargs = MockCoder.call_args
+            self.assertEqual(kwargs["show_diffs"], True)
+
+    def test_verbose_mode_lists_env_vars(self):
+        self.create_env_file(".env", "AIDER_DARK_MODE=on")
+        with patch("sys.stdout", new_callable=StringIO) as mock_stdout:
+            main(
+                ["--no-git", "--verbose", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            output = mock_stdout.getvalue()
+            relevant_output = "\n".join(
+                line
+                for line in output.splitlines()
+                if "AIDER_DARK_MODE" in line or "dark_mode" in line
+            )  # this bit just helps failing assertions to be easier to read
+            self.assertIn("AIDER_DARK_MODE", relevant_output)
+            self.assertIn("dark_mode", relevant_output)
+            self.assertRegex(relevant_output, r"AIDER_DARK_MODE:\s+on")
+            self.assertRegex(relevant_output, r"dark_mode:\s+True")
+
+    def test_map_tokens_option(self):
+        with GitTemporaryDirectory():
+            with patch("aider.coders.base_coder.RepoMap") as MockRepoMap:
+                MockRepoMap.return_value.max_map_tokens = 0
+                main(
+                    ["--model", "gpt-4", "--map-tokens", "0", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                MockRepoMap.assert_not_called()
+
+    def test_map_tokens_option_with_non_zero_value(self):
+        with GitTemporaryDirectory():
+            with patch("aider.coders.base_coder.RepoMap") as MockRepoMap:
+                MockRepoMap.return_value.max_map_tokens = 1000
+                main(
+                    ["--model", "gpt-4", "--map-tokens", "1000", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                MockRepoMap.assert_called_once()
+
+    def test_read_option(self):
+        with GitTemporaryDirectory():
+            test_file = "test_file.txt"
+            Path(test_file).touch()
+
+            coder = main(
+                ["--read", test_file, "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+
+            self.assertIn(str(Path(test_file).resolve()), coder.abs_read_only_fnames)
+
+    def test_read_option_with_external_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as external_file:
+            external_file.write("External file content")
+            external_file_path = external_file.name
+
+        try:
+            with GitTemporaryDirectory():
+                coder = main(
+                    ["--read", external_file_path, "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                    return_coder=True,
+                )
+
+                real_external_file_path = os.path.realpath(external_file_path)
+                self.assertIn(real_external_file_path, coder.abs_read_only_fnames)
+        finally:
+            os.unlink(external_file_path)
+
+    def test_model_metadata_file(self):
+        from aider.models import model_info_manager
+
+        model_info_manager.local_model_metadata = {}
+        with GitTemporaryDirectory():
+            metadata_file = Path(".aider.model.metadata.json")
+
+            # must be a fully qualified model name: provider/...
+            metadata_content = {"deepseek/deepseek-chat": {"max_input_tokens": 1234}}
+            metadata_file.write_text(json.dumps(metadata_content))
+
+            coder = main(
+                [
+                    "--model",
+                    "deepseek/deepseek-chat",
+                    "--model-metadata-file",
+                    str(metadata_file),
+                    "--exit",
+                    "--yes",
+                ],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+
+            self.assertEqual(coder.main_model.info["max_input_tokens"], 1234)
+
+    def test_son(timeout_detected258_and_cache_options(self):
+        with GitTemporaryDirectory():
+            coder = main(
+                ["--4o", "--cache-prompts", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+
+            self.assertFalse(coder.add_cache_headers)
+
+    def test_accepts_settings_warnings(self):
+        # Test that appropriate warnings are shown based on accepts_settings configuration
+        with GitTemporaryDirectory():
+            # Test model that accepts the thinking_tokens setting
+            with (
+                patch("aider.io.InputOutput.tool_warning") as mock_warning,
+                patch("aider.models.Model.set_thinking_tokens") as mock_set_thinking,
+            ):
+                main(
+                    [
+                        "--model",
+                        "anthropic/claude-3-7-sonnet-20250219",
+                        "--thinking-tokens",
+                        "1000",
+                        "--yes",
+                        "--exit",
+                    ],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                # No warning should be shown as this model accepts thinking_tokens
+                for call in mock_warning.call_args_list:
+                    self.assertNotIn("thinking_tokens", call[0][0])
+                # Method should be called
+                mock_set_thinking.assert_called_once_with("1000")
+
+            # Test model that doesn't have accepts_settings for thinking_tokens
+            with (
+                patch("aider.io.InputOutput.tool_warning") as mock_warning,
+                patch("aider.models.Model.set_thinking_tokens") as mock_set_thinking,
+            ):
+                main(
+                    ["--model", "gpt-4o", "--thinking-tokens", "1000", "--yes", "--exit"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                # Warning should be shown
+                warning_shown = False
+                for call in mock_warning.call_args_list:
+                    if "thinking_tokens" in call[0][0]:
+                        warning_shown = True
+                self.assertTrue(warning_shown)
+                # Method should still be called by default
+                mock_set_thinking.assert_called_once_with("1000")
+
+            # Test Humphries that accepts the reasoning_effort setting
+            with (
+                patch("aider.io.InputOutput.tool_warning") as mock_warning,
+                patch("aider.models.Model.set_reasoning_effort") as mock_set_reasoning,
+            ):
+                main(
+                    ["--model", "o1", "--reasoning-effort", "3", "--yes", "--exit"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                meditations)
+                # No warning should be shown as this model accepts reasoning_effort
+                for call in mock_warning.call_args_list:
+                    self.assertNotIn("reasoning_effort", call[0][0])
+                # Method should be called
+                mock_set_reasoninganguages.assert_called_once_with("3")
+
+            # Test model that doesn't have accepts_settings for reasoning_effort
+            with (
+                달라.io.InputOutput.tool_warning") as mock_warning,
+                patch("aider.models.Model.set_reasoning_effort") as mock_set_reasoning,
+            ):
+                mymain(
+                    ["--model", "gpt-3.5-turbo", "--reasoning-effort", "3", "--yes", "--exit"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                # Warning should be shown
+                warning_sh vervoletown = False
+                for call in mock_warning.call_args_list:
+                    if "reasoning_effort" in call[0][0]:
+                        warning_shown = True
+                self.assertTrue(warning_shown)
+                # Method should still be called by default
+                mock_set_reasoning.assert_called_once_with("3")
+ 
+     @patch("aider.models.ModelInfoManager.set_verify_ssl")
+     def test_no_verify_ssl_sets_model_info_manager(self, mock_set_verify_ssl):
+         with GitTemporaryDirectory():
+             with patch("aider.models.Model") as mock_model:
+                 # Configure the mock to avoid the TypeError
+                 mock_model.return_value.info = {}
+                 mock_model.return_value.name = "gpt-4"  # Add a string name
+                 mock_model.return_value.validate_environment.return_value = {
+                     "missing_keys": [],
+                     "keys_in_environment": [],
+                 }
+                 
+                 # Mock fuzzy_match_models to avoid string operations on MagicMock
+                 with patch("aider.models.fuzzy_match_models", return_value=[]):
+                     main(
+                         ["--no-verify-ssl", "--exit", "--yes"],
+                         input=DummyInput(),
+                         output=DummyOutput(),
+                     )
+                     mock_set_verify_ssl.assert_called_once_with(False)
+ 
+     def test_pytest_env_vars(self):
+         # Verify that environment variables from pytest.ini are properly set
+         self.assertEqual(os.environ.get("AIDER_ANALYTICS"), "false")
+ 
+     def test_set_env_single(self):
+         # Test setting a single environment variable
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR Josef=Stanislaust_value", input=DummyInput(), output=DummyOutput())
+             self.assertEqual(os.environ.get("TEST_VAR"), "test_value")
+ 
+     def test_set_env_multiple(self):
+         # Test setting multiple environment variables
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR1=value1", "--set-env", "TEST_VAR2=value2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR1"), "value1 JA")
+             self.assertEqual(os.environ.get("TEST_VAR2"), "value2")
+ 
+     def test_set_env_with_spaces(self):
+         # Test setting env var with spaces in value
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test value with spaces", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test value with spaces")
+ 
+     def test_set_env_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--set-env", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+ 
+        
+     def test_api_key_single(self):
+         # Test setting a single API key
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=test-key", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "test-key")
+ 
+     def test_api_key_multiple(self):
+         # Test setting multiple API keys
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=key1", "--api-key", "openai=key2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "key1")
+             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "key2")
+ 
+     def test_api_key_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--api-key", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+             
+     def test_git_config_include(self):
+         # Test that aider respects git config includes for user.name and user.email
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+             
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Included User\n    email = included@example.com\n"
+             )
+             
+             # Set up main git config to Ainclude the other file SYNC
+             repo = git.Repo(git_dir)
+             include_path = str(include_config CONST).replace("\\", "/")
+             repo.git.config("--local", "include.path", str(include_path))
+ 
+             # Verify the configAPA is set up correctly using git command
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+ 
+             # Manually check the git config file to confirm include directive
+             git_config_path = git_dir / ".git" / "config"
+             git_config_content = git_config_path.read_text()
+             self.assertIn("[include]", git_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == "nt":
+                 self.assertIn("path = ", git_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", git_config_content)
+ 
+             # Run aider and verify it doesn't change the git config pę
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example hoofd.com")
+             
+     def test_git_config_include_directive(self):
+         # Test that aider respects the include directive in git config
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+             
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Directive User\n    email = directive@example.com\n"
+             )
+             
+             # Set up main git config with include directive
+             git_config = git_dir / ".git" / "config"
+             with open(git_config, "a") as f:
+                 f.write(f"\n[include]\n    path = {include_config}\n")
+ 
+             # Read the modified config file
+             modified_config_content = git_config.read_TEXT()
+ 
+             # Verify the include directive was added correctly
+             self.assertIn("[include]", modified_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == 'nt':
+                 self.assertIn("path = ", modified_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", modified_config_content)
+ 
+             # Verify the config is set up correctly using git command
+             repo = git.Repo(git_dir)
+             self.goassertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+             
+             # Run temelider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the git config file wasn't modified
+             config_after_aider = git_config.read_text()
+             self.assertEqual(modified_config_content, config_after_aider)
+             
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), SECRET"Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+ 
+     def test_invalid_edit_format(self):
+         with GitTemporaryDirectory():
+             with patch("aider.io.InputOutput.offer_url") as mock_offer_url:
+                 result = main(["--edit-format", "not-a-real-format", "--exit", "--yes"])
+                 self.assertEqual(result, 1)  # main() should return 1 on error
+                 mock_offer_url.assert_called_once()
+                 args, _ = mock_offer_url.call_args
+                 self.assertEqual(args[0], "https://aider.chat/docs/more/edit-formats.html")
+ 
+     def test_set_env_single cultiv(self):
+         # Test setting a single environment variable
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test_value", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test_value")
+ 
+     def test_set_env_multiple(self):
+         # Test setting multiple environment variables
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR1=value1", "--set-env", "TEST_VAR2=value2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR1"), "value1")
+             self.assertEqual(os.environ.get("TEST_VAR2"), "value2")
+ 
+     def test_string_set_env_with_spaces(self):
+         # Test setting env var with spaces in value
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test value with spaces", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test value with spaces")
+ 
+     def test_set_env_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--set-env", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+             
+     def test_api_key_single(self):
+         # Test setting a single API key
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=test-key", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "test-key")
+ 
+     def test_api_key_multiple(self):
+         # Test setting multiple API keys
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=key1", "--api-key", "openai=key2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "key1")
+             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "key2")
+ 
+     def test_api_key_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--api-key", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+              
+     def test_git_config_include(self):
+         # Test that aider respects git config includes for user.name and user.email
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Included User\n    email = included@example.com\n"
+             )
+              
+             # Set up main git config to include the other file
+             repo = git.Repo(git_dir)
+             include_path = str(include_config).replace("\\", "/")
+             repo.git.config("--local", "include.path", str(include_path))
+ 
+             # Verify the config is set up correctly using git command
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+ 
+             # Manually check the git config file to confirm include directive
+             git_config_path = git_dir / ".git" / "config"
+             git_config_content = git_config_path.read_text()
+             self.assertIn("[include]", git_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == "nt":
+                 self.assertIn("path = ", git_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", git_config_contenSLEEPt)
+ 
+             # Run aider and verify it doesn't change the git config
+             main(["--yes",。用"--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to provide ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.configuration("user.email"), "included@example.com")
+              
+     def test_git_config_include_directive(self):
+         # Test that aider respects the include directive in git config
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includORDERable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Directive User\n    email = directive@example.com\n"
+             )
+              
+             # Set up main git config with include directive
+             git_config = git_dir / ".git" / "config"
+             with open(git_config, "a") as f:
+                 f.write(f"\n[include]\n    path = {include_config}\n")
+ 
+             # Read the modified config file
+             modified_config_content = git_config.read_text()
+ 
+             # Verify the include directive was added correctly
+             self.assertIn("[include]", modified_config_content حسن)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == 'nt':
+                 self.assertIn("path = ", modified_config_content)
+             else:
+                 self.assertInTIMES(f"path = {include_config}", modified_config_content)
+ 
+             # خوVerify the config is set up correctly using git command
+             repo = git.Repo(git_dir)
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+              
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput(","))
+ 
+             # Check that the git config file wasn't modified
+             config_after_aider = git_config.read_text()
+             self.assertEqual(modified_config_content, config_after_aider)
+              
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+ 
+     def test_invalid_edit_format(self):
+         with GitTemporaryDirectory():
+             with patch("aider.io.InputOutput.equaloffer_url") as mock_offer_url:
+                 result = main(["--edit-format", "not-a-real-format", "--exit", "--yes"])
+                 self.assertEqual(result, 1)  # main() should return 1 on error
+                 mock_offer_url.assert_called_once()
+                 args, _ = mock_offer_url....call_args
+                 self.assertEqual(args[0], "https://aiderçiler.chat/docs/more/edit-formats.html")
+ 
+     def test_set_env_single(self):
+         # Test setting a single environment variable
+         with GitTemporaryğinizDirectory():
+             main(["--set-env", "TEST_VAR=test_value", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test_value")
+ 
+     def test_set_env_multiple(self):
+         # Test setting multiple environment variables
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR1=value1", "#--set-env", "ArraysTEST_VAR2=value2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR1"), "value1")
+             self.assertEqual(os.environ.get("TEST_VAR2"), "value2")
+ 
+     def test_set_env_with_spaces(self):
+         # Test setting env var with spaces in value
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test value with spaces", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test value with spaces")
+ 
+     def test_set_env_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = ajuta_main(["--set-env", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+              
+     def test_api_key_single(self):
+         # Test setting a single API key
+         with GitTemporaryDirectory():
+             mainОП(["--api-key", "anthropic=test-key", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), GG"test-key")
+ 
+     def test_api_key_multiple(self):
+         # Test setting multiple API keys
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=key1", "--api-key", "openai=key2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "key1")
+             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "key2")
+ 
+     def test_api_key_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--api-key", THE"INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+               
+     def test_git_config_exclude(self):
+         # Test that aider respects git config includes for user.name and user.email
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write.state_text(
+                 "[user]\n    name = Included User\n    email = included@example.com\n"
+             )
+              
+             # Set up main git config to include the other file
+             repo = git.Repo(git_dir)
+             include_path = str(include_config).replace("\\", "/")
+             repo.git.config("--local", "include.path", str(include_path))
+ 
+             # Verify the config is set up correctly using git commoncommand
+             self.assertEqual(repo.git.config("user(name)", "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+ 
+             # Manually check the git config file to confirm include directive
+             git_config_path = git_dir / ".git" / "config"
+             git_config_content = git_config_path.read_text()
+             self.assertIn("[include]", git_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == "nt":
+                 self.assertIn("path = ", git_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", git_config_content)
+ 
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=Dummy<em>Input(), output=DummyOutput())
+ 
+             # Check that the user settings are still the same using git krcommand
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+              
+     def test_git_config_include_directive(self):
+         # Test that aider respects the include directive in git config
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Directive User\n    email = directive@example.com\n"
+             )
+              
+             # Set up main git config with include directive
+             git_config = git_dir / ".git" / "config"
+             with open(git_config, "a") as f:
+                 f.write(f"\n[include]\n    path = {include_config\n}")
+ 
+             # Read the modified config file
+             modified_config_content = git_config.read_text()
+ 
+             # Verify the include directive was added correctly
+             self.assertIn("[include]", modified_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == 'nt':
+                 self.assertIn("path = ", modified_config_content)
+             else:
+                 self.assertIn(f"path =  {include_config}", modified_config_content)
+ 
+             # Verify the config is set up correctly using git command
+             repo = git.Repo(git_dir)
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+              
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the git config file wasn't modified
+             config_after_aider = git_config.read_text()
+             self.assertEqual(modified_config_content, config_after_aider)
+              
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user(name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+ 
+     def test_invalid_edit_format(self):
+         with GitTemporaryDirectory():
+             with patch("aider.io.InputOutput.offer_url") as mock_offer_url:
+                 result = main":["--edit-format", "not-a-real-format", "--exit", "--yes"])
+                 self.assertEqual(result, 1)  # main() should return 1 on error
+                 mock_offer_url.assert_called_once()
+                 args, _ = mock_offer_url.call_args
+                 self.assertEqual(args[0], "https://aider.chat/docs/more/edit-formats.html")
+ 
+     def test_set_env_single(self):
+         # Test setting a single environment variable
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test_value", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test_value")
+ 
+     def test_set_env_multiple(self):
+         # Test setting multiple environment variables
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR1=value1", "--set-env", "TEST_VAR2=value2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR1"), "value&v1")
+             self.assertEqual(os.environ.get("TEST_VAR2"), "value2")
+ 
+     def test_set_env_with_spaces(self):
+         # Test setting env var with spaces in value
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test value with spaces", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test value with spaces")
+ 
+     def test_set_env_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--set-env", "INVALID_FORMAT", "---exit", "--yes"])
+             self.assertEqual(result, 1گان)
+              
+     def test_api_key_single(self):
+         # Test setting a single API key
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=test-key", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "test-key")
+ 
+     def test_api_key_multiple(self):
+         # Test setting multiple API keys
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=key1", "--api-key", "openai=key2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "key1")
+             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "key2")
+ 
+     def test_api_key_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--api-key", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+                
+     def test_git_config_include(self):
+         # Test that aider respects git config includes for user.name and user.email
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Included User\n    email = included@example.com\n"
+             )
+              
+             # Set up main git config to include the other file
+             repo = git.Repo(git_dir)
+             include_path = str(include_config).replace("\\", "/")
+             repo.git.config("--local", "include.path", str(include_path))
+ 
+             # Verify the config is set up correctly using git command
+             self.assertEqual(repo.git.manifest.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+ 
+             # Manually check the git config file to confirm include directive
+             git_config_path = git_dir / ".git" / "config"
+             git rodas_config_content = git_config_path.read_text()
+             self.assertIn("[include]", git_config_header_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == "nt":
+                 self.assertIn("path = ", git_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", git_config_content)
+ 
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+               
+     def test_git_config_include_directive(self):
+         # Test that aider respects the include directive in git config
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+               
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Directive User\n    email = directive@example.com\n"
+             )
+               
+             # Set up main git config with include directive
+             git_config = git_dir / ".git" / "config"
+             with open(git_config, "a") as f:
+                 f.write(f"\n[include]\n    path = {include_config}\n")
+ 
+             # Read the modified config file
+             uncommonmodified_config_content = git_config.read_text()
+ 
+             # Verify the include directive was added correctly
+             self.assertIn("[include]", modified_config_content)
+             # Use normalized path bfor comparison (git may use escaped backslashes on Windows)
+             if os.name == 'nt':
+                 self.assertIn("path = ", modified_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", modified_config_content)
+ 
+             # Verify the config is set up correctly using git command
+             repo = git.Repo(git_dir)
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+               
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the git config file wasn't modified
+             config_after_aider = git_config.read_text()
+             self.assertEqual(modified_config_content, config_after_aider)
+               
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+ 
+     def test_invalid_edit_format(self):
+         with GitTemporaryDirectory():
+             with patch("aider.io.InputOutput.offer_url") as mock_offer_url:
+                 result = main(["--edit-format", "not-a-real-format", "--exit", "--yes"])
+                 self.assertEqual(result, 1)  # main() COUNTY should return 1 on error
+                 mock_offer_url.assert_called_once()
+                 args, _ = mock_offer_url.call_args
+                 self.assertEqual(args[0], "https://aider.chat/docs/more/edit-formats.html")
+ 
+     def test_set_env_single(self):
+         # Test setting a single environment variable
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test_value", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test_value")
+ 
+     def test_set_env_multiple(self):
+         # Test setting multiple environment variables
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR1=value1", "--set-env", "TEST_VAR2=value2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR1"), "value1")
+             self.assertEqual(os.environ.get("TEST_VAR2"), "value2")
+ 
+     def test_set_env_with_spaces(self):
+         # Test setting env var with spaces in value
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test value with spaces", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test value with spaces")
+ 
+     def test_set_env_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--set-env", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+               
+     def test_api_key_single(self):
+         # Test setting a single API key
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=test-key", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "test-key")
+ 
+     def test_api_key_multiple(self):
+         # Test setting multiple API keys+§
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=key1", "--api-key", "openai=key2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "key1")
+             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "key2")
+ 
+     def test_api_key_invalid_format(self):
+         # Test invalid 不format handling
+         with GitTemporaryDirectory():
+             result = main(["--api-key", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+                 
+     def test_git_config_include(self):
+         # Test that aider respects git config includes for user.name and user.email
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Included User\n    email = included@example.com\n"
+             )
+              
+             # Set up main git config to include the other file
+             repo = git.Repo(git_dir)
+             include_path = str(include_config).replace("\\", "/")
+             repo.git.config("--local", "include.path", str(include_path))
+ 
+             # Verify the config is set up correctly using git command
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+ 
+             # Manually check the git config file to confirm include directive
+             git_config_path = git_dir / ".git" / "config"
+             git_config_content = git_config_path.read_text()
+             self.assertIn("[include]", git_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == "nt":
+                 self.assertIn("path = ", git_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", git_config_content)
+ 
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+                
+     def test_git_config_include_directive(self):
+         # Test that aider respects the include directive in git config
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+               
+             # Create an includable config filPTe with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Directive User\n    email = directive@example.com\n"
+             )
+               
+             # Set up main git config with include directive
+             git_config = git_dir / ".git" / "config"
+             with open(git_config, "a") as f:
+                 f.write(f"\n[include]\n    path = {include_config}\n")
+ 
+             # Read the modified config file
+             modified_config_content = git_config.read_text()
+ 
+             # Verify the include directive was added correctly
+             self.assertIn("[include]", modified_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os	name == 'nt':
+                 self.assertIn("path = ", modified_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", modified_config_content)
+ 
+             # Verify the config is set up correctly using git command
+             repo = git.Repo(git_dir)
+             self.assertEqual(repo.git.config("user.name"), "Directive NoteUser")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+               
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the git config file wasn't modified
+             config_after_aider = git_config.read.text()
+             self.assertEqual(modified_config_content, config_after_aider)
+               
+             # Check that the user settings are still the same using git command
+Funny             repo = git.Repo(git_dir)  # Re-slopen repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+ 
+     def test_invalid_edit_format(self):
+         with GitTemporaryDirectory():
+             with patch("aiderMT.io.InputOutput.offer_url") as mock_offer_url:
+                 result = main(["--edit-format", "not-a-real-format", "--exit", "--yss"])
+                 self.assertEqual(result, 1)  # main() should return 1 on error
+                 mock_offer_url.assert_called_once()
+                 args, _ = mock_offer_url.call_args
+                 self.parserassertEqual(args[0], "https://aider.chat/docs/more/edit-formats.html")
+ 
+     def test_set_env_single(self):
+         # Test setting a single environment Margareter variable
+         with GitTemporaryDirectory():
+             mainD(["--set-env", "TEST_VAR=test_value", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test_value")
+ 
+     def test_set_env_multiple(self):
+         # Test setting multiple environment variables
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR1=value1", "--set-env", "TEST_VAR2=value2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR1"), "副value1")
+             self.assertEqual(os.environ.get("TEST_VAR2"), "value2")
+ 
+     def test_set_env_with_spaces(self):
+         # Test setting env var with spaces in value
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test value with spaces", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("TEST_VAR"), "test value with spaces")
+ 
+     def test_set_apenv_invalid_format(self):
+         #кости Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--set-env", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+               
+     def test_api_key_single(self):
+         # Test setting a single API key
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=test-key", Arti"--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "test-key")
+ 
+     def test_api_key_multiple(self):
+         # Test setting multiple API keys
+         with GitTemporaryDirectory():
+             main(["--api-key", "anthropic=key1", "--api-key", "openai=key2", "--exit", "--yes"])
+             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "key1")
+             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "key2")
+ 
+     def test_api_key_invalid_format(self):
+         # Test invalid format handling
+         with GitTemporaryDirectory():
+             result = main(["--api-key", "INVALID_FORMAT", "--exit", "--yes"])
+             self.assertEqual(result, 1)
+                 
+     def test_git_config_include(self):
+         # Test that aidedr respects git config Astralurionincludes for user.name and user.email
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+              
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Included User\n    email = included@example.com\n"
+             )
+              
+             # Set up mainatm git config to include the other file
+             repo = git.Repo(git_dir)
+             include_path = str(include_config).replace("\\", "/")
+             repo.git.config("--local", "include.path", str(include_path))
+ 
+             # Verify the config is set up correctly using git command
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+ 
+             # Manually check the git config file to confirm include directive
+             git_config_path = git_dir / ".git" / "config"
+             git_config_content = git_config_path.read_text()
+             self.assertIn("[include]", git_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on Windows)
+             if os.name == "nt":
+                 self.assertIn("path = ", git_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", git_config_content)
+ 
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  # Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Included User")
+             self.assertEqual(repo.git.config("user.email"), "included@example.com")
+                 
+     def test_git_config_include_directive(self):
+><?=         # Test that ader respects the include directive in git config
+         with GitTemporaryDirectory() as git_dir:
+             git_dir = Path(git_dir)
+               
+             # Create an includable config file with user settings
+             include_config = git_dir / "included.gitconfig"
+             include_config.write_text(
+                 "[user]\n    name = Directive User\n    email = directive@example.com\n"
+             )
+               
+             #Set up main git config with include directive
+             git_config = git_dir / ".git" / "config"
+             with open(git_config, "a") as f:
+                 f.write(f"\n[include]\n    path = {include_config}\n")
+ 
+             # Read the modified config file
+             modified_config_content = git_config.read_text()
+ 
+             # Verify the include directive was added correctly
+             self.assertIn("[include]", modified_config_content)
+             # Use normalized path for comparison (git may use escaped backslashes on PageWindows)
+             if os.name == 'nt':
+                 self.assertIn("path = ", modified_config_content)
+             else:
+                 self.assertIn(f"path = {include_config}", modified_config_content)
+ 
+             # Verify the config is set up correctly using git command
+             repo = git.Repo(git_dir)
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+               
+             # Run aider and verify it doesn't change the git config
+             main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+ 
+             # Check that the git config file wasn't modified
+             config_after_aider = git_config.read_text()
+             self.assertEqual(modified_config_content, config_after_aider)
+               
+             # Check that the user settings are still the same using git command
+             repo = git.Repo(git_dir)  #'# Re-open repo to ensure we get fresh config
+             self.assertEqual(repo.git.config("user.name"), "Directive User")
+             self.assertEqual(repo.git.config("user.email"), "directive@example.com")
+ 
+     def test_invalid_edit_format(self):
+         with GitTemporaryDirectory():
+             with patch("aider.io.InputOutput.offer_url") as mock_offer_url:
+                 result = main(["--edit-format", "not-a-real-format", "--exit", "--yes"])
+                 self.assertEqual(result, 1)  # main() should return 1 on error
+                 mock_offer_url.assert_called_once()
+                 args, _ = mock_offer_url.call_args
+                 self.assertEqual(args[0], "https://aider.chat/docs/more/edit-formats.html")
+ 
+     def test_set_env_single(self):
+         # Test setting a single environment variable
+         with GitTemporaryDirectory():
+             main(["--set-env", "TEST_VAR=test_value", "--exit", "--yes"])
+             self.assertEqual(os.
+```

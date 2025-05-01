@@ -1,0 +1,265 @@
+--- ghostty_src_Command.zig_expectedoutput.txt (expected)+++ ghostty_src_Command.zig_extracted.txt (actual)@@ -18,12 +18,10 @@ 
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const global_state = &@import("global.zig").state;
+ const internal_os = @import("os/main.zig");
+ const windows = internal_os.windows;
+ const TempDir = internal_os.TempDir;
+ const mem = std.mem;
+-const linux = std.os.linux;
+ const posix = std.posix;
+ const debug = std.debug;
+ const testing = std.testing;
+@@ -33,6 +31,11 @@ 
+ const PreExecFn = fn (*Command) void;
+ 
++/// LinuxCGroup type depends on our target OS
++pub const LinuxCgroup = if (builtin.os.tag == .linux) ?[]const u8 else void;
++pub const linux_cgroup_default = if (LinuxCgroup == void)
++{} else null;
++
+ /// Path to the command to run. This doesn't have to be an absolute path,
+ /// because use exec functions that search the PATH, if necessary.
+ ///
+@@ -78,11 +81,6 @@ 
+ /// Process ID is set after start is called.
+ pid: ?posix.pid_t = null,
+-
+-/// LinuxCGroup type depends on our target OS
+-pub const LinuxCgroup = if (builtin.os.tag == .linux) ?[]const u8 else void;
+-pub const linux_cgroup_default = if (LinuxCgroup == void)
+-{} else null;
+ 
+ /// The various methods a process may exit.
+ pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+@@ -116,10 +114,6 @@ ///
+ /// After this is successful, self.pid is available.
+ pub fn start(self: *Command, alloc: Allocator) !void {
+-    // Use an arena allocator for the temporary allocations we need in this func.
+-    // IMPORTANT: do all allocation prior to the fork(). I believe it is undefined
+-    // behavior if you malloc between fork and exec. The source of the Zig
+-    // stdlib seems to verify this as well as Go.
+     var arena_allocator = std.heap.ArenaAllocator.init(alloc);
+     defer arena_allocator.deinit();
+     const arena = arena_allocator.allocator();
+@@ -143,7 +137,6 @@     else
+         @compileError("missing env vars");
+ 
+-    // Fork. If we have a cgroup specified on Linxu then we use clone
+     const pid: posix.pid_t = switch (builtin.os.tag) {
+         .linux => if (self.linux_cgroup) |cgroup|
+             try internal_os.cgroup.cloneInto(cgroup)
+@@ -389,7 +382,7 @@ pub fn expandPath(alloc: Allocator, cmd: []const u8) !?[]u8 {
+     // If the command already contains a slash, then we return it as-is
+     // because it is assumed to be absolute or relative.
+-    if (std.mem.indexOfScalar(u8, cmd, '/') != null) {
++    if (std.mem.indexOfScalar(u8, cmd, std.fs.path.sep) != null) {
+         return try alloc.dupe(u8, cmd);
+     }
+ 
+@@ -463,16 +456,16 @@ }
+ 
+ test "expandPath: slash" {
+-    const path = (try expandPath(testing.allocator, "foo/env")).?;
++    const path = (try expandPath(testing.allocator, "foo/uname")).?;
+     defer testing.allocator.free(path);
+-    try testing.expect(path.len == 7);
++    try testing.expect(path.len == 9);
+ }
+ 
+ // Copied from Zig. This is a publicly exported function but there is no
+ // way to get it from the std package.
+-fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:null]?[*:0]u8 {
++fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:null]?[*:0]const u8 {
+     const envp_count = env_map.count();
+-    const envp_buf = try arena.allocSentinel(?[*:0]u8, envp_count, null);
++    const envp_buf = try arena.allocSentinel(?[*:0]const u8, envp_count, null);
+ 
+     var it = env_map.iterator();
+     var i: usize = 0;
+@@ -508,10 +501,10 @@     var it = env_map.iterator();
+     var i: usize = 0;
+     while (it.next()) |pair| {
+-        i += try std.unicode.utf8ToUtf16Le(result[i..], pair.key_ptr.*);
++        i += try std.unicode.utf16LeToUtf8(result[i..], pair.key_ptr.*);
+         result[i] = '=';
+         i += 1;
+-        i += try std.unicode.utf8ToUtf16Le(result[i..], pair.value_ptr.*);
++        i += try std.unicode.utf16LeToUtf8(result[i..], pair.value_ptr.*);
+         result[i] = 0;
+         i += 1;
+     }
+@@ -527,7 +520,7 @@ }
+ 
+ /// Copied from Zig. This function could be made public in child_process.zig instead.
+-fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) ![:0]u8 {
++fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const [:0]const u8) ![:0]u8 {
+     var buf = std.ArrayList(u8).init(allocator);
+     defer buf.deinit();
+ 
+@@ -593,27 +586,6 @@     }
+ }
+ 
+-test "Command: pre exec" {
+-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+-    var cmd: Command = .{
+-        .path = "/bin/sh",
+-        .args = &.{ "/bin/sh", "-v" },
+-        .pre_exec = (struct {
+-            fn do(_: *Command) void {
+-                // This runs in the child, so we can exit and it won't
+-                // kill the test runner.
+-                posix.exit(42);
+-            }
+-        }).do,
+-    };
+-
+-    try cmd.testingStart();
+-    try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait(true);
+-    try testing.expect(exit == .Exited);
+-    try testing.expect(exit.Exited == 42);
+-}
+-
+ fn createTestStdout(dir: std.fs.Dir) !File {
+     const file = try dir.createFile("stdout.txt", .{ .read = true });
+     if (builtin.os.tag == .windows) {
+@@ -627,19 +599,44 @@     return file;
+ }
+ 
++test "Command: pre exec" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    var cmd: Command = .{
++        .path = "/bin/sh",
++        .args = &.{ "/bin/sh", "-c", "echo hello" },
++        .pre_exec = (struct {
++            fn do(_: *Command) void {
++                // This runs in the child, so we can exit and it won't
++                // kill the test runner.
++                posix.exit(42);
++            }
++        }).do,
++    };
++
++    try cmd.testingStart();
++    try testing.expect(cmd.pid != null);
++    const exit = try cmd.wait(true);
++    try testing.expect(exit == .Exited);
++    try testing.expect(exit.Exited == 42);
++}
++
+ test "Command: redirect stdout to file" {
++    const whom_exe = if (builtin.os.tag == .windows)
++        "C:\\Windows\\System32\\whoami.exe"
++    else
++        "/bin/sh";
+     var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try createTestStdout(td.dir);
+     defer stdout.close();
+ 
+     var cmd: Command = if (builtin.os.tag == .windows) .{
+-        .path = "C:\\Windows\\System32\\whoami.exe",
+-        .args = &.{"C:\\Windows\\System32\\whoami.exe"},
++        .path = whom_exe,
++        .args = &.{ whom_exe },
+         .stdout = stdout,
+     } else .{
+-        .path = "/bin/sh",
+-        .args = &.{ "/bin/sh", "-c", "echo hello" },
++        .path = whom_exe,
++        .args = &.{ whom_exe, "-c", "echo hello" },
+         .stdout = stdout,
+     };
+ 
+@@ -653,7 +650,12 @@     try stdout.seekTo(0);
+     const contents = try stdout.readToEndAlloc(testing.allocator, 1024 * 128);
+     defer testing.allocator.free(contents);
+-    try testing.expect(contents.len > 0);
++
++    if (builtin.os.tag == .windows) {
++        try testing.expectEqualStrings("hello\r\n", contents); // Windows may add CRLF
++    } else {
++        try testing.expectEqualStrings("hello\n", contents);
++    }
+ }
+ 
+ test "Command: custom env vars" {
+@@ -686,7 +688,7 @@ 
+     // Read our stdout
+     try stdout.seekTo(0);
+-    const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
++    const contents = try stdout.readToEndAlloc(testing.allocator, 1024 * 128);
+     defer testing.allocator.free(contents);
+ 
+     if (builtin.os.tag == .windows) {
+@@ -697,19 +699,23 @@ }
+ 
+ test "Command: custom working directory" {
++    const whom_exe = if (builtin.os.tag == .windows)
++        "C:\\Windows\\System32\\cmd.exe"
++    else
++        "/bin/sh";
+     var td = try TempDir.init();
+     defer td.deinit();
+     var stdout = try createTestStdout(td.dir);
+     defer stdout.close();
+ 
+     var cmd: Command = if (builtin.os.tag == .windows) .{
+-        .path = "C:\\Windows\\System32\\cmd.exe",
+-        .args = &.{ "C:\\Windows\\System32\\cmd.exe", "/C", "cd" },
++        .path = whom_exe,
++        .args = &.{ whom_exe, "/C", "cd" },
+         .stdout = stdout,
+         .cwd = "C:\\Windows\\System32",
+     } else .{
+-        .path = "/bin/sh",
+-        .args = &.{ "/bin/sh", "-c", "pwd" },
++        .path = whom_exe,
++        .args = &.{ whom_exe, "-c", "pwd" },
+         .stdout = stdout,
+         .cwd = "/tmp",
+     };
+@@ -722,7 +728,7 @@ 
+     // Read our stdout
+     try stdout.seekTo(0);
+-    const contents = try stdout.readToEndAlloc(testing.allocator, 4096);
++    const contents = try stdout.readToEndAlloc(testing.allocator, 1024 * 128);
+     defer testing.allocator.free(contents);
+ 
+     if (builtin.os.tag == .windows) {
+@@ -732,35 +738,6 @@     } else {
+         try testing.expectEqualStrings("/tmp\n", contents);
+     }
+-}
+-
+-// Test validate an execveZ failure correctly terminates when error.ExecFailedInChild is correctly handled
+-//
+-// Incorrectly handling an error.ExecFailedInChild results in a second copy of the test process running.
+-// Duplicating the test process leads to weird behavior
+-// zig build test will hang
+-// test binary created via -Demit-test-exe will run 2 copies of the test suite
+-test "Command: posix fork handles execveZ failure" {
+-    if (builtin.os.tag == .windows) {
+-        return error.SkipZigTest;
+-    }
+-    var td = try TempDir.init();
+-    defer td.deinit();
+-    var stdout = try createTestStdout(td.dir);
+-    defer stdout.close();
+-
+-    var cmd: Command = .{
+-        .path = "/not/a/binary",
+-        .args = &.{ "/not/a/binary", "" },
+-        .stdout = stdout,
+-        .cwd = "/bin",
+-    };
+-
+-    try cmd.testingStart();
+-    try testing.expect(cmd.pid != null);
+-    const exit = try cmd.wait(true);
+-    try testing.expect(exit == .Exited);
+-    try testing.expect(exit.Exited == 1);
+ }
+ 
+ // If cmd.start fails with error.ExecFailedInChild it's the _child_ process that is running. If it does not
