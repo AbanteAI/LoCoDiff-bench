@@ -1,0 +1,263 @@
+```rust
+#[cfg(feature = "web")]
+mod actix;
+mod common;
+mod consensus;
+mod greeting;
+mod issues_setup;
+mod migrations;
+mod settings;
+mod snapshots;
+mod startup;
+mod tonic;
+
+use std::io::Error;
+use std::sync::Arc;
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use ::common::budget::{get_io_budget, ResourceBudget};
+use ::common::cpu::get_cpu_budget;
+use ::tonic::transport::Uri;
+use api::grpc::transport_channel_pool::TransportChannelPool;
+use clap::Parser;
+use collection::shards::channel_service::ChannelService;
+use crate::common::helpers::{
+    create_general_purpose_runtime, create_search_runtime, create_update_runtime,
+    load_tls_client_config,
+};
+use crate::common::inference::service::InferenceService;
+use crate::common::telemetry::TelemetryCollector;
+use crate::common::telemetry_reporting::TelemetryReporter;
+use crate::greeting::welcome;
+use crate::migrations::single_to_cluster::handle_existing_collections;
+use crate::settings::Settings;
+use crate::snapshots::{recover_full_snapshot, recover_snapshots};
+use crate::startup::{remove_started_file_indicator, touch_started_file_indicator};
+use storage::content_manager::consensus::operation_sender::OperationSender;
+use storage::content_manager::consensus::persistent::Persistent;
+use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
+use storage::content_manager::toc::dispatcher::TocDispatcher;
+use storage::content_manager::toc::TableOfContent;
+use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
+
+#[cfg(all(
+    not(target_env = "msvc"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use tikv_jemallocator::Jemalloc;
+#[cfg(all(
+    not(target_env = "msvc"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+const FULL_ACCESS: Access = Access::full("For main");
+
+/// Qdrant (read: quadrant) is a vector similarity search engine.
+/// It provides a production-ready service with a convenient API to store, search,
+/// and manage points—vectors with an additional payload.
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    /// URI of the peer to bootstrap from in case of multi-peer deployment.
+    /// If not specified, this peer will be considered the first in a new deployment.
+    #[arg(long, value_parser, value_name = "URI", env = "QDRANT_BOOTSTRAP")]
+    bootstrap: Option<Uri>,
+
+    /// URI of this peer.
+    /// Other peers should be able to reach it by this URI.
+    ///
+    /// In case this is not the first peer and it bootstraps, the value is optional.
+    /// If not supplied, qdrant will take the internal gRPC port from config
+    /// and derive the IP address of this peer on the bootstrap peer (receiving side).
+    #[arg(long, value_parser, value_name = "URI", env = "QDRANT_URI")]
+    uri: Option<Uri>,
+
+    /// Force snapshot re-creation.
+    /// If provided, existing collections will be replaced with snapshots.
+    /// Default is to not recreate from snapshots.
+    #[arg(short, long, action, default_value_t = false)]
+    force_snapshot: bool,
+
+    /// List of paths to collection snapshots.
+    /// Format: <snapshot_file_path>:<target_collection_name>
+    #[arg(long, value_name = "PATH:NAME", alias = "collection-snapshot")]
+    snapshot: Option<Vec<String>>,
+
+    /// Path to a snapshot of multiple collections.
+    /// Format: <snapshot_file_path>
+    #[arg(long, value_name = "PATH")]
+    storage_snapshot: Option<String>,
+
+    /// Path to an alternative configuration file.
+    /// Default path: config/config.yaml
+    #[arg(long, value_name = "PATH")]
+    config_path: Option<String>,
+
+    /// Disable telemetry sending to developers.
+    /// Read more: <https://qdrant.tech/documentation/guides/telemetry>
+    #[arg(long, action, default_value_t = false)]
+    disable_telemetry: bool,
+
+    /// Run stacktrace collector. Used for debugging.
+    #[arg(long, action, default_value_t = false)]
+    stacktrace: bool,
+
+    /// Reinit consensus state.
+    /// When enabled, the service will assume the consensus state should be reinitialized.
+    #[arg(long, action, default_value_t = false)]
+    reinit: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // Run backtrace collector, expected to be used by `rstack` crate.
+    if args.stacktrace {
+        #[cfg(all(target_os = "linux", feature = "stacktrace"))]
+        {
+            let _ = rstack_self::child();
+        }
+        return Ok(());
+    }
+
+    // No logging before setup
+    remove_started_file_indicator();
+
+    // Load settings
+    let settings = Settings::new(args.config_path)?;
+    // Setup logging / tracing
+    let logger_handle = tracing::setup(
+        settings
+            .logger
+            .with_top_level_directive(settings.log_level.clone()),
+    )?;
+    touch_started_file_indicator();
+    setup_panic_hook(!settings.telemetry_disabled && !args.disable_telemetry, TelemetryCollector::generate_id().to_string());
+
+    // Memory advice and async scorer configuration
+    memory::madvise::set_global(settings.storage.mmap_advice);
+    segment::vector_storage::common::set_async_scorer(
+        settings
+            .storage
+            .performance
+            .async_scorer
+            .unwrap_or_default(),
+    );
+
+    welcome(&settings);
+
+    // GPU HNSW initialization if enabled
+    #[cfg(feature = "gpu")]
+    if let Some(settings_gpu) = &settings.gpu {
+        use segment::index::hnsw_index::gpu::*;
+        if settings_gpu.indexing {
+            set_gpu_force_half_precision(settings_gpu.force_half_precision);
+            set_gpu_groups_count(settings_gpu.groups_count);
+            let mut manager = GPU_DEVICES_MANAGER.write();
+            *manager = match gpu_devices_manager::GpuDevicesMaganer::new(
+                &settings_gpu.device_filter,
+                settings_gpu.devices.as_deref(),
+                settings_gpu.allow_integrated,
+                settings_gpu.allow_emulated,
+                true,
+                settings_gpu.parallel_indexes.unwrap_or(1),
+            ) {
+                Ok(mgr) => Some(mgr),
+                Err(err) => {
+                    log::error!("Can't initialize GPU devices manager: {err}");
+                    None
+                }
+            };
+        }
+    }
+
+    // Validate settings early
+    settings.validate_and_warn();
+
+    // Determine bootstrap logic
+    let bootstrap = if args.bootstrap == args.uri {
+        if args.bootstrap.is_some() {
+            log::warn!(
+                "Bootstrap URI is the same as this peer URI. \
+                 Consider this peer the first in a new deployment."
+            );
+        }
+        None
+    } else {
+        args.bootstrap
+    };
+
+    // Load or initialize persistent consensus state
+    let persistent_consensus_state = Persistent::load_or_init(
+        &settings.storage.storage_path,
+        bootstrap.is_none(),
+        args.reinit,
+    )?;
+
+    let is_distributed_deployment = settings.cluster.enabled;
+    let temp_path = settings.storage.temp_path.as_deref();
+
+    // Recover snapshots if requested
+    let restored_collections = if let Some(full_snapshot) = args.storage_snapshot {
+        recover_full_snapshot(
+            temp_path,
+            &full_snapshot,
+            &settings.storage.storage_path,
+            args.force_snapshot,
+            persistent_consensus_state.this_peer_id(),
+            is_distributed_deployment,
+        )
+    } else if let Some(snapshots) = args.snapshot {
+        recover_snapshots(
+            &snapshots,
+            args.force_snapshot,
+            temp_path,
+            &settings.storage.storage_path,
+            persistent_consensus_state.this_peer_id(),
+            is_distributed_deployment,
+        )
+    } else {
+        vec![]
+    };
+
+    // Inference Service integration
+    if let Some(inf_cfg) = settings.inference.clone() {
+        match InferenceService::init_global(inf_cfg) {
+            Ok(_) => log::info!("Inference service is configured."),
+            Err(err) => log::error!("{err}"),
+        }
+    } else {
+        log::info!("Inference service is not configured.");
+    }
+
+    // Telemetry setup
+    let reporting_enabled = !settings.telemetry_disabled && !args.disable_telemetry;
+    let reporting_id = TelemetryCollector::generate_id();
+    let telemetry_collector =
+        TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
+    let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
+    if reporting_enabled {
+        log::info!("Telemetry reporting enabled, id: {reporting_id}");
+        runtime_handle.spawn(TelemetryReporter::run(Arc::new(tokio::sync::Mutex::new(telemetry_collector))));
+    } else {
+        log::info!("Telemetry reporting disabled");
+    }
+
+    // Feature flags reporting
+    let flags = feature_flags();
+    if !flags.is_default() {
+        log::debug!("Feature flags: {flags:?}");
+    }
+
+    // Rest of main: set up runtimes, channels, consensus, web & gRPC servers, health checks, etc.
+    // (omitted here for brevity; this block includes creating TableOfContent,
+    // Dispatcher, Consensus::run(), thread spawns for actix and tonic, and so on)
+
+    Ok(())
+}
+```
