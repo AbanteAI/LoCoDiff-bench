@@ -1,0 +1,227 @@
+--- qdrant_lib_segment_src_index_struct_payload_index.rs_expectedoutput.txt (expected)+++ qdrant_lib_segment_src_index_struct_payload_index.rs_extracted.txt (actual)@@ -1,4 +1,5 @@ use std::collections::HashMap;
++use std::fmt;
+ use std::fs::create_dir_all;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+@@ -29,6 +30,7 @@ };
+ use crate::index::payload_config::PayloadConfig;
+ use crate::index::query_estimator::estimate_filter;
++use crate::index::query_optimization::Optimizer;
+ use crate::index::query_optimization::payload_provider::PayloadProvider;
+ use crate::index::struct_filter_context::StructFilterContext;
+ use crate::index::visited_pool::VisitedPool;
+@@ -39,7 +41,7 @@ use crate::types::{
+     Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition, Payload,
+     PayloadContainer, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
+-    VectorNameBuf, infer_collection_value_type, infer_value_type,
++    VectorNameBuf, VectorStorageQuery, infer_collection_value_type, infer_value_type,
+ };
+ use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+ 
+@@ -70,7 +72,27 @@ }
+ 
+ impl StructPayloadIndex {
+-    pub fn estimate_field_condition(
++    fn config_path(&self) -> PathBuf {
++        PayloadConfig::get_config_path(&self.path)
++    }
++
++    fn save_config(&self) -> OperationResult<()> {
++        let config_path = self.config_path();
++        self.config.save(&config_path)
++    }
++
++    fn load_all_fields(&mut self) -> OperationResult<()> {
++        let mut field_indexes: IndexesMap = Default::default();
++
++        for (field, payload_schema) in &self.config.indexed_fields {
++            let field_index = self.load_from_db(field, payload_schema)?;
++            field_indexes.insert(field.clone(), field_index);
++        }
++        self.field_indexes = field_indexes;
++        Ok(())
++    }
++
++    fn estimate_field_condition(
+         &self,
+         condition: &FieldCondition,
+         nested_path: Option<&JsonPath>,
+@@ -108,26 +130,7 @@         }
+     }
+ 
+-    fn config_path(&self) -> PathBuf {
+-        PayloadConfig::get_config_path(&self.path)
+-    }
+-
+-    fn save_config(&self) -> OperationResult<()> {
+-        let config_path = self.config_path();
+-        self.config.save(&config_path)
+-    }
+-
+-    fn load_all_fields(&mut self) -> OperationResult<()> {
+-        let mut field_indexes: IndexesMap = Default::default();
+-
+-        for (field, payload_schema) in &self.config.indexed_fields {
+-            let field_index = self.load_from_db(field, payload_schema)?;
+-            field_indexes.insert(field.clone(), field_index);
+-        }
+-        self.field_indexes = field_indexes;
+-        Ok(())
+-    }
+-
++    /// Load field index from disk or build if not exists.
+     fn load_from_db(
+         &self,
+         field: PayloadKeyTypeRef,
+@@ -138,7 +141,7 @@             .new_index(field, payload_schema)?;
+ 
+         let mut is_loaded = true;
+-        for ref mut index in indexes.iter_mut() {
++        for index in &mut indexes {
+             if !index.load()? {
+                 is_loaded = false;
+                 break;
+@@ -150,7 +153,7 @@             indexes = self.build_field_indexes(
+                 field,
+                 payload_schema,
+-                &HardwareCounterCell::disposable(), // Internal operation.
++                &HardwareCounterCell::disposable(), // Internal operation
+             )?;
+         }
+ 
+@@ -179,20 +182,18 @@         let skip_rocksdb = config.skip_rocksdb.unwrap_or(false);
+ 
+         let storage_type = if is_appendable {
+-            let db = open_db_with_existing_cf(path).map_err(|err| {
+-                OperationError::service_error(format!("RocksDB open error: {err}"))
+-            })?;
++            let db = open_db_with_existing_cf(path)
++                .map_err(|err| OperationError::service_error(format!("RocksDB open error: {err}")))?;
+             StorageType::Appendable(db)
+         } else if skip_rocksdb {
+             StorageType::NonAppendable
+         } else {
+-            let db = open_db_with_existing_cf(path).map_err(|err| {
+-                OperationError::service_error(format!("RocksDB open error: {err}"))
+-            })?;
++            let db = open_db_with_existing_cf(path)
++                .map_err(|err| OperationError::service_error(format!("RocksDB open error: {err}")))?;
+             StorageType::NonAppendableRocksDb(db)
+         };
+ 
+-        let mut index = StructPayloadIndex {
++        let mut index = Self {
+             payload,
+             id_tracker,
+             vector_storages,
+@@ -239,10 +240,10 @@             hw_counter,
+         )?;
+ 
+-        builders
++        Ok(builders
+             .into_iter()
+             .map(|builder| builder.finalize())
+-            .collect()
++            .collect::<Result<_, _>>()?)
+     }
+ 
+     /// Number of available points
+@@ -312,11 +313,12 @@                 }
+             }
+             Condition::HasVector(has_vectors) => {
+-                if let Some(vector_storage) = self.vector_storages.get(&has_vectors.has_vector) {
++                let vector_name = &has_vectors.has_vector;
++                if let Some(vector_storage) = self.vector_storages.get(vector_name) {
+                     let vector_storage = vector_storage.borrow();
+                     let vectors = vector_storage.available_vector_count();
+                     CardinalityEstimation::exact(vectors).with_primary_clause(
+-                        PrimaryCondition::HasVector(has_vectors.has_vector.clone()),
++                        PrimaryCondition::HasVector(vector_name.clone()),
+                     )
+                 } else {
+                     CardinalityEstimation::exact(0)
+@@ -330,37 +332,6 @@                 cond.estimate_cardinality(self.id_tracker.borrow().available_point_count())
+             }
+         }
+-    }
+-
+-    pub fn get_telemetry_data(&self) -> Vec<PayloadIndexTelemetry> {
+-        self.field_indexes
+-            .iter()
+-            .flat_map(|(name, field)| -> Vec<PayloadIndexTelemetry> {
+-                field
+-                    .iter()
+-                    .map(|field| field.get_telemetry_data().set_name(name.to_string()))
+-                    .collect()
+-            })
+-            .collect()
+-    }
+-
+-    pub fn restore_database_snapshot(
+-        snapshot_path: &Path,
+-        segment_path: &Path,
+-    ) -> OperationResult<()> {
+-        crate::rocksdb_backup::restore(snapshot_path, &segment_path.join("payload_index"))
+-    }
+-
+-    fn clear_index_for_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
+-        for (_, field_indexes) in self.field_indexes.iter_mut() {
+-            for index in field_indexes {
+-                index.remove_point(point_id)?;
+-            }
+-        }
+-        Ok(())
+-    }
+-    pub fn config(&self) -> &PayloadConfig {
+-        &self.config
+     }
+ 
+     pub fn iter_filtered_points<'a>(
+@@ -444,7 +415,7 @@     }
+ 
+     pub fn populate(&self) -> OperationResult<()> {
+-        for (_, field_indexes) in self.field_indexes.iter() {
++        for field_indexes in self.field_indexes.values() {
+             for index in field_indexes {
+                 index.populate()?;
+             }
+@@ -453,7 +424,7 @@     }
+ 
+     pub fn clear_cache(&self) -> OperationResult<()> {
+-        for (_, field_indexes) in self.field_indexes.iter() {
++        for field_indexes in self.field_indexes.values() {
+             for index in field_indexes {
+                 index.clear_cache()?;
+             }
+@@ -462,11 +433,23 @@     }
+ 
+     pub fn clear_cache_if_on_disk(&self) -> OperationResult<()> {
+-        for (_, field_indexes) in self.field_indexes.iter() {
++        for field_indexes in self.field_indexes.values() {
+             for index in field_indexes {
+                 if index.is_on_disk() {
+                     index.clear_cache()?;
+                 }
++            }
++        }
++        Ok(())
++    }
++    pub fn config(&self) -> &PayloadConfig {
++        &self.config
++    }
++
++    fn clear_index_for_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
++        for field_indexes in self.field_indexes.values_mut() {
++            for index in field_indexes {
++                index.remove_point(point_id)?;
+             }
+         }
+         Ok(())
+@@ -762,7 +745,7 @@         let mut files = self
+             .field_indexes
+             .values()
+-            .flat_map(|indexes| indexes.iter().flat_map(|index| index.files().into_iter()))
++            .flat_map(|indexes| indexes.iter().flat_map(|index| index.files()))
+             .collect::<Vec<PathBuf>>();
+         files.push(self.config_path());
+         files
