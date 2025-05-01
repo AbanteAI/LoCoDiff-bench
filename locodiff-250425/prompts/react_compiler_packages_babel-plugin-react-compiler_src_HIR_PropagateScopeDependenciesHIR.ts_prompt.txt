@@ -1,0 +1,2290 @@
+# Instructions
+
+You are being benchmarked. You will see the output of a git log command, and from that must infer the current state of a file. Think carefully, as you must output the exact state of the file to earn full marks.
+
+**Important:** Your goal is to reproduce the file's content *exactly* as it exists at the final commit, even if the code appears broken, buggy, or contains obvious errors. Do **not** try to "fix" the code. Attempting to correct issues will result in a poor score, as this benchmark evaluates your ability to reproduce the precise state of the file based on its history.
+
+# Required Response Format
+
+Wrap the content of the file in triple backticks (```). Any text outside the final closing backticks will be ignored. End your response after outputting the closing backticks.
+
+# Example Response
+
+```python
+#!/usr/bin/env python
+print('Hello, world!')
+```
+
+# File History
+
+> git log -p --cc --topo-order --reverse -- compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+
+commit 206df66e70652e85711c3177ce1a0459609a7771
+Author: Mofei Zhang <feifei0@meta.com>
+Date:   Thu Sep 12 16:59:40 2024 -0400
+
+    [compiler][rewrite] PropagateScopeDeps hir rewrite
+    
+    Resubmission of #30079 -- core logic unchanged, but needed to rebase past #30573
+    
+    ### Quick background
+    #### Temporaries
+    
+    The compiler currently treats temporaries and named variables (e.g. `x`) differently in this pass.
+    - named variables may be reassigned (in fact, since we're running after LeaveSSA, a single named identifier's IdentifierId may map to multiple `Identifier` instances -- each with its own scope and mutable range)
+    - temporaries are replaced with their represented expressions during codegen. This is correct (mostly correct, see #29878) as we're careful to always lower the correct evaluation semantics. However, since we rewrite reactive scopes entirely (to if/else blocks), we need to track temporaries that a scope produces in `ReactiveScope.declarations` and later promote them to named variables.
+    In the same example, $4, $5, and $6 need to be promoted: $2 ->`t0`,  $5 ->`t1`, and $6 ->`t2`.
+    ```js
+    [1] $2 = LoadGlobal(global) foo
+    [2] $3 = LoadLocal bar$1
+    scope 0:
+      [3] $4 = Call $2(<unknown> $3)
+    scope 1:
+      [4] $5 = Object {  }
+    scope 2:
+      [5] $6 = Object { a: $4, b: $5 }
+    [6] $8 = StoreLocal Const x$7 = $6
+    ```
+    
+    #### Dependencies
+    `ReactiveScope.dependencies` records the set of (read-only) values that a reactive scope is dependent on. This is currently limited to just variables (named variables from source and promoted temporaries) and property-loads.
+    All dependencies we record need to be hoistable -- i.e. reordered to just before the ReactiveScope begins. Not all PropertyLoads are hoistable.
+    
+    In this example, we should not evaluate `obj.a.b` without before creating x and checking `objIsNull`.
+    ```js
+    // reduce-reactive-deps/no-uncond.js
+    function useFoo({ obj, objIsNull }) {
+      const x = [];
+      if (isFalse(objIsNull)) {
+        x.push(obj.a.b);
+      }
+      return x;
+    }
+    ```
+    
+    While other memoization strategies with different constraints exist, the current compiler requires that `ReactiveScope.dependencies` be re-orderable to the beginning of the reactive scope. But.. `PropertyLoad`s from null values will throw `TypeError`. This means that evaluating hoisted dependencies should throw if and only if the source program throws. (It is also a bug if source throws and compiler output does not throw. See https://github.com/facebook/react-forget/pull/2709)
+    
+    ---
+    ### Rough high level overview
+    1. Pass 1
+    Walk over instructions to gather every temporary used outside of its defining scope (same as ReactiveFunction version). These determine the sidemaps we produce, as temporaries used outside of their declaring scopes get promoted to named variables later (and are not considered hoistable rvals).
+    2. Pass 2 (collectTemporariesSidemap)
+    Walk over instructions to generate a sidemap of temporary identifier -> named variable and property path (e.g. `$3 -> {obj: props, path: ["a", "b"]}`)
+    2. Pass 2 (collectHoistablePropertyLoads)
+      a. Build a sidemap of block -> accessed variables and properties (e.g. `bb0 -> [ {obj: props, path: ["a", "b"]} ]`)
+      b. Propagate "non-nullness" i.e. variables and properties for which we can safely evaluate `PropertyLoad`.
+      A basic block can unconditionally read from identifier X if any of the following applies:
+        - the block itself reads from identifier X
+        - all predecessors of the block read from identifier X
+        - all successors of the block read from identifier X
+    4. Pass 3: (collectDependencies)
+    Walks over instructions again to record dependencies and declarations, using the previously produced sidemaps. We do not record any control-flow here
+    5. Merge every scope's recorded dependencies with the set of hoistable PropertyLoads
+    
+    Tested by syncing internally and (1) checking compilation output differences ([internal link](https://www.internalfb.com/intern/everpaste/?handle=GPCfUBt_HCoy_S4EAJDVFJyJJMR0bsIXAAAB)), running internally e2e tests ([internal link](https://fburl.com/sandcastle/cs5mlkxq))
+    
+    ---
+    ### Followups:
+    1. Rewrite function expression deps
+    This change produces much more optimal output as the compiler now uses the function CFG to understand which variables / paths are assumed to be non-null. However, it may exacerbate [this function-expr hoisting bug](https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/src/__tests__/fixtures/compiler/bug-invalid-hoisting-functionexpr.tsx). A short term fix here is to simply call some form of `collectNonNullObjects` on every function expression to find hoistable variable / paths. In the longer term, we should refactor out `FunctionExpression.deps`.
+    
+    2. Enable optional paths
+    (a) don't count optional load temporaries as dependencies (e.g. `collectOptionalLoadRValues(...)`).
+    (b) record optional paths in both collectHoistablePropertyLoads and dependency collection
+    
+    ghstack-source-id: 2507f6ea751dce09ad1dccd353ae6fc7cf411582
+    Pull Request resolved: https://github.com/facebook/react/pull/30894
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+new file mode 100644
+index 0000000000..4c7dac004d
+--- /dev/null
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -0,0 +1,557 @@
++import {
++  ScopeId,
++  HIRFunction,
++  Place,
++  Instruction,
++  ReactiveScopeDependency,
++  Identifier,
++  ReactiveScope,
++  isObjectMethodType,
++  isRefValueType,
++  isUseRefType,
++  makeInstructionId,
++  InstructionId,
++  InstructionKind,
++  GeneratedSource,
++  DeclarationId,
++  areEqualPaths,
++  IdentifierId,
++} from './HIR';
++import {
++  BlockInfo,
++  collectHoistablePropertyLoads,
++  getProperty,
++} from './CollectHoistablePropertyLoads';
++import {
++  ScopeBlockTraversal,
++  eachInstructionOperand,
++  eachInstructionValueOperand,
++  eachPatternOperand,
++  eachTerminalOperand,
++} from './visitors';
++import {Stack, empty} from '../Utils/Stack';
++import {CompilerError} from '../CompilerError';
++import {Iterable_some} from '../Utils/utils';
++import {ReactiveScopeDependencyTreeHIR} from './DeriveMinimalDependenciesHIR';
++
++export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
++  const usedOutsideDeclaringScope =
++    findTemporariesUsedOutsideDeclaringScope(fn);
++  const temporaries = collectTemporariesSidemap(fn, usedOutsideDeclaringScope);
++
++  const hoistablePropertyLoads = collectHoistablePropertyLoads(fn, temporaries);
++
++  const scopeDeps = collectDependencies(
++    fn,
++    usedOutsideDeclaringScope,
++    temporaries,
++  );
++
++  /**
++   * Derive the minimal set of hoistable dependencies for each scope.
++   */
++  for (const [scope, deps] of scopeDeps) {
++    const tree = new ReactiveScopeDependencyTreeHIR();
++
++    /**
++     * Step 1: Add every dependency used by this scope (e.g. `a.b.c`)
++     */
++    for (const dep of deps) {
++      tree.addDependency({...dep});
++    }
++    /**
++     * Step 2: Mark hoistable dependencies, given the basic block in
++     * which the scope begins.
++     */
++    recordHoistablePropertyReads(hoistablePropertyLoads, scope.id, tree);
++    const candidates = tree.deriveMinimalDependencies();
++    for (const candidateDep of candidates) {
++      if (
++        !Iterable_some(
++          scope.dependencies,
++          existingDep =>
++            existingDep.identifier.declarationId ===
++              candidateDep.identifier.declarationId &&
++            areEqualPaths(existingDep.path, candidateDep.path),
++        )
++      )
++        scope.dependencies.add(candidateDep);
++    }
++  }
++}
++
++function findTemporariesUsedOutsideDeclaringScope(
++  fn: HIRFunction,
++): ReadonlySet<DeclarationId> {
++  /*
++   * tracks all relevant LoadLocal and PropertyLoad lvalues
++   * and the scope where they are defined
++   */
++  const declarations = new Map<DeclarationId, ScopeId>();
++  const prunedScopes = new Set<ScopeId>();
++  const scopeTraversal = new ScopeBlockTraversal();
++  const usedOutsideDeclaringScope = new Set<DeclarationId>();
++
++  function handlePlace(place: Place): void {
++    const declaringScope = declarations.get(place.identifier.declarationId);
++    if (
++      declaringScope != null &&
++      !scopeTraversal.isScopeActive(declaringScope) &&
++      !prunedScopes.has(declaringScope)
++    ) {
++      // Declaring scope is not active === used outside declaring scope
++      usedOutsideDeclaringScope.add(place.identifier.declarationId);
++    }
++  }
++
++  function handleInstruction(instr: Instruction): void {
++    const scope = scopeTraversal.currentScope;
++    if (scope == null || prunedScopes.has(scope)) {
++      return;
++    }
++    switch (instr.value.kind) {
++      case 'LoadLocal':
++      case 'LoadContext':
++      case 'PropertyLoad': {
++        declarations.set(instr.lvalue.identifier.declarationId, scope);
++        break;
++      }
++      default: {
++        break;
++      }
++    }
++  }
++
++  for (const [blockId, block] of fn.body.blocks) {
++    scopeTraversal.recordScopes(block);
++    const scopeStartInfo = scopeTraversal.blockInfos.get(blockId);
++    if (scopeStartInfo?.kind === 'begin' && scopeStartInfo.pruned) {
++      prunedScopes.add(scopeStartInfo.scope.id);
++    }
++    for (const instr of block.instructions) {
++      for (const place of eachInstructionOperand(instr)) {
++        handlePlace(place);
++      }
++      handleInstruction(instr);
++    }
++
++    for (const place of eachTerminalOperand(block.terminal)) {
++      handlePlace(place);
++    }
++  }
++  return usedOutsideDeclaringScope;
++}
++
++/**
++ * @returns mapping of LoadLocal and PropertyLoad to the source of the load.
++ * ```js
++ * // source
++ * foo(a.b);
++ *
++ * // HIR: a potential sidemap is {0: a, 1: a.b, 2: foo}
++ * $0 = LoadLocal 'a'
++ * $1 = PropertyLoad $0, 'b'
++ * $2 = LoadLocal 'foo'
++ * $3 = CallExpression $2($1)
++ * ```
++ * Only map LoadLocal and PropertyLoad lvalues to their source if we know that
++ * reordering the read (from the time-of-load to time-of-use) is valid.
++ *
++ * If a LoadLocal or PropertyLoad instruction is within the reactive scope range
++ * (a proxy for mutable range) of the load source, later instructions may
++ * reassign / mutate the source value. Since it's incorrect to reorder these
++ * load instructions to after their scope ranges, we also do not store them in
++ * identifier sidemaps.
++ *
++ * Take this example (from fixture
++ * `evaluation-order-mutate-call-after-dependency-load`)
++ * ```js
++ * // source
++ * function useFoo(arg) {
++ *   const arr = [1, 2, 3, ...arg];
++ *   return [
++ *     arr.length,
++ *     arr.push(0)
++ *   ];
++ * }
++ *
++ * // IR pseudocode
++ * scope @0 {
++ *   $0 = arr = ArrayExpression [1, 2, 3, ...arg]
++ *   $1 = arr.length
++ *   $2 = arr.push(0)
++ * }
++ * scope @1 {
++ *   $3 = ArrayExpression [$1, $2]
++ * }
++ * ```
++ * Here, it's invalid for scope@1 to take `arr.length` as a dependency instead
++ * of $1, as the evaluation of `arr.length` changes between instructions $1 and
++ * $3. We do not track $1 -> arr.length in this case.
++ */
++function collectTemporariesSidemap(
++  fn: HIRFunction,
++  usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
++): ReadonlyMap<IdentifierId, ReactiveScopeDependency> {
++  const temporaries = new Map<IdentifierId, ReactiveScopeDependency>();
++  for (const [_, block] of fn.body.blocks) {
++    for (const instr of block.instructions) {
++      const {value, lvalue} = instr;
++      const usedOutside = usedOutsideDeclaringScope.has(
++        lvalue.identifier.declarationId,
++      );
++
++      if (value.kind === 'PropertyLoad' && !usedOutside) {
++        const property = getProperty(value.object, value.property, temporaries);
++        temporaries.set(lvalue.identifier.id, property);
++      } else if (
++        value.kind === 'LoadLocal' &&
++        lvalue.identifier.name == null &&
++        value.place.identifier.name !== null &&
++        !usedOutside
++      ) {
++        temporaries.set(lvalue.identifier.id, {
++          identifier: value.place.identifier,
++          path: [],
++        });
++      }
++    }
++  }
++  return temporaries;
++}
++
++type Decl = {
++  id: InstructionId;
++  scope: Stack<ReactiveScope>;
++};
++
++class Context {
++  #declarations: Map<DeclarationId, Decl> = new Map();
++  #reassignments: Map<Identifier, Decl> = new Map();
++
++  #scopes: Stack<ReactiveScope> = empty();
++  // Reactive dependencies used in the current reactive scope.
++  #dependencies: Stack<Array<ReactiveScopeDependency>> = empty();
++  deps: Map<ReactiveScope, Array<ReactiveScopeDependency>> = new Map();
++
++  #temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>;
++  #temporariesUsedOutsideScope: ReadonlySet<DeclarationId>;
++
++  constructor(
++    temporariesUsedOutsideScope: ReadonlySet<DeclarationId>,
++    temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
++  ) {
++    this.#temporariesUsedOutsideScope = temporariesUsedOutsideScope;
++    this.#temporaries = temporaries;
++  }
++
++  enterScope(scope: ReactiveScope): void {
++    // Set context for new scope
++    this.#dependencies = this.#dependencies.push([]);
++    this.#scopes = this.#scopes.push(scope);
++  }
++
++  exitScope(scope: ReactiveScope, pruned: boolean): void {
++    // Save dependencies we collected from the exiting scope
++    const scopedDependencies = this.#dependencies.value;
++    CompilerError.invariant(scopedDependencies != null, {
++      reason: '[PropagateScopeDeps]: Unexpected scope mismatch',
++      loc: scope.loc,
++    });
++
++    // Restore context of previous scope
++    this.#scopes = this.#scopes.pop();
++    this.#dependencies = this.#dependencies.pop();
++
++    /*
++     * Collect dependencies we recorded for the exiting scope and propagate
++     * them upward using the same rules as normal dependency collection.
++     * Child scopes may have dependencies on values created within the outer
++     * scope, which necessarily cannot be dependencies of the outer scope.
++     */
++    for (const dep of scopedDependencies) {
++      if (this.#checkValidDependency(dep)) {
++        this.#dependencies.value?.push(dep);
++      }
++    }
++
++    if (!pruned) {
++      this.deps.set(scope, scopedDependencies);
++    }
++  }
++
++  isUsedOutsideDeclaringScope(place: Place): boolean {
++    return this.#temporariesUsedOutsideScope.has(
++      place.identifier.declarationId,
++    );
++  }
++
++  /*
++   * Records where a value was declared, and optionally, the scope where the value originated from.
++   * This is later used to determine if a dependency should be added to a scope; if the current
++   * scope we are visiting is the same scope where the value originates, it can't be a dependency
++   * on itself.
++   */
++  declare(identifier: Identifier, decl: Decl): void {
++    if (!this.#declarations.has(identifier.declarationId)) {
++      this.#declarations.set(identifier.declarationId, decl);
++    }
++    this.#reassignments.set(identifier, decl);
++  }
++
++  // Checks if identifier is a valid dependency in the current scope
++  #checkValidDependency(maybeDependency: ReactiveScopeDependency): boolean {
++    // ref.current access is not a valid dep
++    if (
++      isUseRefType(maybeDependency.identifier) &&
++      maybeDependency.path.at(0)?.property === 'current'
++    ) {
++      return false;
++    }
++
++    // ref value is not a valid dep
++    if (isRefValueType(maybeDependency.identifier)) {
++      return false;
++    }
++
++    /*
++     * object methods are not deps because they will be codegen'ed back in to
++     * the object literal.
++     */
++    if (isObjectMethodType(maybeDependency.identifier)) {
++      return false;
++    }
++
++    const identifier = maybeDependency.identifier;
++    /*
++     * If this operand is used in a scope, has a dynamic value, and was defined
++     * before this scope, then its a dependency of the scope.
++     */
++    const currentDeclaration =
++      this.#reassignments.get(identifier) ??
++      this.#declarations.get(identifier.declarationId);
++    const currentScope = this.currentScope.value;
++    return (
++      currentScope != null &&
++      currentDeclaration !== undefined &&
++      currentDeclaration.id < currentScope.range.start
++    );
++  }
++
++  #isScopeActive(scope: ReactiveScope): boolean {
++    if (this.#scopes === null) {
++      return false;
++    }
++    return this.#scopes.find(state => state === scope);
++  }
++
++  get currentScope(): Stack<ReactiveScope> {
++    return this.#scopes;
++  }
++
++  visitOperand(place: Place): void {
++    /*
++     * if this operand is a temporary created for a property load, try to resolve it to
++     * the expanded Place. Fall back to using the operand as-is.
++     */
++    this.visitDependency(
++      this.#temporaries.get(place.identifier.id) ?? {
++        identifier: place.identifier,
++        path: [],
++      },
++    );
++  }
++
++  visitProperty(object: Place, property: string): void {
++    const nextDependency = getProperty(object, property, this.#temporaries);
++    this.visitDependency(nextDependency);
++  }
++
++  visitDependency(maybeDependency: ReactiveScopeDependency): void {
++    /*
++     * Any value used after its originally defining scope has concluded must be added as an
++     * output of its defining scope. Regardless of whether its a const or not,
++     * some later code needs access to the value. If the current
++     * scope we are visiting is the same scope where the value originates, it can't be a dependency
++     * on itself.
++     */
++
++    /*
++     * if originalDeclaration is undefined here, then this is not a local var
++     * (all decls e.g. `let x;` should be initialized in BuildHIR)
++     */
++    const originalDeclaration = this.#declarations.get(
++      maybeDependency.identifier.declarationId,
++    );
++    if (
++      originalDeclaration !== undefined &&
++      originalDeclaration.scope.value !== null
++    ) {
++      originalDeclaration.scope.each(scope => {
++        if (
++          !this.#isScopeActive(scope) &&
++          !Iterable_some(
++            scope.declarations.values(),
++            decl =>
++              decl.identifier.declarationId ===
++              maybeDependency.identifier.declarationId,
++          )
++        ) {
++          scope.declarations.set(maybeDependency.identifier.id, {
++            identifier: maybeDependency.identifier,
++            scope: originalDeclaration.scope.value!,
++          });
++        }
++      });
++    }
++
++    if (this.#checkValidDependency(maybeDependency)) {
++      this.#dependencies.value!.push(maybeDependency);
++    }
++  }
++
++  /*
++   * Record a variable that is declared in some other scope and that is being reassigned in the
++   * current one as a {@link ReactiveScope.reassignments}
++   */
++  visitReassignment(place: Place): void {
++    const currentScope = this.currentScope.value;
++    if (
++      currentScope != null &&
++      !Iterable_some(
++        currentScope.reassignments,
++        identifier =>
++          identifier.declarationId === place.identifier.declarationId,
++      ) &&
++      this.#checkValidDependency({identifier: place.identifier, path: []})
++    ) {
++      currentScope.reassignments.add(place.identifier);
++    }
++  }
++}
++
++function handleInstruction(instr: Instruction, context: Context): void {
++  const {id, value, lvalue} = instr;
++  if (value.kind === 'LoadLocal') {
++    if (
++      value.place.identifier.name === null ||
++      lvalue.identifier.name !== null ||
++      context.isUsedOutsideDeclaringScope(lvalue)
++    ) {
++      context.visitOperand(value.place);
++    }
++  } else if (value.kind === 'PropertyLoad') {
++    if (context.isUsedOutsideDeclaringScope(lvalue)) {
++      context.visitProperty(value.object, value.property);
++    }
++  } else if (value.kind === 'StoreLocal') {
++    context.visitOperand(value.value);
++    if (value.lvalue.kind === InstructionKind.Reassign) {
++      context.visitReassignment(value.lvalue.place);
++    }
++    context.declare(value.lvalue.place.identifier, {
++      id,
++      scope: context.currentScope,
++    });
++  } else if (value.kind === 'DeclareLocal' || value.kind === 'DeclareContext') {
++    /*
++     * Some variables may be declared and never initialized. We need
++     * to retain (and hoist) these declarations if they are included
++     * in a reactive scope. One approach is to simply add all `DeclareLocal`s
++     * as scope declarations.
++     */
++
++    /*
++     * We add context variable declarations here, not at `StoreContext`, since
++     * context Store / Loads are modeled as reads and mutates to the underlying
++     * variable reference (instead of through intermediate / inlined temporaries)
++     */
++    context.declare(value.lvalue.place.identifier, {
++      id,
++      scope: context.currentScope,
++    });
++  } else if (value.kind === 'Destructure') {
++    context.visitOperand(value.value);
++    for (const place of eachPatternOperand(value.lvalue.pattern)) {
++      if (value.lvalue.kind === InstructionKind.Reassign) {
++        context.visitReassignment(place);
++      }
++      context.declare(place.identifier, {
++        id,
++        scope: context.currentScope,
++      });
++    }
++  } else {
++    for (const operand of eachInstructionValueOperand(value)) {
++      context.visitOperand(operand);
++    }
++  }
++
++  context.declare(lvalue.identifier, {
++    id,
++    scope: context.currentScope,
++  });
++}
++
++function collectDependencies(
++  fn: HIRFunction,
++  usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
++  temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
++): Map<ReactiveScope, Array<ReactiveScopeDependency>> {
++  const context = new Context(usedOutsideDeclaringScope, temporaries);
++
++  for (const param of fn.params) {
++    if (param.kind === 'Identifier') {
++      context.declare(param.identifier, {
++        id: makeInstructionId(0),
++        scope: empty(),
++      });
++    } else {
++      context.declare(param.place.identifier, {
++        id: makeInstructionId(0),
++        scope: empty(),
++      });
++    }
++  }
++
++  const scopeTraversal = new ScopeBlockTraversal();
++
++  for (const [blockId, block] of fn.body.blocks) {
++    scopeTraversal.recordScopes(block);
++    const scopeBlockInfo = scopeTraversal.blockInfos.get(blockId);
++    if (scopeBlockInfo?.kind === 'begin') {
++      context.enterScope(scopeBlockInfo.scope);
++    } else if (scopeBlockInfo?.kind === 'end') {
++      context.exitScope(scopeBlockInfo.scope, scopeBlockInfo?.pruned);
++    }
++
++    for (const instr of block.instructions) {
++      handleInstruction(instr, context);
++    }
++    for (const place of eachTerminalOperand(block.terminal)) {
++      context.visitOperand(place);
++    }
++  }
++  return context.deps;
++}
++
++/**
++ * Compute the set of hoistable property reads.
++ */
++function recordHoistablePropertyReads(
++  nodes: ReadonlyMap<ScopeId, BlockInfo>,
++  scopeId: ScopeId,
++  tree: ReactiveScopeDependencyTreeHIR,
++): void {
++  const node = nodes.get(scopeId);
++  CompilerError.invariant(node != null, {
++    reason: '[PropagateScopeDependencies] Scope not found in tracked blocks',
++    loc: GeneratedSource,
++  });
++
++  for (const item of node.assumedNonNullObjects) {
++    tree.markNodesNonNull({
++      ...item.fullPath,
++    });
++  }
++}
+
+commit 58a3ca3b47f6a51cea48ea95ded26c9887baca38
+Author: Mofei Zhang <feifei0@meta.com>
+Date:   Mon Sep 30 12:24:21 2024 -0400
+
+    [compiler][hir-rewrite] Cleanup Identifier -> IdentifierId
+    
+    Since removing ExitSSA, Identifier and IdentifierId should mean the same thing
+    
+    ghstack-source-id: 076cacbe8360e716b0555088043502823f9ee72e
+    Pull Request resolved: https://github.com/facebook/react/pull/31034
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 4c7dac004d..1fe218c352 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -20,7 +20,6 @@ import {
+ import {
+   BlockInfo,
+   collectHoistablePropertyLoads,
+-  getProperty,
+ } from './CollectHoistablePropertyLoads';
+ import {
+   ScopeBlockTraversal,
+@@ -220,6 +219,54 @@ function collectTemporariesSidemap(
+   return temporaries;
+ }
+ 
++function getProperty(
++  object: Place,
++  propertyName: string,
++  temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
++): ReactiveScopeDependency {
++  /*
++   * (1) Get the base object either from the temporary sidemap (e.g. a LoadLocal)
++   * or a deep copy of an existing property dependency.
++   *  Example 1:
++   *    $0 = LoadLocal x
++   *    $1 = PropertyLoad $0.y
++   *  getProperty($0, ...) -> resolvedObject = x, resolvedDependency = null
++   *
++   *  Example 2:
++   *    $0 = LoadLocal x
++   *    $1 = PropertyLoad $0.y
++   *    $2 = PropertyLoad $1.z
++   *  getProperty($1, ...) -> resolvedObject = null, resolvedDependency = x.y
++   *
++   *  Example 3:
++   *    $0 = Call(...)
++   *    $1 = PropertyLoad $0.y
++   *  getProperty($0, ...) -> resolvedObject = null, resolvedDependency = null
++   */
++  const resolvedDependency = temporaries.get(object.identifier.id);
++
++  /**
++   * (2) Push the last PropertyLoad
++   * TODO(mofeiZ): understand optional chaining
++   */
++  let property: ReactiveScopeDependency;
++  if (resolvedDependency == null) {
++    property = {
++      identifier: object.identifier,
++      path: [{property: propertyName, optional: false}],
++    };
++  } else {
++    property = {
++      identifier: resolvedDependency.identifier,
++      path: [
++        ...resolvedDependency.path,
++        {property: propertyName, optional: false},
++      ],
++    };
++  }
++  return property;
++}
++
+ type Decl = {
+   id: InstructionId;
+   scope: Stack<ReactiveScope>;
+
+commit 0751fac747452af8c0494900b4afa7c56ee7b32c
+Author: Mofei Zhang <feifei0@meta.com>
+Date:   Wed Oct 2 12:53:57 2024 -0400
+
+    [compiler] Optional chaining for dependencies (HIR rewrite)
+    
+    Adds HIR version of `PropagateScopeDeps` to handle optional chaining.
+    
+    Internally, this improves memoization on ~4% of compiled files (internal links: [1](https://www.internalfb.com/intern/paste/P1610406497/))
+    
+    Summarizing the changes in this PR.
+    1. `CollectOptionalChainDependencies` recursively traverses optional blocks down to the base. From the base, we build up a set of `baseIdentifier.propertyA?.propertyB` mappings.
+    The tricky bit here is that optional blocks sometimes reference other optional blocks that are *not* part of the same chain e.g. a(c?.d)?.d. See code + comments in `traverseOptionalBlock` for how we avoid concatenating unrelated blocks.
+    
+    2. Adding optional chains into non-null object calculation.
+    (Note that marking `a?.b` as 'non-null' means that `a?.b.c` is safe to evaluate, *not* `(a?.b).c`. Happy to rename this / reword comments accordingly if there's a better term)
+    This pass is split into two stages. (1) collecting non-null objects by block and (2) propagating non-null objects across blocks. The only significant change here was to (2). We add an extra reduce step `X=Reduce(Union(X, Intersect(X_neighbors)))` to merge optional and non-optional nodes (e.g. nonNulls=`{a, a?.b}` reduces to `{a, a.b}`)
+    
+    3. Adding optional chains into dependency calculation.
+    This was the trickiest. We need to take the "maximal" property chain as a dependency. Prior to this PR, we avoided taking subpaths e.g. `a.b` of `a.b.c` as dependencies by only visiting non-PropertyLoad/LoadLocal instructions. This effectively only recorded the property-path at site-of-use.
+    
+        Unfortunately, this *quite* doesn't work for optional chains for a few reasons:
+        - We would need to skip relevant `StoreLocal`/`Branch terminal` instructions (but only those within optional blocks that have been successfully read).
+        - Given an optional chain, either (1) only a subpath or (2) the entire path can be represented as a PropertyLoad. We cannot directly add the last hoistable optional-block as a dependency as MethodCalls are an edge case e.g. given a?.b.c(), we should depend on `a?.b`, not `a?.b.c`
+          This means that we add its dependency at either the innermost unhoistable optional-block or when encountering it within its phi-join.
+    
+    4. Handle optional chains in DeriveMinimalDependenciesHIR.
+    This was also a bit tricky to formulate. Ideally, we would avoid a 2^3 case join (cond | uncond cfg, optional | not optional load, access | dependency). This PR attempts to simplify by building two trees
+        1. First add each hoistable path into a tree containing `Optional | NonOptional` nodes.
+        2. Then add each dependency into another tree containing `Optional | NonOptional`, `Access | Dependency` nodes, truncating the dependency at the earliest non-hoistable node (i.e. non-matching pair when walking the hoistable tree)
+    
+    ghstack-source-id: a2170f26280dfbf65a4893d8a658f863a0fd0c88
+    Pull Request resolved: https://github.com/facebook/react/pull/31037
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 1fe218c352..a7346e0e6b 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -17,10 +17,7 @@ import {
+   areEqualPaths,
+   IdentifierId,
+ } from './HIR';
+-import {
+-  BlockInfo,
+-  collectHoistablePropertyLoads,
+-} from './CollectHoistablePropertyLoads';
++import {collectHoistablePropertyLoads} from './CollectHoistablePropertyLoads';
+ import {
+   ScopeBlockTraversal,
+   eachInstructionOperand,
+@@ -32,37 +29,61 @@ import {Stack, empty} from '../Utils/Stack';
+ import {CompilerError} from '../CompilerError';
+ import {Iterable_some} from '../Utils/utils';
+ import {ReactiveScopeDependencyTreeHIR} from './DeriveMinimalDependenciesHIR';
++import {collectOptionalChainSidemap} from './CollectOptionalChainDependencies';
+ 
+ export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
+   const usedOutsideDeclaringScope =
+     findTemporariesUsedOutsideDeclaringScope(fn);
+   const temporaries = collectTemporariesSidemap(fn, usedOutsideDeclaringScope);
++  const {
++    temporariesReadInOptional,
++    processedInstrsInOptional,
++    hoistableObjects,
++  } = collectOptionalChainSidemap(fn);
+ 
+-  const hoistablePropertyLoads = collectHoistablePropertyLoads(fn, temporaries);
++  const hoistablePropertyLoads = collectHoistablePropertyLoads(
++    fn,
++    temporaries,
++    hoistableObjects,
++  );
+ 
+   const scopeDeps = collectDependencies(
+     fn,
+     usedOutsideDeclaringScope,
+-    temporaries,
++    new Map([...temporaries, ...temporariesReadInOptional]),
++    processedInstrsInOptional,
+   );
+ 
+   /**
+    * Derive the minimal set of hoistable dependencies for each scope.
+    */
+   for (const [scope, deps] of scopeDeps) {
+-    const tree = new ReactiveScopeDependencyTreeHIR();
++    if (deps.length === 0) {
++      continue;
++    }
+ 
+     /**
+-     * Step 1: Add every dependency used by this scope (e.g. `a.b.c`)
++     * Step 1: Find hoistable accesses, given the basic block in which the scope
++     * begins.
++     */
++    const hoistables = hoistablePropertyLoads.get(scope.id);
++    CompilerError.invariant(hoistables != null, {
++      reason: '[PropagateScopeDependencies] Scope not found in tracked blocks',
++      loc: GeneratedSource,
++    });
++    /**
++     * Step 2: Calculate hoistable dependencies.
+      */
++    const tree = new ReactiveScopeDependencyTreeHIR(
++      [...hoistables.assumedNonNullObjects].map(o => o.fullPath),
++    );
+     for (const dep of deps) {
+       tree.addDependency({...dep});
+     }
++
+     /**
+-     * Step 2: Mark hoistable dependencies, given the basic block in
+-     * which the scope begins.
++     * Step 3: Reduce dependencies to a minimal set.
+      */
+-    recordHoistablePropertyReads(hoistablePropertyLoads, scope.id, tree);
+     const candidates = tree.deriveMinimalDependencies();
+     for (const candidateDep of candidates) {
+       if (
+@@ -201,7 +222,12 @@ function collectTemporariesSidemap(
+       );
+ 
+       if (value.kind === 'PropertyLoad' && !usedOutside) {
+-        const property = getProperty(value.object, value.property, temporaries);
++        const property = getProperty(
++          value.object,
++          value.property,
++          false,
++          temporaries,
++        );
+         temporaries.set(lvalue.identifier.id, property);
+       } else if (
+         value.kind === 'LoadLocal' &&
+@@ -222,6 +248,7 @@ function collectTemporariesSidemap(
+ function getProperty(
+   object: Place,
+   propertyName: string,
++  optional: boolean,
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+ ): ReactiveScopeDependency {
+   /*
+@@ -253,15 +280,12 @@ function getProperty(
+   if (resolvedDependency == null) {
+     property = {
+       identifier: object.identifier,
+-      path: [{property: propertyName, optional: false}],
++      path: [{property: propertyName, optional}],
+     };
+   } else {
+     property = {
+       identifier: resolvedDependency.identifier,
+-      path: [
+-        ...resolvedDependency.path,
+-        {property: propertyName, optional: false},
+-      ],
++      path: [...resolvedDependency.path, {property: propertyName, optional}],
+     };
+   }
+   return property;
+@@ -409,8 +433,13 @@ class Context {
+     );
+   }
+ 
+-  visitProperty(object: Place, property: string): void {
+-    const nextDependency = getProperty(object, property, this.#temporaries);
++  visitProperty(object: Place, property: string, optional: boolean): void {
++    const nextDependency = getProperty(
++      object,
++      property,
++      optional,
++      this.#temporaries,
++    );
+     this.visitDependency(nextDependency);
+   }
+ 
+@@ -489,7 +518,7 @@ function handleInstruction(instr: Instruction, context: Context): void {
+     }
+   } else if (value.kind === 'PropertyLoad') {
+     if (context.isUsedOutsideDeclaringScope(lvalue)) {
+-      context.visitProperty(value.object, value.property);
++      context.visitProperty(value.object, value.property, false);
+     }
+   } else if (value.kind === 'StoreLocal') {
+     context.visitOperand(value.value);
+@@ -544,6 +573,7 @@ function collectDependencies(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
++  processedInstrsInOptional: ReadonlySet<InstructionId>,
+ ): Map<ReactiveScope, Array<ReactiveScopeDependency>> {
+   const context = new Context(usedOutsideDeclaringScope, temporaries);
+ 
+@@ -572,33 +602,26 @@ function collectDependencies(
+       context.exitScope(scopeBlockInfo.scope, scopeBlockInfo?.pruned);
+     }
+ 
++    // Record referenced optional chains in phis
++    for (const phi of block.phis) {
++      for (const operand of phi.operands) {
++        const maybeOptionalChain = temporaries.get(operand[1].id);
++        if (maybeOptionalChain) {
++          context.visitDependency(maybeOptionalChain);
++        }
++      }
++    }
+     for (const instr of block.instructions) {
+-      handleInstruction(instr, context);
++      if (!processedInstrsInOptional.has(instr.id)) {
++        handleInstruction(instr, context);
++      }
+     }
+-    for (const place of eachTerminalOperand(block.terminal)) {
+-      context.visitOperand(place);
++
++    if (!processedInstrsInOptional.has(block.terminal.id)) {
++      for (const place of eachTerminalOperand(block.terminal)) {
++        context.visitOperand(place);
++      }
+     }
+   }
+   return context.deps;
+ }
+-
+-/**
+- * Compute the set of hoistable property reads.
+- */
+-function recordHoistablePropertyReads(
+-  nodes: ReadonlyMap<ScopeId, BlockInfo>,
+-  scopeId: ScopeId,
+-  tree: ReactiveScopeDependencyTreeHIR,
+-): void {
+-  const node = nodes.get(scopeId);
+-  CompilerError.invariant(node != null, {
+-    reason: '[PropagateScopeDependencies] Scope not found in tracked blocks',
+-    loc: GeneratedSource,
+-  });
+-
+-  for (const item of node.assumedNonNullObjects) {
+-    tree.markNodesNonNull({
+-      ...item.fullPath,
+-    });
+-  }
+-}
+
+commit 1460d67c5b9a0d4498b4d22e1a5a6c0ccac85fdd
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Thu Oct 3 14:41:32 2024 -0400
+
+    [compiler][hir] Only hoist always-accessed PropertyLoads from function decls (#31066)
+    
+    Stack from [ghstack](https://github.com/ezyang/ghstack) (oldest at
+    bottom):
+    * __->__ #31066
+    * #31032
+    
+    Prior to this PR, we consider all of a nested function's accessed paths
+    as 'hoistable' (to the basic block in which the function was defined).
+    Now, we traverse nested functions and find all paths hoistable to their
+    *entry block*.
+    
+    Note that this only replaces the *hoisting* part of function
+    declarations, not dependencies. This realistically only affects optional
+    chains within functions, which always get truncated to its inner
+    non-optional path (see
+    [todo-infer-function-uncond-optionals-hoisted.tsx](https://github.com/facebook/react/blob/576f3c0aa898cb99da1b7bf15317756e25c13708/compiler/packages/babel-plugin-react-compiler/src/__tests__/fixtures/compiler/propagate-scope-deps-hir-fork/reduce-reactive-deps/todo-infer-function-uncond-optionals-hoisted.tsx))
+    
+    See newly added test fixtures for details
+    
+    Update: Note that toggling `enableTreatFunctionDepsAsConditional` makes
+    a non-trivial impact on granularity of inferred deps (i.e. we find that
+    function declarations uniquely identify some paths as hoistable).
+    Snapshot comparison of internal code shows ~2.5% of files get worse
+    dependencies ([internal
+    link](https://www.internalfb.com/phabricator/paste/view/P1625792186))
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index a7346e0e6b..ab2cf4cf56 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -17,7 +17,10 @@ import {
+   areEqualPaths,
+   IdentifierId,
+ } from './HIR';
+-import {collectHoistablePropertyLoads} from './CollectHoistablePropertyLoads';
++import {
++  collectHoistablePropertyLoads,
++  keyByScopeId,
++} from './CollectHoistablePropertyLoads';
+ import {
+   ScopeBlockTraversal,
+   eachInstructionOperand,
+@@ -41,10 +44,9 @@ export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
+     hoistableObjects,
+   } = collectOptionalChainSidemap(fn);
+ 
+-  const hoistablePropertyLoads = collectHoistablePropertyLoads(
++  const hoistablePropertyLoads = keyByScopeId(
+     fn,
+-    temporaries,
+-    hoistableObjects,
++    collectHoistablePropertyLoads(fn, temporaries, hoistableObjects, null),
+   );
+ 
+   const scopeDeps = collectDependencies(
+@@ -209,7 +211,7 @@ function findTemporariesUsedOutsideDeclaringScope(
+  * of $1, as the evaluation of `arr.length` changes between instructions $1 and
+  * $3. We do not track $1 -> arr.length in this case.
+  */
+-function collectTemporariesSidemap(
++export function collectTemporariesSidemap(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+ ): ReadonlyMap<IdentifierId, ReactiveScopeDependency> {
+
+commit 7b7fac073d1473df839a1caf8d0444c32bf4de49
+Author: Mike Vitousek <mmvitousek@gmail.com>
+Date:   Thu Oct 10 12:41:03 2024 -0700
+
+    [compiler] Represent phis with places rather than identifiers
+    
+    Summary:
+    The fact that phis are identifiers rather than places is unfortunate in a few cases. In some later analyses, we might wish to know whether a phi is reactive, but we don't have an easy way to do that currently.
+    
+    Most of the changes here is just replacing phi.id with phi.place.identifier and such. Interesting bits are EnterSSA (several functions now take places rather than identifiers, and InferReactivePlaces now needs to mark places as reactive explicitly.
+    
+    ghstack-source-id: 5f4fb396cd86b421008c37832a5735ac40f8806e
+    Pull Request resolved: https://github.com/facebook/react/pull/31171
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index ab2cf4cf56..855ca9121d 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -607,7 +607,7 @@ function collectDependencies(
+     // Record referenced optional chains in phis
+     for (const phi of block.phis) {
+       for (const operand of phi.operands) {
+-        const maybeOptionalChain = temporaries.get(operand[1].id);
++        const maybeOptionalChain = temporaries.get(operand[1].identifier.id);
+         if (maybeOptionalChain) {
+           context.visitDependency(maybeOptionalChain);
+         }
+
+commit e7e269b7265ec94929a53f4d402037261c87cf44
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Tue Nov 5 15:25:54 2024 -0500
+
+    [compiler] bugfix for hoistable deps for nested functions (#31345)
+    
+    `PropertyPathRegistry` is responsible for uniqueing identifier and
+    property paths. This is necessary for the hoistability CFG merging logic
+    which takes unions and intersections of these nodes to determine a basic
+    block's hoistable reads, as a function of its neighbors. We also depend
+    on this to merge optional chained and non-optional chained property
+    paths
+    
+    This fixes a small bug in #31066 in which we create a new registry for
+    nested functions. Now, we use the same registry for a component / hook
+    and all its inner functions
+    
+    '
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/31345).
+    * #31204
+    * #31202
+    * #31203
+    * #31201
+    * #31200
+    * #31346
+    * #31199
+    * #31431
+    * __->__ #31345
+    * #31197
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 855ca9121d..0178aea6e4 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -46,7 +46,7 @@ export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
+ 
+   const hoistablePropertyLoads = keyByScopeId(
+     fn,
+-    collectHoistablePropertyLoads(fn, temporaries, hoistableObjects, null),
++    collectHoistablePropertyLoads(fn, temporaries, hoistableObjects),
+   );
+ 
+   const scopeDeps = collectDependencies(
+
+commit c3570b158d087eb4e3ee5748c4bd9360045c8a26
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Tue Nov 5 19:25:05 2024 -0500
+
+    [compiler] Collect temporaries and optional chains from inner functions (#31346)
+    
+    Recursively collect identifier / property loads and optional chains from
+    inner functions. This PR is in preparation for #31200
+    
+    Previously, we only did this in `collectHoistablePropertyLoads` to
+    understand hoistable property loads from inner functions.
+    1. collectTemporariesSidemap
+    2. collectOptionalChainSidemap
+    3. collectHoistablePropertyLoads
+    - ^ this recursively calls `collectTemporariesSidemap`,
+    `collectOptionalChainSidemap`, and `collectOptionalChainSidemap` on
+    inner functions
+    4. collectDependencies
+    
+    Now, we have
+    1. collectTemporariesSidemap
+    - recursively record identifiers in inner functions. Note that we track
+    all temporaries in the same map as `IdentifierIds` are currently unique
+    across functions
+    2. collectOptionalChainSidemap
+        - recursively records optional chain sidemaps in inner functions
+    3. collectHoistablePropertyLoads
+        - (unchanged, except to remove recursive collection of temporaries)
+    4. collectDependencies
+    - unchanged: to be modified to recursively collect dependencies in next
+    PR
+    
+    '
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/31346).
+    * #31202
+    * #31203
+    * #31201
+    * #31200
+    * __->__ #31346
+    * #31199
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 0178aea6e4..bbec25a57c 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -16,6 +16,7 @@ import {
+   DeclarationId,
+   areEqualPaths,
+   IdentifierId,
++  Terminal,
+ } from './HIR';
+ import {
+   collectHoistablePropertyLoads,
+@@ -176,8 +177,10 @@ function findTemporariesUsedOutsideDeclaringScope(
+  * $2 = LoadLocal 'foo'
+  * $3 = CallExpression $2($1)
+  * ```
+- * Only map LoadLocal and PropertyLoad lvalues to their source if we know that
+- * reordering the read (from the time-of-load to time-of-use) is valid.
++ * @param usedOutsideDeclaringScope is used to check the correctness of
++ * reordering LoadLocal / PropertyLoad calls. We only track a LoadLocal /
++ * PropertyLoad in the returned temporaries map if reordering the read (from the
++ * time-of-load to time-of-use) is valid.
+  *
+  * If a LoadLocal or PropertyLoad instruction is within the reactive scope range
+  * (a proxy for mutable range) of the load source, later instructions may
+@@ -215,7 +218,29 @@ export function collectTemporariesSidemap(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+ ): ReadonlyMap<IdentifierId, ReactiveScopeDependency> {
+-  const temporaries = new Map<IdentifierId, ReactiveScopeDependency>();
++  const temporaries = new Map();
++  collectTemporariesSidemapImpl(
++    fn,
++    usedOutsideDeclaringScope,
++    temporaries,
++    false,
++  );
++  return temporaries;
++}
++
++/**
++ * Recursive collect a sidemap of all `LoadLocal` and `PropertyLoads` with a
++ * function and all nested functions.
++ *
++ * Note that IdentifierIds are currently unique, so we can use a single
++ * Map<IdentifierId, ...> across all nested functions.
++ */
++function collectTemporariesSidemapImpl(
++  fn: HIRFunction,
++  usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
++  temporaries: Map<IdentifierId, ReactiveScopeDependency>,
++  isInnerFn: boolean,
++): void {
+   for (const [_, block] of fn.body.blocks) {
+     for (const instr of block.instructions) {
+       const {value, lvalue} = instr;
+@@ -224,27 +249,51 @@ export function collectTemporariesSidemap(
+       );
+ 
+       if (value.kind === 'PropertyLoad' && !usedOutside) {
+-        const property = getProperty(
+-          value.object,
+-          value.property,
+-          false,
+-          temporaries,
+-        );
+-        temporaries.set(lvalue.identifier.id, property);
++        if (!isInnerFn || temporaries.has(value.object.identifier.id)) {
++          /**
++           * All dependencies of a inner / nested function must have a base
++           * identifier from the outermost component / hook. This is because the
++           * compiler cannot break an inner function into multiple granular
++           * scopes.
++           */
++          const property = getProperty(
++            value.object,
++            value.property,
++            false,
++            temporaries,
++          );
++          temporaries.set(lvalue.identifier.id, property);
++        }
+       } else if (
+         value.kind === 'LoadLocal' &&
+         lvalue.identifier.name == null &&
+         value.place.identifier.name !== null &&
+         !usedOutside
+       ) {
+-        temporaries.set(lvalue.identifier.id, {
+-          identifier: value.place.identifier,
+-          path: [],
+-        });
++        if (
++          !isInnerFn ||
++          fn.context.some(
++            context => context.identifier.id === value.place.identifier.id,
++          )
++        ) {
++          temporaries.set(lvalue.identifier.id, {
++            identifier: value.place.identifier,
++            path: [],
++          });
++        }
++      } else if (
++        value.kind === 'FunctionExpression' ||
++        value.kind === 'ObjectMethod'
++      ) {
++        collectTemporariesSidemapImpl(
++          value.loweredFunc.func,
++          usedOutsideDeclaringScope,
++          temporaries,
++          true,
++        );
+       }
+     }
+   }
+-  return temporaries;
+ }
+ 
+ function getProperty(
+@@ -310,6 +359,12 @@ class Context {
+   #temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>;
+   #temporariesUsedOutsideScope: ReadonlySet<DeclarationId>;
+ 
++  /**
++   * Tracks the traversal state. See Context.declare for explanation of why this
++   * is needed.
++   */
++  inInnerFn: boolean = false;
++
+   constructor(
+     temporariesUsedOutsideScope: ReadonlySet<DeclarationId>,
+     temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+@@ -360,12 +415,23 @@ class Context {
+   }
+ 
+   /*
+-   * Records where a value was declared, and optionally, the scope where the value originated from.
+-   * This is later used to determine if a dependency should be added to a scope; if the current
+-   * scope we are visiting is the same scope where the value originates, it can't be a dependency
+-   * on itself.
++   * Records where a value was declared, and optionally, the scope where the
++   * value originated from. This is later used to determine if a dependency
++   * should be added to a scope; if the current scope we are visiting is the
++   * same scope where the value originates, it can't be a dependency on itself.
++   *
++   * Note that we do not track declarations or reassignments within inner
++   * functions for the following reasons:
++   *   - inner functions cannot be split by scope boundaries and are guaranteed
++   *     to consume their own declarations
++   *   - reassignments within inner functions are tracked as context variables,
++   *     which already have extended mutable ranges to account for reassignments
++   *   - *most importantly* it's currently simply incorrect to compare inner
++   *     function instruction ids (tracked by `decl`) with outer ones (as stored
++   *     by root identifier mutable ranges).
+    */
+   declare(identifier: Identifier, decl: Decl): void {
++    if (this.inInnerFn) return;
+     if (!this.#declarations.has(identifier.declarationId)) {
+       this.#declarations.set(identifier.declarationId, decl);
+     }
+@@ -575,7 +641,7 @@ function collectDependencies(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+-  processedInstrsInOptional: ReadonlySet<InstructionId>,
++  processedInstrsInOptional: ReadonlySet<Instruction | Terminal>,
+ ): Map<ReactiveScope, Array<ReactiveScopeDependency>> {
+   const context = new Context(usedOutsideDeclaringScope, temporaries);
+ 
+@@ -614,12 +680,12 @@ function collectDependencies(
+       }
+     }
+     for (const instr of block.instructions) {
+-      if (!processedInstrsInOptional.has(instr.id)) {
++      if (!processedInstrsInOptional.has(instr)) {
+         handleInstruction(instr, context);
+       }
+     }
+ 
+-    if (!processedInstrsInOptional.has(block.terminal.id)) {
++    if (!processedInstrsInOptional.has(block.terminal)) {
+       for (const place of eachTerminalOperand(block.terminal)) {
+         context.visitOperand(place);
+       }
+
+commit 4972718c264f8f92ea56b86fde6aab610e876717
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Fri Nov 15 13:05:55 2024 -0500
+
+    [compiler] Fix: ref.current now correctly reactive (#31521)
+    
+    We were previously filtering out `ref.current` dependencies in
+    propagateScopeDependencies:checkValidDependency`. This is incorrect.
+    
+    Instead, we now always take a dependency on ref values (the outer box)
+    as they may be reactive. Pruning is done in
+    pruneNonReactiveDependencies.
+    
+    This PR includes a small patch to `collectReactiveIdentifier`. Prior to
+    this, we conservatively assumed that pruned scopes always produced
+    reactive declarations. This assumption fixed a bug with non-reactivity,
+    but some of these declarations are `useRef` calls. Now we have special
+    handling for this case
+    ```js
+    // This often produces a pruned scope
+    React.useRef(1);
+    ```
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/31521).
+    * #31202
+    * #31203
+    * #31201
+    * #31200
+    * __->__ #31521
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index bbec25a57c..7fd44c29dc 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -440,14 +440,6 @@ class Context {
+ 
+   // Checks if identifier is a valid dependency in the current scope
+   #checkValidDependency(maybeDependency: ReactiveScopeDependency): boolean {
+-    // ref.current access is not a valid dep
+-    if (
+-      isUseRefType(maybeDependency.identifier) &&
+-      maybeDependency.path.at(0)?.property === 'current'
+-    ) {
+-      return false;
+-    }
+-
+     // ref value is not a valid dep
+     if (isRefValueType(maybeDependency.identifier)) {
+       return false;
+@@ -549,6 +541,16 @@ class Context {
+       });
+     }
+ 
++    // ref.current access is not a valid dep
++    if (
++      isUseRefType(maybeDependency.identifier) &&
++      maybeDependency.path.at(0)?.property === 'current'
++    ) {
++      maybeDependency = {
++        identifier: maybeDependency.identifier,
++        path: [],
++      };
++    }
+     if (this.#checkValidDependency(maybeDependency)) {
+       this.#dependencies.value!.push(maybeDependency);
+     }
+
+commit c09402aa2fc4da56f6ecabe5f5a042436b277a57
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Fri Nov 15 13:06:05 2024 -0500
+
+    [compiler] Stop using function `dependencies` in propagateScopeDeps (#31200)
+    
+    Recursively visit inner function instructions to extract dependencies
+    instead of using `LoweredFunction.dependencies` directly.
+    
+    This is currently gated by enableFunctionDependencyRewrite, which needs
+    to be removed before we delete `LoweredFunction.dependencies` altogether
+    (#31204).
+    
+    Some nice side effects
+    - optional-chaining deps for inner functions
+    - full DCE and outlining for inner functions (see #31202)
+    - fewer extraneous instructions (see #31204)
+    
+    -
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/31200).
+    * #31202
+    * #31203
+    * #31201
+    * __->__ #31200
+    * #31521
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 7fd44c29dc..8aed17f8ee 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -663,35 +663,54 @@ function collectDependencies(
+ 
+   const scopeTraversal = new ScopeBlockTraversal();
+ 
+-  for (const [blockId, block] of fn.body.blocks) {
+-    scopeTraversal.recordScopes(block);
+-    const scopeBlockInfo = scopeTraversal.blockInfos.get(blockId);
+-    if (scopeBlockInfo?.kind === 'begin') {
+-      context.enterScope(scopeBlockInfo.scope);
+-    } else if (scopeBlockInfo?.kind === 'end') {
+-      context.exitScope(scopeBlockInfo.scope, scopeBlockInfo?.pruned);
+-    }
+-
+-    // Record referenced optional chains in phis
+-    for (const phi of block.phis) {
+-      for (const operand of phi.operands) {
+-        const maybeOptionalChain = temporaries.get(operand[1].identifier.id);
+-        if (maybeOptionalChain) {
+-          context.visitDependency(maybeOptionalChain);
++  const handleFunction = (fn: HIRFunction): void => {
++    for (const [blockId, block] of fn.body.blocks) {
++      scopeTraversal.recordScopes(block);
++      const scopeBlockInfo = scopeTraversal.blockInfos.get(blockId);
++      if (scopeBlockInfo?.kind === 'begin') {
++        context.enterScope(scopeBlockInfo.scope);
++      } else if (scopeBlockInfo?.kind === 'end') {
++        context.exitScope(scopeBlockInfo.scope, scopeBlockInfo.pruned);
++      }
++      // Record referenced optional chains in phis
++      for (const phi of block.phis) {
++        for (const operand of phi.operands) {
++          const maybeOptionalChain = temporaries.get(operand[1].identifier.id);
++          if (maybeOptionalChain) {
++            context.visitDependency(maybeOptionalChain);
++          }
+         }
+       }
+-    }
+-    for (const instr of block.instructions) {
+-      if (!processedInstrsInOptional.has(instr)) {
+-        handleInstruction(instr, context);
++      for (const instr of block.instructions) {
++        if (
++          fn.env.config.enableFunctionDependencyRewrite &&
++          (instr.value.kind === 'FunctionExpression' ||
++            instr.value.kind === 'ObjectMethod')
++        ) {
++          context.declare(instr.lvalue.identifier, {
++            id: instr.id,
++            scope: context.currentScope,
++          });
++          /**
++           * Recursively visit the inner function to extract dependencies there
++           */
++          const wasInInnerFn = context.inInnerFn;
++          context.inInnerFn = true;
++          handleFunction(instr.value.loweredFunc.func);
++          context.inInnerFn = wasInInnerFn;
++        } else if (!processedInstrsInOptional.has(instr)) {
++          handleInstruction(instr, context);
++        }
+       }
+-    }
+ 
+-    if (!processedInstrsInOptional.has(block.terminal)) {
+-      for (const place of eachTerminalOperand(block.terminal)) {
+-        context.visitOperand(place);
++      if (!processedInstrsInOptional.has(block.terminal)) {
++        for (const place of eachTerminalOperand(block.terminal)) {
++          context.visitOperand(place);
++        }
+       }
+     }
+-  }
++  };
++
++  handleFunction(fn);
+   return context.deps;
+ }
+
+commit ac172706526a840100302f92ae90dfa4ad804c56
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Mon Dec 16 15:11:52 2024 -0500
+
+    [compiler][ez] Clean up duplicate code in propagateScopeDeps (#31581)
+    
+    Clean up duplicate checks for when to skip processing values as
+    dependencies / hoistable temporaries.
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/31581).
+    * #31583
+    * #31582
+    * __->__ #31581
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 8aed17f8ee..4a85a4ef5c 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -358,6 +358,7 @@ class Context {
+ 
+   #temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>;
+   #temporariesUsedOutsideScope: ReadonlySet<DeclarationId>;
++  #processedInstrsInOptional: ReadonlySet<Instruction | Terminal>;
+ 
+   /**
+    * Tracks the traversal state. See Context.declare for explanation of why this
+@@ -368,9 +369,11 @@ class Context {
+   constructor(
+     temporariesUsedOutsideScope: ReadonlySet<DeclarationId>,
+     temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
++    processedInstrsInOptional: ReadonlySet<Instruction | Terminal>,
+   ) {
+     this.#temporariesUsedOutsideScope = temporariesUsedOutsideScope;
+     this.#temporaries = temporaries;
++    this.#processedInstrsInOptional = processedInstrsInOptional;
+   }
+ 
+   enterScope(scope: ReactiveScope): void {
+@@ -574,22 +577,49 @@ class Context {
+       currentScope.reassignments.add(place.identifier);
+     }
+   }
++  enterInnerFn<T>(cb: () => T): T {
++    const wasInInnerFn = this.inInnerFn;
++    this.inInnerFn = true;
++    const result = cb();
++    this.inInnerFn = wasInInnerFn;
++    return result;
++  }
++
++  /**
++   * Skip dependencies that are subexpressions of other dependencies. e.g. if a
++   * dependency is tracked in the temporaries sidemap, it can be added at
++   * site-of-use
++   */
++  isDeferredDependency(
++    instr:
++      | {kind: HIRValue.Instruction; value: Instruction}
++      | {kind: HIRValue.Terminal; value: Terminal},
++  ): boolean {
++    return (
++      this.#processedInstrsInOptional.has(instr.value) ||
++      (instr.kind === HIRValue.Instruction &&
++        this.#temporaries.has(instr.value.lvalue.identifier.id))
++    );
++  }
++}
++enum HIRValue {
++  Instruction = 1,
++  Terminal,
+ }
+ 
+ function handleInstruction(instr: Instruction, context: Context): void {
+   const {id, value, lvalue} = instr;
+-  if (value.kind === 'LoadLocal') {
+-    if (
+-      value.place.identifier.name === null ||
+-      lvalue.identifier.name !== null ||
+-      context.isUsedOutsideDeclaringScope(lvalue)
+-    ) {
+-      context.visitOperand(value.place);
+-    }
+-  } else if (value.kind === 'PropertyLoad') {
+-    if (context.isUsedOutsideDeclaringScope(lvalue)) {
+-      context.visitProperty(value.object, value.property, false);
+-    }
++  context.declare(lvalue.identifier, {
++    id,
++    scope: context.currentScope,
++  });
++  if (
++    context.isDeferredDependency({kind: HIRValue.Instruction, value: instr})
++  ) {
++    return;
++  }
++  if (value.kind === 'PropertyLoad') {
++    context.visitProperty(value.object, value.property, false);
+   } else if (value.kind === 'StoreLocal') {
+     context.visitOperand(value.value);
+     if (value.lvalue.kind === InstructionKind.Reassign) {
+@@ -632,11 +662,6 @@ function handleInstruction(instr: Instruction, context: Context): void {
+       context.visitOperand(operand);
+     }
+   }
+-
+-  context.declare(lvalue.identifier, {
+-    id,
+-    scope: context.currentScope,
+-  });
+ }
+ 
+ function collectDependencies(
+@@ -645,7 +670,11 @@ function collectDependencies(
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+   processedInstrsInOptional: ReadonlySet<Instruction | Terminal>,
+ ): Map<ReactiveScope, Array<ReactiveScopeDependency>> {
+-  const context = new Context(usedOutsideDeclaringScope, temporaries);
++  const context = new Context(
++    usedOutsideDeclaringScope,
++    temporaries,
++    processedInstrsInOptional,
++  );
+ 
+   for (const param of fn.params) {
+     if (param.kind === 'Identifier') {
+@@ -694,16 +723,21 @@ function collectDependencies(
+           /**
+            * Recursively visit the inner function to extract dependencies there
+            */
+-          const wasInInnerFn = context.inInnerFn;
+-          context.inInnerFn = true;
+-          handleFunction(instr.value.loweredFunc.func);
+-          context.inInnerFn = wasInInnerFn;
+-        } else if (!processedInstrsInOptional.has(instr)) {
++          const innerFn = instr.value.loweredFunc.func;
++          context.enterInnerFn(() => {
++            handleFunction(innerFn);
++          });
++        } else {
+           handleInstruction(instr, context);
+         }
+       }
+ 
+-      if (!processedInstrsInOptional.has(block.terminal)) {
++      if (
++        !context.isDeferredDependency({
++          kind: HIRValue.Terminal,
++          value: block.terminal,
++        })
++      ) {
+         for (const place of eachTerminalOperand(block.terminal)) {
+           context.visitOperand(place);
+         }
+
+commit a78bbf9dbcf92434c902f9265ddfee34eae51a54
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Mon Dec 16 16:45:05 2024 -0500
+
+    [compiler] Context variables as dependencies (#31582)
+    
+    We previously didn't track context variables in the hoistable values
+    sidemap of `propagateScopeDependencies`. This was overly conservative as
+    we *do* track the mutable range of context variables, and it is safe to
+    hoist accesses to context variables after their last direct / aliased
+    maybe-assignment.
+    
+    ```js
+    function Component({value}) {
+      // start of mutable range for `x`
+      let x = DEFAULT;
+      const setX = () => x = value;
+      const aliasedSet = maybeAlias(setX);
+      maybeCall(aliasedSet);
+      // end of mutable range for `x`
+    
+      // here, we should be able to take x (and property reads
+      // off of x) as dependencies
+      return <Jsx value={x} />
+    }
+    ```
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/31582).
+    * #31583
+    * __->__ #31582
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 4a85a4ef5c..08856e9143 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -17,6 +17,11 @@ import {
+   areEqualPaths,
+   IdentifierId,
+   Terminal,
++  InstructionValue,
++  LoadContext,
++  TInstruction,
++  FunctionExpression,
++  ObjectMethod,
+ } from './HIR';
+ import {
+   collectHoistablePropertyLoads,
+@@ -223,11 +228,25 @@ export function collectTemporariesSidemap(
+     fn,
+     usedOutsideDeclaringScope,
+     temporaries,
+-    false,
++    null,
+   );
+   return temporaries;
+ }
+ 
++function isLoadContextMutable(
++  instrValue: InstructionValue,
++  id: InstructionId,
++): instrValue is LoadContext {
++  if (instrValue.kind === 'LoadContext') {
++    CompilerError.invariant(instrValue.place.identifier.scope != null, {
++      reason:
++        '[PropagateScopeDependencies] Expected all context variables to be assigned a scope',
++      loc: instrValue.loc,
++    });
++    return id >= instrValue.place.identifier.scope.range.end;
++  }
++  return false;
++}
+ /**
+  * Recursive collect a sidemap of all `LoadLocal` and `PropertyLoads` with a
+  * function and all nested functions.
+@@ -239,17 +258,21 @@ function collectTemporariesSidemapImpl(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+   temporaries: Map<IdentifierId, ReactiveScopeDependency>,
+-  isInnerFn: boolean,
++  innerFnContext: {instrId: InstructionId} | null,
+ ): void {
+   for (const [_, block] of fn.body.blocks) {
+-    for (const instr of block.instructions) {
+-      const {value, lvalue} = instr;
++    for (const {value, lvalue, id: origInstrId} of block.instructions) {
++      const instrId =
++        innerFnContext != null ? innerFnContext.instrId : origInstrId;
+       const usedOutside = usedOutsideDeclaringScope.has(
+         lvalue.identifier.declarationId,
+       );
+ 
+       if (value.kind === 'PropertyLoad' && !usedOutside) {
+-        if (!isInnerFn || temporaries.has(value.object.identifier.id)) {
++        if (
++          innerFnContext == null ||
++          temporaries.has(value.object.identifier.id)
++        ) {
+           /**
+            * All dependencies of a inner / nested function must have a base
+            * identifier from the outermost component / hook. This is because the
+@@ -265,13 +288,13 @@ function collectTemporariesSidemapImpl(
+           temporaries.set(lvalue.identifier.id, property);
+         }
+       } else if (
+-        value.kind === 'LoadLocal' &&
++        (value.kind === 'LoadLocal' || isLoadContextMutable(value, instrId)) &&
+         lvalue.identifier.name == null &&
+         value.place.identifier.name !== null &&
+         !usedOutside
+       ) {
+         if (
+-          !isInnerFn ||
++          innerFnContext == null ||
+           fn.context.some(
+             context => context.identifier.id === value.place.identifier.id,
+           )
+@@ -289,7 +312,7 @@ function collectTemporariesSidemapImpl(
+           value.loweredFunc.func,
+           usedOutsideDeclaringScope,
+           temporaries,
+-          true,
++          innerFnContext ?? {instrId},
+         );
+       }
+     }
+@@ -364,7 +387,7 @@ class Context {
+    * Tracks the traversal state. See Context.declare for explanation of why this
+    * is needed.
+    */
+-  inInnerFn: boolean = false;
++  #innerFnContext: {outerInstrId: InstructionId} | null = null;
+ 
+   constructor(
+     temporariesUsedOutsideScope: ReadonlySet<DeclarationId>,
+@@ -434,7 +457,7 @@ class Context {
+    *     by root identifier mutable ranges).
+    */
+   declare(identifier: Identifier, decl: Decl): void {
+-    if (this.inInnerFn) return;
++    if (this.#innerFnContext != null) return;
+     if (!this.#declarations.has(identifier.declarationId)) {
+       this.#declarations.set(identifier.declarationId, decl);
+     }
+@@ -577,11 +600,14 @@ class Context {
+       currentScope.reassignments.add(place.identifier);
+     }
+   }
+-  enterInnerFn<T>(cb: () => T): T {
+-    const wasInInnerFn = this.inInnerFn;
+-    this.inInnerFn = true;
++  enterInnerFn<T>(
++    innerFn: TInstruction<FunctionExpression> | TInstruction<ObjectMethod>,
++    cb: () => T,
++  ): T {
++    const prevContext = this.#innerFnContext;
++    this.#innerFnContext = this.#innerFnContext ?? {outerInstrId: innerFn.id};
+     const result = cb();
+-    this.inInnerFn = wasInInnerFn;
++    this.#innerFnContext = prevContext;
+     return result;
+   }
+ 
+@@ -724,9 +750,14 @@ function collectDependencies(
+            * Recursively visit the inner function to extract dependencies there
+            */
+           const innerFn = instr.value.loweredFunc.func;
+-          context.enterInnerFn(() => {
+-            handleFunction(innerFn);
+-          });
++          context.enterInnerFn(
++            instr as
++              | TInstruction<FunctionExpression>
++              | TInstruction<ObjectMethod>,
++            () => {
++              handleFunction(innerFn);
++            },
++          );
+         } else {
+           handleInstruction(instr, context);
+         }
+
+commit d99f8bba2e07e3bb953f0821d4da5e341136fe5c
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Tue Feb 18 09:32:49 2025 -0700
+
+    [compiler] Delete LoweredFunction.dependencies and hoisted instructions (#32096)
+    
+    LoweredFunction dependencies were exclusively used for dependency
+    extraction (in `propagateScopeDeps`). Now that we have a
+    `propagateScopeDepsHIR` that recursively traverses into nested
+    functions, we can delete `dependencies` and their associated synthetic
+    `LoadLocal`/`PropertyLoad` instructions.
+    
+    [Internal snapshot
+    diff](https://www.internalfb.com/phabricator/paste/view/P1716950202) for
+    this change shows ~.2% of files changed. I [read through ~60 of the
+    changed
+    files](https://www.internalfb.com/phabricator/paste/view/P1733074307)
+    - most changes are due to better outlining (due to better DCE)
+    - a few changes in memo inference are due to changed ordering
+    ```
+    // source
+    arr.map(() => contextVar.inner);
+    
+    // previous instructions
+    $0 = LoadLocal arr
+    $1 = $0.map
+    // Below instructions are synthetic
+    $2 = LoadLocal contextVar
+    $3 = $2.inner
+    $4 = Function deps=$3 context=contextVar {
+      ...
+    }
+    ```
+    - a few changes are effectively bugfixes (see
+    `aliased-nested-scope-fn-expr`)
+    ---
+    [//]: # (BEGIN SAPLING FOOTER)
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed
+    with [ReviewStack](https://reviewstack.dev/facebook/react/pull/32096).
+    * #32099
+    * #32286
+    * #32104
+    * #32098
+    * #32097
+    * __->__ #32096
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 08856e9143..4cb84870a8 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -738,9 +738,8 @@ function collectDependencies(
+       }
+       for (const instr of block.instructions) {
+         if (
+-          fn.env.config.enableFunctionDependencyRewrite &&
+-          (instr.value.kind === 'FunctionExpression' ||
+-            instr.value.kind === 'ObjectMethod')
++          instr.value.kind === 'FunctionExpression' ||
++          instr.value.kind === 'ObjectMethod'
+         ) {
+           context.declare(instr.lvalue.identifier, {
+             id: instr.id,
+
+commit a9575dcf62e5cb6f8b1d8f738aa75ece216d9054
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Tue Feb 18 11:54:20 2025 -0700
+
+    [compiler] Represent array accesses with PropertyLoad (#32287)
+    
+    Prior to this PR, our HIR represented property access with numeric
+    literals (e.g. `myVar[0]`) as ComputedLoads. This means that they were
+    subject to some deopts (most notably, not being easily dedupable /
+    hoistable as dependencies).
+    
+    Now, `PropertyLoad`, `PropertyStore`, etc reference numeric and string
+    literals (although not yet string literals that aren't valid babel
+    identifiers). The difference between PropertyLoad and ComputedLoad is
+    fuzzy now (maybe we should rename these).
+    - PropertyLoad: property keys are string and numeric literals, only when
+    the string literals are valid babel identifiers
+    - ComputedLoad: non-valid babel identifier string literals (rare) and
+    other non-literal expressions
+    
+    The biggest feature from this PR is that it trivially enables
+    array-indicing expressions as dependencies. The compiler can also
+    specify global and imported types for arrays (e.g. return value of
+    `useState`)
+    
+    
+    I'm happy to close this if it complicates more than it helps --
+    alternative options are to entirely rely on instruction reordering-based
+    approaches like ReactiveGraphIR or make dependency-specific parsing +
+    hoisting logic more robust.
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 4cb84870a8..e12d10b406 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -22,6 +22,7 @@ import {
+   TInstruction,
+   FunctionExpression,
+   ObjectMethod,
++  PropertyLiteral,
+ } from './HIR';
+ import {
+   collectHoistablePropertyLoads,
+@@ -321,7 +322,7 @@ function collectTemporariesSidemapImpl(
+ 
+ function getProperty(
+   object: Place,
+-  propertyName: string,
++  propertyName: PropertyLiteral,
+   optional: boolean,
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+ ): ReactiveScopeDependency {
+@@ -519,7 +520,11 @@ class Context {
+     );
+   }
+ 
+-  visitProperty(object: Place, property: string, optional: boolean): void {
++  visitProperty(
++    object: Place,
++    property: PropertyLiteral,
++    optional: boolean,
++  ): void {
+     const nextDependency = getProperty(
+       object,
+       property,
+
+commit ad09027c161f1ce5d9b07bfcfb4ee4fb92444655
+Author: lauren <poteto@users.noreply.github.com>
+Date:   Wed Apr 23 22:04:44 2025 -0400
+
+    [compiler] Add missing copyrights (#33004)
+    
+    `yarn copyright`
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index e12d10b406..934fd98f73 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -1,3 +1,10 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
+ import {
+   ScopeId,
+   HIRFunction,
+
+commit 89e8875ec48c86b366bf62398112923cdf76016a
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Fri Apr 25 15:44:39 2025 -0400
+
+    [compiler] Fallback for inferred effect dependencies (#32984)
+    
+    When effect dependencies cannot be inferred due to memoization-related
+    bailouts or unexpected mutable ranges (which currently often have to do
+    with writes to refs), fall back to traversing the effect lambda itself.
+    
+    This fallback uses the same logic as PropagateScopeDependencies:
+    1. Collect a sidemap of loads and property loads
+    2. Find hoistable accesses from the control flow graph. Note that here,
+    we currently take into account the mutable ranges of instructions (see
+    `mutate-after-useeffect-granular-access` fixture)
+    3. Collect the set of property paths accessed by the effect
+    4. Merge to get the set of minimal dependencies
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 934fd98f73..3d183e8e72 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -116,7 +116,7 @@ export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
+   }
+ }
+ 
+-function findTemporariesUsedOutsideDeclaringScope(
++export function findTemporariesUsedOutsideDeclaringScope(
+   fn: HIRFunction,
+ ): ReadonlySet<DeclarationId> {
+   /*
+@@ -378,7 +378,7 @@ type Decl = {
+   scope: Stack<ReactiveScope>;
+ };
+ 
+-class Context {
++export class DependencyCollectionContext {
+   #declarations: Map<DeclarationId, Decl> = new Map();
+   #reassignments: Map<Identifier, Decl> = new Map();
+ 
+@@ -645,7 +645,10 @@ enum HIRValue {
+   Terminal,
+ }
+ 
+-function handleInstruction(instr: Instruction, context: Context): void {
++export function handleInstruction(
++  instr: Instruction,
++  context: DependencyCollectionContext,
++): void {
+   const {id, value, lvalue} = instr;
+   context.declare(lvalue.identifier, {
+     id,
+@@ -708,7 +711,7 @@ function collectDependencies(
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+   processedInstrsInOptional: ReadonlySet<Instruction | Terminal>,
+ ): Map<ReactiveScope, Array<ReactiveScopeDependency>> {
+-  const context = new Context(
++  const context = new DependencyCollectionContext(
+     usedOutsideDeclaringScope,
+     temporaries,
+     processedInstrsInOptional,
+
+commit 9d795d3808f3202b36740a7a8eb60567bd7f6d90
+Author: mofeiZ <34200447+mofeiZ@users.noreply.github.com>
+Date:   Wed Apr 30 17:18:58 2025 -0400
+
+    [compiler][bugfix] expand StoreContext to const / let / function variants (#32747)
+    
+    ```js
+    function Component() {
+      useEffect(() => {
+        let hasCleanedUp = false;
+        document.addEventListener(..., () => hasCleanedUp ? foo() : bar());
+        // effect return values shouldn't be typed as frozen
+        return () => {
+          hasCleanedUp = true;
+        }
+      };
+    }
+    ```
+    ### Problem
+    `PruneHoistedContexts` currently strips hoisted declarations and
+    rewrites the first `StoreContext` reassignment to a declaration. For
+    example, in the following example, instruction 0 is removed while a
+    synthetic `DeclareContext let` is inserted before instruction 1.
+    
+    ```js
+    // source
+    const cb = () => x; // reference that causes x to be hoisted
+    
+    let x = 4;
+    x = 5;
+    
+    // React Compiler IR
+    [0] DeclareContext HoistedLet 'x'
+    ...
+    [1] StoreContext reassign 'x' = 4
+    [2] StoreContext reassign 'x' = 5
+    ```
+    
+    Currently, we don't account for `DeclareContext let`. As a result, we're
+    rewriting to insert duplicate declarations.
+    ```js
+    // source
+    const cb = () => x; // reference that causes x to be hoisted
+    
+    let x;
+    x = 5;
+    
+    // React Compiler IR
+    [0] DeclareContext HoistedLet 'x'
+    ...
+    [1] DeclareContext Let 'x'
+    [2] StoreContext reassign 'x' = 5
+    ```
+    
+    ### Solution
+    
+    Instead of always lowering context variables to a DeclareContext
+    followed by a StoreContext reassign, we can keep `kind: 'Const' | 'Let'
+    | 'Reassign' | etc` on StoreContext.
+    Pros:
+    - retain more information in HIR, so we can codegen easily `const` and
+    `let` context variable declarations back
+    - pruning hoisted `DeclareContext` instructions is simple.
+    
+    Cons:
+    - passes are more verbose as we need to check for both `DeclareContext`
+    and `StoreContext` declarations
+    
+    ~(note: also see alternative implementation in
+    https://github.com/facebook/react/pull/32745)~
+    
+    ### Testing
+    Context variables are tricky. I synced and diffed changes in a large
+    meta codebase and feel pretty confident about landing this. About 0.01%
+    of compiled files changed. Among these changes, ~25% were [direct
+    bugfixes](https://www.internalfb.com/phabricator/paste/view/P1800029094).
+    The [other
+    changes](https://www.internalfb.com/phabricator/paste/view/P1800028575)
+    were primarily due to changed (corrected) mutable ranges from
+    https://github.com/facebook/react/pull/33047. I tried to represent most
+    interesting changes in new test fixtures
+    
+    `
+
+diff --git a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+index 3d183e8e72..96b9e51710 100644
+--- a/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
++++ b/compiler/packages/babel-plugin-react-compiler/src/HIR/PropagateScopeDependenciesHIR.ts
+@@ -30,6 +30,7 @@ import {
+   FunctionExpression,
+   ObjectMethod,
+   PropertyLiteral,
++  convertHoistedLValueKind,
+ } from './HIR';
+ import {
+   collectHoistablePropertyLoads,
+@@ -246,12 +247,18 @@ function isLoadContextMutable(
+   id: InstructionId,
+ ): instrValue is LoadContext {
+   if (instrValue.kind === 'LoadContext') {
+-    CompilerError.invariant(instrValue.place.identifier.scope != null, {
+-      reason:
+-        '[PropagateScopeDependencies] Expected all context variables to be assigned a scope',
+-      loc: instrValue.loc,
+-    });
+-    return id >= instrValue.place.identifier.scope.range.end;
++    /**
++     * Not all context variables currently have scopes due to limitations of
++     * mutability analysis for function expressions.
++     *
++     * Currently, many function expressions references are inferred to be
++     * 'Read' | 'Freeze' effects which don't replay mutable effects of captured
++     * context.
++     */
++    return (
++      instrValue.place.identifier.scope != null &&
++      id >= instrValue.place.identifier.scope.range.end
++    );
+   }
+   return false;
+ }
+@@ -471,6 +478,9 @@ export class DependencyCollectionContext {
+     }
+     this.#reassignments.set(identifier, decl);
+   }
++  hasDeclared(identifier: Identifier): boolean {
++    return this.#declarations.has(identifier.declarationId);
++  }
+ 
+   // Checks if identifier is a valid dependency in the current scope
+   #checkValidDependency(maybeDependency: ReactiveScopeDependency): boolean {
+@@ -672,21 +682,21 @@ export function handleInstruction(
+     });
+   } else if (value.kind === 'DeclareLocal' || value.kind === 'DeclareContext') {
+     /*
+-     * Some variables may be declared and never initialized. We need
+-     * to retain (and hoist) these declarations if they are included
+-     * in a reactive scope. One approach is to simply add all `DeclareLocal`s
+-     * as scope declarations.
++     * Some variables may be declared and never initialized. We need to retain
++     * (and hoist) these declarations if they are included in a reactive scope.
++     * One approach is to simply add all `DeclareLocal`s as scope declarations.
++     *
++     * Context variables with hoisted declarations only become live after their
++     * first assignment. We only declare real DeclareLocal / DeclareContext
++     * instructions (not hoisted ones) to avoid generating dependencies on
++     * hoisted declarations.
+      */
+-
+-    /*
+-     * We add context variable declarations here, not at `StoreContext`, since
+-     * context Store / Loads are modeled as reads and mutates to the underlying
+-     * variable reference (instead of through intermediate / inlined temporaries)
+-     */
+-    context.declare(value.lvalue.place.identifier, {
+-      id,
+-      scope: context.currentScope,
+-    });
++    if (convertHoistedLValueKind(value.lvalue.kind) === null) {
++      context.declare(value.lvalue.place.identifier, {
++        id,
++        scope: context.currentScope,
++      });
++    }
+   } else if (value.kind === 'Destructure') {
+     context.visitOperand(value.value);
+     for (const place of eachPatternOperand(value.lvalue.pattern)) {
+@@ -698,6 +708,26 @@ export function handleInstruction(
+         scope: context.currentScope,
+       });
+     }
++  } else if (value.kind === 'StoreContext') {
++    /**
++     * Some StoreContext variables have hoisted declarations. If we're storing
++     * to a context variable that hasn't yet been declared, the StoreContext is
++     * the declaration.
++     * (see corresponding logic in PruneHoistedContext)
++     */
++    if (
++      !context.hasDeclared(value.lvalue.place.identifier) ||
++      value.lvalue.kind !== InstructionKind.Reassign
++    ) {
++      context.declare(value.lvalue.place.identifier, {
++        id,
++        scope: context.currentScope,
++      });
++    }
++
++    for (const operand of eachInstructionValueOperand(value)) {
++      context.visitOperand(operand);
++    }
+   } else {
+     for (const operand of eachInstructionValueOperand(value)) {
+       context.visitOperand(operand);
+
