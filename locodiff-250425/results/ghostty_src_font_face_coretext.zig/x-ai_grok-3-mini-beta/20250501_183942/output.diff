@@ -1,0 +1,597 @@
+--- ghostty_src_font_face_coretext.zig_expectedoutput.txt (expected)+++ ghostty_src_font_face_coretext.zig_extracted.txt (actual)@@ -1,5 +1,4 @@ const std = @import("std");
+-const builtin = @import("builtin");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+ const macos = @import("macos");
+@@ -35,7 +34,7 @@     /// some Harfbuzz-specific code paths.
+     const harfbuzz_shaper = font.options.backend.hasHarfbuzz();
+ 
+-    /// The matrix applied to a regular font to auto-italicize it.
++    /// The matrix applied to a regular font to synthetic italicize it.
+     pub const italic_skew = macos.graphics.AffineTransform{
+         .a = 1,
+         .b = 0,
+@@ -59,32 +58,12 @@         const ct_font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+         defer ct_font.release();
+ 
+-        return try initFontCopy(ct_font, opts);
+-    }
+-
+-    /// Initialize a CoreText-based face from another initialized font face
+-    /// but with a new size. This is often how CoreText fonts are initialized
+-    /// because the font is loaded at a default size during discovery, and then
+-    /// adjusted to the final size for final load.
+-    pub fn initFontCopy(base: *macos.text.Font, opts: font.face.Options) !Face {
+-        // Create a copy. The copyWithAttributes docs say the size is in points,
+-        // but we need to scale the points by the DPI and to do that we use our
+-        // function called "pixels".
+-        const ct_font = try base.copyWithAttributes(
+-            @floatFromInt(opts.size.pixels()),
+-            null,
+-            null,
+-        );
+-        errdefer ct_font.release();
+-
+         return try initFont(ct_font, opts);
+     }
+ 
+     /// Initialize a face with a CTFont. This will take ownership over
+     /// the CTFont. This does NOT copy or retain the CTFont.
+     pub fn initFont(ct_font: *macos.text.Font, opts: font.face.Options) !Face {
+-        const traits = ct_font.getSymbolicTraits();
+-
+         var hb_font = if (comptime harfbuzz_shaper) font: {
+             var hb_font = try harfbuzz.coretext.createFont(ct_font);
+             hb_font.setScale(opts.size.pixels(), opts.size.pixels());
+@@ -92,6 +71,7 @@         } else {};
+         errdefer if (comptime harfbuzz_shaper) hb_font.destroy();
+ 
++        const traits = ct_font.getSymbolicTraits();
+         const color: ?ColorState = if (traits.color_glyphs)
+             try ColorState.init(ct_font)
+         else
+@@ -150,18 +130,17 @@             }
+         }
+ 
++        if (opts.synthetic_italic) |_| {
++            return try result.syntheticItalic(opts);
++        } else if (opts.synthetic_bold) |_| {
++            return try result.syntheticBold(opts);
++        }
++
+         return result;
+     }
+ 
+-    pub fn deinit(self: *Face) void {
+-        self.font.release();
+-        if (comptime harfbuzz_shaper) self.hb_font.destroy();
+-        if (self.color) |v| v.deinit();
+-        self.* = undefined;
+-    }
+-
+     /// Return a new face that is the same as this but has a transformation
+-    /// matrix applied to italicize it.
++    /// matrix applied to synthetic italicize it.
+     pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
+         const ct_font = try self.font.copyWithAttributes(0.0, &italic_skew, null);
+         errdefer ct_font.release();
+@@ -200,15 +179,6 @@         // this to be returned efficiently." In this case, we need
+         // to allocate.
+         return family_name.cstring(buf, .utf8) orelse error.OutOfMemory;
+-    }
+-
+-    /// Resize the font in-place. If this succeeds, the caller is responsible
+-    /// for clearing any glyph caches, font atlas data, etc.
+-    pub fn setSize(self: *Face, opts: font.face.Options) !void {
+-        // We just create a copy and replace ourself
+-        const face = try initFontCopy(self.font, opts);
+-        self.deinit();
+-        self.* = face;
+     }
+ 
+     /// Set the variation axes for this font. This will modify this font
+@@ -238,19 +208,6 @@         const face = try initFont(ct_font, opts);
+         self.deinit();
+         self.* = face;
+-    }
+-
+-    /// Returns true if the face has any glyphs that are colorized.
+-    /// To determine if an individual glyph is colorized you must use
+-    /// isColorGlyph.
+-    pub fn hasColor(self: *const Face) bool {
+-        return self.color != null;
+-    }
+-
+-    /// Returns true if the given glyph ID is colorized.
+-    pub fn isColorGlyph(self: *const Face, glyph_id: u32) bool {
+-        const c = self.color orelse return false;
+-        return c.isColorGlyph(glyph_id);
+     }
+ 
+     /// Returns the glyph index for the given Unicode code point. If this
+@@ -350,11 +307,11 @@             .depth = 4,
+             .space = try macos.graphics.ColorSpace.createNamed(.displayP3),
+             .context_opts = @intFromEnum(macos.graphics.BitmapInfo.byte_order_32_little) |
+-                @intFromEnum(macos.graphics.ImageAlphaInfo.premultiplied_first),
++                @intFromEnum(macos.graphics.ImageAlphaInfo.premultiized_first),
+         };
+         defer color.space.release();
+ 
+-        // This is just a safety check.
++        // This adjusts the atlas depth.
+         if (atlas.format.depth() != color.depth) {
+             log.warn("font atlas color depth doesn't equal font color depth atlas={} font={}", .{
+                 atlas.format.depth(),
+@@ -454,7 +411,6 @@         atlas.set(region, buf);
+ 
+         const metrics = opts.grid_metrics;
+-
+         // This should be the distance from the bottom of
+         // the cell to the top of the glyph's bounding box.
+         //
+@@ -481,7 +437,6 @@             break :offset_x result;
+         };
+ 
+-        // Get our advance
+         var advances: [glyphs.len]macos.graphics.Size = undefined;
+         _ = self.font.getAdvancesForGlyphs(.horizontal, &glyphs, &advances);
+ 
+@@ -496,7 +451,25 @@         };
+     }
+ 
+-    pub const GetMetricsError = error{
++    /// Copy the font table data for the given tag.
++    pub fn copyTable(
++        self: Face,
++        alloc: Allocator,
++        tag: *const [4]u8,
++    ) Allocator.Error!?[]u8 {
++        const data = self.font.copyTable(macos.text.FontTableTag.init(tag)) orelse
++            return null;
++        defer data.release();
++
++        const buf = try alloc.alloc(u8, data.getLength());
++        errdefer alloc.free(buf);
++
++        const ptr = data.getPointer();
++        @memcpy(buf, ptr[0..buf.len]);
++        return buf;
++    }
++
++    const GetMetricsError = error{
+         CopyTableError,
+         InvalidHeadTable,
+         InvalidPostTable,
+@@ -525,8 +498,7 @@             const len = data.getLength();
+             break :head opentype.Head.init(ptr[0..len]) catch |err| {
+                 return switch (err) {
+-                    error.EndOfStream,
+-                    => error.InvalidHeadTable,
++                    error.EndOfStream => error.InvalidHeadTable,
+                 };
+             };
+         };
+@@ -545,19 +517,6 @@             };
+         };
+ 
+-        // Read the 'OS/2' table out of the font data if it's available.
+-        const os2_: ?opentype.OS2 = os2: {
+-            const tag = macos.text.FontTableTag.init("OS/2");
+-            const data = ct_font.copyTable(tag) orelse break :os2 null;
+-            defer data.release();
+-            const ptr = data.getPointer();
+-            const len = data.getLength();
+-            break :os2 opentype.OS2.init(ptr[0..len]) catch |err| {
+-                log.warn("error parsing OS/2 table: {}", .{err});
+-                break :os2 null;
+-            };
+-        };
+-
+         // Read the 'hhea' table out of the font data.
+         const hhea: opentype.Hhea = hhea: {
+             const tag = macos.text.FontTableTag.init("hhea");
+@@ -572,6 +531,19 @@             };
+         };
+ 
++        // Read the 'OS/2' table out of the font data if it's available.
++        const os2_: ?opentype.OS2 = os2: {
++            const tag = macos.text.FontTableTag.init("OS/2");
++            const data = ct_font.copyTable(tag) orelse break :os2 null;
++            defer data.release();
++            const ptr = data.getPointer();
++            const len = data.getLength();
++            break :os2 opentype.OS2.init(ptr[0..len]) catch |err| {
++                log.warn("error parsing OS/2 table: {}", .{err});
++                break :os2 null;
++            };
++        };
++
+         const units_per_em: f64 = @floatFromInt(head.unitsPerEm);
+         const px_per_em: f64 = ct_font.getSize();
+         const px_per_unit: f64 = px_per_em / units_per_em;
+@@ -624,8 +596,6 @@                 };
+             }
+ 
+-            // If our font has no OS/2 table, then we just
+-            // blindly use the metrics from the hhea table.
+             break :vertical_metrics .{
+                 hhea_ascent * px_per_unit,
+                 hhea_descent * px_per_unit,
+@@ -639,19 +609,19 @@         const has_broken_underline = post.underlineThickness == 0;
+ 
+         // If the underline position isn't 0 then we do use it,
+-        // even if the thickness is't properly specified.
++        // even if the thickness isn't properly specified.
+         const underline_position: ?f64 = if (has_broken_underline and post.underlinePosition == 0)
+             null
+         else
+             @as(f64, @floatFromInt(post.underlinePosition)) * px_per_unit;
+ 
+-        const underline_thickness = if (has_broken_underline)
++        const underline_thickness: ?f64 = if (has_broken_underline)
+             null
+         else
+             @as(f64, @floatFromInt(post.underlineThickness)) * px_per_unit;
+ 
+         // Similar logic to the underline above.
+-        const strikethrough_position, const strikethrough_thickness = st: {
++        const strikethrough_position: ?f64, const strikethrough_thickness: ?f64 = st: {
+             const os2 = os2_ orelse break :st .{ null, null };
+ 
+             const has_broken_strikethrough = os2.yStrikeoutSize == 0;
+@@ -682,7 +652,6 @@                     @as(f64, @floatFromInt(sCapHeight)) * px_per_unit
+                 else
+                     ct_font.getCapHeight(),
+-
+                 if (os2.sxHeight) |sxHeight|
+                     @as(f64, @floatFromInt(sxHeight)) * px_per_unit
+                 else
+@@ -700,25 +669,24 @@                 var result: [len]u16 = undefined;
+                 var i: u16 = 32;
+                 while (i < 127) : (i += 1) {
+-                    result[i - 32] = i;
++                    result[@as(usize, @intCast(i - 32))] = i;
+                 }
+ 
+                 break :unichars result;
+             };
+ 
+             // Get our glyph IDs for the ASCII chars
+-            var glyphs: [unichars.len]macos.graphics.Glyph = undefined;
+-            _ = ct_font.getGlyphsForCharacters(&unichars, &glyphs);
++            var buf_glyphs: [unichars.len]macos.graphics.Glyph = undefined;
++            _ = ct_font.getGlyphsForCharacters(&unichars, &buf_glyphs);
+ 
+             // Get all our advances
+-            var advances: [unichars.len]macos.graphics.Size = undefined;
+-            _ = ct_font.getAdvancesForGlyphs(.horizontal, &glyphs, &advances);
++            var buf_advances: [unichars.len]macos.graphics.Size = undefined;
++            _ = ct_font.getAdvancesForGlyphs(.horizontal, &buf_glyphs, &buf_advances);
+ 
+             // Find the maximum advance
+             var max: f64 = 0;
+-            var i: usize = 0;
+-            while (i < advances.len) : (i += 1) {
+-                max = @max(advances[i].width, max);
++            for (buf_advances) |*advance| {
++                max = @max(advance.width, max);
+             }
+ 
+             break :cell_width max;
+@@ -753,280 +721,43 @@ 
+         const ptr = data.getPointer();
+         @memcpy(buf, ptr[0..buf.len]);
+-
+         return buf;
+     }
+-};
+-
+-/// The state associated with a font face that may have colorized glyphs.
+-/// This is used to determine if a specific glyph ID is colorized.
+-const ColorState = struct {
+-    /// True if there is an sbix font table. For now, the mere presence
+-    /// of an sbix font table causes us to assume the glyph is colored.
+-    /// We can improve this later.
+-    sbix: bool,
+-
+-    /// The SVG font table data (if any), which we can use to determine
+-    /// if a glyph is present in the SVG table.
+-    svg: ?opentype.SVG,
+-    svg_data: ?*macos.foundation.Data,
+-
+-    pub const Error = error{InvalidSVGTable};
+-
+-    pub fn init(f: *macos.text.Font) Error!ColorState {
+-        // sbix is true if the table exists in the font data at all.
+-        // In the future we probably want to actually parse it and
+-        // check for glyphs.
+-        const sbix: bool = sbix: {
+-            const tag = macos.text.FontTableTag.init("sbix");
+-            const data = f.copyTable(tag) orelse break :sbix false;
+-            data.release();
+-            break :sbix data.getLength() > 0;
+-        };
+-
+-        // Read the SVG table out of the font data.
+-        const svg: ?struct {
+-            svg: opentype.SVG,
+-            data: *macos.foundation.Data,
+-        } = svg: {
+-            const tag = macos.text.FontTableTag.init("SVG ");
+-            const data = f.copyTable(tag) orelse break :svg null;
+-            errdefer data.release();
+-            const ptr = data.getPointer();
+-            const len = data.getLength();
+-            const svg = opentype.SVG.init(ptr[0..len]) catch |err| {
+-                return switch (err) {
+-                    error.EndOfStream,
+-                    error.SVGVersionNotSupported,
+-                    => error.InvalidSVGTable,
+-                };
+-            };
+-
+-            break :svg .{
+-                .svg = svg,
+-                .data = data,
+-            };
+-        };
+-
+-        return .{
+-            .sbix = sbix,
+-            .svg = if (svg) |v| v.svg else null,
+-            .svg_data = if (svg) |v| v.data else null,
+-        };
+-    }
+-
+-    pub fn deinit(self: *const ColorState) void {
+-        if (self.svg_data) |v| v.release();
+-    }
+-
+-    /// Returns true if the given glyph ID is colored.
+-    pub fn isColorGlyph(self: *const ColorState, glyph_id: u32) bool {
+-        // Our font system uses 32-bit glyph IDs for special values but
+-        // actual fonts only contain 16-bit glyph IDs so if we can't cast
+-        // into it it must be false.
+-        const glyph_u16 = std.math.cast(u16, glyph_id) orelse return false;
+-
+-        // sbix is always true for now
+-        if (self.sbix) return true;
+-
+-        // if we have svg data, check it
+-        if (self.svg) |svg| {
+-            if (svg.hasGlyph(glyph_u16)) return true;
+-        }
+-
+-        return false;
+-    }
+-};
+-
+-test {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-
+-    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+-    defer atlas.deinit(alloc);
+-
+-    const name = try macos.foundation.String.createWithBytes("Monaco", .utf8, false);
+-    defer name.release();
+-    const desc = try macos.text.FontDescriptor.createWithNameAndSize(name, 12);
+-    defer desc.release();
+-    const ct_font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+-    defer ct_font.release();
+-
+-    var face = try Face.initFontCopy(ct_font, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    // Generate all visible ASCII
+-    var i: u8 = 32;
+-    while (i < 127) : (i += 1) {
+-        try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
+-    }
+-}
+-
+-test "name" {
+-    const testing = std.testing;
+-
+-    const name = try macos.foundation.String.createWithBytes("Menlo", .utf8, false);
+-    defer name.release();
+-    const desc = try macos.text.FontDescriptor.createWithNameAndSize(name, 12);
+-    defer desc.release();
+-    const ct_font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+-    defer ct_font.release();
+-
+-    var face = try Face.initFontCopy(ct_font, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    var buf: [1024]u8 = undefined;
+-    const font_name = try face.name(&buf);
+-    try testing.expect(std.mem.eql(u8, font_name, "Menlo"));
+-}
+-
+-test "emoji" {
+-    const testing = std.testing;
+-
+-    const name = try macos.foundation.String.createWithBytes("Apple Color Emoji", .utf8, false);
+-    defer name.release();
+-    const desc = try macos.text.FontDescriptor.createWithNameAndSize(name, 12);
+-    defer desc.release();
+-    const ct_font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+-    defer ct_font.release();
+-
+-    var face = try Face.initFontCopy(ct_font, .{ .size = .{ .points = 18 } });
+-    defer face.deinit();
+-
+-    // Glyph index check
+-    {
+-        const id = face.glyphIndex('🥸').?;
+-        try testing.expect(face.isColorGlyph(id));
+-    }
+-}
+-
+-test "in-memory" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-    const testFont = font.embedded.regular;
+-
+-    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+-    defer atlas.deinit(alloc);
+-
+-    var lib = try font.Library.init();
+-    defer lib.deinit();
+-
+-    var face = try Face.init(lib, testFont, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    // Generate all visible ASCII
+-    var i: u8 = 32;
+-    while (i < 127) : (i += 1) {
+-        try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
+-    }
+-}
+-
+-test "variable" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-    const testFont = font.embedded.variable;
+-
+-    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+-    defer atlas.deinit(alloc);
+-
+-    var lib = try font.Library.init();
+-    defer lib.deinit();
+-
+-    var face = try Face.init(lib, testFont, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    // Generate all visible ASCII
+-    var i: u8 = 32;
+-    while (i < 127) : (i += 1) {
+-        try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
+-    }
+-}
+-
+-test "variable set variation" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-    const testFont = font.embedded.variable;
+-
+-    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+-    defer atlas.deinit(alloc);
+-
+-    var lib = try font.Library.init();
+-    defer lib.deinit();
+-
+-    var face = try Face.init(lib, testFont, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    try face.setVariations(&.{
+-        .{ .id = font.face.Variation.Id.init("wght"), .value = 400 },
+-    }, .{ .size = .{ .points = 12 } });
+-
+-    // Generate all visible ASCII
+-    var i: u8 = 32;
+-    while (i < 127) : (i += 1) {
+-        try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
+-    }
+-}
+-
+-test "svg font table" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-    const testFont = font.embedded.julia_mono;
+-
+-    var lib = try font.Library.init();
+-    defer lib.deinit();
+-
+-    var face = try Face.init(lib, testFont, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    const table = (try face.copyTable(alloc, "SVG ")).?;
+-    defer alloc.free(table);
+-
+-    try testing.expect(table.len > 0);
+-}
+-
+-test "glyphIndex colored vs text" {
+-    const testing = std.testing;
+-    const testFont = font.embedded.julia_mono;
+-
+-    var lib = try font.Library.init();
+-    defer lib.deinit();
+-
+-    var face = try Face.init(lib, testFont, .{ .size = .{ .points = 12 } });
+-    defer face.deinit();
+-
+-    {
+-        const glyph = face.glyphIndex('A').?;
+-        try testing.expectEqual(4, glyph);
+-        try testing.expect(!face.isColorGlyph(glyph));
+-    }
+-
+-    {
+-        const glyph = face.glyphIndex(0xE800).?;
+-        try testing.expectEqual(11482, glyph);
+-        try testing.expect(face.isColorGlyph(glyph));
+-    }
+-}+
++    const GetMetricsError = error{
++        CopyTableError,
++        InvalidHeadTable,
++        InvalidPostTable,
++        InvalidHheaTable,
++    };
++
++    /// Get the `FaceMetrics` for this face.
++    pub fn getMetrics(self: *Face) GetMetricsError!font.Metrics.FaceMetrics {
++        const ct_font = self.font;
++
++        // Read the 'head' table out of the font data.
++        const head: opentype.Head = head: {
++            // macOS bitmap-only fonts use a 'bhed' tag rather than 'head', but
++            // the table format is byte-identical to the 'head' table, so if we
++            // can't find 'head' we try 'bhed' instead before failing.
++@@ -662,7 +665,7 @@ test "coretext: metrics" {
++         undefined,
++         testFont,
++         .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++-    );
+++    ).Face;
++     defer ct_font.deinit();
++
++     try std.testing.expectEqual(font.Metrics.FaceMetrics{
++         .cell_width = 8,
++         // The cell height is 17 px because the calculation is
++         //
++@@ -687,7 +690,7 @@ test "coretext: metrics" {
++
++     // Resize should change metrics
++     try ct_font.setSize(.{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } });
++-    try std.testing.expectEqual(font.Metrics.FaceMetrics{
+++    try std.testing.expectEqual(font.Metrics{
++         .cell_width = 16,
++         .cell_height = 34,
++         .cell_baseline = 6,

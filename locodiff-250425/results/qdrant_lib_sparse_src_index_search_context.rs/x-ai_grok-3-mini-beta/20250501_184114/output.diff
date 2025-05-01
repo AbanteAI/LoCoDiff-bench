@@ -1,0 +1,203 @@
+--- qdrant_lib_sparse_src_index_search_context.rs_expectedoutput.txt (expected)+++ qdrant_lib_sparse_src_index_search_context.rs_extracted.txt (actual)@@ -1,14 +1,15 @@-use std::cmp::{Ordering, max, min};
++use std::cmp::{max, min, Ordering};
+ use std::sync::atomic::AtomicBool;
+ use std::sync::atomic::Ordering::Relaxed;
+ 
+-use common::counter::hardware_counter::HardwareCounterCell;
+ use common::top_k::TopK;
+ use common::types::{PointOffsetType, ScoredPointOffset};
++use common::vector::VectorElement;
+ 
+ use super::posting_list_common::PostingListIter;
+ use crate::common::scores_memory_pool::PooledScoresHandle;
+-use crate::common::sparse_vector::{RemappedSparseVector, score_vectors};
++use crate::common::sparse_vector::RemappedSparseVector;
++use crate::common::sparse_vector::{score_vectors, SparseVector};
+ use crate::common::types::{DimId, DimWeight};
+ use crate::index::inverted_index::InvertedIndex;
+ use crate::index::posting_list::PostingListIterator;
+@@ -33,7 +34,6 @@     max_record_id: PointOffsetType,         // max_record_id ids across all posting lists
+     pooled: PooledScoresHandle<'b>,         // handle to pooled scores
+     use_pruning: bool,
+-    hardware_counter: &'a HardwareCounterCell,
+ }
+ 
+ impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
+@@ -89,11 +89,8 @@             max_record_id,
+             pooled,
+             use_pruning,
+-            hardware_counter,
+-        }
+-    }
+-
+-    const DEFAULT_SCORE: f32 = 0.0;
++        }
++    }
+ 
+     /// Plain search against the given ids without any pruning
+     pub fn plain_search(&mut self, ids: &[PointOffsetType]) -> Vec<ScoredPointOffset> {
+@@ -117,7 +114,9 @@             for posting_iterator in self.postings_iterators.iter_mut() {
+                 // rely on underlying binary search as the posting lists are sorted by record id
+                 match posting_iterator.posting_list_iterator.skip_to(id) {
+-                    None => {} // no match for posting list
++                    None => {
++                        // no match for posting list
++                    }
+                     Some(element) => {
+                         // match for posting list
+                         indices.push(posting_iterator.query_index);
+@@ -133,7 +132,7 @@             // Accumulate the sum of the length of the retrieved sparse vector and the query vector length
+             // as measurement for CPU usage of plain search.
+             cpu_counter
+-                .incr_delta(self.query.indices.len() + values.len() * size_of::<DimWeight>());
++                .incr_delta(self.query.indices.len() + values.len() * core::mem::size_of::<DimWeight>());
+ 
+             // reconstruct sparse vector and score against query
+             let sparse_score =
+@@ -156,8 +155,6 @@         batch_last_id: PointOffsetType,
+         filter_condition: &F,
+     ) {
+-        // init batch scores
+-        let batch_len = batch_last_id - batch_start_id + 1;
+         self.pooled.scores.clear(); // keep underlying allocated memory
+         self.pooled.scores.resize(batch_len as usize, 0.0);
+ 
+@@ -242,7 +239,7 @@             .postings_iterators
+             .iter()
+             .enumerate()
+-            .max_by(|(_, a), (_, b)| {
++            .max_by(|(_, a), en(&b)| {
+                 a.posting_list_iterator
+                     .len_to_end()
+                     .cmp(&b.posting_list_iterator.len_to_end())
+@@ -250,7 +247,7 @@             .map(|(index, _)| index);
+ 
+         if let Some(posting_index) = posting_index {
+-            // make sure it is not already at the head
++            // make sure it is not already at the tips head
+             if posting_index != 0 {
+                 // swap longest posting list to the head
+                 self.postings_iterators.swap(0, posting_index);
+@@ -306,117 +303,10 @@                 self.max_record_id,
+             );
+ 
+-            // advance and score posting lists iterators
+-            self.advance_batch(start_batch_id, last_batch_id, filter_condition);
+-
+-            // remove empty posting lists if necessary
+-            self.postings_iterators.retain(|posting_iterator| {
+-                posting_iterator.posting_list_iterator.len_to_end() != 0
+-            });
+-
+-            // update min_record_id
+-            self.min_record_id = Self::next_min_id(&mut self.postings_iterators);
+-
+-            // check if all posting lists are exhausted
+-            if self.postings_iterators.is_empty() {
+-                break;
+-            }
+-
+-            // if only one posting list left, we can score it quickly
+-            if self.postings_iterators.len() == 1 {
+-                self.process_last_posting_list(filter_condition);
+-                break;
+-            }
+-
+-            // we potentially have enough results to prune low performing posting lists
+-            if self.use_pruning && self.top_results.len() >= self.top {
+-                // current min score
+-                let new_min_score = self.top_results.threshold();
+-                if new_min_score == best_min_score {
+-                    // no improvement in lowest best score since last pruning - skip pruning
+-                    continue;
+-                } else {
+-                    best_min_score = new_min_score;
+-                }
+-                // make sure the first posting list is the longest for pruning
+-                self.promote_longest_posting_lists_to_the_front();
+-
+-                // prune posting list that cannot possibly contribute to the top results
+-                let pruned = self.prune_longest_posting_list(new_min_score);
+-                if pruned {
+-                    // update min_record_id
+-                    self.min_record_id = Self::next_min_id(&mut self.postings_iterators);
+-                }
+-            }
+-        }
+-        // posting iterators exhausted, return result queue
+-        let queue = std::mem::take(&mut self.top_results);
+-        queue.into_vec()
+-    }
+-
+-    /// Prune posting lists that cannot possibly contribute to the top results
+-    /// Assumes longest posting list is at the head of the posting list iterators
+-    /// Returns true if the longest posting list was pruned
+-    pub fn prune_longest_posting_list(&mut self, min_score: f32) -> bool {
+-        if self.postings_iterators.is_empty() {
+-            return false;
+-        }
+-        // peek first element of longest posting list
+-        let (longest_posting_iterator, rest_iterators) = self.postings_iterators.split_at_mut(1);
+-        let longest_posting_iterator = &mut longest_posting_iterator[0];
+-        if let Some(element) = longest_posting_iterator.posting_list_iterator.peek() {
+-            let next_min_id_in_others = Self::next_min_id(rest_iterators);
+-            match next_min_id_in_others {
+-                Some(next_min_id) => {
+-                    match next_min_id.cmp(&element.record_id) {
+-                        Ordering::Equal => {
+-                            // if the next min id in the other posting lists is the same as the current one,
+-                            // we can't prune the current element as it needs to be scored properly across posting lists
+-                            return false;
+-                        }
+-                        Ordering::Less => {
+-                            // we can't prune as there the other posting lists contains smaller smaller ids that need to scored first
+-                            return false;
+-                        }
+-                        Ordering::Greater => {
+-                            // next_min_id is > element.record_id there is a chance to prune up to `next_min_id`
+-                            // check against the max possible score using the `max_next_weight`
+-                            // we can under prune as we should actually check the best score up to `next_min_id` - 1 only
+-                            // instead of the max possible score but it is not possible to know the best score up to `next_min_id` - 1
+-                            let max_weight_from_list = element.weight.max(element.max_next_weight);
+-                            let max_score_contribution =
+-                                max_weight_from_list * longest_posting_iterator.query_weight;
+-                            if max_score_contribution <= min_score {
+-                                // prune to next_min_id
+-                                let longest_posting_iterator =
+-                                    &mut self.postings_iterators[0].posting_list_iterator;
+-                                let position_before_pruning =
+-                                    longest_posting_iterator.current_index();
+-                                longest_posting_iterator.skip_to(next_min_id);
+-                                let position_after_pruning =
+-                                    longest_posting_iterator.current_index();
+-                                // check if pruning took place
+-                                return position_before_pruning != position_after_pruning;
+-                            }
+-                        }
+-                    }
+-                }
+-                None => {
+-                    // the current posting list is the only one left, we can potentially skip it to the end
+-                    // check against the max possible score using the `max_next_weight`
+-                    let max_weight_from_list = element.weight.max(element.max_next_weight);
+-                    let max_score_contribution =
+-                        max_weight_from_list * longest_posting_iterator.query_weight;
+-                    if max_score_contribution <= min_score {
+-                        // prune to the end!
+-                        let longest_posting_iterator = &mut self.postings_iterators[0];
+-                        longest_posting_iterator.posting_list_iterator.skip_to_end();
+-                        return true;
+-                    }
+-                }
+-            }
+-        }
+-        // no pruning took place
+-        false
+-    }
+-}+            // init batch scores
++            self.pooled.scores.clear(); // keep underlying allocated memory
++            self.pooled
++                .scores
++                .resize((last_batch_id - start_batch_id + 1) as usize, 0.0);
++Truncated at the end.
++Truncated at the end.
