@@ -1,0 +1,143 @@
+--- qdrant_lib_collection_src_update_handler.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_update_handler.rs_extracted.txt (actual)@@ -1,8 +1,8 @@ use std::cmp::min;
+ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ 
+ use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+@@ -16,7 +16,7 @@ use segment::types::SeqNumberType;
+ use tokio::runtime::Handle;
+ use tokio::sync::mpsc::{self, Receiver, Sender};
+-use tokio::sync::{Mutex as TokioMutex, oneshot};
++use tokio::sync::{oneshot, Mutex as TokioMutex};
+ use tokio::task::{self, JoinHandle};
+ use tokio::time::error::Elapsed;
+ use tokio::time::{Duration, timeout};
+@@ -40,7 +40,7 @@ 
+ /// Interval at which the optimizer worker cleans up old optimization handles
+ ///
+-/// The longer the duration, the longer it  takes for panicked tasks to be reported.
++/// The longer the duration, the longer it takes for panicked tasks to be reported.
+ const OPTIMIZER_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+ 
+ pub type Optimizer = dyn SegmentOptimizer + Sync + Send;
+@@ -75,7 +75,7 @@ /// Signal, used to inform Optimization process
+ #[derive(PartialEq, Eq, Clone, Copy)]
+ pub enum OptimizerSignal {
+-    /// Sequential number of the operation
++    /// Sequential number of the operation or `0` for `Nop`
+     Operation(SeqNumberType),
+     /// Stop all optimizers and listening
+     Stop,
+@@ -148,18 +148,18 @@             shared_storage_config,
+             payload_index_schema,
+             optimizers,
++            optimizers_log,
++            total_optimized_points,
++            optimizer_resource_budget,
++            flush_interval_sec,
+             segments,
+             update_worker: None,
+             optimizer_worker: None,
+-            optimizers_log,
+-            total_optimized_points,
+-            optimizer_resource_budget,
+             flush_worker: None,
+             flush_stop: None,
+             runtime_handle,
+             wal,
+             wal_keep_from: Arc::new(u64::MAX.into()),
+-            flush_interval_sec,
+             optimization_handles: Arc::new(TokioMutex::new(vec![])),
+             max_optimization_threads,
+             clocks,
+@@ -203,14 +203,6 @@         self.flush_stop = Some(flush_tx);
+     }
+ 
+-    pub fn stop_flush_worker(&mut self) {
+-        if let Some(flush_stop) = self.flush_stop.take() {
+-            if let Err(()) = flush_stop.send(()) {
+-                warn!("Failed to stop flush worker as it is already stopped.");
+-            }
+-        }
+-    }
+-
+     /// Gracefully wait before all optimizations stop
+     /// If some optimization is in progress - it will be finished before shutdown.
+     pub async fn wait_workers_stops(&mut self) -> CollectionResult<()> {
+@@ -284,8 +276,11 @@         'outer: for optimizer in optimizers.iter() {
+             loop {
+                 // Return early if we reached the optimization job limit
+-                if limit.map(|extra| handles.len() >= extra).unwrap_or(false) {
+-                    log::trace!("Reached optimization job limit, postponing other optimizations");
++                if limit.is_some_and(|extra| handles.len() >= extra) {
++                    log::trace!(
++                        "Reached optimization job limit, postponing other {} optimizers",
++                        optimizer.name(),
++                    );
+                     break 'outer;
+                 }
+ 
+@@ -558,8 +553,7 @@         let max_handles = max_handles.unwrap_or(usize::MAX);
+         let max_indexing_threads = optimizers
+             .first()
+-            .map(|optimizer| optimizer.hnsw_config().max_indexing_threads)
+-            .unwrap_or_default();
++            .map_or(0, |optimizer| optimizer.hnsw_config().max_indexing_threads);
+ 
+         // Asynchronous task to trigger optimizers once CPU budget is available again
+         let mut resource_available_trigger: Option<JoinHandle<()>> = None;
+@@ -612,9 +606,7 @@                     &payload_index_schema.read(),
+                 );
+                 if let Err(err) = result {
+-                    log::error!(
+-                        "Failed to ensure there are appendable segments with capacity: {err}"
+-                    );
++                    log::error!("Failed to ensure there are appendable segments with capacity: {err}");
+                     panic!("Failed to ensure there are appendable segments with capacity: {err}");
+                 }
+             }
+@@ -624,10 +616,7 @@                 continue;
+             }
+ 
+-            if Self::try_recover(segments.clone(), wal.clone())
+-                .await
+-                .is_err()
+-            {
++            if Self::try_recover(segments.clone(), wal.clone()).await.is_err() {
+                 continue;
+             }
+ 
+@@ -736,9 +725,7 @@                     .send(OptimizerSignal::Nop)
+                     .await
+                     .unwrap_or_else(|_| {
+-                        info!(
+-                            "Can't notify optimizers, assume process is dead. Restart is required"
+-                        );
++                        info!("Can't notify optimizers, assume process is dead. Restart is required");
+                     }),
+                 UpdateSignal::Plunger(callback_sender) => {
+                     callback_sender.send(()).unwrap_or_else(|_| {
+@@ -791,7 +778,7 @@             let confirmed_version = match confirmed_version {
+                 Ok(version) => version,
+                 Err(err) => {
+-                    error!("Failed to flush: {err}");
++                    error!("Failed to flush segments: {err}");
+                     segments.write().report_optimizer_error(err);
+                     continue;
+                 }
+@@ -845,11 +832,11 @@     sender: Sender<OptimizerSignal>,
+ ) -> JoinHandle<()> {
+     task::spawn(async move {
+-        log::trace!("Skipping optimization checks, waiting for CPU budget to be available");
++        log::trace!("Skipping optimization checks, waiting for resource budget to be available");
+         optimizer_resource_budget
+             .notify_on_budget_available(desired_cpus, desired_io)
+             .await;
+-        log::trace!("Continue optimization checks, new CPU budget available");
++        log::trace!("Continue optimization checks, new resource budget available");
+ 
+         // Trigger optimizers with Nop operation
+         sender.send(OptimizerSignal::Nop).await.unwrap_or_else(|_| {

@@ -1,0 +1,309 @@
+--- qdrant_lib_collection_src_collection_manager_segments_searcher.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_collection_manager_segments_searcher.rs_extracted.txt (actual)@@ -1,15 +1,17 @@-use std::collections::BTreeSet;
+ use std::collections::hash_map::Entry;
++use std::collections::{BTreeSet, HashMap};
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicBool;
+ 
+ use ahash::AHashMap;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
++use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::ScoreType;
+ use futures::stream::FuturesUnordered;
+ use futures::{FutureExt, TryStreamExt};
+ use itertools::Itertools;
+ use ordered_float::Float;
++use parking_lot::RwLock;
+ use segment::common::operation_error::OperationError;
+ use segment::data_types::named_vectors::NamedVectors;
+ use segment::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
+@@ -110,7 +112,7 @@ 
+         // Therefore we need to track the lowest scored element per segment for each batch
+         let mut lowest_scores_per_request: Vec<Vec<ScoreType>> = vec![
+-            vec![f32::max_value(); batch_size]; // initial max score value for each batch
++            vec![f32::MAX; batch_size]; // initial max score value for each batch
+             number_segments
+         ];
+ 
+@@ -217,25 +219,21 @@         }
+ 
+         // Do blocking calls in a blocking task: `segment.get().read()` calls might block async runtime
+-        let task = {
+-            let segments = segments.clone();
+-
+-            tokio::task::spawn_blocking(move || {
+-                let segments = segments.read();
+-
+-                if segments.is_empty() {
+-                    return None;
+-                }
+-
+-                let segments = segments.non_appendable_then_appendable_segments();
+-                for locked_segment in segments {
+-                    let segment = locked_segment.get();
+-                    let segment_guard = segment.read();
+-                    segment_guard.fill_query_context(&mut query_context);
+-                }
+-                Some(query_context)
+-            })
+-        };
++        let task = tokio::task::spawn_blocking(move || {
++            let segments = segments.read();
++
++            if segments.is_empty() {
++                return None;
++            }
++
++            let segments = segments.non_appendable_then_appendable_segments();
++            for locked_segment in segments {
++                let segment = locked_segment.get();
++                let segment_guard = segment.read();
++                segment_guard.fill_query_context(&mut query_context);
++            }
++            Some(query_context)
++        });
+ 
+         Ok(task.await?)
+     }
+@@ -270,7 +268,6 @@             segments
+                 .map(|segment| {
+                     let query_context_arc_segment = query_context_arc.clone();
+-
+                     let search = runtime_handle.spawn_blocking({
+                         let (segment, batch_request) = (segment.clone(), batch_request.clone());
+                         move || {
+@@ -363,7 +360,7 @@             }
+         }
+ 
+-        let top_scores: Vec<_> = result_aggregator.into_topk();
++        let top_scores = result_aggregator.into_topk();
+         Ok(top_scores)
+     }
+ 
+@@ -390,6 +387,7 @@                 let with_payload = with_payload.clone();
+                 let with_vector = with_vector.clone();
+                 let is_stopped = stopping_guard.get_is_stopped();
++                let hw_measurement_acc = hw_measurement_acc.clone();
+                 // TODO create one Task per segment level retrieve
+                 move || {
+                     Self::retrieve_blocking(
+@@ -424,7 +422,6 @@                 let version = segment.point_version(id).ok_or_else(|| {
+                     OperationError::service_error(format!("No version for point {id}"))
+                 })?;
+-
+                 // If we already have the latest point version, keep that and continue
+                 let version_entry = point_version.entry(id);
+                 if matches!(&version_entry, Entry::Occupied(entry) if *entry.get() >= version) {
+@@ -480,6 +477,53 @@         Ok(point_records)
+     }
+ 
++    /// Rescore results with a formula that can reference payload values.
++    ///
++    /// Aggregates rescores from the segments.
++    pub async fn rescore_with_formula(
++        segments: LockedSegmentHolder,
++        arc_ctx: Arc<FormulaContext>,
++        runtime_handle: &Handle,
++        hw_measurement_acc: HwMeasurementAcc,
++    ) -> CollectionResult<Vec<ScoredPoint>> {
++        let limit = arc_ctx.limit;
++
++        let mut futures = {
++            let segments_guard = segments.read();
++            segments_guard
++                .non_appendable_then_appendable_segments()
++                .map(|segment| {
++                    runtime_handle.spawn_blocking({
++                        let segment = segment.clone();
++                        let arc_ctx = arc_ctx.clone();
++                        let hw_counter = hw_measurement_acc.get_counter_cell();
++                        move || {
++                            segment
++                                .get()
++                                .read()
++                                .rescore_with_formula(arc_ctx, &hw_counter)
++                        }
++                    })
++                })
++                .collect::<FuturesUnordered<_>>()
++        };
++
++        let mut segments_results = Vec::with_capacity(futures.len());
++        while let Some(result) = futures.try_next().await? {
++            segments_results.push(result?)
++        }
++
++        // use aggregator with only one "batch"
++        let mut aggregator = BatchResultAggregator::new(std::iter::once(limit));
++        aggregator.update_point_versions(segments_results.iter().flatten());
++        aggregator.update_batch_results(0, segments_results.into_iter().flatten());
++        let top = aggregator.into_topk().into_iter().next().ok_or_else(|| {
++            OperationError::service_error("expected first result of aggregator")
++        })?;
++
++        Ok(top)
++    }
++
+     pub async fn read_filtered(
+         segments: LockedSegmentHolder,
+         filter: Option<&Filter>,
+@@ -509,54 +553,6 @@             })
+             .await?
+     }
+-
+-    /// Rescore results with a formula that can reference payload values.
+-    ///
+-    /// Aggregates rescores from the segments.
+-    pub async fn rescore_with_formula(
+-        segments: LockedSegmentHolder,
+-        arc_ctx: Arc<FormulaContext>,
+-        runtime_handle: &Handle,
+-        hw_measurement_acc: HwMeasurementAcc,
+-    ) -> CollectionResult<Vec<ScoredPoint>> {
+-        let limit = arc_ctx.limit;
+-
+-        let mut futures = {
+-            let segments_guard = segments.read();
+-            segments_guard
+-                .non_appendable_then_appendable_segments()
+-                .map(|segment| {
+-                    runtime_handle.spawn_blocking({
+-                        let segment = segment.clone();
+-                        let arc_ctx = arc_ctx.clone();
+-                        let hw_counter = hw_measurement_acc.get_counter_cell();
+-                        move || {
+-                            segment
+-                                .get()
+-                                .read()
+-                                .rescore_with_formula(arc_ctx, &hw_counter)
+-                        }
+-                    })
+-                })
+-                .collect::<FuturesUnordered<_>>()
+-        };
+-
+-        let mut segments_results = Vec::with_capacity(futures.len());
+-        while let Some(result) = futures.try_next().await? {
+-            segments_results.push(result?)
+-        }
+-
+-        // use aggregator with only one "batch"
+-        let mut aggregator = BatchResultAggregator::new(std::iter::once(limit));
+-        aggregator.update_point_versions(segments_results.iter().flatten());
+-        aggregator.update_batch_results(0, segments_results.into_iter().flatten());
+-        let top =
+-            aggregator.into_topk().into_iter().next().ok_or_else(|| {
+-                OperationError::service_error("expected first result of aggregator")
+-            })?;
+-
+-        Ok(top)
+-    }
+ }
+ 
+ #[derive(PartialEq, Default, Debug)]
+@@ -593,12 +589,7 @@ }
+ 
+ /// Returns suggested search sampling size for a given number of points and required limit.
+-fn sampling_limit(
+-    limit: usize,
+-    ef_limit: Option<usize>,
+-    segment_points: usize,
+-    total_points: usize,
+-) -> usize {
++fn sampling_limit(limit: usize, ef_limit: Option<usize>, segment_points: usize, total_points: usize) -> usize {
+     // shortcut empty segment
+     if segment_points == 0 {
+         return 0;
+@@ -630,7 +621,7 @@ /// * `segment` - Locked segment to search in
+ /// * `request` - Batch of search requests
+ /// * `use_sampling` - If true, try to use probabilistic sampling
+-/// * `query_context` - Additional context for the search
++/// * `segment_query_context` - Additional context for the search
+ ///
+ /// # Returns
+ ///
+@@ -736,6 +727,21 @@         search_params.top
+     };
+ 
++    let ignore_plain_index = search_params
++        .params
++        .map(|p| p.indexed_only)
++        .unwrap_or(false);
++    if ignore_plain_index
++        && !read_segment.is_search_optimized(
++            segment_query_context.search_optimized_threshold(),
++            search_params.vector_name,
++            search_params.filter,
++            segment_query_context.get_hardware_counter(),
++        )?
++    {
++        let batch_len = vectors_batch.len();
++        return Ok((vec![vec![]; batch_len], vec![false; batch_len]));
++    }
+     let vectors_batch = &vectors_batch.iter().collect_vec();
+     let res = read_segment.search_batch(
+         search_params.vector_name,
+@@ -772,6 +778,8 @@ 
+ #[cfg(test)]
+ mod tests {
++    use std::collections::HashSet;
++
+     use ahash::AHashSet;
+     use api::rest::SearchRequestInternal;
+     use common::counter::hardware_counter::HardwareCounterCell;
+@@ -853,12 +861,13 @@         };
+ 
+         let hw_acc = HwMeasurementAcc::new();
++        let query_context = QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_acc);
+         let result = SegmentsSearcher::search(
+             Arc::new(segment_holder),
+             Arc::new(batch_request),
+             &Handle::current(),
+             true,
+-            QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_acc),
++            query_context,
+         )
+         .await
+         .unwrap()
+@@ -916,15 +925,13 @@                 searches: vec![req1.into(), req2.into()],
+             };
+ 
+-            let batch_request = Arc::new(batch_request);
+-
+             let hw_measurement_acc = HwMeasurementAcc::new();
+             let query_context =
+                 QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_measurement_acc.clone());
+ 
+             let result_no_sampling = SegmentsSearcher::search(
+                 segment_holder.clone(),
+-                batch_request.clone(),
++                Arc::new(batch_request.clone()),
+                 &Handle::current(),
+                 false,
+                 query_context,
+@@ -942,7 +949,7 @@ 
+             let result_sampling = SegmentsSearcher::search(
+                 segment_holder.clone(),
+-                batch_request,
++                Arc::new(batch_request),
+                 &Handle::current(),
+                 true,
+                 query_context,
+@@ -1017,10 +1024,14 @@             (1000, 0, 150, 150),
+             (1000, 0, 110, 110),
+         ];
+-        tests.into_iter().for_each(|(limit, ef_limit, poisson_sampling, effective)| assert_eq!(
+-            effective_limit(limit, ef_limit, poisson_sampling),
+-            effective,
+-            "effective limit for [limit: {limit}, ef_limit: {ef_limit}, poisson_sampling: {poisson_sampling}] must be {effective}",
+-        ));
++        tests
++            .into_iter()
++            .for_each(|(limit, ef_limit, poisson_sampling, effective)| {
++                assert_eq!(
++                    effective_limit(limit, ef_limit, poisson_sampling),
++                    effective,
++                    "effective limit for [limit: {limit}, ef_limit: {ef_limit}, poisson_sampling: {poisson_sampling}] must be {effective}",
++                )
++            });
+     }
+ }

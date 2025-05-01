@@ -1,0 +1,309 @@
+--- qdrant_lib_collection_src_shards_local_shard_mod.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_shards_local_shard_mod.rs_extracted.txt (actual)@@ -21,6 +21,7 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::rate_limiting::RateLimiter;
++use common::telemetry_module::TelemetryDetail;
+ use common::{panic, tar_ext};
+ use indicatif::{ProgressBar, ProgressStyle};
+ use itertools::Itertools;
+@@ -34,6 +35,7 @@     Filter, PayloadIndexInfo, PayloadKeyType, PointIdType, SegmentConfig, SegmentType,
+     SnapshotFormat,
+ };
++use segment::vector_storage::common::get_async_scorer;
+ use tokio::fs::{create_dir_all, remove_dir_all, remove_file};
+ use tokio::runtime::Handle;
+ use tokio::sync::mpsc::Sender;
+@@ -55,22 +57,18 @@ use crate::operations::OperationWithClockTag;
+ use crate::operations::shared_storage_config::SharedStorageConfig;
+ use crate::operations::types::{
+-    CollectionError, CollectionResult, OptimizersStatus, ShardInfoInternal, ShardStatus,
+-    check_sparse_compatible_with_segment_config,
++    CollectionError, CollectionRequestVerification, CollectionResult, OptimizersStatus,
++    ShardInfoInternal, ShardStatus, check_sparse_compatible_with_segment_config,
+ };
+ use crate::optimizers_builder::{OptimizersConfig, build_optimizers, clear_temp_segments};
+ use crate::save_on_disk::SaveOnDisk;
+ use crate::shards::CollectionId;
+ use crate::shards::shard::ShardId;
+ use crate::shards::shard_config::ShardConfig;
++use crate::shards::telemetry::{LocalShardTelemetry, OptimizerTelemetry};
+ use crate::update_handler::{Optimizer, UpdateHandler, UpdateSignal};
+ use crate::wal::SerdeWal;
+-use crate::wal_delta::{LockedWal, RecoverableWal};
+-
+-/// If rendering WAL load progression in basic text form, report progression every 60 seconds.
+-const WAL_LOAD_REPORT_EVERY: Duration = Duration::from_secs(60);
+-
+-const WAL_PATH: &str = "wal";
++use crate::wal_delta::{LockedWal, RecoverableWal, WAL_PATH};
+ 
+ const SEGMENTS_PATH: &str = "segments";
+ 
+@@ -175,11 +173,11 @@ 
+         // default to 2x the WAL capacity
+         let disk_buffer_threshold_mb =
+-            2 * (collection_config.read().await.wal_config.wal_capacity_mb);
++            2 * (config.wal_config.wal_capacity_mb as u64);
+ 
+         let disk_usage_watcher = disk_usage_watcher::DiskUsageWatcher::new(
+             shard_path.to_owned(),
+-            disk_buffer_threshold_mb,
++            disk_buffer_threshold_threshold_mb,
+         )
+         .await;
+ 
+@@ -234,11 +232,7 @@         }
+     }
+ 
+-    pub(super) fn segments(&self) -> &RwLock<SegmentHolder> {
+-        self.segments.deref()
+-    }
+-
+-    /// Recovers shard from disk.
++
+     #[allow(clippy::too_many_arguments)]
+     pub async fn load(
+         id: ShardId,
+@@ -258,10 +252,11 @@         let segments_path = Self::segments_path(shard_path);
+ 
+         let wal: SerdeWal<OperationWithClockTag> = SerdeWal::new(
+-            wal_path.to_str().unwrap(),
++            wal_path.to_str().unwrap().to_string(),
+             (&collection_config_read.wal_config).into(),
+         )
+         .map_err(|e| CollectionError::service_error(format!("Wal error: {e}")))?;
++
+ 
+         // Walk over segments directory and collect all directory entries now
+         // Collect now and error early to prevent errors while we've already spawned load threads
+@@ -307,6 +302,7 @@             })
+             .map(|entry| entry.path());
+ 
++
+         let mut load_handlers = vec![];
+ 
+         // This semaphore is used to limit the number of threads that load segments concurrently.
+@@ -371,6 +367,7 @@                 })
+                 .unwrap_or(Ok(()))?;
+ 
++
+             segment_holder.add_new(segment);
+         }
+ 
+@@ -410,6 +407,7 @@                 &payload_index_schema,
+             )?;
+         }
++
+ 
+         let local_shard = LocalShard::new(
+             segment_holder,
+@@ -548,7 +546,7 @@         }
+ 
+         let wal: SerdeWal<OperationWithClockTag> =
+-            SerdeWal::new(wal_path.to_str().unwrap(), (&config.wal_config).into())?;
++            SerdeWal::new(wal_path.to_str().unwrap().to_string(), (&config.wal_config).into())?;
+ 
+         let optimizers = build_optimizers(
+             shard_path,
+@@ -708,7 +706,8 @@         bar.finish();
+         if !show_progress_bar {
+             log::info!(
+-                "Recovered collection {collection_id}: {0}/{0} (100%)",
++                "Recovered shard {}: {0}/{0} (100%)",
++                self.path.display(),
+                 wal.len(false),
+             );
+         }
+@@ -732,9 +731,8 @@                     let segment_guard = raw_segment.read();
+                     if let Err(err) = segment_guard.check_data_consistency() {
+                         log::error!(
+-                            "Segment {:?} is inconsistent: {}",
++                            "Segment {:?} is inconsistent: {err}",
+                             segment_guard.current_path,
+-                            err
+                         );
+                         return Err(err.into());
+                     }
+@@ -747,76 +745,6 @@             }
+         }
+         Ok(())
+-    }
+-
+-    pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
+-        let config = self.collection_config.read().await;
+-        let mut update_handler = self.update_handler.lock().await;
+-
+-        let (update_sender, update_receiver) =
+-            mpsc::channel(self.shared_storage_config.update_queue_size);
+-        // makes sure that the Stop signal is the last one in this channel
+-        let old_sender = self.update_sender.swap(Arc::new(update_sender));
+-        old_sender.send(UpdateSignal::Stop).await?;
+-        update_handler.stop_flush_worker();
+-
+-        update_handler.wait_workers_stops().await?;
+-        let new_optimizers = build_optimizers(
+-            &self.path,
+-            &config.params,
+-            &config.optimizer_config,
+-            &config.hnsw_config,
+-            &config.quantization_config,
+-        );
+-        update_handler.optimizers = new_optimizers;
+-        update_handler.flush_interval_sec = config.optimizer_config.flush_interval_sec;
+-        update_handler.max_optimization_threads = config.optimizer_config.max_optimization_threads;
+-        update_handler.run_workers(update_receiver);
+-
+-        self.update_sender.load().send(UpdateSignal::Nop).await?;
+-
+-        Ok(())
+-    }
+-
+-    /// Apply shard's strict mode configuration update
+-    /// - Update read rate limiter
+-    pub async fn on_strict_mode_config_update(&mut self) {
+-        let config = self.collection_config.read().await;
+-
+-        if let Some(strict_mode_config) = &config.strict_mode_config {
+-            if strict_mode_config.enabled == Some(true) {
+-                // update read rate limiter
+-                if let Some(read_rate_limit_per_min) = strict_mode_config.read_rate_limit {
+-                    let new_read_rate_limiter =
+-                        RateLimiter::new_per_minute(read_rate_limit_per_min);
+-                    self.read_rate_limiter
+-                        .replace(parking_lot::Mutex::new(new_read_rate_limiter));
+-                    return;
+-                }
+-            }
+-        }
+-        // remove read rate limiter for all other situations
+-        self.read_rate_limiter.take();
+-    }
+-
+-    pub fn trigger_optimizers(&self) {
+-        // Send a trigger signal and ignore errors because all error cases are acceptable:
+-        // - If receiver is already dead - we do not care
+-        // - If channel is full - optimization will be triggered by some other signal
+-        let _ = self.update_sender.load().try_send(UpdateSignal::Nop);
+-    }
+-
+-    /// Finishes ongoing update tasks
+-    pub async fn stop_gracefully(&self) {
+-        if let Err(err) = self.update_sender.load().send(UpdateSignal::Stop).await {
+-            log::warn!("Error sending stop signal to update handler: {err}");
+-        }
+-
+-        self.stop_flush_worker().await;
+-
+-        if let Err(err) = self.wait_update_workers_stop().await {
+-            log::warn!("Update workers failed with: {err}");
+-        }
+     }
+ 
+     pub fn restore_snapshot(snapshot_path: &Path) -> CollectionResult<()> {
+@@ -847,7 +775,7 @@         Ok(())
+     }
+ 
+-    /// Create snapshot for local shard into `target_path`
++    /// Create snapshot for local shard and archive to a tar builder
+     pub async fn create_snapshot(
+         &self,
+         temp_path: &Path,
+@@ -864,8 +792,11 @@             // It will notify us when all submitted updates so far have been processed.
+             let (tx, rx) = oneshot::channel();
+             let plunger = UpdateSignal::Plunger(tx);
+-            self.update_sender.load().send(plunger).await?;
+-            rx.await?;
++            // Send a trigger signal and ignore errors because all error cases are acceptable:
++            // - If receiver is already dead - we do not care
++            // - If channel is full - optimization will be triggered by some other signal
++            let _ = self.update_sender.load().send(plunger).await;
++            let _ = rx.await; // Ignore error even if the notification mechanism does not work for some reason
+         }
+ 
+         let segments_path = Self::segments_path(&self.path);
+@@ -1106,21 +1037,48 @@     }
+ 
+     pub fn update_tracker(&self) -> &UpdateTracker {
+-        &self.update_tracker
+-    }
+-
+-    /// Get the recovery point for the current shard
+-    ///
+-    /// This is sourced from the last seen clocks from other nodes that we know about.
+-    pub async fn recovery_point(&self) -> RecoveryPoint {
+-        self.wal.recovery_point().await
+-    }
+-
+-    /// Update the cutoff point on the current shard
+-    ///
+-    /// This also updates the highest seen clocks.
+-    pub async fn update_cutoff(&self, cutoff: &RecoveryPoint) {
+-        self.wal.update_cutoff(cutoff).await
++        self.update_tracker
++    }
++
++    /// Apply shard's strict mode configuration update
++    /// - Update read rate limiter
++    pub async fn on_strict_mode_config_update(&mut self) {
++        let config = self.collection_config.read().await;
++
++        if let Some(strict_mode_config) = &config.strict_mode_config {
++            if let Some(true) = strict_mode_config.enabled {
++                // update read rate limiter
++                if let Some(read_rate_limit_per_min) = strict_mode_config.read_rate_limit {
++                    let new_read_rate_limiter =
++                        RateLimiter::new_per_minute(read_rate_limit_per_min);
++                    self.read_rate_limiter
++                        .replace(parking_lot::Mutex::new(new_read_rate_limiter));
++                    return;
++                }
++            }
++        }
++        // remove read rate limiter for all other situations
++        self.read_rate_limiter.take();
++    }
++
++    pub fn trigger_optimizers(&self) {
++        // Send a trigger signal and ignore errors because all error cases are acceptable:
++        // - If receiver is already dead - we do not care
++        // - If channel is full - optimization will be triggered by some other signal
++        let _ = self.update_sender.load().try_send(UpdateSignal::Nop);
++    }
++
++    /// Finishes ongoing update tasks
++    pub async fn stop_gracefully(&self) {
++        if let Err(err) = self.update_sender.load().send(UpdateSignal::Stop).await {
++            log::warn!("Error sending stop signal to update handler: {err}");
++        }
++
++        self.stop_flush_worker().await;
++
++        if let Err(err) = self.wait_update_workers_stops().await {
++            log::warn!("Update workers failed with: {err}");
++        }
+     }
+ 
+     /// Check if the read rate limiter allows the operation to proceed
+@@ -1154,6 +1112,14 @@         }
+         Ok(())
+     }
++
++    pub fn read_query_verification_config(&self) -> Option<CollectionRequestVerification> {
++        self.collection_config
++            .blocking_read()
++            .strict_mode_config
++            .as_ref()
++            .and_then(|config| config.enabled.then(|| config.verification.clone()))
++    }
+ }
+ 
+ impl Drop for LocalShard {
+@@ -1171,6 +1137,10 @@     }
+ }
+ 
++const NEWEST_CLOCKS_PATH: &str = "newest_clocks.json";
++
++const OLDEST_CLOCKS_PATH: &str = "oldest_clocks.json";
++
+ /// Convenience struct for combining clock maps belonging to a shard
+ ///
+ /// Holds a clock map for tracking the highest clocks and the cutoff clocks.
