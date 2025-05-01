@@ -37,6 +37,7 @@ import glob
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import yaml
@@ -47,6 +48,21 @@ from typing import Dict, List, Any, Tuple, Set
 
 
 # --- Helper Functions ---
+
+
+def sanitize_filename(name):
+    """
+    Sanitizes a string to be safely used as a filename.
+    Replaces path separators with underscores and removes characters illegal in filenames.
+
+    Args:
+        name: The string to sanitize
+
+    Returns:
+        A sanitized string safe for use as a filename
+    """
+    name = name.replace(os.path.sep, "_").replace("/", "_")
+    return re.sub(r'[<>:"|?*]', "", name)
 
 
 def delete_and_recreate_dir(dir_path: Path) -> None:
@@ -280,8 +296,8 @@ def collect_results_metadata(
         # Get all model directories for this case
         model_dirs = [d for d in case_dir.iterdir() if d.is_dir()]
         for model_dir in model_dirs:
-            model_name = model_dir.name.replace("_", "/")  # Convert back from sanitized
-            all_models.add(model_name)
+            # Extract original model name from metadata.json if available
+            # rather than trying to reverse the sanitization
 
             # Find the latest run for this case and model
             timestamp_dirs = sorted(
@@ -298,6 +314,16 @@ def collect_results_metadata(
 
             if metadata_path.exists():
                 metadata = read_json_file(metadata_path)
+
+                # Get the model name from metadata if available, or try to reconstruct it
+                if "model" in metadata:
+                    model_name = metadata["model"]
+                else:
+                    # As a fallback, try to recreate the model name from the directory name
+                    # This is not perfect but better than nothing
+                    model_name = model_dir.name.replace("_", "/")
+
+                all_models.add(model_name)
                 results_metadata[(case_prefix, model_name)] = metadata
 
     return results_metadata, all_models
@@ -1255,7 +1281,7 @@ def create_cases_section(
     # Add links to model pages
     for model in sorted(all_models):
         # Create a safe filename for the model (sanitized)
-        safe_model = model.replace("/", "_")
+        safe_model = sanitize_filename(model)
         # Use display name if available
         display_name = model_display_names.get(model, model)
         html += f"""
@@ -1292,7 +1318,7 @@ def generate_prompt_page(
         docs_dir: Path to the docs directory
         model_display_names: Optional mapping of model names to display names
     """
-    safe_model = model.replace("/", "_")
+    safe_model = sanitize_filename(model)
     safe_case = case_prefix.replace("/", "_")
     content_dir = docs_dir / "content" / safe_model / safe_case
     content_dir.mkdir(parents=True, exist_ok=True)
@@ -1357,7 +1383,7 @@ def generate_expected_output_page(
         docs_dir: Path to the docs directory
         model_display_names: Optional mapping of model names to display names
     """
-    safe_model = model.replace("/", "_")
+    safe_model = sanitize_filename(model)
     safe_case = case_prefix.replace("/", "_")
     content_dir = docs_dir / "content" / safe_model / safe_case
     content_dir.mkdir(parents=True, exist_ok=True)
@@ -1428,7 +1454,7 @@ def generate_actual_output_page(
         expected_output: The expected output content (used as fallback)
         extracted_output: The extracted code from the raw response (used as fallback)
     """
-    safe_model = model.replace("/", "_")
+    safe_model = sanitize_filename(model)
     safe_case = case_prefix.replace("/", "_")
     content_dir = docs_dir / "content" / safe_model / safe_case
     content_dir.mkdir(parents=True, exist_ok=True)
@@ -1595,7 +1621,7 @@ def generate_model_page(
     models_dir.mkdir(exist_ok=True)
 
     # Get the sanitized model name for the filename
-    safe_model = model.replace("/", "_")
+    safe_model = sanitize_filename(model)
     model_page_path = models_dir / f"{safe_model}.html"
 
     # Get display name if available
@@ -1750,7 +1776,7 @@ def generate_case_page(
         model_display_names: Optional mapping of model names to display names
     """
     # Create the cases directory structure if it doesn't exist
-    safe_model = model.replace("/", "_")
+    safe_model = sanitize_filename(model)
     cases_dir = docs_dir / "cases" / safe_model
     cases_dir.mkdir(parents=True, exist_ok=True)
 
