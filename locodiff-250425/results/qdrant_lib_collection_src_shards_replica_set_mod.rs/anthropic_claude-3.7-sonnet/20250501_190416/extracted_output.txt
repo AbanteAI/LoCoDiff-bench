@@ -1,0 +1,282 @@
+mod clock_set;
+mod execute_read_operation;
+mod locally_disabled_peers;
+mod read_ops;
+mod shard_transfer;
+pub mod snapshots;
+mod telemetry;
+mod update;
+
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::budget::ResourceBudget;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::rate_limiting::RateLimiter;
+use schemars::JsonSchema;
+use segment::common::anonymize::Anonymize;
+use segment::types::{ExtendedPointId, Filter, ShardKey};
+use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, RwLock};
+
+use super::CollectionId;
+use super::local_shard::LocalShard;
+use super::local_shard::clock_map::RecoveryPoint;
+use super::remote_shard::RemoteShard;
+use super::transfer::ShardTransfer;
+use crate::collection::payload_index_schema::PayloadIndexSchema;
+use crate::common::collection_size_stats::CollectionSizeStats;
+use crate::common::snapshots_manager::SnapshotStorageManager;
+use crate::config::CollectionConfigInternal;
+use crate::operations::shared_storage_config::SharedStorageConfig;
+use crate::operations::types::{CollectionError, CollectionResult, UpdateResult, UpdateStatus};
+use crate::operations::{CollectionUpdateOperations, point_ops};
+use crate::optimizers_builder::OptimizersConfig;
+use crate::save_on_disk::SaveOnDisk;
+use crate::shards::channel_service::ChannelService;
+use crate::shards::dummy_shard::DummyShard;
+use crate::shards::replica_set::clock_set::ClockSet;
+use crate::shards::shard::{PeerId, Shard, ShardId};
+use crate::shards::shard_config::ShardConfig;
+
+//    │    Collection Created
+//    │
+//    ▼
+//  ┌──────────────┐
+//  │              │
+//  │ Initializing │
+//  │              │
+//  └──────┬───────┘
+//         │  Report created    ┌───────────┐
+//         └────────────────────►           │
+//             Activate         │ Consensus │
+//        ┌─────────────────────┤           │
+//        │                     └───────────┘
+//  ┌─────▼───────┐   User Promote           ┌──────────┐
+//  │             ◄──────────────────────────►          │
+//  │ Active      │                          │ Listener │
+//  │             ◄───────────┐              │          │
+//  └──┬──────────┘           │Transfer      └──┬───────┘
+//     │                      │Finished         │
+//     │               ┌──────┴────────┐        │Update
+//     │Update         │               │        │Failure
+//     │Failure        │ Partial       ├───┐    │
+//     │               │               │   │    │
+//     │               └───────▲───────┘   │    │
+//     │                       │           │    │
+//  ┌──▼──────────┐ Transfer   │           │    │
+//  │             │ Started    │           │    │
+//  │ Dead        ├────────────┘           │    │
+//  │             │                        │    │
+//  └─▲───────▲───┘        Transfer        │    │
+//    │       │            Failed/Cancelled│    │
+//    │       └────────────────────────────┘    │
+//    │                                         │
+//    └─────────────────────────────────────────┘
+//
+
+/// A set of shard replicas.
+///
+/// Handles operations so that the state is consistent across all the replicas of the shard.
+/// Prefers local shard for read-only operations.
+/// Perform updates on all replicas and report error if there is at least one failure.
+///
+pub struct ShardReplicaSet {
+    local: RwLock<Option<Shard>>, // Abstract Shard to be able to use a Proxy during replication
+    remotes: RwLock<Vec<RemoteShard>>,
+    replica_state: Arc<SaveOnDisk<ReplicaSetState>>,
+    /// List of peers that are marked as dead locally, but are not yet submitted to the consensus.
+    /// List is checked on each consensus round and submitted to the consensus.
+    /// If the state of the peer is changed in the consensus, it is removed from the list.
+    /// Update and read operations are not performed on the peers marked as dead.
+    locally_disabled_peers: parking_lot::RwLock<locally_disabled_peers::Registry>,
+    pub(crate) shard_path: PathBuf,
+    pub(crate) shard_id: ShardId,
+    shard_key: Option<ShardKey>,
+    notify_peer_failure_cb: ChangePeerFromState,
+    abort_shard_transfer_cb: AbortShardTransfer,
+    channel_service: ChannelService,
+    collection_id: CollectionId,
+    collection_config: Arc<RwLock<CollectionConfigInternal>>,
+    optimizers_config: OptimizersConfig,
+    pub(crate) shared_storage_config: Arc<SharedStorageConfig>,
+    payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    update_runtime: Handle,
+    search_runtime: Handle,
+    optimizer_resource_budget: ResourceBudget,
+    /// Lock to serialized write operations on the replicaset when a write ordering is used.
+    write_ordering_lock: Mutex<()>,
+    /// Local clock set, used to tag new operations on this shard.
+    clock_set: Mutex<ClockSet>,
+    write_rate_limiter: Option<parking_lot::Mutex<RateLimiter>>,
+}
+
+pub type AbortShardTransfer = Arc<dyn Fn(ShardTransfer, &str) + Send + Sync>;
+pub type ChangePeerState = Arc<dyn Fn(PeerId, ShardId) + Send + Sync>;
+pub type ChangePeerFromState = Arc<dyn Fn(PeerId, ShardId, Option<ReplicaState>) + Send + Sync>;
+
+const REPLICA_STATE_FILE: &str = "replica_state.json";
+
+/// Represents a replica set state
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Clone)]
+pub struct ReplicaSetState {
+    pub is_local: bool,
+    pub this_peer_id: PeerId,
+    peers: HashMap<PeerId, ReplicaState>,
+}
+
+impl ReplicaSetState {
+    pub fn get_peer_state(&self, peer_id: PeerId) -> Option<ReplicaState> {
+        self.peers.get(&peer_id).copied()
+    }
+
+    pub fn set_peer_state(&mut self, peer_id: PeerId, state: ReplicaState) {
+        self.peers.insert(peer_id, state);
+    }
+
+    pub fn remove_peer_state(&mut self, peer_id: PeerId) -> Option<ReplicaState> {
+        self.peers.remove(&peer_id)
+    }
+
+    pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
+        self.peers.clone()
+    }
+
+    pub fn active_peers(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter_map(|(peer_id, state)| {
+                // We consider `ReshardingScaleDown` to be `Active`!
+                matches!(
+                    state,
+                    ReplicaState::Active | ReplicaState::ReshardingScaleDown
+                )
+                .then_some(*peer_id)
+            })
+            .collect()
+    }
+
+    pub fn active_or_resharding_peers(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.peers.iter().filter_map(|(peer_id, state)| {
+            matches!(
+                state,
+                ReplicaState::Active | ReplicaState::Resharding | ReplicaState::ReshardingScaleDown
+            )
+            .then_some(*peer_id)
+        })
+    }
+
+    pub fn set_peers(&mut self, peers: HashMap<PeerId, ReplicaState>) {
+        self.peers = peers;
+    }
+}
+
+/// State of the single shard within a replica set.
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Eq, Hash, Clone, Copy, Anonymize,
+)]
+pub enum ReplicaState {
+    // Active and sound
+    #[default]
+    Active,
+    // Failed for some reason
+    Dead,
+    // The shard is partially loaded and is currently receiving data from other shards
+    Partial,
+    // Collection is being created
+    Initializing,
+    // A shard which receives data, but is not used for search
+    // Useful for backup shards
+    Listener,
+    // Deprecated since Qdrant 1.9.0, used in Qdrant 1.7.0 and 1.8.0
+    //
+    // Snapshot shard transfer is in progress, updates aren't sent to the shard
+    // Normally rejects updates. Since 1.8 it allows updates if force is true.
+    PartialSnapshot,
+    // Shard is undergoing recovery by an external node
+    // Normally rejects updates, accepts updates if force is true
+    Recovery,
+    // Points are being migrated to this shard as part of resharding up
+    Resharding,
+    // Points are being migrated to this shard as part of resharding down
+    ReshardingScaleDown,
+}
+
+impl ReplicaState {
+    /// Check if replica state is active
+    pub fn is_active(self) -> bool {
+        match self {
+            ReplicaState::Active => true,
+            ReplicaState::ReshardingScaleDown => true,
+
+            ReplicaState::Dead => false,
+            ReplicaState::Partial => false,
+            ReplicaState::Initializing => false,
+            ReplicaState::Listener => false,
+            ReplicaState::PartialSnapshot => false,
+            ReplicaState::Recovery => false,
+            ReplicaState::Resharding => false,
+        }
+    }
+
+    /// Check whether the replica state is active or listener or resharding.
+    pub fn is_active_or_listener_or_resharding(self) -> bool {
+        match self {
+            ReplicaState::Active
+            | ReplicaState::Listener
+            | ReplicaState::Resharding
+            | ReplicaState::ReshardingScaleDown => true,
+
+            ReplicaState::Dead
+            | ReplicaState::Initializing
+            | ReplicaState::Partial
+            | ReplicaState::PartialSnapshot
+            | ReplicaState::Recovery => false,
+        }
+    }
+
+    /// Check whether the replica state is partial or partial-like.
+    ///
+    /// In other words: is the state related to shard transfers?
+    //
+    // TODO(resharding): What's the best way to handle `ReshardingScaleDown` properly!?
+    pub fn is_partial_or_recovery(self) -> bool {
+        match self {
+            ReplicaState::Partial
+            | ReplicaState::PartialSnapshot
+            | ReplicaState::Recovery
+            | ReplicaState::Resharding
+            | ReplicaState::ReshardingScaleDown => true,
+
+            ReplicaState::Active
+            | ReplicaState::Dead
+            | ReplicaState::Initializing
+            | ReplicaState::Listener => false,
+        }
+    }
+
+    /// Returns `true` if the replica state is resharding, either up or down.
+    pub fn is_resharding(&self) -> bool {
+        match self {
+            ReplicaState::Resharding | ReplicaState::ReshardingScaleDown => true,
+
+            ReplicaState::Partial
+            | ReplicaState::PartialSnapshot
+            | ReplicaState::Recovery
+            | ReplicaState::Active
+            | ReplicaState::Dead
+            | ReplicaState::Initializing
+            | ReplicaState::Listener => false,
+        }
+    }
+}
+
+/// Represents a change in replica set, due to scaling of `replication_factor`
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub enum Change {
+    Remove(ShardId, PeerId),
+}
