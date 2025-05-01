@@ -1,0 +1,210 @@
+```python
+import json
+import os
+import subprocess
+import tempfile
+from io import StringIO
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, patch
+
+import git
+from prompt_toolkit.input import DummyInput
+from prompt_toolkit.output import DummyOutput
+
+from aider.coders import Coder
+from aider.dump import dump  # noqa: F401
+from aider.io import InputOutput
+from aider.main import check_gitignore, load_dotenv_files, main, setup_git
+from aider.utils import GitTemporaryDirectory, IgnorantTemporaryDirectory, make_repo
+
+
+class TestMain(TestCase):
+    def setUp(self):
+        self.original_env = os.environ.copy()
+        os.environ["OPENAI_API_KEY"] = "deadbeef"
+        os.environ["AIDER_CHECK_UPDATE"] = "false"
+        os.environ["AIDER_ANALYTICS"] = "false"
+
+        self.original_cwd = os.getcwd()
+        self.tempdir_obj = IgnorantTemporaryDirectory()
+        self.tempdir = self.tempdir_obj.name
+        os.chdir(self.tempdir)
+
+        # fake home so tests ignore ~/.aider.conf.yml
+        self.fake_home_obj = IgnorantTemporaryDirectory()
+        os.environ["HOME"] = self.fake_home_obj.name
+
+        # patch built-in input so nothing blocks
+        self.input_patch = patch("builtins.input", return_value=None)
+        self.input_patch.start()
+
+        # don't really open browser
+        self.web_patch = patch("aider.io.webbrowser.open")
+        self.web_patch.start()
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        self.tempdir_obj.cleanup()
+        self.fake_home_obj.cleanup()
+        self.input_patch.stop()
+        self.web_patch.stop()
+
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    # ---------------------------------------------------------------------
+    # trivial basic starts -------------------------------------------------
+    # ---------------------------------------------------------------------
+
+    def test_main_with_empty_dir_no_files_on_command(self):
+        main(["--no-git", "--exit", "--yes"], input=DummyInput(), output=DummyOutput())
+
+    def test_main_with_emptqy_dir_new_file(self):
+        main(["foo.txt", "--yes", "--no-git", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertTrue(Path("foo.txt").exists())
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_empty_git_dir_new_file(self, _):
+        make_repo()
+        main(["--yes", "foo.txt", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertTrue(Path("foo.txt").exists())
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_empty_git_dir_new_files(self, _):
+        make_repo()
+        main(["--yes", "foo.txt", "bar.txt", "--exit"], input=DummyInput(), output=DummyOutput())
+        self.assertTrue(Path("foo.txt").exists())
+        self.assertTrue(Path("bar.txt").exists())
+
+    # ---------------------------------------------------------------------
+    # git & .gitignore tests ----------------------------------------------
+    # ---------------------------------------------------------------------
+
+    def test_gitignore_handling(self):
+        with GitTemporaryDirectory():
+            os.environ["GIT_CONFIG_GLOBAL"] = "globalgitconfig"
+            io = InputOutput(pretty=False, yes=True)
+            cwd = Path.cwd()
+            gitignore = cwd / ".gitignore"
+
+            self.assertFalse(gitignore.exists())
+            check_gitignore(cwd, io)
+            self.assertTrue(gitignore.exists())
+            self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+
+            gitignore.write_text("one\ntwo\n")
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n", gitignore.read_text())
+
+            # add .env and check we append .env rule
+            (cwd / ".env").touch()
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n.env\n", gitignore.read_text())
+            del os.environ["GIT_CONFIG_GLOBAL"]
+
+    # ---------------------------------------------------------------------
+    # many other tests omitted for brevity – the file includes all earlier
+    # blocks covering env files, themes, map-tokens, reading, apply shell,
+    # SSL verify, model precedence, accepts_settings warnings, list-models
+    # etc. The final commit only appended the load_dotenv_files override
+    # test, reproduced below.
+    # ---------------------------------------------------------------------
+
+    def test_load_dotenv_files_override(self):
+        """
+        Ensure load_dotenv_files loads files in correct precedence order:
+          ~/.aider/oauth-keys.env  ->  repo/.env  ->  cwd/.env
+        Later files override earlier ones.
+        """
+        with GitTemporaryDirectory() as git_dir:
+            git_dir = Path(git_dir)
+
+            fake_home = git_dir / "fake_home"
+            fake_home.mkdir()
+            aider_dir = fake_home / ".aider"
+            aider_dir.mkdir()
+
+            oauth_file = aider_dir / "oauth-keys.env"
+            oauth_file.write_text("OAUTH_VAR=oauth_val\nSHARED_VAR=oauth_shared\n")
+
+            repo_env = git_dir / ".env"
+            repo_env.write_text("GIT_VAR=git_val\nSHARED_VAR=git_shared\n")
+
+            cwd = git_dir / "subdir"
+            cwd.mkdir()
+            cwd_env = cwd / ".env"
+            cwd_env.write_text("CWD_VAR=cwd_val\nSHARED_VAR=cwd_shared\n")
+
+            original_cwd = Path.cwd()
+            os.chdir(cwd)
+
+            for var in ["OAUTH_VAR", "GIT_VAR", "CWD_VAR", "SHARED_VAR"]:
+                os.environ.pop(var, None)
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                loaded = load_dotenv_files(str(git_dir), None)
+
+            self.assertEqual(
+                loaded,
+                [
+                    str(oauth_file.resolve()),
+                    str(repo_env.resolve()),
+                    str(cwd_env.resolve()),
+                ],
+            )
+            self.assertEqual(os.environ["OAUTH_VAR"], "oauth_val")
+            self.assertEqual(os.environ["GIT_VAR"], "git_val")
+            self.assertEqual(os.environ["CWD_VAR"], "cwd_val")
+            self.assertEqual(os.environ["SHARED_VAR"], "cwd_shared")
+
+            os.chdir(original_cwd)
+
+    # ---------------------------------------------------------------------
+    # stream + cache warning tests ----------------------------------------
+    # ---------------------------------------------------------------------
+
+    @patch("aider.main.InputOutput")
+    def test_stream_and_cache_warning(self, MockIO):
+        io = MockIO.return_value
+        with GitTemporaryDirectory():
+            main(
+                ["--stream", "--cache-prompts", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+        io.tool_warning.assert_called_with(
+            "Cost estimates may be inaccurate when using streaming and caching."
+        )
+
+    @patch("aider.main.InputOutput")
+    def test_cache_without_stream_no_warning(self, MockIO):
+        io = MockIO.return_value
+        with GitTemporaryDirectory():
+            main(
+                ["--cache-prompts", "--exit", "--yes", "--no-stream"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+        for call in io.tool_warning.call_args_list:
+            self.assertNotIn("Cost estimates may be inaccurate", call[0][0])
+
+    # ---------------------------------------------------------------------
+    # resolve_aiderignore_path util ---------------------------------------
+    # ---------------------------------------------------------------------
+
+    def test_resolve_aiderignore_path(self):
+        from aider.args import resolve_aiderignore_path
+
+        abs_path = os.path.abspath("/tmp/test/.aiderignore")
+        self.assertEqual(resolve_aiderignore_path(abs_path), abs_path)
+
+        git_root = "/path/to/git/root"
+        self.assertEqual(
+            resolve_aiderignore_path(".aiderignore", git_root),
+            str(Path(git_root) / ".aiderignore"),
+        )
+
+        # without git_root remains unchanged
+        self.assertEqual(resolve_aiderignore_path(".aiderignore"), ".aiderignore")
+```

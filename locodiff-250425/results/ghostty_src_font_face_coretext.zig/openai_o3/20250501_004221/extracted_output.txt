@@ -1,0 +1,382 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const macos = @import("macos");
+const harfbuzz = @import("harfbuzz");
+const font = @import("../main.zig");
+const opentype = @import("../opentype.zig");
+const quirks = @import("../../quirks.zig");
+
+const log = std.log.scoped(.font_face);
+
+pub const Face = struct {
+    /// CoreText font.
+    font: *macos.text.Font,
+
+    /// Harfbuzz font for shaping, only if Harfbuzz is enabled.
+    hb_font: if (harfbuzz_shaper) harfbuzz.Font else void,
+
+    /// Disable default font features quirk.
+    quirks_disable_default_font_features: bool = false,
+
+    /// Synthetic-bold stroke width, when requested.
+    synthetic_bold: ?f64 = null,
+
+    /// Colour information helper.
+    color: ?ColorState = null,
+
+    /// Are we using the Harfbuzz shaper?
+    const harfbuzz_shaper = font.options.backend.hasHarfbuzz();
+
+    /// Affine transform for synthetic italics.
+    pub const italic_skew = macos.graphics.AffineTransform{
+        .a = 1,
+        .b = 0,
+        .c = 0.267949, // tan(15°)
+        .d = 1,
+        .tx = 0,
+        .ty = 0,
+    };
+
+    // --------------------------------------------------------------------- //
+    // Construction / Destruction
+    // --------------------------------------------------------------------- //
+
+    /// Init from raw font bytes.
+    pub fn init(
+        lib: font.Library,
+        source: [:0]const u8,
+        opts: font.face.Options,
+    ) !Face {
+        _ = lib;
+
+        const data = try macos.foundation.Data.createWithBytesNoCopy(source);
+        defer data.release();
+
+        const desc = macos.text.createFontDescriptorFromData(data) orelse
+            return error.FontInitFailure;
+        defer desc.release();
+
+        const ct_font = try macos.text.Font.createWithFontDescriptor(desc, 12);
+        defer ct_font.release();
+
+        return try initFontCopy(ct_font, opts);
+    }
+
+    /// Init as copy of another CTFont but with new size/options.
+    pub fn initFontCopy(
+        base: *macos.text.Font,
+        opts: font.face.Options,
+    ) !Face {
+        const ct_font = try base.copyWithAttributes(
+            @floatFromInt(opts.size.pixels()),
+            null,
+            null,
+        );
+        errdefer ct_font.release();
+
+        return try initFont(ct_font, opts);
+    }
+
+    /// Init from an existing CTFont (takes ownership).
+    pub fn initFont(
+        ct_font: *macos.text.Font,
+        opts: font.face.Options,
+    ) !Face {
+        // Harfbuzz font if required
+        var hb_font = if (comptime harfbuzz_shaper) blk: {
+            var f = try harfbuzz.coretext.createFont(ct_font);
+            f.setScale(opts.size.pixels(), opts.size.pixels());
+            break :blk f;
+        } else {};
+        errdefer if (comptime harfbuzz_shaper) hb_font.destroy();
+
+        // Colour state (only if colour glyphs present)
+        const traits = ct_font.getSymbolicTraits();
+        const color_state = if (traits.color_glyphs)
+            try ColorState.init(ct_font)
+        else
+            null;
+        errdefer if (color_state) |cs| cs.deinit();
+
+        var self: Face = .{
+            .font = ct_font,
+            .hb_font = hb_font,
+            .color = color_state,
+        };
+
+        self.quirks_disable_default_font_features =
+            quirks.disableDefaultFontFeatures(&self);
+
+        // Mixed colour/text font tweak
+        if (self.color != null and self.glyphIndex('🥸') == null) {
+            log.warn(
+                "font has colour glyphs but no emoji code-points; "
+                ++ "treating as text",
+                .{},
+            );
+            self.color = null;
+        }
+
+        return self;
+    }
+
+    /// Free resources.
+    pub fn deinit(self: *Face) void {
+        self.font.release();
+        if (comptime harfbuzz_shaper) self.hb_font.destroy();
+        if (self.color) |c| c.deinit();
+        self.* = undefined;
+    }
+
+    // --------------------------------------------------------------------- //
+    // Styling helpers
+    // --------------------------------------------------------------------- //
+
+    /// Synthetic italics.
+    pub fn syntheticItalic(
+        self: *const Face,
+        opts: font.face.Options,
+    ) !Face {
+        const ct = try self.font.copyWithAttributes(0.0, &italic_skew, null);
+        errdefer ct.release();
+        return try initFont(ct, opts);
+    }
+
+    /// Synthetic bold (stroke width proportional to point size).
+    pub fn syntheticBold(
+        self: *const Face,
+        opts: font.face.Options,
+    ) !Face {
+        const ct = try self.font.copyWithAttributes(0.0, null, null);
+        errdefer ct.release();
+
+        var f = try initFont(ct, opts);
+
+        // heuristic: 1 px @ 14 pt, scale linearly
+        const lw = @max(@floatFromInt(opts.size.points) / 14.0, 1);
+        f.synthetic_bold = lw;
+
+        return f;
+    }
+
+    // --------------------------------------------------------------------- //
+    // Introspection helpers
+    // --------------------------------------------------------------------- //
+
+    /// Family name.
+    pub fn name(self: *const Face, buf: []u8) Allocator.Error![]const u8 {
+        const fam = self.font.copyFamilyName();
+        if (fam.cstringPtr(.utf8)) |s| return s;
+        return fam.cstring(buf, .utf8) orelse error.OutOfMemory;
+    }
+
+    /// Does font have *any* colour glyphs?
+    pub fn hasColor(self: *const Face) bool {
+        return self.color != null;
+    }
+
+    /// Is specific glyph coloured?
+    pub fn isColorGlyph(self: *const Face, gid: u32) bool {
+        const c = self.color orelse return false;
+        return c.isColorGlyph(gid);
+    }
+
+    // --------------------------------------------------------------------- //
+    // Metrics
+    // --------------------------------------------------------------------- //
+
+    pub const GetMetricsError = error{
+        CopyTableError,
+        InvalidHeadTable,
+        InvalidPostTable,
+        InvalidHheaTable,
+    };
+
+    /// Returns face metrics.
+    pub fn getMetrics(self: *Face) GetMetricsError!font.Metrics.FaceMetrics {
+        return calcMetrics(self.font);
+    }
+
+    // core metrics calculation (shared with tests)
+    pub fn calcMetrics(ct_font: *macos.text.Font)
+        GetMetricsError!font.Metrics.FaceMetrics
+    {
+        // head / bhed
+        const head: opentype.Head = blk: {
+            const head_tag = macos.text.FontTableTag.init("head");
+            const bhed_tag = macos.text.FontTableTag.init("bhed");
+            const d =
+                ct_font.copyTable(head_tag) orelse
+                ct_font.copyTable(bhed_tag) orelse
+                return error.CopyTableError;
+            defer d.release();
+            break :blk opentype.Head.init(d.getPointer()[0 .. d.getLength()])
+                catch error.InvalidHeadTable;
+        };
+
+        // post
+        const post: opentype.Post = blk: {
+            const tag = macos.text.FontTableTag.init("post");
+            const d = ct_font.copyTable(tag) orelse
+                return error.CopyTableError;
+            defer d.release();
+            break :blk opentype.Post.init(d.getPointer()[0 .. d.getLength()])
+                catch error.InvalidPostTable;
+        };
+
+        // hhea (required)
+        const hhea: opentype.Hhea = blk: {
+            const tag = macos.text.FontTableTag.init("hhea");
+            const d = ct_font.copyTable(tag) orelse
+                return error.CopyTableError;
+            defer d.release();
+            break :blk opentype.Hhea.init(d.getPointer()[0 .. d.getLength()])
+                catch error.InvalidHheaTable;
+        };
+
+        // optional OS/2
+        const os2: ?opentype.OS2 = blk: {
+            const tag = macos.text.FontTableTag.init("OS/2");
+            const d = ct_font.copyTable(tag) orelse break :blk null;
+            defer d.release();
+            break :blk opentype.OS2.init(d.getPointer()[0 .. d.getLength()])
+                catch |e| {
+                    log.warn("error parsing OS/2: {}", .{e});
+                    break :blk null;
+                };
+        };
+
+        const units_per_em = @as(f64, @floatFromInt(head.unitsPerEm));
+        const px_per_em = ct_font.getSize();
+        const px_per_unit = px_per_em / units_per_em;
+
+        const hhea_a = @as(f64, @floatFromInt(hhea.ascender));
+        const hhea_d = @as(f64, @floatFromInt(hhea.descender));
+        const hhea_g = @as(f64, @floatFromInt(hhea.lineGap));
+
+        var ascent = hhea_a;
+        var descent = hhea_d;
+        var line_gap = hhea_g;
+
+        if (os2) |o| {
+            const os2_a  = @as(f64, @floatFromInt(o.sTypoAscender));
+            const os2_d  = @as(f64, @floatFromInt(o.sTypoDescender));
+            const os2_g  = @as(f64, @floatFromInt(o.sTypoLineGap));
+            const win_a  = @as(f64, @floatFromInt(o.usWinAscent));
+            const win_d  = -@as(f64, @floatFromInt(o.usWinDescent));
+
+            if (o.fsSelection.use_typo_metrics) {
+                ascent = os2_a;
+                descent = os2_d;
+                line_gap = os2_g;
+            } else if (hhea_a == 0 and hhea_d == 0) {
+                if (os2_a != 0 or os2_d != 0) {
+                    ascent = os2_a;
+                    descent = os2_d;
+                    line_gap = os2_g;
+                } else {
+                    ascent = win_a;
+                    descent = win_d;
+                    line_gap = 0;
+                }
+            }
+        }
+
+        ascent  *= px_per_unit;
+        descent *= px_per_unit;
+        line_gap*= px_per_unit;
+
+        const underline_pos =
+            if (post.underlineThickness == 0 and post.underlinePosition == 0)
+                null
+            else
+                @as(f64, @floatFromInt(post.underlinePosition)) * px_per_unit;
+
+        const underline_thick =
+            if (post.underlineThickness == 0) null
+            else @as(f64, @floatFromInt(post.underlineThickness)) * px_per_unit;
+
+        var strike_pos: ?f64 = null;
+        var strike_thick: ?f64 = null;
+        if (os2) |o| {
+            if (o.yStrikeoutSize != 0 or o.yStrikeoutPosition != 0) {
+                strike_pos   = @as(f64, @floatFromInt(o.yStrikeoutPosition)) * px_per_unit;
+                strike_thick = @as(f64, @floatFromInt(o.yStrikeoutSize))     * px_per_unit;
+            }
+        }
+
+        const cap_height =
+            if (os2) |o| if (o.sCapHeight) |c|
+                @as(f64, @floatFromInt(c)) * px_per_unit
+            else ct_font.getCapHeight()
+        else ct_font.getCapHeight();
+
+        const ex_height =
+            if (os2) |o| if (o.sxHeight) |x|
+                @as(f64, @floatFromInt(x)) * px_per_unit
+            else ct_font.getXHeight()
+        else ct_font.getXHeight();
+
+        // widest ASCII char for cell width
+        const cell_w = blk: {
+            const bytes = comptime blk: {
+                var arr: [95]u16 = undefined;
+                var i: u16 = 32;
+                while (i < 127) : (i += 1) arr[i - 32] = i;
+                break :blk arr;
+            };
+            var gids: [bytes.len]macos.graphics.Glyph = undefined;
+            _ = ct_font.getGlyphsForCharacters(&bytes, &gids);
+            var adv: [bytes.len]macos.graphics.Size = undefined;
+            _ = ct_font.getAdvancesForGlyphs(.horizontal, &gids, &adv);
+            var mx: f64 = 0;
+            for (adv) |a| mx = @max(mx, a.width);
+            break :blk mx;
+        };
+
+        return font.Metrics.calc(.{
+            .cell_width               = cell_w,
+            .ascent                   = ascent,
+            .descent                  = descent,
+            .line_gap                 = line_gap,
+            .underline_position       = underline_pos,
+            .underline_thickness      = underline_thick,
+            .strikethrough_position   = strike_pos,
+            .strikethrough_thickness  = strike_thick,
+            .cap_height               = cap_height,
+            .ex_height                = ex_height,
+        });
+    }
+
+    /// Copy arbitrary font table.
+    pub fn copyTable(
+        self: Face,
+        alloc: Allocator,
+@@
+                    .y = render_y + padding_ctx_f64,
+                 },
+             }, ctx);
+ 
+         const region = region: {
+-            // We reserve a region that's 1px wider and taller than we need
++            // reserve region 1 px wider/taller to keep spacing
+             var region = try atlas.reserve(
+                 alloc,
+                 width + 1,
+                 height + 1,
+@@
+ 
+         // -----------------------------------------------------------------
+         return .{
+             .width   = width,
+             .height  = height,
+             .offset_x = offset_x,
+             .offset_y = offset_y,
+             .atlas_x  = region.x,
+             .atlas_y  = region.y,
+             .advance_x = @floatCast(advances[0].width),
+         };
+     }
+@@ tests remain same up to renderGlyph calls using grid_metrics etc.

@@ -1,0 +1,712 @@
+//! A font collection is a list of faces of different styles. The list is
+//! ordered by priority (per style). All fonts in a collection share the same
+//! size so they can be used interchangeably in cases a glyph is missing in one
+//! and present in another.
+//!
+//! The purpose of a collection is to store a list of fonts by style
+//! and priority order. A collection does not handle searching for font
+//! callbacks, rasterization, etc. For this, see CodepointResolver.
+//!
+//! The collection can contain both loaded and deferred faces. Deferred faces
+//! typically use less memory while still providing some necessary information
+//! such as codepoint support, presentation, etc. This is useful for looking
+//! for fallback fonts as efficiently as possible. For example, when the glyph
+//! "X" is not found, we can quickly search through deferred fonts rather
+//! than loading the font completely.
+const Collection = @This();
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const config = @import("../config.zig");
+const font = @import("main.zig");
+const options = font.options;
+const DeferredFace = font.DeferredFace;
+const DesiredSize = font.face.DesiredSize;
+const Face = font.Face;
+const Library = font.Library;
+const Metrics = font.Metrics;
+const Presentation = font.Presentation;
+const Style = font.Style;
+
+const log = std.log.scoped(.font_collection);
+
+/// The available faces we have. This shouldn't be modified manually.
+/// Instead, use the functions available on Collection.
+faces: StyleArray,
+
+/// The metric modifiers to use for this collection. The memory
+/// for this is owned by the user and is not freed by the collection.
+///
+/// Call `Collection.updateMetrics` to recompute the
+/// collection's metrics after making changes to these.
+metric_modifiers: Metrics.ModifierSet = .{},
+
+/// Metrics for this collection. Call `Collection.updateMetrics` to (re)compute
+/// these after adding a primary font or making changes to `metric_modifiers`.
+metrics: ?Metrics = null,
+
+/// The load options for deferred faces in the face list. If this
+/// is not set, then deferred faces will not be loaded. Attempting to
+/// add a deferred face will result in an error.
+load_options: ?LoadOptions = null,
+
+/// Initialize an empty collection.
+pub fn init() Collection {
+    return .{ .faces = StyleArray.initFill(.{}) };
+}
+
+pub fn deinit(self: *Collection, alloc: Allocator) void {
+    var it = self.faces.iterator();
+    while (it.next()) |array| {
+        var entry_it = array.value.iterator(0);
+        while (entry_it.next()) |entry| entry.deinit();
+        array.value.deinit(alloc);
+    }
+
+    if (self.load_options) |*v| v.deinit(alloc);
+}
+
+pub const AddError = Allocator.Error || error{
+    CollectionFull,
+    DeferredLoadingUnavailable,
+};
+
+/// Add a face to the collection for the given style. The collection takes
+/// ownership of the face. The returned index can be used to reference the
+/// face later.
+pub fn add(
+    self: *Collection,
+    alloc: Allocator,
+    style: Style,
+    face: Entry,
+) AddError!Index {
+    const list = self.faces.getPtr(style);
+
+    // We have some special indexes so we must never pass those.
+    const idx = list.count();
+    if (idx >= Index.Special.start - 1)
+        return error.CollectionFull;
+
+    // If this is deferred and we don't have load options, we can't.
+    if (face.isDeferred() and self.load_options == null)
+        return error.DeferredLoadingUnavailable;
+
+    try list.append(alloc, face);
+    return .{ .style = style, .idx = @intCast(idx) };
+}
+
+/// Return the Face represented by a given Index. The returned pointer
+/// is only valid as long as this collection is not modified.
+///
+/// This will initialize the face if it is deferred and not yet loaded,
+/// which can fail.
+pub fn getFace(self: *Collection, index: Index) !*Face {
+    if (index.special() != null) return error.SpecialHasNoFace;
+    const list = self.faces.getPtr(index.style);
+    const item: *Entry = blk: {
+        var item_ptr = list.at(index.idx);
+        switch (item_ptr.*) {
+            .alias => |ptr| item_ptr = ptr,
+            else => {},
+        }
+        assert(item_ptr.* != .alias);
+        break :blk item_ptr;
+    };
+
+    return try self.getFaceFromEntry(item);
+}
+
+/// Get the face from an entry. The entry must not be an alias.
+fn getFaceFromEntry(self: *Collection, entry: *Entry) !*Face {
+    assert(entry.* != .alias);
+
+    return switch (entry.*) {
+        inline .deferred, .fallback_deferred => |*d, tag| blk: {
+            const opts = self.load_options orelse
+                return error.DeferredLoadingUnavailable;
+            const face_loaded = try d.load(opts.library, opts.faceOptions());
+            d.deinit();
+            entry.* = switch (tag) {
+                .deferred => .{ .loaded = face_loaded },
+                .fallback_deferred => .{ .fallback_loaded = face_loaded },
+                else => unreachable,
+            };
+            break :blk switch (tag) {
+                .deferred => &entry.loaded,
+                .fallback_deferred => &entry.fallback_loaded,
+                else => unreachable,
+            };
+        },
+
+        .loaded, .fallback_loaded => |*f| f,
+
+        .alias => unreachable,
+    };
+}
+
+/// Return the index of the font in this collection that contains
+/// the given codepoint, style, and presentation. If no font is found,
+/// null is returned.
+///
+/// This does not trigger font loading; deferred fonts can be
+/// searched for codepoints.
+pub fn getIndex(
+    self: *const Collection,
+    cp: u32,
+    style: Style,
+    p_mode: PresentationMode,
+) ?Index {
+    var i: usize = 0;
+    var it = self.faces.get(style).constIterator(0);
+    while (it.next()) |entry| {
+        if (entry.hasCodepoint(cp, p_mode)) {
+            return .{ .style = style, .idx = @intCast(i) };
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Check if a specific font index has a specific codepoint.
+pub fn hasCodepoint(
+    self: *const Collection,
+    index: Index,
+    cp: u32,
+    p_mode: PresentationMode,
+) bool {
+    const list = self.faces.get(index.style);
+    if (index.idx >= list.count()) return false;
+    return list.at(index.idx).hasCodepoint(cp, p_mode);
+}
+
+pub const CompleteError = Allocator.Error || error{
+    DefaultUnavailable,
+};
+
+/// Ensure we have an option for all styles in the collection, such
+/// as italic and bold by synthesizing them if necessary from the
+/// first regular face that has text glyphs.
+///
+/// If there is no regular face that has text glyphs, then this
+/// does nothing.
+pub fn completeStyles(
+    self: *Collection,
+    alloc: Allocator,
+    synthetic_config: config.FontSyntheticStyle,
+) CompleteError!void {
+    // If every style has at least one entry then we're done!
+    empty_check: {
+        var it_enum = self.faces.iterator();
+        while (it_enum.next()) |entry| {
+            if (entry.value.count() == 0) break :empty_check;
+        }
+        return;
+    }
+
+    // Find first regular entry with text glyphs.
+    const regular_entry: *Entry = blk: {
+        const list = self.faces.getPtr(.regular);
+        if (list.count() == 0) return;
+
+        var it = list.iterator(0);
+        while (it.next()) |e| {
+            const face = self.getFaceFromEntry(e) catch continue;
+            if (!face.hasColor() or face.glyphIndex('A') != null) break :blk e;
+        }
+        return error.DefaultUnavailable;
+    };
+
+    // Italic
+    const italic_list = self.faces.getPtr(.italic);
+    const have_italic = italic_list.count() > 0;
+    if (!have_italic) italic: {
+        if (!synthetic_config.italic) {
+            try italic_list.append(alloc, .{ .alias = regular_entry });
+            break :italic;
+        }
+        const italic_face = self.syntheticItalic(regular_entry) catch |err| {
+            log.warn("failed synthetic italic: {}", .{err});
+            try italic_list.append(alloc, .{ .alias = regular_entry });
+            break :italic;
+        };
+        try italic_list.append(alloc, .{ .loaded = italic_face });
+    }
+
+    // Bold
+    const bold_list = self.faces.getPtr(.bold);
+    const have_bold = bold_list.count() > 0;
+    if (!have_bold) bold: {
+        if (!synthetic_config.bold) {
+            try bold_list.append(alloc, .{ .alias = regular_entry });
+            break :bold;
+        }
+        const bold_face = self.syntheticBold(regular_entry) catch |err| {
+            log.warn("failed synthetic bold: {}", .{err});
+            try bold_list.append(alloc, .{ .alias = regular_entry });
+            break :bold;
+        };
+        try bold_list.append(alloc, .{ .loaded = bold_face });
+    }
+
+    // Bold Italic
+    const bold_italic_list = self.faces.getPtr(.bold_italic);
+    if (bold_italic_list.count() == 0) bold_italic: {
+        if (!synthetic_config.@"bold-italic") {
+            try bold_italic_list.append(alloc, .{ .alias = regular_entry });
+            break :bold_italic;
+        }
+
+        if (have_bold) if (self.syntheticItalic(bold_list.at(0))) |synth| {
+            try bold_italic_list.append(alloc, .{ .loaded = synth });
+            break :bold_italic;
+        } else |_| {}
+
+        const base_entry = switch (italic_list.at(0).*) {
+            .alias => |v| v,
+            else => italic_list.at(0),
+        };
+
+        if (self.syntheticBold(base_entry)) |synth| {
+            try bold_italic_list.append(alloc, .{ .loaded = synth });
+            break :bold_italic;
+        } else |_| {}
+
+        try bold_italic_list.append(alloc, .{ .alias = base_entry });
+    }
+}
+
+// Create a synthetic bold font face.
+fn syntheticBold(self: *Collection, entry: *Entry) !Face {
+    if (comptime !@hasDecl(Face, "syntheticBold"))
+        return error.SyntheticBoldUnavailable;
+    const opts = self.load_options orelse return error.DeferredLoadingUnavailable;
+    const base = try self.getFaceFromEntry(entry);
+    const face = try base.syntheticBold(opts.faceOptions());
+
+    var buf: [256]u8 = undefined;
+    if (face.name(&buf)) |name| log.info("synthetic bold: {s}", .{name}) else |_| {};
+    return face;
+}
+
+// Create a synthetic italic font face.
+fn syntheticItalic(self: *Collection, entry: *Entry) !Face {
+    if (comptime !@hasDecl(Face, "syntheticItalic"))
+        return error.SyntheticItalicUnavailable;
+    const opts = self.load_options orelse return error.DeferredLoadingUnavailable;
+    const base = try self.getFaceFromEntry(entry);
+    const face = try base.syntheticItalic(opts.faceOptions());
+
+    var buf: [256]u8 = undefined;
+    if (face.name(&buf)) |name| log.info("synthetic italic: {s}", .{name}) else |_| {};
+    return face;
+}
+
+/// Update the size of all faces in the collection and recompute metrics.
+pub fn setSize(self: *Collection, size: DesiredSize) !void {
+    const opts = if (self.load_options) |*v| v else return error.DeferredLoadingUnavailable;
+    opts.size = size;
+
+    var it = self.faces.iterator();
+    while (it.next()) |array| {
+        var eit = array.value.iterator(0);
+        while (eit.next()) |entry| switch (entry.*) {
+            .loaded, .fallback_loaded => |*f| try f.setSize(opts.faceOptions()),
+            else => {},
+        };
+    }
+    try self.updateMetrics();
+}
+
+const UpdateMetricsError = font.Face.GetMetricsError || error{
+    CannotLoadPrimaryFont,
+};
+
+/// Recompute metrics from primary face and modifiers.
+pub fn updateMetrics(self: *Collection) UpdateMetricsError!void {
+    const prim_face = self.getFace(.{ .style = .regular, .idx = 0 }) catch
+        return error.CannotLoadPrimaryFont;
+
+    const fm = try prim_face.getMetrics();
+    var m = Metrics.calc(fm);
+    m.apply(self.metric_modifiers);
+    self.metrics = m;
+}
+
+/// Packed array of all Style enum cases mapped to a growable list of faces.
+///
+/// We use a segmented list because entry values must be pointer-stable
+/// to support the "alias" field in Entry.
+const StyleArray = std.EnumArray(Style, std.SegmentedList(Entry, 0));
+
+/// Load options are used to configure loading of deferred faces.
+pub const LoadOptions = struct {
+    /// The library to use for loading faces.
+    library: Library,
+
+    /// Desired size.
+    size: DesiredSize = .{ .points = 12 },
+
+    /// Freetype load flags.
+    freetype_load_flags: font.face.FreetypeLoadFlags = font.face.freetype_load_flags_default,
+
+    pub fn deinit(self: *LoadOptions, alloc: Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    pub fn faceOptions(self: *const LoadOptions) font.face.Options {
+        return .{
+            .size = self.size,
+            .freetype_load_flags = self.freetype_load_flags,
+        };
+    }
+};
+
+/// A collection entry can be deferred, loaded, or an alias.
+pub const Entry = union(enum) {
+    deferred: DeferredFace,
+    loaded: Face,
+    fallback_deferred: DeferredFace,
+    fallback_loaded: Face,
+    alias: *Entry,
+
+    pub fn deinit(self: *Entry) void {
+        switch (self.*) {
+            inline .deferred,
+            .loaded,
+            .fallback_deferred,
+            .fallback_loaded => |*v| v.deinit(),
+            .alias => {},
+        }
+    }
+
+    fn isDeferred(self: Entry) bool {
+        return switch (self) {
+            .deferred, .fallback_deferred => true,
+            .loaded, .fallback_loaded => false,
+            .alias => |v| v.isDeferred(),
+        };
+    }
+
+    pub fn hasCodepoint(
+        self: Entry,
+        cp: u32,
+        p_mode: PresentationMode,
+    ) bool {
+        return switch (self) {
+            .alias => |v| v.hasCodepoint(cp, p_mode),
+
+            .deferred => |v| switch (p_mode) {
+                .explicit => |p| v.hasCodepoint(cp, p),
+                .default, .any => v.hasCodepoint(cp, null),
+            },
+
+            .loaded => |face| switch (p_mode) {
+                .explicit => |p| blk: {
+                    const index = face.glyphIndex(cp) orelse break :blk false;
+                    break :blk switch (p) {
+                        .text => !face.isColorGlyph(index),
+                        .emoji => face.isColorGlyph(index),
+                    };
+                },
+                .default, .any => face.glyphIndex(cp) != null,
+            },
+
+            .fallback_deferred => |v| switch (p_mode) {
+                .explicit, .default => |p| v.hasCodepoint(cp, p),
+                .any => v.hasCodepoint(cp, null),
+            },
+
+            .fallback_loaded => |face| switch (p_mode) {
+                .explicit, .default => |p| blk: {
+                    const index = face.glyphIndex(cp) orelse break :blk false;
+                    break :blk switch (p) {
+                        .text => !face.isColorGlyph(index),
+                        .emoji => face.isColorGlyph(index),
+                    };
+                },
+                .any => face.glyphIndex(cp) != null,
+            },
+        };
+    }
+};
+
+/// Presentation mode for a codepoint.
+pub const PresentationMode = union(enum) {
+    explicit: Presentation,
+    default: Presentation,
+    any: void,
+};
+
+/// Represents a specific font in the collection.
+pub const Index = packed struct(Index.Backing) {
+    const Backing = u16;
+    const backing_bits = @typeInfo(Backing).int.bits;
+
+    /// bits for index
+    const idx_bits =
+        backing_bits - @typeInfo(@typeInfo(Style).@"enum".tag_type).int.bits;
+    pub const IndexInt = @Type(.{ .int = .{ .signedness = .unsigned, .bits = idx_bits } });
+
+    pub const Special = enum(IndexInt) {
+        start = std.math.maxInt(IndexInt),
+        sprite = start,
+    };
+
+    style: Style = .regular,
+    idx: IndexInt = 0,
+
+    pub fn initSpecial(v: Special) Index {
+        return .{ .style = .regular, .idx = @intFromEnum(v) };
+    }
+
+    pub fn int(self: Index) Backing {
+        return @bitCast(self);
+    }
+
+    pub fn special(self: Index) ?Special {
+        if (self.idx < Special.start) return null;
+        return @enumFromInt(self.idx);
+    }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Tests
+///////////////////////////////////////////////////////////////////////////////
+
+test init {
+    const alloc = std.testing.allocator;
+    var c = init();
+    defer c.deinit(alloc);
+}
+
+test "add full" {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+
+    for (0..Index.Special.start - 1) |_| {
+        _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+            lib,
+            testFont,
+            .{ .size = .{ .points = 12 } },
+        ) });
+    }
+
+    try std.testing.expectError(error.CollectionFull, c.add(
+        alloc,
+        .regular,
+        .{ .loaded = try Face.init(
+            lib,
+            testFont,
+            .{ .size = .{ .points = 12 } },
+        ) },
+    ));
+}
+
+test "add deferred without loading options" {
+    const alloc = std.testing.allocator;
+
+    var c = init();
+    defer c.deinit(alloc);
+
+    try std.testing.expectError(error.DeferredLoadingUnavailable, c.add(
+        alloc,
+        .regular,
+        .{ .deferred = undefined },
+    ));
+}
+
+test getFace {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+
+    const idx = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    const face1 = try c.getFace(idx);
+    const face2 = try c.getFace(idx);
+    try std.testing.expectEqual(@intFromPtr(face1), @intFromPtr(face2));
+}
+
+test getIndex {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+
+    _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    var i: u32 = 32;
+    while (i < 127) : (i += 1) {
+        const idx = c.getIndex(i, .regular, .{ .any = {} });
+        try std.testing.expect(idx != null);
+    }
+
+    const idx = c.getIndex('🥸', .regular, .{ .any = {} });
+    try std.testing.expect(idx == null);
+}
+
+test completeStyles {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib };
+
+    _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    try std.testing.expect(c.getIndex('A', .bold, .{ .any = {} }) == null);
+    try std.testing.expect(c.getIndex('A', .italic, .{ .any = {} }) == null);
+    try std.testing.expect(c.getIndex('A', .bold_italic, .{ .any = {} }) == null);
+    try c.completeStyles(alloc, .{});
+    try std.testing.expect(c.getIndex('A', .bold, .{ .any = {} }) != null);
+    try std.testing.expect(c.getIndex('A', .italic, .{ .any = {} }) != null);
+    try std.testing.expect(c.getIndex('A', .bold_italic, .{ .any = {} }) != null);
+}
+
+test setSize {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib };
+
+    _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    try std.testing.expectEqual(@as(u32, 12), c.load_options.?.size.points);
+    try c.setSize(.{ .points = 24 });
+    try std.testing.expectEqual(@as(u32, 24), c.load_options.?.size.points);
+}
+
+test hasCodepoint {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib };
+
+    const idx = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    try std.testing.expect(c.hasCodepoint(idx, 'A', .{ .any = {} }));
+    try std.testing.expect(!c.hasCodepoint(idx, '🥸', .{ .any = {} }));
+}
+
+test "hasCodepoint emoji default graphical" {
+    if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const testEmoji = font.embedded.emoji;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib };
+
+    const idx = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testEmoji,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    try std.testing.expect(!c.hasCodepoint(idx, 'A', .{ .any = {} }));
+    try std.testing.expect(c.hasCodepoint(idx, '🥸', .{ .any = {} }));
+}
+
+test "metrics" {
+    const alloc = std.testing.allocator;
+    const testFont = font.embedded.inconsolata;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib };
+
+    _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+        lib,
+        testFont,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ) });
+
+    try c.updateMetrics();
+
+    try std.testing.expectEqual(font.Metrics{
+        .cell_width = 8,
+        .cell_height = 17,
+        .cell_baseline = 3,
+        .underline_position = 17,
+        .underline_thickness = 1,
+        .strikethrough_position = 10,
+        .strikethrough_thickness = 1,
+        .overline_position = 0,
+        .overline_thickness = 1,
+        .box_thickness = 1,
+        .cursor_height = 17,
+    }, c.metrics);
+
+    try c.setSize(.{ .points = 24, .xdpi = 96, .ydpi = 96 });
+    try std.testing.expectEqual(font.Metrics{
+        .cell_width = 16,
+        .cell_height = 34,
+        .cell_baseline = 6,
+        .underline_position = 34,
+        .underline_thickness = 2,
+        .strikethrough_position = 19,
+        .strikethrough_thickness = 2,
+        .overline_position = 0,
+        .overline_thickness = 2,
+        .box_thickness = 2,
+        .cursor_height = 34,
+    }, c.metrics);
+}

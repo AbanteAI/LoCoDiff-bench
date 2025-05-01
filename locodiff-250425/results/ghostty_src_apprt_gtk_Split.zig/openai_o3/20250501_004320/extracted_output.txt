@@ -1,0 +1,331 @@
+/// Split represents a surface split where two surfaces are shown side-by-side
+/// within the same window either vertically or horizontally.
+const Split = @This();
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+
+const gobject = @import("gobject");
+const gtk = @import("gtk");
+
+const apprt = @import("../../apprt.zig");
+const CoreSurface = @import("../../Surface.zig");
+
+const Surface = @import("Surface.zig");
+const Tab = @import("Tab.zig");
+
+const log = std.log.scoped(.gtk);
+
+/// The split orientation.
+pub const Orientation = enum {
+    horizontal,
+    vertical,
+
+    pub fn fromDirection(direction: apprt.action.SplitDirection) Orientation {
+        return switch (direction) {
+            .right, .left => .horizontal,
+            .down,  .up   => .vertical,
+        };
+    }
+
+    pub fn fromResizeDirection(direction: apprt.action.ResizeSplit.Direction) Orientation {
+        return switch (direction) {
+            .up, .down   => .vertical,
+            .left, .right => .horizontal,
+        };
+    }
+};
+
+/// Our actual GtkPaned widget
+paned: *gtk.Paned,
+
+/// The container for this split panel.
+container: Surface.Container,
+
+/// The orientation of this split.
+orientation: Orientation,
+
+/// The elements of this split panel.
+top_left:     Surface.Container.Elem,
+bottom_right: Surface.Container.Elem,
+
+/// Create a new split.
+pub fn create(
+    alloc: Allocator,
+    sibling: *Surface,
+    direction: apprt.action.SplitDirection,
+) !*Split {
+    var split = try alloc.create(Split);
+    errdefer alloc.destroy(split);
+    try split.init(sibling, direction);
+    return split;
+}
+
+/// Initialize an already-allocated Split.
+pub fn init(
+    self: *Split,
+    sibling: *Surface,
+    direction: apprt.action.SplitDirection,
+) !void {
+    // If the sibling would get too small by being split, abort.
+    {
+        const min_cells = 4; // the new split would be <2×2 otherwise
+        const size  = &sibling.core_surface.size;
+        const small = switch (direction) {
+            .right, .left => size.screen.width  < size.cell.width  * min_cells,
+            .down,  .up   => size.screen.height < size.cell.height * min_cells,
+        };
+        if (small) return error.SplitTooSmall;
+    }
+
+    // Create the new child surface.
+    const alloc = sibling.app.core_app.alloc;
+    var surface = try Surface.create(alloc, sibling.app, .{
+        .parent = &sibling.core_surface,
+    });
+    errdefer surface.destroy(alloc);
+    sibling.dimSurface();
+    sibling.setSplitZoom(false);
+
+    // Build the GtkPaned.
+    const orientation: gtk.Orientation = switch (direction) {
+        .right, .left => .horizontal,
+        .down,  .up   => .vertical,
+    };
+    const paned = gtk.Paned.new(orientation);
+    errdefer paned.unref();
+    paned.ref(); // long-lived
+
+    // Update containers.
+    const container = sibling.container;
+    const tl: *Surface, const br: *Surface = switch (direction) {
+        .right, .down => blk: {
+            sibling.container = .{ .split_tl = &self.top_left  };
+            surface.container = .{ .split_br = &self.bottom_right };
+            break :blk .{ sibling, surface };
+        },
+        .left, .up => blk: {
+            sibling.container = .{ .split_br = &self.bottom_right };
+            surface.container = .{ .split_tl = &self.top_left };
+            break :blk .{ surface, sibling };
+        },
+    };
+
+    self.* = .{
+        .paned       = paned,
+        .container   = container,
+        .top_left    = .{ .surface = tl },
+        .bottom_right= .{ .surface = br },
+        .orientation = Orientation.fromDirection(direction),
+    };
+
+    // Replace previous element with our new split and wire up children.
+    container.replace(.{ .split = self });
+    self.updateChildren();
+
+    // Focus the new surface.
+    surface.grabFocus();
+}
+
+/// Destroy the split and its children.
+pub fn destroy(self: *Split, alloc: Allocator) void {
+    self.top_left.deinit(alloc);
+    self.bottom_right.deinit(alloc);
+    self.paned.unref();
+    alloc.destroy(self);
+}
+
+/// Remove one child, collapsing the split.
+fn removeChild(
+    self: *Split,
+    remove: Surface.Container.Elem,
+    keep:   Surface.Container.Elem,
+) void {
+    const window = self.container.window() orelse return;
+    const alloc  = window.app.core_app.alloc;
+
+    // We’re no longer a split – clean up.
+    self.removeChildren();
+    self.container.replace(keep);
+    keep.grabFocus();
+
+    remove.deinit(alloc);
+    alloc.destroy(self);
+}
+
+/// Convenience helpers.
+pub fn removeTopLeft   (self: *Split) void { self.removeChild(self.top_left,     self.bottom_right); }
+pub fn removeBottomRight(self: *Split) void { self.removeChild(self.bottom_right, self.top_left    ); }
+
+/// Move divider by amount in direction.
+pub fn moveDivider(
+    self: *Split,
+    direction: apprt.action.ResizeSplit.Direction,
+    amount: u16,
+) void {
+    const min_pos = 10;
+    const pos     = self.paned.getPosition();
+    const new     = switch (direction) {
+        .up, .left   => @max(pos - amount, min_pos),
+        .down, .right => blk: {
+            const max_pos: u16 = @as(u16, @intFromFloat(self.maxPosition())) - min_pos;
+            break :blk @min(pos + amount, max_pos);
+        },
+    };
+    self.paned.setPosition(new);
+}
+
+/// Equalize child splits recursively; returns weight.
+pub fn equalize(self: *Split) f64 {
+    const wl = self.top_left.equalize();
+    const wr = self.bottom_right.equalize();
+    const w  = wl + wr;
+    self.paned.setPosition(@intFromFloat(self.maxPosition() * (wl / w)));
+    return w;
+}
+
+/// Maximum position (property “max-position”) of the paned.
+fn maxPosition(self: *Split) f64 {
+    var value: gobject.Value = std.mem.zeroes(gobject.Value);
+    defer value.unset();
+
+    _ = value.init(gobject.ext.types.int);
+    self.paned.as(gobject.Object).getProperty("max-position", &value);
+    return @floatFromInt(value.getInt());
+}
+
+/// Replace element at pointer with new element.
+pub fn replace(
+    self: *Split,
+    ptr: *Surface.Container.Elem,
+    new: Surface.Container.Elem,
+) void {
+    assert(ptr == &self.top_left or ptr == &self.bottom_right);
+
+    ptr.* = new;
+
+    const pos = self.paned.getPosition();
+    defer self.paned.setPosition(pos);
+
+    self.updateChildren();
+}
+
+/// Focus on first surface (top-left).
+pub fn grabFocus(self: *Split) void {
+    self.top_left.grabFocus();
+}
+
+/// Update paned children to match state.
+pub fn updateChildren(self: *const Split) void {
+    self.removeChildren();
+    self.paned.setStartChild(self.top_left.widget());
+    self.paned.setEndChild  (self.bottom_right.widget());
+}
+
+/// Mapping type used for goto-split.
+pub const DirectionMap = std.EnumMap(
+    apprt.action.GotoSplit,
+    ?*Surface,
+);
+
+pub const Side = enum { top_left, bottom_right };
+
+/// Compute map of neighbour surfaces relative to “from”.
+pub fn directionMap(self: *const Split, from: Side) DirectionMap {
+    var result = DirectionMap.initFull(null);
+
+    if (self.directionPrevious(from)) |prev| {
+        result.put(.previous, prev.surface);
+        if (!prev.wrapped) result.put(.up, prev.surface);
+    }
+    if (self.directionNext(from)) |next| {
+        result.put(.next, next.surface);
+        if (!next.wrapped) result.put(.down, next.surface);
+    }
+    if (self.directionLeft(from)) |l|  result.put(.left,  l);
+    if (self.directionRight(from))|r|  result.put(.right, r);
+
+    return result;
+}
+
+/// Horizontal neighbour to the left.
+fn directionLeft(self: *const Split, from: Side) ?*Surface {
+    switch (from) {
+        .bottom_right => switch (self.orientation) {
+            .horizontal => return self.top_left.deepestSurface(.bottom_right),
+            .vertical   => return directionLeft(self.container.split() orelse return null, .bottom_right),
+        },
+        .top_left => return directionLeft(self.container.split() orelse return null, .bottom_right),
+    }
+}
+
+/// Horizontal neighbour to the right.
+fn directionRight(self: *const Split, from: Side) ?*Surface {
+    switch (from) {
+        .top_left => switch (self.orientation) {
+            .horizontal => return self.bottom_right.deepestSurface(.top_left),
+            .vertical   => return directionRight(self.container.split() orelse return null, .top_left),
+        },
+        .bottom_right => return directionRight(self.container.split() orelse return null, .top_left),
+    }
+}
+
+/// Previous/next helpers (used for goto-split up/down/previous/next).
+fn directionPrevious(self: *const Split, from: Side) ?struct { surface: *Surface, wrapped: bool } {
+    switch (from) {
+        .bottom_right => return .{ .surface = self.top_left.deepestSurface(.bottom_right) orelse return null, .wrapped = false },
+        .top_left => {
+            const parent = self.container.split() orelse return .{
+                .surface = self.bottom_right.deepestSurface(.bottom_right) orelse return null,
+                .wrapped = true,
+            };
+            const side = self.container.splitSide() orelse return null;
+            return switch (side) {
+                .top_left      => parent.directionPrevious(.top_left),
+                .bottom_right  => parent.directionPrevious(.bottom_right),
+            };
+        },
+    }
+}
+
+fn directionNext(self: *const Split, from: Side) ?struct { surface: *Surface, wrapped: bool } {
+    switch (from) {
+        .top_left => return .{ .surface = self.bottom_right.deepestSurface(.top_left) orelse return null, .wrapped = false },
+        .bottom_right => {
+            const parent = self.container.split() orelse return .{
+                .surface = self.top_left.deepestSurface(.top_left) orelse return null,
+                .wrapped = true,
+            };
+            const side = self.container.splitSide() orelse return null;
+            return switch (side) {
+                .top_left     => parent.directionNext(.top_left),
+                .bottom_right => parent.directionNext(.bottom_right),
+            };
+        },
+    }
+}
+
+/// Detach helpers used when collapsing.
+pub fn detachTopLeft   (self: *const Split) void { self.paned.setStartChild(null); }
+pub fn detachBottomRight(self: *const Split) void { self.paned.setEndChild(null); }
+
+/// Remove both children from paned.
+fn removeChildren(self: *const Split) void {
+    self.detachTopLeft();
+    self.detachBottomRight();
+}
+
+/// Recursively find deepest surface on a side.
+fn deepestSurface(self: *const Split, side: Side) *Surface {
+    return switch (side) {
+        .bottom_right => switch (self.bottom_right) {
+            .surface => |s| s,
+            .split   => |s| s.deepestSurface(.bottom_right),
+        },
+        .top_left => switch (self.top_left) {
+            .surface => |s| s,
+            .split   => |s| s.deepestSurface(.top_left),
+        },
+    };
+}
