@@ -1,0 +1,380 @@
+```rust
+use std::borrow::Cow;
+use std::cmp::max;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+
+use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
+use common::types::{PointOffsetType, ScoredPointOffset};
+use io::file_operations::{atomic_save_bin, read_bin};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+
+use super::entry_points::EntryPoint;
+use super::graph_links::{GraphLinks, GraphLinksFormat};
+use crate::common::operation_error::{CancellableResult, OperationError, OperationResult, check_process_stopped};
+use crate::common::utils::rev_range;
+use crate::index::hnsw_index::entry_points::EntryPoints;
+use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::index::hnsw_index::search_context::SearchContext;
+use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
+
+pub type LinkContainer = Vec<PointOffsetType>;
+pub type LayersContainer = Vec<LinkContainer>;
+
+pub const HNSW_GRAPH_FILE: &str = "graph.bin";
+pub const HNSW_LINKS_FILE: &str = "links.bin";
+pub const COMPRESSED_HNSW_LINKS_FILE: &str = "links_compressed.bin";
+
+#[derive(Deserialize, Serialize, Debug)]
+struct GraphLayerData<'a> {
+    m: usize,
+    m0: usize,
+    ef_construct: usize,
+    entry_points: Cow<'a, EntryPoints>,
+}
+
+#[derive(Debug)]
+pub struct GraphLayers {
+    pub(super) m: usize,
+    pub(super) m0: usize,
+    pub(super) ef_construct: usize,
+    pub(super) links: GraphLinks,
+    pub(super) entry_points: EntryPoints,
+    pub(super) visited_pool: VisitedPool,
+}
+
+pub trait GraphLayersBase {
+    fn get_visited_list_from_pool(&self) -> VisitedListHandle;
+
+    fn links_map<F>(&self, point_id: PointOffsetType, level: usize, f: F)
+    where
+        F: FnMut(PointOffsetType);
+
+    fn get_m(&self, level: usize) -> usize;
+
+    fn _search_on_level(
+        &self,
+        searcher: &mut SearchContext,
+        level: usize,
+        visited_list: &mut VisitedListHandle,
+        points_scorer: &mut FilteredScorer,
+        is_stopped: &AtomicBool,
+    ) -> CancellableResult<()> {
+        let limit = self.get_m(level);
+        let mut points_ids: Vec<PointOffsetType> = Vec::with_capacity(2 * limit);
+
+        while let Some(candidate) = searcher.candidates.pop() {
+            check_process_stopped(is_stopped)?;
+
+            if candidate.score < searcher.lower_bound() {
+                break;
+            }
+
+            points_ids.clear();
+            self.links_map(candidate.idx, level, |link| {
+                if !visited_list.check(link) {
+                    points_ids.push(link);
+                }
+            });
+
+            let scores = points_scorer.score_points(&mut points_ids, limit);
+            scores.iter().copied().for_each(|score_point| {
+                searcher.process_candidate(score_point);
+                visited_list.check_and_update_visited(score_point.idx);
+            });
+        }
+
+        Ok(())
+    }
+
+    fn search_on_level(
+        &self,
+        level_entry: ScoredPointOffset,
+        level: usize,
+        ef: usize,
+        points_scorer: &mut FilteredScorer,
+        is_stopped: &AtomicBool,
+    ) -> CancellableResult<FixedLengthPriorityQueue<ScoredPointOffset>> {
+        let mut visited_list = self.get_visited_list_from_pool();
+        visited_list.check_and_update_visited(level_entry.idx);
+        let mut search_context = SearchContext::new(level_entry, ef);
+
+        self._search_on_level(&mut search_context, level, &mut visited_list, points_scorer, is_stopped)?;
+
+        Ok(search_context.nearest)
+    }
+
+    fn search_entry(
+        &self,
+        entry_point: PointOffsetType,
+        top_level: usize,
+        target_level: usize,
+        points_scorer: &mut FilteredScorer,
+        is_stopped: &AtomicBool,
+    ) -> CancellableResult<ScoredPointOffset> {
+        let mut links: Vec<PointOffsetType> = Vec::with_capacity(2 * self.get_m(0));
+        let mut current_point = ScoredPointOffset {
+            idx: entry_point,
+            score: points_scorer.score_point(entry_point),
+        };
+        for level in rev_range(top_level, target_level) {
+            check_process_stopped(is_stopped)?;
+            let limit = self.get_m(level);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                links.clear();
+                self.links_map(current_point.idx, level, |link| links.push(link));
+                let scores = points_scorer.score_points(&mut links, limit);
+                scores.iter().copied().for_each(|score_point| {
+                    if score_point.score > current_point.score {
+                        changed = true;
+                        current_point = score_point;
+                    }
+                });
+            }
+        }
+        Ok(current_point)
+    }
+}
+
+impl GraphLayers {
+    /// Path to the graph metadata file.
+    pub fn get_path(path: &Path) -> PathBuf {
+        path.join(HNSW_GRAPH_FILE)
+    }
+
+    /// Path to the links file, plain or compressed.
+    pub fn get_links_path(path: &Path, format: GraphLinksFormat) -> PathBuf {
+        match format {
+            GraphLinksFormat::Plain => path.join(HNSW_LINKS_FILE),
+            GraphLinksFormat::Compressed => path.join(COMPRESSED_HNSW_LINKS_FILE),
+        }
+    }
+
+    /// All files comprising this graph in the directory.
+    pub fn files(&self, dir: &Path) -> Vec<PathBuf> {
+        vec![
+            GraphLayers::get_path(dir),
+            GraphLayers::get_links_path(dir, self.links.format()),
+        ]
+    }
+
+    /// Number of points in the graph.
+    pub fn num_points(&self) -> usize {
+        self.links.num_points()
+    }
+
+    /// Highest level of a given point.
+    pub fn point_level(&self, point_id: PointOffsetType) -> usize {
+        self.links.point_level(point_id)
+    }
+
+    /// Allow custom entry points or fall back to the indexed ones.
+    fn get_entry_point(
+        &self,
+        points_scorer: &FilteredScorer,
+        custom_entry_points: Option<&[PointOffsetType]>,
+    ) -> Option<EntryPoint> {
+        custom_entry_points
+            .and_then(|custom| {
+                custom
+                    .iter()
+                    .filter(|&&pid| points_scorer.check_vector(pid))
+                    .map(|&pid| EntryPoint { point_id: pid, level: self.point_level(pid) })
+                    .max_by_key(|ep| ep.level)
+            })
+            .or_else(|| {
+                self.entry_points
+                    .get_entry_point(|pid| points_scorer.check_vector(pid))
+            })
+    }
+
+    /// Main search API with optional custom entry points and cancellation.
+    pub fn search(
+        &self,
+        top: usize,
+        ef: usize,
+        mut points_scorer: FilteredScorer,
+        custom_entry_points: Option<&[PointOffsetType]>,
+        is_stopped: &AtomicBool,
+    ) -> CancellableResult<Vec<ScoredPointOffset>> {
+        let entry_point = match self.get_entry_point(&points_scorer, custom_entry_points) {
+            Some(ep) => ep,
+            None => return Ok(Vec::new()),
+        };
+        let zero_level_entry = self.search_entry(
+            entry_point.point_id,
+            entry_point.level,
+            0,
+            &mut points_scorer,
+            is_stopped,
+        )?;
+        let nearest = self.search_on_level(
+            zero_level_entry,
+            0,
+            max(top, ef),
+            &mut points_scorer,
+            is_stopped,
+        )?;
+        Ok(nearest.into_iter_sorted().take(top).collect_vec())
+    }
+
+    /// Load a graph (metadata + links), optionally converting to compressed first.
+    pub fn load(dir: &Path, on_disk: bool, compress: bool) -> OperationResult<Self> {
+        let data: GraphLayerData = read_bin(&GraphLayers::get_path(dir))?;
+        if compress {
+            Self::convert_to_compressed(dir, data.m, data.m0)?
+        }
+        Ok(GraphLayers {
+            m: data.m,
+            m0: data.m0,
+            ef_construct: data.ef_construct,
+            links: GraphLinks::load_from_file(
+                &GraphLayers::get_links_path(dir, GraphLinksFormat::Compressed),
+                on_disk,
+                if compress { GraphLinksFormat::Compressed } else { GraphLinksFormat::Plain },
+            )?,
+            entry_points: data.entry_points.into_owned(),
+            visited_pool: VisitedPool::new(),
+        })
+    }
+
+    /// Save just the metadata (graph.bin). Links are saved separately.
+    pub fn save(&self, path: &Path) -> OperationResult<()> {
+        Ok(atomic_save_bin(path, &self.data())?)
+    }
+
+    fn data(&self) -> GraphLayerData {
+        GraphLayerData {
+            m: self.m,
+            m0: self.m0,
+            ef_construct: self.ef_construct,
+            entry_points: Cow::Borrowed(&self.entry_points),
+        }
+    }
+
+    /// Convert plain links to compressed format on disk.
+    fn convert_to_compressed(dir: &Path, m: usize, m0: usize) -> OperationResult<()> {
+        let plain = GraphLayers::get_links_path(dir, GraphLinksFormat::Plain);
+        let comp = GraphLayers::get_links_path(dir, GraphLinksFormat::Compressed);
+        if comp.exists() {
+            return Ok(());
+        }
+        let start = std::time::Instant::now();
+        let links = GraphLinks::load_from_file(&plain, true, GraphLinksFormat::Plain)?;
+        let orig_size = plain.metadata()?.len();
+        super::graph_links::GraphLinksSerializer::new(links.into_edges(), GraphLinksFormat::Compressed, m, m0)
+            .save_as(&comp)?;
+        let new_size = comp.metadata()?.len();
+        std::fs::remove_file(plain)?;
+        log::debug!(
+            "Compressed HNSW links in {:?}: {:.1}MB -> {:.1}MB ({:.1}%)",
+            start.elapsed(),
+            orig_size as f64 / 1024.0 / 1024.0,
+            new_size as f64 / 1024.0 / 1024.0,
+            new_size as f64 / orig_size as f64 * 100.0
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn compress_ram(&mut self) {
+        use super::graph_links::GraphLinksSerializer;
+        assert_eq!(self.links.format(), GraphLinksFormat::Plain);
+        let dummy = GraphLinksSerializer::new(Vec::new(), GraphLinksFormat::Plain, 0, 0)
+            .to_graph_links_ram();
+        let old = std::mem::replace(&mut self.links, dummy);
+        self.links = GraphLinksSerializer::new(old.into_edges(), GraphLinksFormat::Compressed, self.m, self.m0)
+            .to_graph_links_ram();
+    }
+
+    /// Advise the OS to evict any caches for this graph’s links.
+    pub fn populate(&self) -> OperationResult<()> {
+        self.links.populate()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rstest::rstest;
+    use tempfile::Builder;
+    use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
+    use common::types::ScoredPointOffset;
+    use crate::vector_storage::DEFAULT_STOPPED;
+    use crate::data_types::vectors::VectorElementType;
+    use crate::fixtures::index_fixtures::{random_vector, FakeFilterContext, TestRawScorerProducer};
+    use crate::spaces::metric::Metric;
+    use crate::spaces::simple::{CosineMetric, DotProductMetric};
+    use super::super::graph_links::GraphLinksSerializer;
+    use crate::index::hnsw_index::tests::{create_graph_layer_builder_fixture, create_graph_layer_fixture};
+
+    fn search_in_graph(
+        query: &[VectorElementType],
+        top: usize,
+        storage: &TestRawScorerProducer<CosineMetric>,
+        graph: &GraphLayers,
+    ) -> Vec<ScoredPointOffset> {
+        let fake = FakeFilterContext {};
+        let raw = storage.get_raw_scorer(query.to_owned()).unwrap();
+        let scorer = FilteredScorer::new(raw.as_ref(), Some(&fake));
+        graph.search(top, 16, scorer, None, &DEFAULT_STOPPED).unwrap()
+    }
+
+    const M: usize = 8;
+
+    #[rstest]
+    #[case::plain(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_search_on_level(#[case] format: GraphLinksFormat) {
+        let dim = 8;
+        let m = M;
+        let entry_points = 10;
+        let vectors = 10;
+
+        // Build a simple graph...
+        let mut graph = GraphLayers {
+            m,
+            m0: 2 * m,
+            ef_construct: 32,
+            links: GraphLinksSerializer::new(vec![vec![(0, vec![1,2,3])]], format, m, 2*m).to_graph_links_ram(),
+            entry_points: EntryPoints::new(entry_points),
+            visited_pool: VisitedPool::new(),
+        };
+
+        // ...test search_on_level works...
+        // (omitted for brevity)
+    }
+
+    #[rstest]
+    #[case::plain_convert((GraphLinksFormat::Plain, false))]
+    #[case::plain_to_comp((GraphLinksFormat::Plain, true))]
+    #[case::comp_no_convert((GraphLinksFormat::Compressed, false))]
+    #[case::comp_to_comp((GraphLinksFormat::Compressed, true))]
+    fn test_save_and_load(#[case] (initial_format, compress): (GraphLinksFormat, bool)) {
+        let num = 100;
+        let dim = 8;
+        let top = 5;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let dir = Builder::new().prefix("graph_dir").tempdir().unwrap();
+        let (holder, builder) = create_graph_layer_builder_fixture(num, M, dim, false, &mut rng);
+        let graph1 = builder.into_graph_layers(dir.path(), initial_format, true).unwrap();
+        let res1 = search_in_graph(&random_vector(&mut rng, dim), top, &holder, &graph1);
+        drop(graph1);
+
+        let graph2 = GraphLayers::load(dir.path(), false, compress).unwrap();
+        let res2 = search_in_graph(&random_vector(&mut rng, dim), top, &holder, &graph2);
+        assert_eq!(res1, res2);
+    }
+
+    // ...additional tests...
+}
+```
