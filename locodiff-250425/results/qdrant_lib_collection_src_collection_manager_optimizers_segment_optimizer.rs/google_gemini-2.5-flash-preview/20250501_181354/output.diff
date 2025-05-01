@@ -1,0 +1,169 @@
+--- qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_extracted.txt (actual)@@ -26,7 +26,6 @@     LockedSegment, LockedSegmentHolder, SegmentId,
+ };
+ use crate::config::CollectionParams;
+-use crate::operations::config_diff::DiffConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
+ 
+ const BYTES_IN_KB: usize = 1024;
+@@ -248,7 +247,7 @@ 
+                 match config_on_disk {
+                     Some(true) => config.storage_type = VectorStorageType::Mmap, // Both agree, but prefer mmap storage type
+-                    Some(false) => {} // on_disk=false wins, do nothing
++                    Some(false) => {}
+                     None => config.storage_type = VectorStorageType::Mmap, // Mmap threshold wins
+                 }
+ 
+@@ -256,7 +255,9 @@                 // that doesn't match, warn about it
+                 if let Some(config_on_disk) = config_on_disk {
+                     if config_on_disk != config.storage_type.is_on_disk() {
+-                        log::warn!("Collection config for vector {vector_name} has on_disk={config_on_disk:?} configured, but storage type for segment doesn't match it");
++                        log::warn!(
++                            "Collection config for vector {vector_name} has on_disk={config_on_disk:?} configured, but storage type for segment doesn't match it"
++                        );
+                     }
+                 }
+             });
+@@ -341,12 +342,7 @@ 
+     /// Checks if optimization cancellation is requested.
+     fn check_cancellation(&self, stopped: &AtomicBool) -> CollectionResult<()> {
+-        if stopped.load(Ordering::Relaxed) {
+-            return Err(CollectionError::Cancelled {
+-                description: "optimization cancelled by service".to_string(),
+-            });
+-        }
+-        Ok(())
++        check_process_stopped(stopped).map_err(CollectionError::from)
+     }
+ 
+     /// Unwraps proxy, adds temp segment into collection and returns a `Cancelled` error.
+@@ -441,20 +437,15 @@             segment_builder.update(
+                 &segment_guards.iter().map(Deref::deref).collect_vec(),
+                 stopped,
++                hw_counter,
+             )?;
+         }
+ 
+-        // Apply index changes to segment builder
+-        // Indexes are only used for defragmentation in segment builder, so versions are ignored
+-        for (field_name, change) in proxy_changed_indexes.read().iter_unordered() {
+-            match change {
+-                ProxyIndexChange::Create(schema, _) => {
+-                    segment_builder.add_indexed_field(field_name.to_owned(), schema.to_owned());
+-                }
+-                ProxyIndexChange::Delete(_) => {
+-                    segment_builder.remove_indexed_field(field_name);
+-                }
+-            }
++        for field in proxy_changed_indexes.read().get_deleted().iter() {
++            segment_builder.remove_indexed_field(field);
++        }
++        for (field, schema_type) in proxy_changed_indexes.read().get_created().iter() {
++            segment_builder.add_indexed_field(field.to_owned(), schema_type.to_owned());
+         }
+ 
+         // 000 - acquired
+@@ -505,21 +496,13 @@         let mut optimized_segment: Segment =
+             segment_builder.build(indexing_permit, stopped, hw_counter)?;
+ 
+-        // Delete points
+-        let deleted_points_snapshot = proxy_deleted_points
+-            .read()
+-            .iter()
+-            .map(|(point_id, versions)| (*point_id, *versions))
+-            .collect::<Vec<_>>();
+-
+         // Apply index changes before point deletions
+         // Point deletions bump the segment version, can cause index changes to be ignored
+         let old_optimized_segment_version = optimized_segment.version();
+         for (field_name, change) in proxy_changed_indexes.read().iter_ordered() {
+-            debug_assert!(
+-                change.version() >= old_optimized_segment_version,
+-                "proxied index change should have newer version than segment",
+-            );
++            // Warn: change version might be lower than the segment version,
++            // because we might already applied the change earlier in optimization.
++            // Applied optimizations are not removed from `proxy_index_changes`.
+             match change {
+                 ProxyIndexChange::Create(schema, version) => {
+                     optimized_segment.create_field_index(
+@@ -536,6 +519,12 @@             self.check_cancellation(stopped)?;
+         }
+ 
++        // Delete points
++        let deleted_points_snapshot = proxy_deleted_points
++            .read()
++            .iter()
++            .map(|(point_id, versions)| (*point_id, *versions))
++            .collect::<Vec<_>>();
+         for (point_id, versions) in deleted_points_snapshot {
+             optimized_segment
+                 .delete_point(versions.operation_version, point_id, hw_counter)
+@@ -554,11 +543,6 @@     /// * `segments` - segments holder
+     /// * `ids` - list of segment ids to perform optimization on. All segments will be merged into single one
+     /// * `stopped` - flag for early stopping of the optimization. If appears to be `true` - optimization process should be cancelled, all segments unwrapped.
+-    ///
+-    /// # Result
+-    ///
+-    /// New optimized segment should be added into `segments`.
+-    /// If there were any record changes during the optimization - an additional plain segment will be created.
+     ///
+     /// Returns id of the created optimized segment. If no optimization was done - returns None
+     fn optimize(
+@@ -590,6 +574,7 @@             .collect();
+ 
+         // Check if all segments are not under other optimization or some ids are missing
++        // If there is a proxy, it means the segment is already included in some optimization
+         let all_segments_ok = optimizing_segments.len() == ids.len()
+             && optimizing_segments
+                 .iter()
+@@ -602,13 +587,12 @@ 
+         check_process_stopped(stopped)?;
+ 
+-        let hw_counter = HardwareCounterCell::disposable(); // Internal operation, no measurement needed!
+-
+         let tmp_segment = self.temp_segment(false)?;
+         let proxy_deleted_points = proxy_segment::LockedRmSet::default();
+         let proxy_index_changes = proxy_segment::LockedIndexChanges::default();
+ 
+         let mut proxies = Vec::new();
++        let hw_counter = HardwareCounterCell::disposable(); // Internal operation, no measurement needed!
+         for sg in optimizing_segments.iter() {
+             let mut proxy = ProxySegment::new(
+                 sg.clone(),
+@@ -676,14 +660,7 @@         // Avoid unnecessary point removing in the critical section:
+         // - save already removed points while avoiding long read locks
+         // - exclude already removed points from post-optimization removing
+-        let already_remove_points = {
+-            let mut all_removed_points: HashSet<_> =
+-                proxy_deleted_points.read().keys().copied().collect();
+-            for existing_point in optimized_segment.iter_points() {
+-                all_removed_points.remove(&existing_point);
+-            }
+-            all_removed_points
+-        };
++        let already_remove_points: HashSet<_> = proxy_deleted_points.read().keys().copied().collect();
+ 
+         // ---- SLOW PART ENDS HERE -----
+ 
+@@ -695,6 +672,7 @@         {
+             // This block locks all operations with collection. It should be fast
+             let mut write_segments_guard = segments.write();
++            let old_optimized_segment_version = optimized_segment.version();
+ 
+             // Apply index changes before point deletions
+             // Point deletions bump the segment version, can cause index changes to be ignored
+@@ -773,10 +751,10 @@                 }
+                 tmp_segment.drop_data()?;
+             }
+-
+-            timer.set_success(true);
+-
+-            Ok(point_count)
+-        }
++        }
++
++        timer.set_success(true);
++
++        Ok(point_count)
+     }
+ }
