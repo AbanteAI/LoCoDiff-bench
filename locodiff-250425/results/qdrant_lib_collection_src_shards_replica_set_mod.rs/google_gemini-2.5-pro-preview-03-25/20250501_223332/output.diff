@@ -1,0 +1,182 @@
+--- qdrant_lib_collection_src_shards_replica_set_mod.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_shards_replica_set_mod.rs_extracted.txt (actual)@@ -24,8 +24,8 @@ use tokio::sync::{Mutex, RwLock};
+ 
+ use super::CollectionId;
++use super::local_shard::clock_map::RecoveryPoint;
+ use super::local_shard::LocalShard;
+-use super::local_shard::clock_map::RecoveryPoint;
+ use super::remote_shard::RemoteShard;
+ use super::transfer::ShardTransfer;
+ use crate::collection::payload_index_schema::PayloadIndexSchema;
+@@ -114,8 +114,9 @@     clock_set: Mutex<ClockSet>,
+     write_rate_limiter: Option<parking_lot::Mutex<RateLimiter>>,
+ }
+-
++// TODO: Remove? Seems excessive to pass this around everywhere.
+ pub type AbortShardTransfer = Arc<dyn Fn(ShardTransfer, &str) + Send + Sync>;
++// TODO: Remove? Maybe consensus dispatcher or notifier can handle this?
+ pub type ChangePeerState = Arc<dyn Fn(PeerId, ShardId) + Send + Sync>;
+ pub type ChangePeerFromState = Arc<dyn Fn(PeerId, ShardId, Option<ReplicaState>) + Send + Sync>;
+ 
+@@ -208,8 +209,8 @@             replica_state: replica_state.into(),
+             locally_disabled_peers: Default::default(),
+             shard_path,
++            notify_peer_failure_cb: on_peer_failure,
+             abort_shard_transfer_cb: abort_shard_transfer,
+-            notify_peer_failure_cb: on_peer_failure,
+             channel_service,
+             collection_id,
+             collection_config,
+@@ -224,6 +225,7 @@             write_rate_limiter,
+         })
+     }
++    // TODO(strict_mode): Maybe we should initialize the read rate limiter here too?
+ 
+     /// Recovers shard from disk.
+     ///
+@@ -301,6 +303,8 @@                     optimizer_resource_budget.clone(),
+                 )
+                 .await;
++                // TODO(resharding): Recreate shard if shard key is different from expected?
++                //                   In that case, `is_dirty_shard` flag should be ignored too?
+ 
+                 match res {
+                     Ok(shard) => Shard::Local(shard),
+@@ -318,7 +322,7 @@                         );
+ 
+                         Shard::Dummy(DummyShard::new(format!(
+-                            "Failed to load local shard {shard_path:?}: {err}"
++                            "Failed to load local shard {shard_path:?}: {err}",
+                         )))
+                     }
+                 }
+@@ -389,17 +393,17 @@ 
+     pub async fn is_local(&self) -> bool {
+         let local_read = self.local.read().await;
+-        matches!(*local_read, Some(Shard::Local(_) | Shard::Dummy(_)))
++        matches!(local_read.as_ref(), Some(Shard::Local(_) | Shard::Dummy(_)))
+     }
+ 
+     pub async fn is_queue_proxy(&self) -> bool {
+         let local_read = self.local.read().await;
+-        matches!(*local_read, Some(Shard::QueueProxy(_)))
++        matches!(local_read.as_ref(), Some(Shard::QueueProxy(_)))
+     }
+ 
+     pub async fn is_dummy(&self) -> bool {
+         let local_read = self.local.read().await;
+-        matches!(*local_read, Some(Shard::Dummy(_)))
++        matches!(local_read.as_ref(), Some(Shard::Dummy(_)))
+     }
+ 
+     pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
+@@ -526,10 +530,9 @@     /// Clears the local shard data and loads an empty local shard
+     pub async fn init_empty_local_shard(&self) -> CollectionResult<()> {
+         let mut local = self.local.write().await;
+-
+         let current_shard = local.take();
+-
+         LocalShard::clear(&self.shard_path).await?;
++
+         let local_shard_res = LocalShard::build(
+             self.shard_id,
+             self.collection_id.clone(),
+@@ -580,7 +583,7 @@     }
+ 
+     pub async fn remove_local(&self) -> CollectionResult<()> {
+-        // TODO: Ensure cancel safety!
++        // TODO: Ensure cancel safety!?
+ 
+         self.replica_state.write(|rs| {
+             rs.is_local = false;
+@@ -590,10 +593,7 @@ 
+         self.update_locally_disabled(self.this_peer_id());
+ 
+-        let removing_local = {
+-            let mut local = self.local.write().await;
+-            local.take()
+-        };
++        let removing_local = { self.local.write().await.take() };
+ 
+         if let Some(removing_local) = removing_local {
+             // stop ongoing tasks and delete data
+@@ -773,7 +773,7 @@ 
+     pub(crate) async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
+         let read_local = self.local.read().await;
+-        if let Some(shard) = &*read_local {
++        if let Some(shard) = read_local.as_ref() {
+             shard.on_optimizer_config_update().await
+         } else {
+             Ok(())
+@@ -867,7 +867,7 @@ 
+         let Some(remote) = remotes.iter().find(|remote| remote.peer_id == peer_id) else {
+             return Err(CollectionError::NotFound {
+-                what: format!("{}/{}:{} shard", peer_id, self.collection_id, self.shard_id),
++                what: format!("{peer_id}/{}:{}} shard", self.collection_id, self.shard_id),
+             });
+         };
+ 
+@@ -936,8 +936,10 @@             });
+ 
+         // TODO(resharding): Assign clock tag to the operation!? 🤔
++        // Measurement is marked as disposable to avoid rate limiting this internal cleanup operation.
++        // If the shard deletion fails, the cleanup will be retried on the next node restart.
+         let result = self
+-            .update_local(op.into(), true, hw_measurement_acc, force)
++            .update_local(op.into(), true, HwMeasurementAcc::disposable(), force)
+             .await?
+             .ok_or_else(|| {
+                 CollectionError::bad_request(format!(
+@@ -995,6 +997,46 @@ 
+         is_active_or_resharding && !is_locally_disabled
+     }
++    // TODO(resharding-cleanup): Rename, remove?
++    //                           Used only in `shard_transfer`, specifically for `TransferMethod::StreamRecords`
++
++    // TODO(resharding-cleanup): Rename, remove?
++    //                            Used in `update` for write consistency
++    //                            Used in `resolve_wal_delta` for WAL delta
++    #[allow(unused)]
++    /// Check whether a peer accepts updates.
++    fn accepts_updates(&self, peer_id: PeerId) -> bool {
++        // Do not send updates to replicas in recovery state.
++        // The peer holding the replica may keep it in active state for some time if consensus is slow to respond.
++        // It allows the peer to keep responding to read requests. Those reads may be stale if we don't send updates to it, causing data inconsistencies.
++        // See https://github.com/qdrant/qdrant/pull/3659#pullrequestreview-1871944333
++        //
++        // UPD(1.8.0): The issue is known and documented now.
++        // See https://github.com/qdrant/qdrant/issues/3660
++        //
++        // UPD(1.10.0): The issue is solved now.
++        // See https://github.com/qdrant/qdrant/pull/5298
++        let Some(state) = self.peer_state(peer_id) else {
++            // We don't know the state of the peer, assume it doesn't accept updates
++            return false;
++        };
++
++        // Let's check the state explicitly
++        use ReplicaState::*;
++        let state_accepts_updates = match state {
++            Active => true,
++            Listener => true,
++            Resharding => true,
++            ReshardingScaleDown => true,
++            PartialSnapshot => true, // Since 1.8.0, accepts updates if force is true, which is handled internally
++            Initializing => false,
++            Partial => false,
++            Recovery => false,
++            Dead => false,
++        };
++
++        state_accepts_updates && !self.is_locally_disabled(peer_id)
++    }
+ 
+     fn is_locally_disabled(&self, peer_id: PeerId) -> bool {
+         self.locally_disabled_peers.read().is_disabled(peer_id)
+@@ -1059,7 +1101,7 @@ 
+     fn abort_shard_transfer(&self, transfer: ShardTransfer, reason: &str) {
+         log::debug!(
+-            "Abort {}:{} / {} -> {} shard transfer",
++            "Abort {}:{}/({} -> {}) shard transfer: {reason}",
+             self.collection_id,
+             transfer.shard_id,
+             transfer.from,
