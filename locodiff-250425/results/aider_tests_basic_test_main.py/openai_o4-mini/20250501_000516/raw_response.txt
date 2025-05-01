@@ -1,0 +1,665 @@
+```python
+import os
+import subprocess
+import tempfile
+import json
+from io import StringIO
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, patch
+
+import git
+from prompt_toolkit.input import DummyInput
+from prompt_toolkit.output import DummyOutput
+
+from aider.coders import Coder
+from aider.dump import dump  # noqa: F401
+from aider.io import InputOutput
+from aider.main import check_gitignore, load_dotenv_files, main, setup_git
+from aider.utils import GitTemporaryDirectory, IgnorantTemporaryDirectory, make_repo
+
+
+class TestMain(TestCase):
+    def setUp(self):
+        self.original_env = os.environ.copy()
+        os.environ["OPENAI_API_KEY"] = "deadbeef"
+        os.environ["AIDER_CHECK_UPDATE"] = "false"
+        os.environ["AIDER_ANALYTICS"] = "false"
+        self.original_cwd = os.getcwd()
+        self.tempdir_obj = IgnorantTemporaryDirectory()
+        self.tempdir = self.tempdir_obj.name
+        os.chdir(self.tempdir)
+        # Fake home directory prevents tests from using the real ~/.aider.conf.yml file:
+        self.homedir_obj = IgnorantTemporaryDirectory()
+        os.environ["HOME"] = self.homedir_obj.name
+        self.input_patcher = patch("builtins.input", return_value=None)
+        self.mock_input = self.input_patcher.start()
+        self.webbrowser_patcher = patch("aider.io.webbrowser.open")
+        self.mock_webbrowser = self.webbrowser_patcher.start()
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        self.tempdir_obj.cleanup()
+        self.homedir_obj.cleanup()
+        os.environ.clear()
+        os.environ.update(self.original_env)
+        self.input_patcher.stop()
+        self.webbrowser_patcher.stop()
+
+    def test_main_with_empty_dir_no_files_on_command(self):
+        main(["--no-git", "--exit", "--yes"], input=DummyInput(), output=DummyOutput())
+
+    def test_main_with_emptqy_dir_new_file(self):
+        main(
+            ["foo.txt", "--yes", "--no-git", "--exit"],
+            input=DummyInput(),
+            output=DummyOutput(),
+        )
+        self.assertTrue(os.path.exists("foo.txt"))
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_empty_git_dir_new_file(self, _):
+        make_repo()
+        main(
+            ["--yes", "foo.txt", "--exit"],
+            input=DummyInput(),
+            output=DummyOutput(),
+        )
+        self.assertTrue(os.path.exists("foo.txt"))
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_empty_git_dir_new_files(self, _):
+        make_repo()
+        main(
+            ["--yes", "foo.txt", "bar.txt", "--exit"],
+            input=DummyInput(),
+            output=DummyOutput(),
+        )
+        self.assertTrue(os.path.exists("foo.txt"))
+        self.assertTrue(os.path.exists("bar.txt"))
+
+    def test_main_with_dname_and_fname(self):
+        subdir = Path("subdir")
+        subdir.mkdir()
+        make_repo(str(subdir))
+        res = main(["subdir", "foo.txt"], input=DummyInput(), output=DummyOutput())
+        self.assertNotEqual(res, None)
+
+    @patch("aider.repo.GitRepo.get_commit_message", return_value="mock commit message")
+    def test_main_with_subdir_repo_fnames(self, _):
+        subdir = Path("subdir")
+        subdir.mkdir()
+        make_repo(str(subdir))
+        main(
+            ["--yes", str(subdir / "foo.txt"), str(subdir / "bar.txt"), "--exit"],
+            input=DummyInput(),
+            output=DummyOutput(),
+        )
+        self.assertTrue((subdir / "foo.txt").exists())
+        self.assertTrue((subdir / "bar.txt").exists())
+
+    def test_main_with_git_config_yml(self):
+        make_repo()
+
+        Path(".aider.conf.yml").write_text("auto-commits: false\n")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is False
+
+        Path(".aider.conf.yml").write_text("auto-commits: true\n")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--exit", "--yes"], input=DummyInput(), output=DummyOutput())
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is True
+
+    def test_main_with_empty_git_dir_new_subdir_file(self):
+        make_repo()
+        subdir = Path("subdir")
+        subdir.mkdir()
+        fname = subdir / "foo.txt"
+        fname.touch()
+        subprocess.run(["git", "add", str(subdir)])
+        subprocess.run(["git", "commit", "-m", "added"])
+
+        main(
+            ["--yes", str(fname), "--exit"],
+            input=DummyInput(),
+            output=DummyOutput(),
+        )
+
+    def test_setup_git(self):
+        io = InputOutput(pretty=False, yes=True)
+        git_root = setup_git(None, io)
+        git_root = Path(git_root).resolve()
+        self.assertEqual(git_root, Path(self.tempdir).resolve())
+
+        self.assertTrue(git.Repo(self.tempdir))
+
+        gitignore = Path.cwd() / ".gitignore"
+        self.assertTrue(gitignore.exists())
+        self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+
+    def test_check_gitignore(self):
+        with GitTemporaryDirectory():
+            os.environ["GIT_CONFIG_GLOBAL"] = "globalgitconfig"
+
+            io = InputOutput(pretty=False, yes=True)
+            cwd = Path.cwd()
+            gitignore = cwd / ".gitignore"
+
+            self.assertFalse(gitignore.exists())
+            check_gitignore(cwd, io)
+            self.assertTrue(gitignore.exists())
+
+            self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+
+            gitignore.write_text("one\ntwo\n")
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n", gitignore.read_text())
+            del os.environ["GIT_CONFIG_GLOBAL"]
+
+            # Test without .env file present
+            gitignore.write_text("one\ntwo\n")
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n", gitignore.read_text())
+
+            # Test with .env file present
+            env_file = cwd / ".env"
+            env_file.touch()
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n.env\n", gitignore.read_text())
+
+    def test_main_args(self):
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(
+                ["--no-auto-commits", "--yes", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is False
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(
+                ["--auto-commits", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            _, kwargs = MockCoder.call_args
+            assert kwargs["auto_commits"] is True
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(
+                ["--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            _, kwargs = MockCoder.call_args
+            assert kwargs["dirty_commits"] is True
+            assert kwargs["auto_commits"] is True
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(
+                ["--no-dirty-commits", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            _, kwargs = MockCoder.call_args
+            assert kwargs["dirty_commits"] is False
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(
+                ["--dirty-commits", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            _, kwargs = MockCoder.call_args
+            assert kwargs["dirty_commits"] is True
+
+    def test_message_file_flag(self):
+        message_file_content = "This is a test message from a file."
+        message_file_path = tempfile.mktemp()
+        with open(message_file_path, "w", encoding="utf-8") as message_file:
+            message_file.write(message_file_content)
+
+        with patch("aider.coders.Coder.create") as MockCoder:
+            MockCoder.return_value.run = MagicMock()
+            main(
+                ["--yes", "--message-file", message_file_path, "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            MockCoder.return_value.run.assert_called_once_with(
+                with_message=message_file_content
+            )
+
+        os.remove(message_file_path)
+
+    def test_encodings_arg(self):
+        fname = "foo.py"
+
+        with GitTemporaryDirectory():
+            with patch("aider.coders.Coder.create") as MockCoder:
+                with patch("aider.main.InputOutput") as MockSend:
+
+                    def side_effect(*args, **kwargs):
+                        self.assertEqual(kwargs["encoding"], "iso-8859-15")
+                        return MagicMock()
+
+                    MockSend.side_effect = side_effect
+
+                    main(
+                        ["--yes", fname, "--encoding", "iso-8859-15", "--exit"],
+                        input=DummyInput(),
+                        output=DummyOutput(),
+                    )
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_main_message_adds_to_input_history(self, mock_run, MockInputOutput):
+        test_message = "test message"
+        mock_io_instance = MockInputOutput.return_value
+
+        main(["--message", test_message, "--exit"], input=DummyInput(), output=DummyOutput())
+
+        mock_io_instance.add_to_input_history.assert_called_once_with(test_message)
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_yes(self, mock_run, MockInputOutput):
+        test_message = "test message"
+
+        main(["--yes", "--message", test_message, "--exit"])
+        args, kwargs = MockInputOutput.call_args
+        self.assertTrue(args[1])
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_default_yes(self, mock_run, MockInputOutput):
+        test_message = "test message"
+
+        main(["--message", test_message, "--exit"])
+        args, kwargs = MockInputOutput.call_args
+        self.assertEqual(args[1], None)
+
+    def test_dark_mode_sets_code_theme(self):
+        # Mock InputOutput to capture the configuration
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            MockInputOutput.return_value.get_input.return_value = None
+            main(
+                ["--dark-mode", "--no-git", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            # Ensure InputOutput was called
+            MockInputOutput.assert_called_once()
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "monokai")
+
+    def test_light_mode_sets_code_theme(self):
+        # Mock InputOutput to capture the configuration
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            MockInputOutput.return_value.get_input.return_value = None
+            main(
+                ["--light-mode", "--no-git", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            # Ensure InputOutput was called
+            MockInputOutput.assert_called_once()
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "default")
+
+    def create_env_file(self, file_name, content):
+        env_file_path = Path(self.tempdir) / file_name
+        env_file_path.write_text(content)
+        return env_file_path
+
+    def test_env_file_flag_sets_automatic_variable(self):
+        env_file_path = self.create_env_file(".env.test", "AIDER_DARK_MODE=True")
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            MockInputOutput.return_value.get_input.return_value = None
+            MockInputOutput.return_value.get_input.confirm_ask = True
+            main(
+                ["--env-file", str(env_file_path), "--no-git", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            MockInputOutput.assert_called_once()
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "monokai")
+
+    def test_default_env_file_sets_automatic_variable(self):
+        self.create_env_file(".env", "AIDER_DARK_MODE=True")
+        with patch("aider.main.InputOutput") as MockInputOutput:
+            MockInputOutput.return_value.get_input.return_value = None
+            MockInputOutput.return_value.get_input.confirm_ask = True
+            main(
+                ["--no-git", "--exit"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            MockInputOutput.assert_called_once()
+            _, kwargs = MockInputOutput.call_args
+            self.assertEqual(kwargs["code_theme"], "monokai")
+
+    def test_false_vals_in_env_file(self):
+        self.create_env_file(".env", "AIDER_SHOW_DIFFS=off")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--no-git", "--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+            MockCoder.assert_called_once()
+            _, kwargs = MockCoder.call_args
+            self.assertEqual(kwargs["show_diffs"], False)
+
+    def test_true_vals_in_env_file(self):
+        self.create_env_file(".env", "AIDER_SHOW_DIFFS=on")
+        with patch("aider.coders.Coder.create") as MockCoder:
+            main(["--no-git", "--yes", "--exit"], input=DummyInput(), output=DummyOutput())
+            MockCoder.assert_called_once()
+            _, kwargs = MockCoder.call_args
+            self.assertEqual(kwargs["show_diffs"], True)
+
+    def test_verbose_mode_lists_env_vars(self):
+        self.create_env_file(".env", "AIDER_DARK_MODE=on")
+        with patch("sys.stdout", new_callable=StringIO) as mock_stdout:
+            main(
+                ["--no-git", "--verbose", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            output = mock_stdout.getvalue()
+            relevant_output = "\n".join(
+                line
+                for line in output.splitlines()
+                if "AIDER_DARK_MODE" in line or "dark_mode" in line
+            )
+            self.assertIn("AIDER_DARK_MODE", relevant_output)
+            self.assertIn("dark_mode", relevant_output)
+            self.assertRegex(relevant_output, r"AIDER_DARK_MODE:\s+on")
+            self.assertRegex(relevant_output, r"dark_mode:\s+True")
+
+    def test_map_tokens_option(self):
+        with GitTemporaryDirectory():
+            with patch("aider.coders.base_coder.RepoMap") as MockRepoMap:
+                MockRepoMap.return_value.max_map_tokens = 0
+                main(
+                    ["--model", "gpt-4", "--map-tokens", "0", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                MockRepoMap.assert_not_called()
+
+    def test_map_tokens_option_with_non_zero_value(self):
+        with GitTemporaryDirectory():
+            with patch("aider.coders.base_coder.RepoMap") as MockRepoMap:
+                MockRepoMap.return_value.max_map_tokens = 1000
+                main(
+                    ["--model", "gpt-4", "--map-tokens", "1000", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+                MockRepoMap.assert_called_once()
+
+    def test_read_option(self):
+        with GitTemporaryDirectory():
+            test_file = "test_file.txt"
+            Path(test_file).touch()
+
+            coder = main(
+                ["--read", test_file, "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+
+            self.assertIn(str(Path(test_file).resolve()), coder.abs_read_only_fnames)
+
+    def test_read_option_with_external_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as external_file:
+            external_file.write("External file content")
+            external_file_path = external_file.name
+
+        try:
+            with GitTemporaryDirectory():
+                coder = main(
+                    ["--read", external_file_path, "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                    return_coder=True,
+                )
+
+                real_external_file_path = os.path.realpath(external_file_path)
+                self.assertIn(real_external_file_path, coder.abs_read_only_fnames)
+        finally:
+            os.unlink(external_file_path)
+
+    def test_model_metadata_file(self):
+        # Re-init so we don't have old data lying around from earlier test cases
+        from aider import models
+
+        models.model_info_manager = models.ModelInfoManager()
+
+        from aider.llm import litellm
+
+        litellm._lazy_module = None
+
+        with GitTemporaryDirectory():
+            metadata_file = Path(".aider.model.metadata.json")
+            metadata_content = {"deepseek/deepseek-chat": {"max_input_tokens": 1234}}
+            metadata_file.write_text(json.dumps(metadata_content))
+
+            coder = main(
+                [
+                    "--model",
+                    "deepseek/deepseek-chat",
+                    "--model-metadata-file",
+                    str(metadata_file),
+                    "--exit",
+                    "--yes",
+                ],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+
+            self.assertEqual(coder.main_model.info["max_input_tokens"], 1234)
+
+    def test_sonnet_and_cache_options(self):
+        with GitTemporaryDirectory():
+            with patch("aider.coders.base_coder.RepoMap") as MockRepoMap:
+                mock_repo_map = MagicMock()
+                mock_repo_map.max_map_tokens = 1000  # Set a specific value
+                MockRepoMap.return_value = mock_repo_map
+
+                main(
+                    ["--sonnet", "--cache-prompts", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+
+                MockRepoMap.assert_called_once()
+                call_args, call_kwargs = MockRepoMap.call_args
+                self.assertEqual(
+                    call_kwargs.get("refresh"), "files"
+                )  # Check the 'refresh' keyword argument
+
+    def test_4o_and_cache_options(self):
+        with GitTemporaryDirectory():
+            coder = main(
+                ["--4o", "--cache-prompts", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+
+            self.assertFalse(coder.add_cache_headers)
+
+    def test_return_coder(self):
+        with GitTemporaryDirectory():
+            result = main(
+                ["--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+            self.assertIsInstance(result, Coder)
+
+            result = main(
+                ["--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=False,
+            )
+            self.assertIsNone(result)
+
+    def test_map_mul_option(self):
+        with GitTemporaryDirectory():
+            coder = main(
+                ["--map-mul", "5", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+            self.assertIsInstance(coder, Coder)
+            self.assertEqual(coder.repo_map.map_mul_no_files, 5)
+
+    def test_apply_shell_commands_with_no_suggest(self):
+        shell_md = Path("shell.md")
+        shell_md.write_text("```bash\ntouch no_suggest_file.txt\n```")
+        with patch("aider.coders.base_coder.Coder.handle_shell_commands") as mock_handle:
+            main(
+                ["--apply", "shell.md", "--no-git"],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            mock_handle.assert_called_once()
+        self.assertFalse(Path("no_suggest_file.txt").exists())
+
+    def test_suggest_shell_commands_default(self):
+        with GitTemporaryDirectory():
+            coder = main(
+                ["--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+            self.assertTrue(coder.suggest_shell_commands)
+
+    def test_suggest_shell_commands_disabled(self):
+        with GitTemporaryDirectory():
+            coder = main(
+                ["--no-suggest-shell-commands", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+            self.assertFalse(coder.suggest_shell_commands)
+
+    def test_suggest_shell_commands_enabled(self):
+        with GitTemporaryDirectory():
+            coder = main(
+                ["--suggest-shell-commands", "--exit", "--yes"],
+                input=DummyInput(),
+                output=DummyOutput(),
+                return_coder=True,
+            )
+            self.assertTrue(coder.suggest_shell_commands)
+
+    def test_stream_and_cache_warning(self, MockInputOutput=None):
+        # Warn when using --stream and --cache-prompts together
+        with patch("aider.main.InputOutput") as MockIO:
+            mock_io = MockIO.return_value
+            with GitTemporaryDirectory():
+                main(
+                    ["--stream", "--cache-prompts", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+            mock_io.tool_warning.assert_called_with(
+                "Cost estimates may be inaccurate when using streaming and caching."
+            )
+
+    def test_stream_without_cache_no_warning(self, MockInputOutput=None):
+        with patch("aider.main.InputOutput") as MockIO:
+            mock_io = MockIO.return_value
+            with GitTemporaryDirectory():
+                main(
+                    ["--stream", "--exit", "--yes"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+            for call in mock_io.tool_warning.call_args_list:
+                self.assertNotIn("Cost estimates may be inaccurate", call[0][0])
+
+    def test_cache_without_stream_no_warning(self, MockInputOutput=None):
+        with patch("aider.main.InputOutput") as MockIO:
+            mock_io = MockIO.return_value
+            with GitTemporaryDirectory():
+                main(
+                    ["--cache-prompts", "--exit", "--yes", "--no-stream"],
+                    input=DummyInput(),
+                    output=DummyOutput(),
+                )
+            for call in mock_io.tool_warning.call_args_list:
+                self.assertNotIn("Cost estimates may be inaccurate", call[0][0])
+
+    def test_load_dotenv_files_override(self):
+        with GitTemporaryDirectory() as git_dir:
+            git_dir = Path(git_dir)
+
+            # Create fake home and .aider directory
+            fake_home = git_dir / "fake_home"
+            fake_home.mkdir()
+            aider_dir = fake_home / ".aider"
+            aider_dir.mkdir()
+
+            # Create oauth keys file
+            oauth_keys_file = aider_dir / "oauth-keys.env"
+            oauth_keys_file.write_text("OAUTH_VAR=oauth_val\nSHARED_VAR=oauth_shared\n")
+
+            # Create git root .env file
+            git_root_env = git_dir / ".env"
+            git_root_env.write_text("GIT_VAR=git_val\nSHARED_VAR=git_shared\n")
+
+            # Create CWD .env file in a subdir
+            cwd_subdir = git_dir / "subdir"
+            cwd_subdir.mkdir()
+            cwd_env = cwd_subdir / ".env"
+            cwd_env.write_text("CWD_VAR=cwd_val\nSHARED_VAR=cwd_shared\n")
+
+            # Change to subdir
+            original_cwd = os.getcwd()
+            os.chdir(cwd_subdir)
+
+            # Clear relevant env vars before test
+            for var in ["OAUTH_VAR", "SHARED_VAR", "GIT_VAR", "CWD_VAR"]:
+                if var in os.environ:
+                    del os.environ[var]
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                loaded_files = load_dotenv_files(str(git_dir), None)
+
+                # Assert files were loaded in expected order (oauth first)
+                self.assertIn(str(oauth_keys_file.resolve()), loaded_files)
+                self.assertIn(str(git_root_env.resolve()), loaded_files)
+                self.assertIn(str(cwd_env.resolve()), loaded_files)
+                self.assertLess(
+                    loaded_files.index(str(oauth_keys_file.resolve())),
+                    loaded_files.index(str(git_root_env.resolve())),
+                )
+                self.assertLess(
+                    loaded_files.index(str(git_root_env.resolve())),
+                    loaded_files.index(str(cwd_env.resolve())),
+                )
+
+                # Assert environment variables reflect the override order
+                self.assertEqual(os.environ.get("OAUTH_VAR"), "oauth_val")
+                self.assertEqual(os.environ.get("GIT_VAR"), "git_val")
+                self.assertEqual(os.environ.get("CWD_VAR"), "cwd_val")
+                # SHARED_VAR should be overridden by the last loaded file (cwd .env)
+                self.assertEqual(os.environ.get("SHARED_VAR"), "cwd_shared")
+
+            # Restore CWD
+            os.chdir(original_cwd)
+```
