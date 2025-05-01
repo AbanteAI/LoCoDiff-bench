@@ -1,0 +1,543 @@
+```rust
+//! A collection of functions for updating points and payloads stored in segments
+
+use std::sync::atomic::AtomicBool;
+
+use ahash::{AHashMap, AHashSet};
+use common::counter::hardware_counter::HardwareCounterCell;
+use itertools::iproduct;
+use parking_lot::{RwLock, RwLockWriteGuard};
+use segment::common::operation_error::{OperationError, OperationResult};
+use segment::data_types::named_vectors::NamedVectors;
+use segment::data_types::vectors::{BatchVectorStructInternal, VectorStructInternal};
+use segment::entry::entry_point::SegmentEntry;
+use segment::json_path::JsonPath;
+use segment::types::{
+    Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PointIdType,
+    SeqNumberType, VectorElementType, VectorNameBuf,
+};
+
+use crate::collection_manager::holders::segment_holder::SegmentHolder;
+use crate::operations::payload_ops::PayloadOps;
+use crate::operations::point_ops::{
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted,
+};
+use crate::operations::vector_ops::{PointVectorsPersisted, VectorOperations};
+use crate::operations::types::{CollectionError, CollectionResult};
+use crate::operations::FieldIndexOperations;
+
+/// Checks unprocessed points for batch operations.
+pub(crate) fn check_unprocessed_points(
+    points: &[PointIdType],
+    processed: &AHashSet<PointIdType>,
+) -> CollectionResult<usize> {
+    let first_missed = points.iter().copied().find(|p| !processed.contains(p));
+    match first_missed {
+        None => Ok(processed.len()),
+        Some(missed_point_id) => Err(CollectionError::PointNotFound { missed_point_id }),
+    }
+}
+
+/// Tries to delete points from all segments, returns number of actually deleted points.
+pub(crate) fn delete_points(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    ids: &[PointIdType],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut total_deleted_points = 0;
+    for batch in ids.chunks(512) {
+        let deleted_points = segments.apply_points(
+            batch,
+            |_| (),
+            |id, _idx, write_segment, ()| write_segment.delete_point(op_num, id, hw_counter),
+            // Apply to all point versions
+            true,
+        )?;
+        total_deleted_points += deleted_points;
+    }
+    Ok(total_deleted_points)
+}
+
+/// Overwrite payload for points.
+pub(crate) fn overwrite_payload(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    payload: &Payload,
+    points: &[PointIdType],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut total_updated = 0;
+    for batch in points.chunks(512) {
+        let updated_points = segments.apply_points_with_conditional_move(
+            op_num,
+            batch,
+            |id, write_segment| write_segment.set_full_payload(op_num, id, payload, hw_counter),
+            |_, _, old_payload| {
+                *old_payload = payload.clone();
+            },
+            |segment| segment.get_indexed_fields().is_empty(),
+            hw_counter,
+        )?;
+        total_updated += updated_points.len();
+        check_unprocessed_points(batch, &updated_points)?;
+    }
+    Ok(total_updated)
+}
+
+/// Overwrite payload by filter.
+pub(crate) fn overwrite_payload_by_filter(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    payload: &Payload,
+    filter: &Filter,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let points = points_by_filter(segments, filter, hw_counter)?;
+    overwrite_payload(segments, op_num, payload, &points, hw_counter)
+}
+
+/// Set payload for given points.
+pub(crate) fn set_payload(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    payload: &Payload,
+    points: &[PointIdType],
+    key: &Option<JsonPath>,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut total_updated = 0;
+    for chunk in points.chunks(512) {
+        let updated_points = segments.apply_points_with_conditional_move(
+            op_num,
+            chunk,
+            |id, write_segment| write_segment.set_payload(op_num, id, payload, key, hw_counter),
+            |_, _, old_payload| match key {
+                Some(key) => old_payload.merge_by_key(payload, key),
+                None => old_payload.merge(payload),
+            },
+            |segment| {
+                segment
+                    .get_indexed_fields()
+                    .keys()
+                    .all(|indexed_path| !indexed_path.is_affected_by_value_set(&payload.0, key.as_ref()))
+            },
+            hw_counter,
+        )?;
+        check_unprocessed_points(chunk, &updated_points)?;
+        total_updated += updated_points.len();
+    }
+    Ok(total_updated)
+}
+
+/// Set payload by filter.
+pub(crate) fn set_payload_by_filter(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    payload: &Payload,
+    filter: &Filter,
+    key: &Option<JsonPath>,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let points = points_by_filter(segments, filter, hw_counter)?;
+    set_payload(segments, op_num, payload, &points, key, hw_counter)
+}
+
+/// Delete payload keys for given points.
+pub(crate) fn delete_payload(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    points: &[PointIdType],
+    keys: &[PayloadKeyType],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut total_deleted = 0;
+    for batch in points.chunks(512) {
+        let updated_points = segments.apply_points_with_conditional_move(
+            op_num,
+            batch,
+            |id, _write_segment| {
+                let mut res = true;
+                for key in keys {
+                    res &= _write_segment.delete_payload(op_num, id, key, hw_counter)?;
+                }
+                Ok(res)
+            },
+            |segment| {
+                iproduct!(segment.get_indexed_fields().keys(), keys).all(
+                    |(indexed_path, path_to_delete)| {
+                        !indexed_path.is_affected_by_value_remove(path_to_delete)
+                    },
+                )
+            },
+            hw_counter,
+        )?;
+        check_unprocessed_points(batch, &updated_points)?;
+        total_deleted += updated_points.len();
+    }
+    Ok(total_deleted)
+}
+
+/// Delete payload by filter.
+pub(crate) fn delete_payload_by_filter(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    filter: &Filter,
+    keys: &[PayloadKeyType],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let points = points_by_filter(segments, filter, hw_counter)?;
+    delete_payload(segments, op_num, &points, keys, hw_counter)
+}
+
+/// Clear payload for given points.
+pub(crate) fn clear_payload(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    points: &[PointIdType],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut total_cleared = 0;
+    for batch in points.chunks(512) {
+        let updated_points = segments.apply_points_with_conditional_move(
+            op_num,
+            batch,
+            |id, write_segment| write_segment.clear_payload(op_num, id, hw_counter),
+            |_, _, payload| payload.0.clear(),
+            |segment| segment.get_indexed_fields().is_empty(),
+            hw_counter,
+        )?;
+        check_unprocessed_points(batch, &updated_points)?;
+        total_cleared += updated_points.len();
+    }
+    Ok(total_cleared)
+}
+
+/// Clear payload by filter.
+pub(crate) fn clear_payload_by_filter(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    filter: &Filter,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let points = points_by_filter(segments, filter, hw_counter)?;
+    clear_payload(segments, op_num, &points, hw_counter)
+}
+
+/// Helper to collect points matching a filter.
+fn points_by_filter(
+    segments: &SegmentHolder,
+    filter: &Filter,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<Vec<PointIdType>> {
+    let mut affected = Vec::new();
+    let is_stopped = AtomicBool::new(false);
+    segments.for_each_segment(|s| {
+        let pts = s.read_filtered(None, None, Some(filter), &is_stopped, hw_counter);
+        affected.extend_from_slice(pts.as_slice());
+        Ok(true)
+    })?;
+    Ok(affected)
+}
+
+/// Create field index.
+pub(crate) fn create_field_index(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    field_name: PayloadKeyTypeRef,
+    field_schema: Option<&PayloadFieldSchema>,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    segments
+        .apply_segments(|write_segment| {
+            let Some((schema, index)) =
+                write_segment.build_field_index(op_num, field_name, field_schema, hw_counter)?
+            else {
+                return Ok(false);
+            };
+            write_segment.with_upgraded(|segment| {
+                segment.apply_field_index(op_num, field_name.to_owned(), schema, index)
+            })
+        })
+        .map_err(Into::into)
+}
+
+/// Delete field index.
+pub(crate) fn delete_field_index(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    field_name: PayloadKeyTypeRef,
+) -> CollectionResult<usize> {
+    segments
+        .apply_segments(|write_segment| {
+            write_segment.with_upgraded(|segment| segment.delete_field_index(op_num, field_name))
+        })
+        .map_err(Into::into)
+}
+
+/// Upsert or insert points with vector & payload.
+fn upsert_with_payload(
+    segment: &mut RwLockWriteGuard<dyn SegmentEntry>,
+    op_num: SeqNumberType,
+    point_id: PointIdType,
+    vectors: NamedVectors,
+    payload: Option<&Payload>,
+    hw_counter: &HardwareCounterCell,
+) -> OperationResult<bool> {
+    let mut res = segment.upsert_point(op_num, point_id, vectors, hw_counter)?;
+    if let Some(full_payload) = payload {
+        res &= segment.set_full_payload(op_num, point_id, full_payload, hw_counter)?;
+    }
+    Ok(res)
+}
+
+/// Sync points in a range.
+pub(crate) fn sync_points(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    from_id: Option<PointIdType>,
+    to_id: Option<PointIdType>,
+    points: &[PointStructPersisted],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<(usize, usize, usize)> {
+    let id_to_point: AHashMap<PointIdType, _> = points.iter().map(|p| (p.id, p)).collect();
+    let sync_ids: AHashSet<_> = points.iter().map(|p| p.id).collect();
+    // 1. existing points
+    let stored_ids: AHashSet<_> = segments
+        .iter()
+        .flat_map(|(_, segment)| segment.get().read().read_range(from_id, to_id))
+        .collect();
+    // 2. delete missing
+    let to_remove: Vec<_> = stored_ids.difference(&sync_ids).copied().collect();
+    let deleted = delete_points(segments, op_num, &to_remove, hw_counter)?;
+    // 3. detect updated
+    let overlap: Vec<_> = stored_ids.intersection(&sync_ids).copied().collect();
+    let mut to_update = Vec::new();
+    let _ = segments.read_points(overlap.as_slice(), &is_stopped, |id, segment| {
+        let all_vec = match segment.all_vectors(id) {
+            Ok(v) => v,
+            Err(OperationError::InconsistentStorage { .. }) => NamedVectors::default(),
+            Err(e) => return Err(e),
+        };
+        let payload = segment.payload(id, hw_counter)?;
+        let point = id_to_point.get(&id).unwrap();
+        if point.get_vectors() != all_vec || point.payload.as_ref() != &Some(payload.clone()) {
+            to_update.push(*point);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })?;
+    let num_updated = to_update.len();
+    // 4. new points
+    for &id in sync_ids.difference(&stored_ids) {
+        to_update.push(*id_to_point.get(&id).unwrap());
+    }
+    let num_new = to_update.len() - num_updated;
+    // 5. apply upsert
+    let num_replaced = upsert_points(segments, op_num, to_update, hw_counter)?;
+    debug_assert!(
+        num_replaced <= num_updated,
+        "number of replaced points cannot be greater than points to update ({num_replaced} <= {num_updated})",
+    );
+    Ok((deleted, num_new, num_updated))
+}
+
+/// Upsert batch of points.
+pub(crate) fn upsert_points<'a, T>(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    points: T,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize>
+where
+    T: IntoIterator<Item = &'a PointStructPersisted>,
+{
+    let points_map: AHashMap<PointIdType, _> = points.into_iter().map(|p| (p.id, p)).collect();
+    let ids: Vec<_> = points_map.keys().copied().collect();
+    let updated = segments.apply_points_with_conditional_move(
+        op_num,
+        &ids,
+        |id, write_segment| {
+            let pt = points_map[&id];
+            upsert_with_payload(
+                write_segment,
+                op_num,
+                id,
+                pt.get_vectors(),
+                pt.payload.as_ref(),
+                hw_counter,
+            )
+        },
+        |id, owned_vectors, old_payload| {
+            let pt = points_map[&id];
+            for (name, vec) in pt.get_vectors() {
+                owned_vectors.insert(name, vec.clone());
+            }
+            if let Some(payload) = &pt.payload {
+                *old_payload = payload.clone();
+            }
+        },
+        |_| false,
+        hw_counter,
+    )?;
+    let mut res = updated.len();
+    // insert missing
+    let mut write_sig = segments.smallest_appendable_segment().expect(
+        "No appendable segments exists, expected at least one",
+    );
+    let mut guard = write_sig.get().write();
+    for &id in ids.iter().filter(|&&id| !updated.contains(&id)) {
+        let pt = points_map[&id];
+        res += usize::from(upsert_with_payload(
+            &mut guard,
+            op_num,
+            id,
+            pt.get_vectors(),
+            pt.payload.as_ref(),
+            hw_counter,
+        )?);
+    }
+    RwLockWriteGuard::unlock_fair(guard);
+    Ok(res)
+}
+
+/// Process point operations.
+pub(crate) fn process_point_operation(
+    segments: &RwLock<SegmentHolder>,
+    op_num: SeqNumberType,
+    point_operation: PointOperations,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    match point_operation {
+        PointOperations::DeletePoints { ids, .. } => {
+            delete_points(&segments.read(), op_num, &ids, hw_counter)
+        }
+        PointOperations::UpsertPoints(operation) => {
+            let pts: Vec<_> = match operation {
+                PointInsertOperationsInternal::PointsBatch(batch) => {
+                    let batch_vecs = BatchVectorStructInternal::from(batch.vectors);
+                    let all_vecs = batch_vecs.into_all_vectors(batch.ids.len());
+                    batch
+                        .ids
+                        .into_iter()
+                        .zip(all_vecs)
+                        .zip(batch.payloads.into_iter().flatten().map(Some))
+                        .map(|((id, vecs), payload)| PointStructPersisted { id, vector: vecs.into(), payload })
+                        .collect()
+                }
+                PointInsertOperationsInternal::PointsList(list) => list.points,
+            };
+            let res = upsert_points(&segments.read(), op_num, pts.iter(), hw_counter)?;
+            Ok(res)
+        }
+        PointOperations::DeletePointsByFilter(filter) => {
+            delete_points_by_filter(&segments.read(), op_num, &filter, hw_counter)
+        }
+        PointOperations::SyncPoints(operation) => {
+            let (deleted, new, updated) = sync_points(
+                &segments.read(),
+                op_num,
+                operation.from_id,
+                operation.to_id,
+                &operation.points,
+                hw_counter,
+            )?;
+            Ok(deleted + new + updated)
+        }
+    }
+}
+
+/// Process vector operations.
+pub(crate) fn process_vector_operation(
+    segments: &RwLock<SegmentHolder>,
+    op_num: SeqNumberType,
+    vector_operation: VectorOperations,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    match vector_operation {
+        VectorOperations::UpdateVectors(op) => update_vectors(&segments.read(), op_num, op.points, hw_counter),
+        VectorOperations::DeleteVectors(ids, names) => {
+            delete_vectors(&segments.read(), op_num, &ids.points, &names, hw_counter)
+        }
+        VectorOperations::DeleteVectorsByFilter(filter, names) => {
+            delete_vectors_by_filter(&segments.read(), op_num, &filter, &names, hw_counter)
+        }
+    }
+}
+
+/// Update vectors for given points.
+pub(crate) fn update_vectors(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    points: Vec<PointVectorsPersisted>,
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut points_map: AHashMap<PointIdType, NamedVectors> = AHashMap::new();
+    for PointVectorsPersisted { id, vector } in points {
+        let named = NamedVectors::from(vector);
+        points_map.entry(id).and_modify(|e| e.merge(named.clone())).or_insert(named);
+    }
+    let ids: Vec<_> = points_map.keys().copied().collect();
+    let mut total = 0;
+    for batch in ids.chunks(512) {
+        let updated = segments.apply_points_with_conditional_move(
+            op_num,
+            batch,
+            |id, write_segment| write_segment.update_vectors(op_num, id, points_map[&id].clone(), hw_counter),
+            |id, owned, _| {
+                for (name, vec) in points_map[&id].iter() {
+                    owned.insert(name.clone(), vec.clone());
+                }
+            },
+            |_| false,
+            hw_counter,
+        )?;
+        check_unprocessed_points(batch, &updated)?;
+        total += updated.len();
+    }
+    Ok(total)
+}
+
+/// Delete named vectors for given points.
+pub(crate) fn delete_vectors(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    points: &[PointIdType],
+    vector_names: &[VectorNameBuf],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let mut total = 0;
+    for batch in points.chunks(512) {
+        let deleted = segments.apply_points(
+            batch,
+            |_| (),
+            |id, _idx, write_segment, ()| {
+                let mut res = true;
+                for name in vector_names {
+                    res &= write_segment.delete_vector(op_num, id, name)?;
+                }
+                Ok(res)
+            },
+            // only latest versions
+            false,
+        )?;
+        total += deleted;
+    }
+    Ok(total)
+}
+
+/// Delete named vectors by filter.
+pub(crate) fn delete_vectors_by_filter(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    filter: &Filter,
+    vector_names: &[VectorNameBuf],
+    hw_counter: &HardwareCounterCell,
+) -> CollectionResult<usize> {
+    let points = points_by_filter(segments, filter, hw_counter)?;
+    delete_vectors(segments, op_num, &points, vector_names, hw_counter)
+}
+
+```
+

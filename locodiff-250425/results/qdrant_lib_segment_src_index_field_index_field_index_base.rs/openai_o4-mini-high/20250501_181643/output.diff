@@ -1,0 +1,913 @@
+--- qdrant_lib_segment_src_index_field_index_field_index_base.rs_expectedoutput.txt (expected)+++ qdrant_lib_segment_src_index_field_index_field_index_base.rs_extracted.txt (actual)@@ -6,29 +6,30 @@ use serde_json::Value;
+ 
+ use super::bool_index::BoolIndex;
++use super::bool_index::simple_bool_index::BoolIndexBuilder;
+ use super::bool_index::mmap_bool_index::MmapBoolIndexBuilder;
+-use super::bool_index::simple_bool_index::BoolIndexBuilder;
+ use super::facet_index::FacetIndexEnum;
+ use super::full_text_index::mmap_text_index::FullTextMmapIndexBuilder;
+ use super::full_text_index::text_index::{FullTextIndex, FullTextIndexBuilder};
+-use super::geo_index::{GeoMapIndexBuilder, GeoMapIndexMmapBuilder};
++use super::geo_index::GeoMapIndex;
++use super::geo_index::GeoMapIndexBuilder;
++use super::geo_index::GeoMapIndexMmapBuilder;
+ use super::map_index::{MapIndex, MapIndexBuilder, MapIndexMmapBuilder};
+-use super::numeric_index::{
+-    NumericIndex, NumericIndexBuilder, NumericIndexMmapBuilder, StreamRange,
+-};
++use super::numeric_index::{NumericIndex, NumericIndexBuilder, NumericIndexMmapBuilder, StreamRange};
++use crate::index::field_index::null_index::mmap_null_index::{MmapNullIndex, MmapNullIndexBuilder};
+ use crate::common::Flusher;
+ use crate::common::operation_error::OperationResult;
++use crate::telemetry::PayloadIndexTelemetry;
+ use crate::data_types::order_by::OrderValue;
+-use crate::index::field_index::geo_index::GeoMapIndex;
+-use crate::index::field_index::null_index::mmap_null_index::{MmapNullIndex, MmapNullIndexBuilder};
+-use crate::index::field_index::numeric_index::NumericIndexInner;
+-use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
+-use crate::telemetry::PayloadIndexTelemetry;
+ use crate::types::{
+     DateTimePayloadType, FieldCondition, FloatPayloadType, IntPayloadType, Match, MatchText,
+     PayloadKeyType, RangeInterface, UuidIntType, UuidPayloadType,
+ };
+-
++use crate::index::field_index::numeric_index::NumericIndexInner;
++use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
++
++/// Common interface for all possible types of field indexes
++/// Enables polymorphism on field indexes
+ pub trait PayloadFieldIndex {
+     /// Return number of points with at least one value indexed in here
+     fn count_indexed_points(&self) -> usize;
+@@ -42,14 +43,11 @@     /// Return function that flushes all pending updates to disk.
+     fn flusher(&self) -> Flusher;
+ 
+-    fn files(&self) -> Vec<PathBuf>;
+-
+     /// Get iterator over points fitting given `condition`
+-    /// Return `None` if condition does not match the index type
+     fn filter<'a>(
+         &'a self,
+         condition: &'a FieldCondition,
+-        hw_counter: &'a HardwareCounterCell,
++        hw_counter: &HardwareCounterCell,
+     ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>>;
+ 
+     /// Return estimation of amount of points which satisfy given condition.
+@@ -67,8 +65,19 @@         threshold: usize,
+         key: PayloadKeyType,
+     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_>;
+-}
+-
++
++    /// Return list of files backing the index on disk
++    fn files(&self) -> Vec<PathBuf>;
++
++    /// Remove a point from the index
++    fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()>;
++
++    /// Return telemetry data for this index
++    fn get_telemetry_data(&self) -> PayloadIndexTelemetry;
++}
++
++/// Trait implemented by concrete indexers to extract and index values of
++/// a specific type from JSON payloads.
+ pub trait ValueIndexer {
+     type ValueType;
+ 
+@@ -100,8 +109,8 @@         hw_counter: &HardwareCounterCell,
+     ) -> OperationResult<()> {
+         self.remove_point(id)?;
+-        let mut flatten_values: Vec<_> = vec![];
+-        for value in payload.iter() {
++        let mut flatten_values = Vec::new();
++        for value in payload {
+             match value {
+                 Value::Array(values) => {
+                     flatten_values.extend(values.iter().filter_map(|x| Self::get_value(x)));
+@@ -116,360 +125,8 @@         self.add_many(id, flatten_values, hw_counter)
+     }
+ 
+-    /// remove a point from the index
++    /// Remove a point from the index
+     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()>;
+-}
+-
+-/// Common interface for all possible types of field indexes
+-/// Enables polymorphism on field indexes
+-pub enum FieldIndex {
+-    IntIndex(NumericIndex<IntPayloadType, IntPayloadType>),
+-    DatetimeIndex(NumericIndex<IntPayloadType, DateTimePayloadType>),
+-    IntMapIndex(MapIndex<IntPayloadType>),
+-    KeywordIndex(MapIndex<str>),
+-    FloatIndex(NumericIndex<FloatPayloadType, FloatPayloadType>),
+-    GeoIndex(GeoMapIndex),
+-    FullTextIndex(FullTextIndex),
+-    BoolIndex(BoolIndex),
+-    UuidIndex(NumericIndex<UuidIntType, UuidPayloadType>),
+-    UuidMapIndex(MapIndex<UuidIntType>),
+-    NullIndex(MmapNullIndex),
+-}
+-
+-impl std::fmt::Debug for FieldIndex {
+-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            FieldIndex::IntIndex(_index) => write!(f, "IntIndex"),
+-            FieldIndex::DatetimeIndex(_index) => write!(f, "DatetimeIndex"),
+-            FieldIndex::IntMapIndex(_index) => write!(f, "IntMapIndex"),
+-            FieldIndex::KeywordIndex(_index) => write!(f, "KeywordIndex"),
+-            FieldIndex::FloatIndex(_index) => write!(f, "FloatIndex"),
+-            FieldIndex::GeoIndex(_index) => write!(f, "GeoIndex"),
+-            FieldIndex::BoolIndex(_index) => write!(f, "BoolIndex"),
+-            FieldIndex::FullTextIndex(_index) => write!(f, "FullTextIndex"),
+-            FieldIndex::UuidIndex(_index) => write!(f, "UuidIndex"),
+-            FieldIndex::UuidMapIndex(_index) => write!(f, "UuidMapIndex"),
+-            FieldIndex::NullIndex(_index) => write!(f, "NullIndex"),
+-        }
+-    }
+-}
+-
+-impl FieldIndex {
+-    /// Try to check condition for a payload given a field index.
+-    /// Required because some index parameters may influence the condition checking logic.
+-    /// For example, full text index may have different tokenizers.
+-    ///
+-    /// Returns `None` if there is no special logic for the given index
+-    /// returns `Some(true)` if condition is satisfied
+-    /// returns `Some(false)` if condition is not satisfied
+-    pub fn special_check_condition(
+-        &self,
+-        condition: &FieldCondition,
+-        payload_value: &Value,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> Option<bool> {
+-        match self {
+-            FieldIndex::IntIndex(_) => None,
+-            FieldIndex::DatetimeIndex(_) => None,
+-            FieldIndex::IntMapIndex(_) => None,
+-            FieldIndex::KeywordIndex(_) => None,
+-            FieldIndex::FloatIndex(_) => None,
+-            FieldIndex::GeoIndex(_) => None,
+-            FieldIndex::BoolIndex(_) => None,
+-            FieldIndex::FullTextIndex(full_text_index) => match &condition.r#match {
+-                Some(Match::Text(MatchText { text })) => {
+-                    let query = full_text_index.parse_query(text, hw_counter);
+-                    for value in FullTextIndex::get_values(payload_value) {
+-                        let document = full_text_index.parse_document(&value, hw_counter);
+-                        if query.check_match(&document) {
+-                            return Some(true);
+-                        }
+-                    }
+-                    Some(false)
+-                }
+-                _ => None,
+-            },
+-            FieldIndex::UuidIndex(_) => None,
+-            FieldIndex::UuidMapIndex(_) => None,
+-            FieldIndex::NullIndex(_) => None,
+-        }
+-    }
+-
+-    fn get_payload_field_index(&self) -> &dyn PayloadFieldIndex {
+-        match self {
+-            FieldIndex::IntIndex(payload_field_index) => payload_field_index.inner(),
+-            FieldIndex::DatetimeIndex(payload_field_index) => payload_field_index.inner(),
+-            FieldIndex::IntMapIndex(payload_field_index) => payload_field_index,
+-            FieldIndex::KeywordIndex(payload_field_index) => payload_field_index,
+-            FieldIndex::FloatIndex(payload_field_index) => payload_field_index.inner(),
+-            FieldIndex::GeoIndex(payload_field_index) => payload_field_index,
+-            FieldIndex::BoolIndex(payload_field_index) => payload_field_index,
+-            FieldIndex::FullTextIndex(payload_field_index) => payload_field_index,
+-            FieldIndex::UuidIndex(payload_field_index) => payload_field_index.inner(),
+-            FieldIndex::UuidMapIndex(payload_field_index) => payload_field_index,
+-            FieldIndex::NullIndex(payload_field_index) => payload_field_index,
+-        }
+-    }
+-
+-    pub fn load(&mut self) -> OperationResult<bool> {
+-        match self {
+-            FieldIndex::IntIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::DatetimeIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::IntMapIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::KeywordIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::FloatIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::GeoIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::BoolIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::FullTextIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::UuidIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::UuidMapIndex(payload_field_index) => payload_field_index.load(),
+-            FieldIndex::NullIndex(payload_field_index) => payload_field_index.load(),
+-        }
+-    }
+-
+-    pub fn cleanup(self) -> OperationResult<()> {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.cleanup(),
+-            FieldIndex::DatetimeIndex(index) => index.cleanup(),
+-            FieldIndex::IntMapIndex(index) => index.cleanup(),
+-            FieldIndex::KeywordIndex(index) => index.cleanup(),
+-            FieldIndex::FloatIndex(index) => index.cleanup(),
+-            FieldIndex::GeoIndex(index) => index.cleanup(),
+-            FieldIndex::BoolIndex(index) => index.cleanup(),
+-            FieldIndex::FullTextIndex(index) => index.cleanup(),
+-            FieldIndex::UuidIndex(index) => index.cleanup(),
+-            FieldIndex::UuidMapIndex(index) => index.cleanup(),
+-            FieldIndex::NullIndex(index) => index.cleanup(),
+-        }
+-    }
+-
+-    pub fn count_indexed_points(&self) -> usize {
+-        self.get_payload_field_index().count_indexed_points()
+-    }
+-
+-    pub fn flusher(&self) -> Flusher {
+-        self.get_payload_field_index().flusher()
+-    }
+-
+-    pub fn files(&self) -> Vec<PathBuf> {
+-        self.get_payload_field_index().files()
+-    }
+-
+-    pub fn filter<'a>(
+-        &'a self,
+-        condition: &'a FieldCondition,
+-        hw_counter: &'a HardwareCounterCell,
+-    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
+-        self.get_payload_field_index().filter(condition, hw_counter)
+-    }
+-
+-    pub fn estimate_cardinality(
+-        &self,
+-        condition: &FieldCondition,
+-        hw_counter: &HardwareCounterCell,
+-    ) -> Option<CardinalityEstimation> {
+-        self.get_payload_field_index()
+-            .estimate_cardinality(condition, hw_counter)
+-    }
+-
+-    pub fn payload_blocks(
+-        &self,
+-        threshold: usize,
+-        key: PayloadKeyType,
+-    ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
+-        self.get_payload_field_index()
+-            .payload_blocks(threshold, key)
+-    }
+-
+-    pub fn add_point(
+-        &mut self,
+-        id: PointOffsetType,
+-        payload: &[&Value],
+-        hw_counter: &HardwareCounterCell,
+-    ) -> OperationResult<()> {
+-        match self {
+-            FieldIndex::IntIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::DatetimeIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::IntMapIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::KeywordIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::FloatIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::GeoIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::BoolIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::FullTextIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::UuidIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::UuidMapIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-            FieldIndex::NullIndex(payload_field_index) => {
+-                payload_field_index.add_point(id, payload, hw_counter)
+-            }
+-        }
+-    }
+-
+-    pub fn remove_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.mut_inner().remove_point(point_id),
+-            FieldIndex::DatetimeIndex(index) => index.mut_inner().remove_point(point_id),
+-            FieldIndex::IntMapIndex(index) => index.remove_point(point_id),
+-            FieldIndex::KeywordIndex(index) => index.remove_point(point_id),
+-            FieldIndex::FloatIndex(index) => index.mut_inner().remove_point(point_id),
+-            FieldIndex::GeoIndex(index) => index.remove_point(point_id),
+-            FieldIndex::BoolIndex(index) => index.remove_point(point_id),
+-            FieldIndex::FullTextIndex(index) => index.remove_point(point_id),
+-            FieldIndex::UuidIndex(index) => index.remove_point(point_id),
+-            FieldIndex::UuidMapIndex(index) => index.remove_point(point_id),
+-            FieldIndex::NullIndex(index) => index.remove_point(point_id),
+-        }
+-    }
+-
+-    pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::DatetimeIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::IntMapIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::KeywordIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::FloatIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::GeoIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::BoolIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::FullTextIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::UuidIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::UuidMapIndex(index) => index.get_telemetry_data(),
+-            FieldIndex::NullIndex(index) => index.get_telemetry_data(),
+-        }
+-    }
+-
+-    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.values_count(point_id),
+-            FieldIndex::DatetimeIndex(index) => index.values_count(point_id),
+-            FieldIndex::IntMapIndex(index) => index.values_count(point_id),
+-            FieldIndex::KeywordIndex(index) => index.values_count(point_id),
+-            FieldIndex::FloatIndex(index) => index.values_count(point_id),
+-            FieldIndex::GeoIndex(index) => index.values_count(point_id),
+-            FieldIndex::BoolIndex(index) => index.values_count(point_id),
+-            FieldIndex::FullTextIndex(index) => index.values_count(point_id),
+-            FieldIndex::UuidIndex(index) => index.values_count(point_id),
+-            FieldIndex::UuidMapIndex(index) => index.values_count(point_id),
+-            FieldIndex::NullIndex(index) => index.values_count(point_id),
+-        }
+-    }
+-
+-    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::DatetimeIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::IntMapIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::KeywordIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::FloatIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::GeoIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::BoolIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::FullTextIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::UuidIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::UuidMapIndex(index) => index.values_is_empty(point_id),
+-            FieldIndex::NullIndex(index) => index.values_is_empty(point_id),
+-        }
+-    }
+-
+-    pub fn as_numeric(&self) -> Option<NumericFieldIndex> {
+-        match self {
+-            FieldIndex::IntIndex(index) => Some(NumericFieldIndex::IntIndex(index.inner())),
+-            FieldIndex::DatetimeIndex(index) => Some(NumericFieldIndex::IntIndex(index.inner())),
+-            FieldIndex::FloatIndex(index) => Some(NumericFieldIndex::FloatIndex(index.inner())),
+-            FieldIndex::IntMapIndex(_)
+-            | FieldIndex::KeywordIndex(_)
+-            | FieldIndex::GeoIndex(_)
+-            | FieldIndex::BoolIndex(_)
+-            | FieldIndex::UuidMapIndex(_)
+-            | FieldIndex::UuidIndex(_)
+-            | FieldIndex::FullTextIndex(_)
+-            | FieldIndex::NullIndex(_) => None,
+-        }
+-    }
+-
+-    pub fn as_facet_index(&self) -> Option<FacetIndexEnum> {
+-        match self {
+-            FieldIndex::KeywordIndex(index) => Some(FacetIndexEnum::Keyword(index)),
+-            FieldIndex::IntMapIndex(index) => Some(FacetIndexEnum::Int(index)),
+-            FieldIndex::UuidMapIndex(index) => Some(FacetIndexEnum::Uuid(index)),
+-            FieldIndex::BoolIndex(index) => Some(FacetIndexEnum::Bool(index)),
+-            FieldIndex::UuidIndex(_)
+-            | FieldIndex::IntIndex(_)
+-            | FieldIndex::DatetimeIndex(_)
+-            | FieldIndex::FloatIndex(_)
+-            | FieldIndex::GeoIndex(_)
+-            | FieldIndex::FullTextIndex(_)
+-            | FieldIndex::NullIndex(_) => None,
+-        }
+-    }
+-
+-    pub fn is_on_disk(&self) -> bool {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.is_on_disk(),
+-            FieldIndex::DatetimeIndex(index) => index.is_on_disk(),
+-            FieldIndex::IntMapIndex(index) => index.is_on_disk(),
+-            FieldIndex::KeywordIndex(index) => index.is_on_disk(),
+-            FieldIndex::FloatIndex(index) => index.is_on_disk(),
+-            FieldIndex::GeoIndex(index) => index.is_on_disk(),
+-            FieldIndex::BoolIndex(index) => index.is_on_disk(),
+-            FieldIndex::FullTextIndex(index) => index.is_on_disk(),
+-            FieldIndex::UuidIndex(index) => index.is_on_disk(),
+-            FieldIndex::UuidMapIndex(index) => index.is_on_disk(),
+-            FieldIndex::NullIndex(index) => index.is_on_disk(),
+-        }
+-    }
+-
+-    /// Populate all pages in the mmap.
+-    /// Block until all pages are populated.
+-    pub fn populate(&self) -> OperationResult<()> {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.populate(),
+-            FieldIndex::DatetimeIndex(index) => index.populate(),
+-            FieldIndex::IntMapIndex(index) => index.populate(),
+-            FieldIndex::KeywordIndex(index) => index.populate(),
+-            FieldIndex::FloatIndex(index) => index.populate(),
+-            FieldIndex::GeoIndex(index) => index.populate(),
+-            FieldIndex::BoolIndex(index) => index.populate(),
+-            FieldIndex::FullTextIndex(index) => index.populate(),
+-            FieldIndex::UuidIndex(index) => index.populate(),
+-            FieldIndex::UuidMapIndex(index) => index.populate(),
+-            FieldIndex::NullIndex(index) => index.populate(),
+-        }
+-    }
+-
+-    /// Drop disk cache.
+-    pub fn clear_cache(&self) -> OperationResult<()> {
+-        match self {
+-            FieldIndex::IntIndex(index) => index.clear_cache(),
+-            FieldIndex::DatetimeIndex(index) => index.clear_cache(),
+-            FieldIndex::IntMapIndex(index) => index.clear_cache(),
+-            FieldIndex::KeywordIndex(index) => index.clear_cache(),
+-            FieldIndex::FloatIndex(index) => index.clear_cache(),
+-            FieldIndex::GeoIndex(index) => index.clear_cache(),
+-            FieldIndex::BoolIndex(index) => index.clear_cache(),
+-            FieldIndex::FullTextIndex(index) => index.clear_cache(),
+-            FieldIndex::UuidIndex(index) => index.clear_cache(),
+-            FieldIndex::UuidMapIndex(index) => index.clear_cache(),
+-            FieldIndex::NullIndex(index) => index.clear_cache(),
+-        }
+-    }
+ }
+ 
+ /// Common interface for all index builders.
+@@ -515,10 +172,10 @@     FloatMmapIndex(NumericIndexMmapBuilder<FloatPayloadType, FloatPayloadType>),
+     GeoIndex(GeoMapIndexBuilder),
+     GeoMmapIndex(GeoMapIndexMmapBuilder),
++    BoolIndex(BoolIndexBuilder),
++    BoolMmapIndex(MmapBoolIndexBuilder),
+     FullTextIndex(FullTextIndexBuilder),
+     FullTextMmapIndex(FullTextMmapIndexBuilder),
+-    BoolIndex(BoolIndexBuilder),
+-    BoolMmapIndex(MmapBoolIndexBuilder),
+     UuidIndex(MapIndexBuilder<UuidIntType>),
+     UuidMmapIndex(MapIndexMmapBuilder<UuidIntType>),
+     NullIndex(MmapNullIndexBuilder),
+@@ -529,25 +186,25 @@ 
+     fn init(&mut self) -> OperationResult<()> {
+         match self {
+-            Self::IntIndex(index) => index.init(),
+-            Self::IntMmapIndex(index) => index.init(),
+-            Self::DatetimeIndex(index) => index.init(),
+-            Self::DatetimeMmapIndex(index) => index.init(),
+-            Self::IntMapIndex(index) => index.init(),
+-            Self::IntMapMmapIndex(index) => index.init(),
+-            Self::KeywordIndex(index) => index.init(),
+-            Self::KeywordMmapIndex(index) => index.init(),
+-            Self::FloatIndex(index) => index.init(),
+-            Self::FloatMmapIndex(index) => index.init(),
+-            Self::GeoIndex(index) => index.init(),
+-            Self::GeoMmapIndex(index) => index.init(),
+-            Self::BoolIndex(index) => index.init(),
+-            Self::BoolMmapIndex(index) => index.init(),
+-            Self::FullTextIndex(index) => index.init(),
+-            Self::FullTextMmapIndex(builder) => builder.init(),
+-            Self::UuidIndex(index) => index.init(),
+-            Self::UuidMmapIndex(index) => index.init(),
+-            Self::NullIndex(index) => index.init(),
++            FieldIndexBuilder::IntIndex(i) => i.init(),
++            FieldIndexBuilder::IntMmapIndex(i) => i.init(),
++            FieldIndexBuilder::DatetimeIndex(i) => i.init(),
++            FieldIndexBuilder::DatetimeMmapIndex(i) => i.init(),
++            FieldIndexBuilder::IntMapIndex(i) => i.init(),
++            FieldIndexBuilder::IntMapMmapIndex(i) => i.init(),
++            FieldIndexBuilder::KeywordIndex(i) => i.init(),
++            FieldIndexBuilder::KeywordMmapIndex(i) => i.init(),
++            FieldIndexBuilder::FloatIndex(i) => i.init(),
++            FieldIndexBuilder::FloatMmapIndex(i) => i.init(),
++            FieldIndexBuilder::GeoIndex(i) => i.init(),
++            FieldIndexBuilder::GeoMmapIndex(i) => i.init(),
++            FieldIndexBuilder::BoolIndex(i) => i.init(),
++            FieldIndexBuilder::BoolMmapIndex(i) => i.init(),
++            FieldIndexBuilder::FullTextIndex(i) => i.init(),
++            FieldIndexBuilder::FullTextMmapIndex(i) => i.init(),
++            FieldIndexBuilder::UuidIndex(i) => i.init(),
++            FieldIndexBuilder::UuidMmapIndex(i) => i.init(),
++            FieldIndexBuilder::NullIndex(i) => i.init(),
+         }
+     }
+ 
+@@ -558,52 +215,347 @@         hw_counter: &HardwareCounterCell,
+     ) -> OperationResult<()> {
+         match self {
+-            Self::IntIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::IntMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::DatetimeIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::DatetimeMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::IntMapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::IntMapMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::KeywordIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::KeywordMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::FloatIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::FloatMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::GeoIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::GeoMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::BoolIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::BoolMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::FullTextIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::FullTextMmapIndex(builder) => {
+-                FieldIndexBuilderTrait::add_point(builder, id, payload, hw_counter)
+-            }
+-            Self::UuidIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::UuidMmapIndex(index) => index.add_point(id, payload, hw_counter),
+-            Self::NullIndex(index) => index.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::IntIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::IntMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::DatetimeIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::DatetimeMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::IntMapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::IntMapMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::KeywordIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::KeywordMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::FloatIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::FloatMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::GeoIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::GeoMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::BoolIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::BoolMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::FullTextIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::FullTextMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::UuidIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::UuidMmapIndex(i) => i.add_point(id, payload, hw_counter),
++            FieldIndexBuilder::NullIndex(i) => i.add_point(id, payload, hw_counter),
+         }
+     }
+ 
+     fn finalize(self) -> OperationResult<FieldIndex> {
+         Ok(match self {
+-            Self::IntIndex(index) => FieldIndex::IntIndex(index.finalize()?),
+-            Self::IntMmapIndex(index) => FieldIndex::IntIndex(index.finalize()?),
+-            Self::DatetimeIndex(index) => FieldIndex::DatetimeIndex(index.finalize()?),
+-            Self::DatetimeMmapIndex(index) => FieldIndex::DatetimeIndex(index.finalize()?),
+-            Self::IntMapIndex(index) => FieldIndex::IntMapIndex(index.finalize()?),
+-            Self::IntMapMmapIndex(index) => FieldIndex::IntMapIndex(index.finalize()?),
+-            Self::KeywordIndex(index) => FieldIndex::KeywordIndex(index.finalize()?),
+-            Self::KeywordMmapIndex(index) => FieldIndex::KeywordIndex(index.finalize()?),
+-            Self::FloatIndex(index) => FieldIndex::FloatIndex(index.finalize()?),
+-            Self::FloatMmapIndex(index) => FieldIndex::FloatIndex(index.finalize()?),
+-            Self::GeoIndex(index) => FieldIndex::GeoIndex(index.finalize()?),
+-            Self::GeoMmapIndex(index) => FieldIndex::GeoIndex(index.finalize()?),
+-            Self::BoolIndex(index) => FieldIndex::BoolIndex(index.finalize()?),
+-            Self::BoolMmapIndex(index) => FieldIndex::BoolIndex(index.finalize()?),
+-            Self::FullTextIndex(index) => FieldIndex::FullTextIndex(index.finalize()?),
+-            Self::FullTextMmapIndex(builder) => FieldIndex::FullTextIndex(builder.finalize()?),
+-            Self::UuidIndex(index) => FieldIndex::UuidMapIndex(index.finalize()?),
+-            Self::UuidMmapIndex(index) => FieldIndex::UuidMapIndex(index.finalize()?),
+-            Self::NullIndex(index) => FieldIndex::NullIndex(index.finalize()?),
++            FieldIndexBuilder::IntIndex(i) => FieldIndex::IntIndex(i.finalize()?),
++            FieldIndexBuilder::IntMmapIndex(i) => FieldIndex::IntIndex(i.finalize()?),
++            FieldIndexBuilder::DatetimeIndex(i) => FieldIndex::DatetimeIndex(i.finalize()?),
++            FieldIndexBuilder::DatetimeMmapIndex(i) => FieldIndex::DatetimeIndex(i.finalize()?),
++            FieldIndexBuilder::IntMapIndex(i) => FieldIndex::IntMapIndex(i.finalize()?),
++            FieldIndexBuilder::IntMapMmapIndex(i) => FieldIndex::IntMapIndex(i.finalize()?),
++            FieldIndexBuilder::KeywordIndex(i) => FieldIndex::KeywordIndex(i.finalize()?),
++            FieldIndexBuilder::KeywordMmapIndex(i) => FieldIndex::KeywordIndex(i.finalize()?),
++            FieldIndexBuilder::FloatIndex(i) => FieldIndex::FloatIndex(i.finalize()?),
++            FieldIndexBuilder::FloatMmapIndex(i) => FieldIndex::FloatIndex(i.finalize()?),
++            FieldIndexBuilder::GeoIndex(i) => FieldIndex::GeoIndex(i.finalize()?),
++            FieldIndexBuilder::GeoMmapIndex(i) => FieldIndex::GeoIndex(i.finalize()?),
++            FieldIndexBuilder::BoolIndex(i) => FieldIndex::BoolIndex(i.finalize()?),
++            FieldIndexBuilder::BoolMmapIndex(i) => FieldIndex::BoolIndex(i.finalize()?),
++            FieldIndexBuilder::FullTextIndex(i) => FieldIndex::FullTextIndex(i.finalize()?),
++            FieldIndexBuilder::FullTextMmapIndex(i) => FieldIndex::FullTextIndex(i.finalize()?),
++            FieldIndexBuilder::UuidIndex(i) => FieldIndex::UuidMapIndex(i.finalize()?),
++            FieldIndexBuilder::UuidMmapIndex(i) => FieldIndex::UuidMapIndex(i.finalize()?),
++            FieldIndexBuilder::NullIndex(i) => FieldIndex::NullIndex(i.finalize()?),
+         })
++    }
++}
++
++/// Common interface for all possible types of field indexes
++/// Enables polymorphism on field indexes
++pub enum FieldIndex {
++    IntIndex(NumericIndex<IntPayloadType, IntPayloadType>),
++    DatetimeIndex(NumericIndex<IntPayloadType, DateTimePayloadType>),
++    IntMapIndex(MapIndex<IntPayloadType>),
++    KeywordIndex(MapIndex<str>),
++    FloatIndex(NumericIndex<FloatPayloadType, FloatPayloadType>),
++    GeoIndex(GeoMapIndex),
++    BoolIndex(BoolIndex),
++    FullTextIndex(FullTextIndex),
++    UuidIndex(NumericIndex<UuidIntType, UuidPayloadType>),
++    UuidMapIndex(MapIndex<UuidIntType>),
++    NullIndex(MmapNullIndex),
++}
++
++impl std::fmt::Debug for FieldIndex {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        match self {
++            FieldIndex::IntIndex(_) => write!(f, "IntIndex"),
++            FieldIndex::DatetimeIndex(_) => write!(f, "DatetimeIndex"),
++            FieldIndex::IntMapIndex(_) => write!(f, "IntMapIndex"),
++            FieldIndex::KeywordIndex(_) => write!(f, "KeywordIndex"),
++            FieldIndex::FloatIndex(_) => write!(f, "FloatIndex"),
++            FieldIndex::GeoIndex(_) => write!(f, "GeoIndex"),
++            FieldIndex::BoolIndex(_) => write!(f, "BoolIndex"),
++            FieldIndex::FullTextIndex(_) => write!(f, "FullTextIndex"),
++            FieldIndex::UuidIndex(_) => write!(f, "UuidIndex"),
++            FieldIndex::UuidMapIndex(_) => write!(f, "UuidMapIndex"),
++            FieldIndex::NullIndex(_) => write!(f, "NullIndex"),
++        }
++    }
++}
++
++impl FieldIndex {
++    /// Try to check condition for a payload given a field index.
++    /// Required because some index parameters may influence the condition checking logic.
++    /// For example, full text index may have different tokenizers.
++    ///
++    /// Returns `None` if there is no special logic for the given index
++    /// returns `Some(true)` if condition is satisfied
++    /// returns `Some(false)` if condition is not satisfied
++    pub fn special_check_condition(
++        &self,
++        condition: &FieldCondition,
++        payload_value: &Value,
++        hw_counter: &HardwareCounterCell,
++    ) -> Option<bool> {
++        match self {
++            FieldIndex::FullTextIndex(full_text_index) => {
++                if let Some(Match::Text(MatchText { text })) = &condition.r#match {
++                    let query = full_text_index.parse_query(text, hw_counter);
++                    for v in FullTextIndex::get_values(payload_value) {
++                        let doc = full_text_index.parse_document(&v, hw_counter);
++                        if query.check_match(&doc) {
++                            return Some(true);
++                        }
++                    }
++                    Some(false)
++                } else {
++                    None
++                }
++            }
++            _ => None,
++        }
++    }
++
++    fn get_payload_field_index(&self) -> &dyn PayloadFieldIndex {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.inner(),
++            FieldIndex::DatetimeIndex(idx) => idx.inner(),
++            FieldIndex::IntMapIndex(idx) => idx,
++            FieldIndex::KeywordIndex(idx) => idx,
++            FieldIndex::FloatIndex(idx) => idx.inner(),
++            FieldIndex::GeoIndex(idx) => idx,
++            FieldIndex::BoolIndex(idx) => idx,
++            FieldIndex::FullTextIndex(idx) => idx,
++            FieldIndex::UuidIndex(idx) => idx.inner(),
++            FieldIndex::UuidMapIndex(idx) => idx,
++            FieldIndex::NullIndex(idx) => idx,
++        }
++    }
++
++    pub fn load(&mut self) -> OperationResult<bool> {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.load(),
++            FieldIndex::DatetimeIndex(idx) => idx.load(),
++            FieldIndex::IntMapIndex(idx) => idx.load(),
++            FieldIndex::KeywordIndex(idx) => idx.load(),
++            FieldIndex::FloatIndex(idx) => idx.load(),
++            FieldIndex::GeoIndex(idx) => idx.load(),
++            FieldIndex::BoolIndex(idx) => idx.load(),
++            FieldIndex::FullTextIndex(idx) => idx.load(),
++            FieldIndex::UuidIndex(idx) => idx.load(),
++            FieldIndex::UuidMapIndex(idx) => idx.load(),
++            FieldIndex::NullIndex(idx) => idx.load(),
++        }
++    }
++
++    pub fn cleanup(self) -> OperationResult<()> {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.cleanup(),
++            FieldIndex::DatetimeIndex(idx) => idx.cleanup(),
++            FieldIndex::IntMapIndex(idx) => idx.cleanup(),
++            FieldIndex::KeywordIndex(idx) => idx.cleanup(),
++            FieldIndex::FloatIndex(idx) => idx.cleanup(),
++            FieldIndex::GeoIndex(idx) => idx.cleanup(),
++            FieldIndex::BoolIndex(idx) => idx.cleanup(),
++            FieldIndex::FullTextIndex(idx) => idx.cleanup(),
++            FieldIndex::UuidIndex(idx) => idx.cleanup(),
++            FieldIndex::UuidMapIndex(idx) => idx.cleanup(),
++            FieldIndex::NullIndex(idx) => idx.cleanup(),
++        }
++    }
++
++    pub fn count_indexed_points(&self) -> usize {
++        self.get_payload_field_index().count_indexed_points()
++    }
++
++    pub fn flusher(&self) -> Flusher {
++        self.get_payload_field_index().flusher()
++    }
++
++    pub fn files(&self) -> Vec<PathBuf> {
++        self.get_payload_field_index().files()
++    }
++
++    pub fn filter<'a>(
++        &'a self,
++        condition: &'a FieldCondition,
++        hw_counter: &HardwareCounterCell,
++    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
++        self.get_payload_field_index().filter(condition, hw_counter)
++    }
++
++    pub fn estimate_cardinality(
++        &self,
++        condition: &FieldCondition,
++        hw_counter: &HardwareCounterCell,
++    ) -> Option<CardinalityEstimation> {
++        self.get_payload_field_index().estimate_cardinality(condition, hw_counter)
++    }
++
++    pub fn payload_blocks(
++        &self,
++        threshold: usize,
++        key: PayloadKeyType,
++    ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
++        self.get_payload_field_index().payload_blocks(threshold, key)
++    }
++
++    pub fn add_point(
++        &mut self,
++        id: PointOffsetType,
++        payload: &[&Value],
++        hw_counter: &HardwareCounterCell,
++    ) -> OperationResult<()> {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::DatetimeIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::IntMapIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::KeywordIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::FloatIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::GeoIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::BoolIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::FullTextIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::UuidIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::UuidMapIndex(idx) => idx.add_point(id, payload, hw_counter),
++            FieldIndex::NullIndex(idx) => idx.add_point(id, payload, hw_counter),
++        }
++    }
++
++    pub fn remove_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::DatetimeIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::IntMapIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::KeywordIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::FloatIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::GeoIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::BoolIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::FullTextIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::UuidIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::UuidMapIndex(idx) => idx.remove_point(point_id),
++            FieldIndex::NullIndex(idx) => idx.remove_point(point_id),
++        }
++    }
++
++    pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::DatetimeIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::IntMapIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::KeywordIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::FloatIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::GeoIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::BoolIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::FullTextIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::UuidIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::UuidMapIndex(idx) => idx.get_telemetry_data(),
++            FieldIndex::NullIndex(idx) => idx.get_telemetry_data(),
++        }
++    }
++
++    pub fn values_count(&self, point_id: PointOffsetType) -> usize {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.values_count(point_id),
++            FieldIndex::DatetimeIndex(idx) => idx.values_count(point_id),
++            FieldIndex::IntMapIndex(idx) => idx.values_count(point_id),
++            FieldIndex::KeywordIndex(idx) => idx.values_count(point_id),
++            FieldIndex::FloatIndex(idx) => idx.values_count(point_id),
++            FieldIndex::GeoIndex(idx) => idx.values_count(point_id),
++            FieldIndex::BoolIndex(idx) => idx.values_count(point_id),
++            FieldIndex::FullTextIndex(idx) => idx.values_count(point_id),
++            FieldIndex::UuidIndex(idx) => idx.values_count(point_id),
++            FieldIndex::UuidMapIndex(idx) => idx.values_count(point_id),
++            FieldIndex::NullIndex(idx) => idx.values_count(point_id),
++        }
++    }
++
++    pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::DatetimeIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::IntMapIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::KeywordIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::FloatIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::GeoIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::BoolIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::FullTextIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::UuidIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::UuidMapIndex(idx) => idx.values_is_empty(point_id),
++            FieldIndex::NullIndex(idx) => idx.values_is_empty(point_id),
++        }
++    }
++
++    pub fn is_on_disk(&self) -> bool {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.is_on_disk(),
++            FieldIndex::DatetimeIndex(idx) => idx.is_on_disk(),
++            FieldIndex::IntMapIndex(idx) => idx.is_on_disk(),
++            FieldIndex::KeywordIndex(idx) => idx.is_on_disk(),
++            FieldIndex::FloatIndex(idx) => idx.is_on_disk(),
++            FieldIndex::GeoIndex(idx) => idx.is_on_disk(),
++            FieldIndex::BoolIndex(idx) => idx.is_on_disk(),
++            FieldIndex::FullTextIndex(idx) => idx.is_on_disk(),
++            FieldIndex::UuidIndex(idx) => idx.is_on_disk(),
++            FieldIndex::UuidMapIndex(idx) => idx.is_on_disk(),
++            FieldIndex::NullIndex(idx) => idx.is_on_disk(),
++        }
++    }
++
++    /// Populate all pages in the mmap.
++    /// Block until all pages are populated.
++    pub fn populate(&self) -> OperationResult<()> {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.populate(),
++            FieldIndex::DatetimeIndex(idx) => idx.populate(),
++            FieldIndex::IntMapIndex(idx) => idx.populate(),
++            FieldIndex::KeywordIndex(idx) => idx.populate(),
++            FieldIndex::FloatIndex(idx) => idx.populate(),
++            FieldIndex::GeoIndex(idx) => idx.populate(),
++            FieldIndex::BoolIndex(idx) => idx.populate(),
++            FieldIndex::FullTextIndex(idx) => idx.populate(),
++            FieldIndex::UuidIndex(idx) => idx.populate(),
++            FieldIndex::UuidMapIndex(idx) => idx.populate(),
++            FieldIndex::NullIndex(idx) => idx.populate(),
++        }
++    }
++
++    /// Drop disk cache.
++    pub fn clear_cache(&self) -> OperationResult<()> {
++        match self {
++            FieldIndex::IntIndex(idx) => idx.clear_cache(),
++            FieldIndex::DatetimeIndex(idx) => idx.clear_cache(),
++            FieldIndex::IntMapIndex(idx) => idx.clear_cache(),
++            FieldIndex::KeywordIndex(idx) => idx.clear_cache(),
++            FieldIndex::FloatIndex(idx) => idx.clear_cache(),
++            FieldIndex::GeoIndex(idx) => idx.clear_cache(),
++            FieldIndex::BoolIndex(idx) => idx.clear_cache(),
++            FieldIndex::FullTextIndex(idx) => idx.clear_cache(),
++            FieldIndex::UuidIndex(idx) => idx.clear_cache(),
++            FieldIndex::UuidMapIndex(idx) => idx.clear_cache(),
++            FieldIndex::NullIndex(idx) => idx.clear_cache(),
++        }
++    }
++
++    pub fn as_numeric(&self) -> Option<NumericFieldIndex> {
++        match self {
++            FieldIndex::IntIndex(idx) => Some(NumericFieldIndex::IntIndex(idx.inner())),
++            FieldIndex::DatetimeIndex(idx) => Some(NumericFieldIndex::IntIndex(idx.inner())),
++            FieldIndex::FloatIndex(idx) => Some(NumericFieldIndex::FloatIndex(idx.inner())),
++            _ => None,
++        }
+     }
+ }
+ 
+@@ -618,16 +570,12 @@         range: &RangeInterface,
+     ) -> Box<dyn DoubleEndedIterator<Item = (OrderValue, PointOffsetType)> + 'a> {
+         match self {
+-            NumericFieldIndex::IntIndex(index) => Box::new(
+-                index
+-                    .stream_range(range)
+-                    .map(|(v, p)| (OrderValue::from(v), p)),
+-            ),
+-            NumericFieldIndex::FloatIndex(index) => Box::new(
+-                index
+-                    .stream_range(range)
+-                    .map(|(v, p)| (OrderValue::from(v), p)),
+-            ),
++            NumericFieldIndex::IntIndex(idx) => {
++                Box::new(idx.stream_range(range).map(|(v, p)| (OrderValue::from(v), p)))
++            }
++            NumericFieldIndex::FloatIndex(idx) => {
++                Box::new(idx.stream_range(range).map(|(v, p)| (OrderValue::from(v), p)))
++            }
+         }
+     }
+ }

@@ -1,0 +1,420 @@
+```zig
+const std = @import("std");
+const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+const EnvMap = std.process.EnvMap;
+const posix = std.posix;
+const termio = @import("../termio.zig");
+const Command = @import("../Command.zig");
+const Pty = @import("../pty.zig").Pty;
+const StreamHandler = @import("stream_handler.zig").StreamHandler;
+const terminalpkg = @import("../terminal/main.zig");
+const terminfo = @import("../terminfo/main.zig");
+const xev = @import("../global.zig").xev;
+const renderer = @import("../renderer.zig");
+const apprt = @import("../apprt.zig");
+const fastmem = @import("../fastmem.zig");
+const internal_os = @import("../os/main.zig");
+const windows = internal_os.windows;
+const configpkg = @import("../config.zig");
+const shell_integration = @import("shell_integration.zig");
+
+pub const Termio = @This();
+
+alloc: Allocator,
+
+/// Implementation for I/O backend.
+backend: termio.Backend,
+
+/// Derived Termio configuration.
+config: DerivedConfig,
+
+/// The terminal emulator state.
+terminal: terminalpkg.Terminal,
+
+/// Shared render state.
+renderer_state: *renderer.State,
+
+/// Handle to wake up renderer.
+renderer_wakeup: xev.Async,
+
+/// Mailbox for renderer messages.
+renderer_mailbox: *renderer.Thread.Mailbox,
+
+/// Mailbox for surface messages.
+surface_mailbox: apprt.surface.Mailbox,
+
+/// Cached size information.
+size: renderer.Size,
+
+/// Mailbox for Termio to surface communication.
+mailbox: termio.Mailbox,
+
+/// Terminal.Stream parser.
+terminal_stream: terminalpkg.Stream(StreamHandler),
+
+/// Last cursor reset time.
+last_cursor_reset: ?std.time.Instant = null,
+
+pub const DerivedConfig = struct {
+    arena: ArenaAllocator,
+
+    palette: terminalpkg.color.Palette,
+    image_storage_limit: usize,
+    cursor_style: terminalpkg.CursorStyle,
+    cursor_blink: ?bool,
+    cursor_color: ?configpkg.Config.Color,
+    cursor_invert: bool,
+    foreground: configpkg.Config.Color,
+    background: configpkg.Config.Color,
+    osc_color_report_format: configpkg.Config.OSCColorReportFormat,
+    abnormal_runtime_threshold_ms: u32,
+    wait_after_command: bool,
+    enquiry_response: []const u8,
+
+    pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
+        var arena = ArenaAllocator.init(alloc_gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        return .{
+            .palette = config.palette.value,
+            .image_storage_limit = config.@"image-storage-limit",
+            .cursor_style = config.@"cursor-style",
+            .cursor_blink = config.@"cursor-style-blink",
+            .cursor_color = config.@"cursor-color",
+            .cursor_invert = config.@"cursor-invert-fg-bg",
+            .foreground = config.foreground,
+            .background = config.background,
+            .osc_color_report_format = config.@"osc-color-report-format",
+            .abnormal_runtime_threshold_ms = config.@"abnormal-command-exit-runtime",
+            .wait_after_command = config.@"wait-after-command",
+            .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
+            .arena = arena,
+        };
+    }
+
+    pub fn deinit(self: *DerivedConfig) void {
+        self.arena.deinit();
+    }
+};
+
+pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
+    // Default terminal modes from config.
+    const default_modes: terminalpkg.ModePacked = modes: {
+        var m: terminalpkg.ModePacked = .{};
+        switch (opts.full_config.@"grapheme-width-method") {
+            .unicode => m.grapheme_cluster = true,
+            .legacy => {},
+        }
+        m.cursor_blinking = opts.config.cursor_blink orelse true;
+        break :m m;
+    };
+
+    // Initialize terminal.
+    var term = try terminalpkg.Terminal.init(alloc, opts: {
+        const g = opts.size.grid();
+        break :opts .{
+            .cols = g.columns,
+            .rows = g.rows,
+            .max_scrollback = opts.full_config.@"scrollback-limit",
+            .default_modes = default_modes,
+        };
+    });
+    errdefer term.deinit(alloc);
+    term.default_palette = opts.config.palette;
+    term.color_palette.colors = opts.config.palette;
+
+    // Kitty image limits.
+    try term.screen.kitty_images.setLimit(alloc, &term.screen, opts.config.image_storage_limit);
+    try term.secondary_screen.kitty_images.setLimit(alloc, &term.secondary_screen, opts.config.image_storage_limit);
+
+    // Default cursor style.
+    term.screen.cursor.cursor_style = opts.config.cursor_style;
+
+    // Pixel size.
+    term.width_px = term.cols * opts.size.cell.width;
+    term.height_px = term.rows * opts.size.cell.height;
+
+    // Initialize backend.
+    var b = opts.backend;
+    b.initTerminal(&term);
+
+    // StreamHandler
+    const handler: StreamHandler = handler: {
+        const default_cursor_color = if (!opts.config.cursor_invert and opts.config.cursor_color) |
+            c | c.toTerminalRGB() else null;
+        break :handler .{
+            .alloc = alloc,
+            .termio_mailbox = &self.mailbox,
+            .surface_mailbox = opts.surface_mailbox,
+            .renderer_state = opts.renderer_state,
+            .renderer_wakeup = opts.renderer_wakeup,
+            .renderer_mailbox = opts.renderer_mailbox,
+            .size = &self.size,
+            .terminal = &self.terminal,
+            .osc_color_report_format = opts.config.osc_color_report_format,
+            .enquiry_response = opts.config.enquiry_response,
+            .default_foreground_color = opts.config.foreground.toTerminalRGB(),
+            .default_background_color = opts.config.background.toTerminalRGB(),
+            .default_cursor_style = opts.config.cursor_style,
+            .default_cursor_blink = opts.config.cursor_blink,
+            .default_cursor_color = default_cursor_color,
+        };
+    };
+
+    self.* = .{
+        .alloc = alloc,
+        .terminal = term,
+        .backend = b,
+        .config = opts.config,
+        .renderer_state = opts.renderer_state,
+        .renderer_wakeup = opts.renderer_wakeup,
+        .renderer_mailbox = opts.renderer_mailbox,
+        .surface_mailbox = opts.surface_mailbox,
+        .size = opts.size,
+        .mailbox = opts.mailbox,
+        .terminal_stream = .{
+            .handler = handler,
+            .parser = .{ .osc_parser = .{ .alloc = alloc } },
+        },
+        .last_cursor_reset = null,
+    };
+}
+
+pub fn deinit(self: *Termio) void {
+    self.backend.deinit();
+    self.terminal.deinit(self.alloc);
+    self.config.deinit();
+    self.mailbox.deinit(self.alloc);
+
+    // Cleanup StreamHandler.
+    self.terminal_stream.handler.deinit();
+    self.terminal_stream.deinit();
+}
+
+pub fn threadEnter(self: *Termio, thread: *termio.Thread, data: *ThreadData) !void {
+    try self.backend.threadEnter(self.alloc, self, data);
+}
+
+pub fn threadExit(self: *Termio, data: *ThreadData) void {
+    self.backend.threadExit(data);
+}
+
+pub fn queueMessage(
+    self: *Termio,
+    msg: termio.Message,
+    mutex: enum { locked, unlocked },
+) void {
+    self.mailbox.send(msg, switch (mutex) {
+        .locked => self.renderer_state.mutex,
+        .unlocked => null,
+    });
+    self.mailbox.notify();
+}
+
+pub fn queueWrite(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+    linefeed: bool,
+) !void {
+    try self.backend.queueWrite(self.alloc, td, data, linefeed);
+}
+
+pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
+    self.terminal_stream.handler.changeConfig(&self.config);
+    td.backend.changeConfig(&self.config);
+
+    self.terminal.default_palette = config.palette;
+    for (config.palette) |c, i| {
+        if (!self.terminal.color_palette.mask.isSet(i)) {
+            self.terminal.color_palette.colors[i] = c;
+            self.terminal.flags.dirty.palette = true;
+        }
+    }
+    try self.terminal.screen.kitty_images.setLimit(self.alloc, &self.terminal.screen, config.image_storage_limit);
+    try self.terminal.secondary_screen.kitty_images.setLimit(self.alloc, &self.terminal.secondary_screen, config.image_storage_limit);
+}
+
+pub fn resize(
+    self: *Termio,
+    td: *ThreadData,
+    size: renderer.Size,
+) !void {
+    self.size = size;
+    const g = size.grid();
+    try self.backend.resize(g, size.terminal());
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        try self.terminal.resize(self.alloc, g.columns, g.rows);
+        self.terminal.width_px = g.columns * self.size.cell.width;
+        self.terminal.height_px = g.rows * self.size.cell.height;
+        self.terminal.modes.set(.synchronized_output, false);
+
+        if (self.terminal.modes.get(.in_band_size_reports)) {
+            try self.sizeReportLocked(td, .mode_2048);
+        }
+    }
+
+    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    self.renderer_wakeup.notify() catch {};
+}
+
+pub fn resetSynchronizedOutput(self: *Termio) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.terminal.modes.set(.synchronized_output, false);
+    self.renderer_wakeup.notify() catch {};
+}
+
+pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        if (self.terminal.active_screen == .alternate) return;
+        self.terminal.screen.clearSelection();
+        if (history) self.terminal.eraseDisplay(.scrollback, false);
+
+        if (!self.terminal.cursorIsAtPrompt()) {
+            if (self.terminal.screen.cursor.y > 0) {
+                self.terminal.screen.eraseRows(
+                    .{ .active = .{ .y = 0 } },
+                    .{ .active = .{ .y = self.terminal.screen.cursor.y - 1 } },
+                );
+            }
+            return;
+        }
+
+        self.terminal.markSemanticPrompt(.command);
+        assert(!self.terminal.cursorIsAtPrompt());
+        self.terminal.eraseDisplay(.complete, false);
+    }
+
+    // FF
+    try self.queueWrite(td, &[_]u8{ 0x0C }, false);
+
+    // Clear Kitty graphics
+    self.terminal.screen.kitty_images.delete(self.terminal.screen.alloc, &self.terminal, .{ .all = true });
+}
+
+pub fn scrollViewport(self: *Termio, scroll: terminalpkg.Terminal.ScrollViewport) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    try self.terminal.scrollViewport(scroll);
+}
+
+pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.terminal.screen.scroll(.{ .delta_prompt = delta });
+    }
+    try self.renderer_wakeup.notify();
+}
+
+pub fn childExitedAbnormally(self: *Termio, exit_code: u32, runtime_ms: u64) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t = self.renderer_state.terminal;
+    try self.backend.childExitedAbnormally(self.alloc, t, exit_code, runtime_ms);
+}
+
+pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
+    self.renderer_state.mutex.lock();
+    const fe = self.renderer_state.terminal.modes.get(.focus_event);
+    self.renderer_state.mutex.unlock();
+
+    if (fe) {
+        const seq = if (focused) "\x1b[I" else "\x1b[O";
+        try self.queueWrite(td, seq, false);
+    }
+    try self.backend.focusGained(td, focused);
+}
+
+pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    try self.sizeReportLocked(td, style);
+}
+
+fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    const g = self.size.grid();
+    var buf: [1024]u8 = undefined;
+    const msg = switch (style) {
+        .mode_2048 => try std.fmt.bufPrint(&buf, "\x1B[48;{};{};{};{}t", .{
+            g.rows, g.columns,
+            g.rows * self.size.cell.height,
+            g.columns * self.size.cell.width,
+        }),
+        .csi_14_t => try std.fmt.bufPrint(&buf, "\x1b[4;{};{}t", .{
+            g.rows * self.size.cell.height,
+            g.columns * self.size.cell.width,
+        }),
+        .csi_16_t => try std.fmt.bufPrint(&buf, "\x1b[6;{};{}t", .{
+            self.size.cell.height,
+            self.size.cell.width,
+        }),
+        .csi_18_t => try std.fmt.bufPrint(&buf, "\x1b[8;{};{}t", .{ g.rows, g.columns }),
+    };
+    try self.queueWrite(td, msg, false);
+}
+
+pub fn processOutput(self: *Termio, buf: []const u8) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.processOutputLocked(buf);
+}
+
+fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    // Render
+    _ = self.renderer_mailbox.push(.{ .render = {} }, .{ .instant = {} });
+
+    // Cursor reset throttle
+    if (std.time.Instant.now()) |now| {
+        if (self.last_cursor_reset) |last| {
+            if (now.since(last) > (500 * std.time.ns_per_ms)) {
+                self.last_cursor_reset = now;
+                _ = self.renderer_mailbox.push(.{ .reset_cursor_blink = {} }, .{ .instant = {} });
+            }
+        } else {
+            self.last_cursor_reset = now;
+            _ = self.renderer_mailbox.push(.{ .reset_cursor_blink = {} }, .{ .instant = {} });
+        }
+    }
+
+    if (self.renderer_state.inspector) |insp| {
+        for (buf, 0..) |byte, i| {
+            insp.recordPtyRead(buf[i..i+1]) catch {};
+            self.terminal_stream.next(byte) catch {};
+        }
+    } else {
+        self.terminal_stream.nextSlice(buf) catch {};
+    }
+
+    if (self.terminal_stream.handler.termio_messaged) {
+        self.terminal_stream.handler.termio_messaged = false;
+        self.mailbox.notify();
+    }
+}
+
+pub const ThreadData = struct {
+    alloc: Allocator,
+    loop: *xev.Loop,
+    renderer_state: *renderer.State,
+    surface_mailbox: apprt.surface.Mailbox,
+    backend: termio.backend.ThreadData,
+    mailbox: *termio.Mailbox,
+
+    pub fn deinit(self: *ThreadData) void {
+        self.backend.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+```

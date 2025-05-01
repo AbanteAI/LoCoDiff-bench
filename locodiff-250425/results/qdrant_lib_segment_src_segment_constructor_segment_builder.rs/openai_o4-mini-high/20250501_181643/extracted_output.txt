@@ -1,0 +1,541 @@
+use std::cmp;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use ahash::AHasher;
+use atomic_refcell::AtomicRefCell;
+use bitvec::macros::internal::funty::Integral;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::small_uint::U24;
+use common::types::PointOffsetType;
+use io::storage_version::StorageVersion;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+use super::{
+    create_mutable_id_tracker, create_payload_storage, create_sparse_vector_index,
+    create_sparse_vector_storage, get_payload_index_path, get_vector_index_path,
+    get_vector_storage_path, new_segment_path, open_segment_db, open_vector_storage,
+};
+use crate::common::error_logging::LogError;
+use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
+use crate::entry::entry_point::SegmentEntry;
+use crate::id_tracker::compressed::compressed_point_mappings::CompressedPointMappings;
+use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
+use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
+use crate::id_tracker::{for_each_unique_point, IdTracker, IdTrackerEnum};
+use crate::index::field_index::FieldIndex;
+use crate::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
+use crate::index::struct_payload_index::StructPayloadIndex;
+use crate::index::{PayloadIndex, VectorIndexEnum};
+use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+use crate::payload_storage::PayloadStorage;
+use crate::segment::{Segment, SegmentVersion};
+use crate::segment_constructor::{
+    build_vector_index, load_segment, VectorIndexBuildArgs, VectorIndexOpenArgs,
+};
+use crate::types::{
+    CompactExtendedPointId, ExtendedPointId, PayloadFieldSchema, PayloadKeyType, SegmentConfig,
+    SegmentState, SeqNumberType, VectorNameBuf,
+};
+use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+
+/// Structure for constructing segment out of several other segments
+pub struct SegmentBuilder {
+    version: SeqNumberType,
+    id_tracker: IdTrackerEnum,
+    payload_storage: PayloadStorageEnum,
+    vector_data: HashMap<VectorNameBuf, VectorData>,
+    segment_config: SegmentConfig,
+
+    /// Where the fully-built segment will be moved
+    destination_path: PathBuf,
+    /// Temporary directory for building
+    temp_dir: TempDir,
+    indexed_fields: HashMap<PayloadKeyType, PayloadFieldSchema>,
+    defragment_keys: Vec<PayloadKeyType>,
+}
+
+struct VectorData {
+    vector_storage: VectorStorageEnum,
+    old_indices: Vec<Arc<AtomicRefCell<VectorIndexEnum>>>,
+}
+
+impl SegmentBuilder {
+    pub fn new(
+        segments_path: &Path,
+        temp_dir: &Path,
+        segment_config: &SegmentConfig,
+    ) -> OperationResult<Self> {
+        // ignore `stopped` flag during initial build
+        let stopped = AtomicBool::new(false);
+
+        let temp_dir = create_temp_dir(temp_dir)?;
+        let database = open_segment_db(temp_dir.path(), segment_config)?;
+
+        let id_tracker = if segment_config.is_appendable() {
+            IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(temp_dir.path())?)
+        } else {
+            IdTrackerEnum::InMemoryIdTracker(InMemoryIdTracker::new())
+        };
+
+        let payload_storage =
+            create_payload_storage(database.clone(), segment_config, segments_path)?;
+
+        let mut vector_data = HashMap::new();
+        for (vector_name, vector_config) in &segment_config.vector_data {
+            let storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
+            let vs = open_vector_storage(
+                &database,
+                vector_config,
+                &stopped,
+                &storage_path,
+                vector_name,
+            )?;
+            vector_data.insert(
+                vector_name.to_owned(),
+                VectorData { vector_storage: vs, old_indices: Vec::new() },
+            );
+        }
+
+        for (vector_name, sparse_config) in &segment_config.sparse_vector_data {
+            let storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
+            let vs = create_sparse_vector_storage(
+                database.clone(),
+                &storage_path,
+                vector_name,
+                &sparse_config.storage_type,
+                &stopped,
+            )?;
+            vector_data.insert(
+                vector_name.to_owned(),
+                VectorData { vector_storage: vs, old_indices: Vec::new() },
+            );
+        }
+
+        let destination_path = new_segment_path(segments_path);
+
+        Ok(SegmentBuilder {
+            version: 0,
+            id_tracker,
+            payload_storage,
+            vector_data,
+            segment_config: segment_config.clone(),
+            destination_path,
+            temp_dir,
+            indexed_fields: Default::default(),
+            defragment_keys: vec![],
+        })
+    }
+
+    pub fn remove_indexed_field(&mut self, field: &PayloadKeyType) {
+        self.indexed_fields.remove(field);
+    }
+
+    pub fn add_indexed_field(&mut self, field: PayloadKeyType, schema: PayloadFieldSchema) {
+        self.indexed_fields.insert(field, schema);
+    }
+
+    fn _get_ordering_value(internal_id: PointOffsetType, indices: &[FieldIndex]) -> u64 {
+        let mut ordering = 0;
+        for idx in indices {
+            match idx {
+                FieldIndex::IntMapIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        for &v in vals { ordering = ordering.wrapping_add(v as u64); }
+                    }
+                    break;
+                }
+                FieldIndex::KeywordIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        for kw in vals {
+                            let mut h = AHasher::default();
+                            kw.hash(&mut h);
+                            ordering = ordering.wrapping_add(h.finish());
+                        }
+                    }
+                    break;
+                }
+                FieldIndex::IntIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        for &v in vals { ordering = ordering.wrapping_add(v as u64); }
+                    }
+                    break;
+                }
+                FieldIndex::FloatIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        for &v in vals { ordering = ordering.wrapping_add(v.to_bits()); }
+                    }
+                    break;
+                }
+                FieldIndex::DatetimeIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        for &v in vals { ordering = ordering.wrapping_add(v as u64); }
+                    }
+                    break;
+                }
+                FieldIndex::UuidMapIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        uuid_hash(&mut ordering, vals.copied());
+                    }
+                    break;
+                }
+                FieldIndex::UuidIndex(i) => {
+                    if let Some(vals) = i.get_values(internal_id) {
+                        uuid_hash(&mut ordering, vals.copied());
+                    }
+                    break;
+                }
+                FieldIndex::BoolIndex(_)
+                | FieldIndex::GeoIndex(_)
+                | FieldIndex::FullTextIndex(_)
+                | FieldIndex::NullIndex(_) => {}
+            }
+        }
+        ordering
+    }
+
+    /// Update builder from multiple existing segments, with optional defragmentation.
+    pub fn update(&mut self, segments: &[&Segment], stopped: &AtomicBool) -> OperationResult<bool> {
+        if segments.is_empty() {
+            return Ok(true);
+        }
+
+        // collect unique points across segments
+        if segments.len() > U24::MAX as usize {
+            return Err(OperationError::service_error("Too many segments to update"));
+        }
+        let mut points_to_insert = Vec::new();
+        let locked_trackers = segments.iter().map(|s| s.id_tracker.borrow()).collect::<Vec<_>>();
+        for_each_unique_point(locked_trackers.iter().map(|i| i.deref()), |item| {
+            points_to_insert.push(PointData {
+                external_id: CompactExtendedPointId::from(item.external_id),
+                segment_index: U24::new_wrapped(item.tracker_index as u32),
+                internal_id: item.internal_id,
+                version: item.version,
+                ordering: 0,
+            });
+        }
+        drop(locked_trackers);
+
+        let payloads: Vec<_> = segments.iter().map(|s| s.payload_index.borrow()).collect();
+
+        // compute defragmentation ordering
+        for key in &self.defragment_keys {
+            for p in &mut points_to_insert {
+                if let Some(idcs) = payloads[p.segment_index.get() as usize].field_indexes.get(key) {
+                    p.ordering = p.ordering.wrapping_add(Self::_get_ordering_value(p.internal_id, idcs));
+                }
+            }
+        }
+        if !self.defragment_keys.is_empty() {
+            points_to_insert.sort_unstable_by_key(|p| p.ordering);
+        }
+
+        // update version
+        let max_ver = segments.iter().map(|s| s.version()).max().unwrap();
+        self.version = cmp::max(self.version, max_ver);
+
+        // gather other-vector storages
+        let other_vecs: Vec<_> = segments.iter().map(|s| &s.vector_data).collect();
+
+        let mut new_range = None;
+        for (name, vd) in &mut self.vector_data {
+            check_process_stopped(stopped)?;
+            // record old indices
+            for seg_vd in &other_vecs {
+                let ovd = seg_vd.get(name).ok_or_else(|| {
+                    OperationError::service_error(format!(
+                        "Cannot update from other segment because it is missing vector name {name}"
+                    ))
+                })?;
+                vd.old_indices.push(Arc::clone(&ovd.vector_index));
+            }
+            // prepare iter of (vec, deleted)
+            let mut iter = points_to_insert.iter().map(|p| {
+                let ovd = &other_vecs[p.segment_index.get() as usize][name].vector_storage;
+                let v = ovd.get_vector(p.internal_id);
+                let d = ovd.is_deleted_vector(p.internal_id);
+                (v, d)
+            });
+            let range = vd.vector_storage.update_from(&mut iter, stopped)?;
+            match &new_range {
+                Some(r0) if r0 != &range => {
+                    return Err(OperationError::service_error(format!(
+                        "Internal ids range mismatch between self and other for {name}: self={r0:?}, other={range:?}"
+                    )));
+                }
+                None => new_range = Some(range.clone()),
+                _ => {}
+            }
+        }
+
+        if let Some(range) = new_range {
+            let mut hw = HardwareCounterCell::disposable();
+            for (new_id, p) in range.zip(points_to_insert.iter()) {
+                check_process_stopped(stopped)?;
+                let old_id = p.internal_id;
+                let other_payload = payloads[p.segment_index.get() as usize]
+                    .get_payload(old_id, &hw)?;
+                match self.id_tracker.internal_id(ExtendedPointId::from(p.external_id)) {
+                    Some(existing) => {
+                        // never actually reached because we collapsed versions above
+                        let ev = self.id_tracker.internal_version(existing).unwrap();
+                        let remove = if ev < p.version {
+                            self.id_tracker.drop(ExtendedPointId::from(p.external_id))?;
+                            self.id_tracker.set_link(ExtendedPointId::from(p.external_id), new_id)?;
+                            self.id_tracker.set_internal_version(new_id, p.version)?;
+                            self.payload_storage.clear(existing, &hw)?;
+                            existing
+                        } else {
+                            new_id
+                        };
+                        for vd in self.vector_data.values_mut() {
+                            vd.vector_storage.delete_vector(remove)?;
+                        }
+                    }
+                    None => {
+                        self.id_tracker.set_link(
+                            ExtendedPointId::from(p.external_id),
+                            new_id,
+                        )?;
+                        self.id_tracker.set_internal_version(new_id, p.version)?;
+                    }
+                }
+                if !other_payload.is_empty() {
+                    self.payload_storage.set(new_id, &other_payload, &hw)?;
+                }
+            }
+            // merge indexed fields
+            for payload in payloads {
+                for (f, s) in payload.indexed_fields() {
+                    self.indexed_fields.insert(f, s);
+                }
+            }
+            // flush trackers
+            let mut m = self.id_tracker.mapping_flusher()()?;
+            let mut v = self.id_tracker.versions_flusher()()?;
+            (m)()?;
+            (v)()?;
+        }
+
+        Ok(true)
+    }
+
+    pub fn build(
+        self,
+        permit: ResourcePermit,
+        stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Result<Segment, OperationError> {
+        let (temp_dir, dest) = {
+            let SegmentBuilder {
+                version,
+                id_tracker,
+                payload_storage,
+                mut vector_data,
+                segment_config,
+                destination_path,
+                temp_dir,
+                indexed_fields,
+                defragment_keys: _,
+            } = self;
+
+            let appendable = segment_config.is_appendable();
+
+            // flush payload storage
+            payload_storage.flusher()()?;
+            let payload_arc = Arc::new(AtomicRefCell::new(payload_storage));
+
+            // flush trackers
+            let mut mf = id_tracker.mapping_flusher()()?;
+            let mut vf = id_tracker.versions_flusher()()?;
+            (mf)()?;
+            (vf)()?;
+            let tracker_arc = Arc::new(AtomicRefCell::new(id_tracker));
+
+            // update quantization
+            let quantized = Self::update_quantization(
+                &segment_config,
+                &vector_data,
+                temp_dir.path(),
+                &permit,
+                stopped,
+            )?;
+
+            // clear caches & build vector indexes
+            let mut vec_storages_arc = HashMap::new();
+            let mut old_inds = HashMap::new();
+            for name in segment_config.vector_data.keys() {
+                let dat = vector_data.remove(name).unwrap();
+                dat.vector_storage.flusher()()?;
+                let stor_arc = Arc::new(AtomicRefCell::new(dat.vector_storage));
+                old_inds.insert(name.clone(), dat.old_indices);
+                vec_storages_arc.insert(name.clone(), stor_arc);
+            }
+            for name in segment_config.sparse_vector_data.keys() {
+                let dat = vector_data.remove(name).unwrap();
+                dat.vector_storage.flusher()()?;
+                let stor_arc = Arc::new(AtomicRefCell::new(dat.vector_storage));
+                vec_storages_arc.insert(name.clone(), stor_arc);
+            }
+
+            // open payload index
+            let pidx_path = get_payload_index_path(temp_dir.path());
+            let mut pidx = StructPayloadIndex::open(
+                payload_arc.clone(),
+                tracker_arc.clone(),
+                vec_storages_arc.clone(),
+                &pidx_path,
+                appendable,
+            )?;
+            for (f, s) in indexed_fields {
+                pidx.set_indexed(&f, s, hw_counter)?;
+                check_process_stopped(stopped)?;
+            }
+            pidx.flusher()()?;
+            let pidx_arc = Arc::new(AtomicRefCell::new(pidx));
+
+            // build HNSW / vector indexes
+            #[cfg(feature = "gpu")]
+            let gpu_d = {
+                let gm = crate::index::hnsw_index::gpu::GPU_DEVICES_MANAGER.read();
+                gm.as_ref().and_then(|m| m.lock_device(stopped)?)
+            };
+            #[cfg(not(feature = "gpu"))]
+            let gpu_d = None;
+
+            let perm = Arc::new(permit);
+
+            for (name, cfg) in &segment_config.vector_data {
+                let sto = vec_storages_arc.remove(name).unwrap();
+                let quant_arc = Arc::new(AtomicRefCell::new(quantized.remove(name)));
+                let idx = build_vector_index(
+                    cfg,
+                    VectorIndexOpenArgs {
+                        path: &get_vector_index_path(temp_dir.path(), name),
+                        id_tracker: tracker_arc.clone(),
+                        vector_storage: sto.clone(),
+                        payload_index: pidx_arc.clone(),
+                        quantized_vectors: quant_arc.clone(),
+                    },
+                    VectorIndexBuildArgs {
+                        permit: perm.clone(),
+                        old_indices: &old_inds.remove(name).unwrap(),
+                        gpu_device: gpu_d.as_ref(),
+                        stopped,
+                        feature_flags: feature_flags(),
+                    },
+                )?;
+                if sto.borrow().is_on_disk() {
+                    sto.borrow().clear_cache()?;
+                }
+                if let Some(qv) = quant_arc.borrow().as_ref() {
+                    qv.clear_cache()?;
+                }
+                idx.clear_cache()?;
+            }
+
+            for (name, sparse_cfg) in &segment_config.sparse_vector_data {
+                let sto = vec_storages_arc.remove(name).unwrap();
+                let idx = create_sparse_vector_index(SparseVectorIndexOpenArgs {
+                    config: sparse_cfg.index,
+                    id_tracker: tracker_arc.clone(),
+                    vector_storage: sto.clone(),
+                    payload_index: pidx_arc.clone(),
+                    path: &get_vector_index_path(temp_dir.path(), name),
+                    stopped,
+                    tick_progress: || {},
+                })?;
+                if sparse_cfg.storage_type.is_on_disk() {
+                    sto.borrow().clear_cache()?;
+                }
+                if sparse_cfg.index.index_type.is_on_disk() {
+                    idx.clear_cache()?;
+                }
+            }
+
+            if segment_config.payload_storage_type.is_on_disk() {
+                payload_arc.borrow().clear_cache()?;
+            }
+            pidx_arc.borrow().clear_cache_if_on_disk()?;
+
+            // finalize
+            Segment::save_state(
+                &SegmentState { version: Some(version), config: segment_config },
+                temp_dir.path(),
+            )?;
+            SegmentVersion::save(temp_dir.path())?;
+            (temp_dir, destination_path)
+        };
+
+        std::fs::rename(temp_dir.into_path(), &dest)
+            .describe("Moving segment data after optimization")?;
+        let loaded = load_segment(&dest, stopped)?
+            .ok_or_else(|| OperationError::service_error(format!("Segment loading error: {}", dest.display())))?;
+        Ok(loaded)
+    }
+
+    fn update_quantization(
+        segment_config: &SegmentConfig,
+        vector_data: &HashMap<VectorNameBuf, VectorData>,
+        temp_path: &Path,
+        permit: &ResourcePermit,
+        stopped: &AtomicBool,
+    ) -> OperationResult<HashMap<VectorNameBuf, QuantizedVectors>> {
+        let cfg = segment_config.clone();
+        let mut out = HashMap::new();
+        for (name, dat) in vector_data {
+            let vc = match cfg.vector_data.get(name) {
+                Some(v) if !v.is_appendable() => v,
+                _ => continue,
+            };
+            let max_threads = permit.num_cpus as usize;
+            if let Some(q) = cfg.quantization_config(name) {
+                check_process_stopped(stopped)?;
+                let path = get_vector_storage_path(temp_path, name);
+                let vq = QuantizedVectors::create(&dat.vector_storage, q, &path, max_threads, stopped)?;
+                out.insert(name.clone(), vq);
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn create_temp_dir(parent: &Path) -> Result<TempDir, OperationError> {
+    std::fs::create_dir_all(parent)
+        .and_then(|_| TempDir::with_prefix_in("segment_builder_", parent))
+        .map_err(|e| OperationError::service_error(format!(
+            "Could not create temp directory in `{}`: {}",
+            parent.display(), e
+        )))
+}
+
+fn uuid_hash<I>(h: &mut u64, iter: I)
+where
+    I: Iterator<Item = u128>,
+{
+    for id in iter {
+        let u = Uuid::from_u128(id);
+        if let Some(ts) = u.get_timestamp() {
+            *h = h.wrapping_add(ts.to_gregorian().0);
+        } else {
+            *h = h.wrapping_add((id >> 64) as u64);
+            *h = h.wrapping_add(id as u64);
+        }
+    }
+}
+
+struct PointData {
+    external_id: CompactExtendedPointId,
+    segment_index: U24,
+    internal_id: PointOffsetType,
+    version: u64,
+    ordering: u64,
+}
