@@ -1,0 +1,579 @@
+--- qdrant_lib_collection_src_update_handler.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_update_handler.rs_extracted.txt (actual)@@ -1,8 +1,8 @@ use std::cmp::min;
+ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ 
+ use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+@@ -16,10 +16,10 @@ use segment::types::SeqNumberType;
+ use tokio::runtime::Handle;
+ use tokio::sync::mpsc::{self, Receiver, Sender};
+-use tokio::sync::{Mutex as TokioMutex, oneshot};
++use tokio::sync::{oneshot, Mutex as TokioMutex};
+ use tokio::task::{self, JoinHandle};
+ use tokio::time::error::Elapsed;
+-use tokio::time::{Duration, timeout};
++use tokio::time::{timeout, Duration};
+ 
+ use crate::collection::payload_index_schema::PayloadIndexSchema;
+ use crate::collection_manager::collection_updater::CollectionUpdater;
+@@ -28,19 +28,16 @@     OptimizerThresholds, SegmentOptimizer,
+ };
+ use crate::collection_manager::optimizers::{Tracker, TrackerLog, TrackerStatus};
+-use crate::common::stoppable_task::{StoppableTaskHandle, spawn_stoppable};
++use crate::common::stoppable_task::{spawn_stoppable, StoppableTaskHandle};
+ use crate::config::CollectionParams;
+-use crate::operations::CollectionUpdateOperations;
+ use crate::operations::shared_storage_config::SharedStorageConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
++use crate::operations::CollectionUpdateOperations;
+ use crate::save_on_disk::SaveOnDisk;
+ use crate::shards::local_shard::LocalShardClocks;
+ use crate::wal::WalError;
+ use crate::wal_delta::LockedWal;
+ 
+-/// Interval at which the optimizer worker cleans up old optimization handles
+-///
+-/// The longer the duration, the longer it  takes for panicked tasks to be reported.
+ const OPTIMIZER_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+ 
+ pub type Optimizer = dyn SegmentOptimizer + Sync + Send;
+@@ -56,6 +53,7 @@     pub wait: bool,
+     /// Callback notification channel
+     pub sender: Option<oneshot::Sender<CollectionResult<usize>>>,
++    /// Hardware measurements accumulator
+     pub hw_measurements: HwMeasurementAcc,
+ }
+ 
+@@ -93,8 +91,7 @@     optimizers_log: Arc<Mutex<TrackerLog>>,
+     /// Total number of optimized points since last start
+     total_optimized_points: Arc<AtomicUsize>,
+-    /// Global CPU budget in number of cores for all optimization tasks.
+-    /// Assigns CPU permits to tasks to limit overall resource utilization.
++    /// Global resource budget for optimization tasks.
+     optimizer_resource_budget: ResourceBudget,
+     /// How frequent can we flush data
+     /// This parameter depends on the optimizer config and should be updated accordingly.
+@@ -104,7 +101,7 @@     update_worker: Option<JoinHandle<()>>,
+     /// Process, that listens for post-update signals and performs optimization
+     optimizer_worker: Option<JoinHandle<()>>,
+-    /// Process that periodically flushes segments and tries to truncate wal
++    /// WAL & flush worker
+     flush_worker: Option<JoinHandle<()>>,
+     /// Sender to stop flush worker
+     flush_stop: Option<oneshot::Sender<()>>,
+@@ -170,6 +167,7 @@ 
+     pub fn run_workers(&mut self, update_receiver: Receiver<UpdateSignal>) {
+         let (tx, rx) = mpsc::channel(self.shared_storage_config.update_queue_size);
++
+         self.optimizer_worker = Some(self.runtime_handle.spawn(Self::optimization_worker_fn(
+             self.optimizers.clone(),
+             tx.clone(),
+@@ -184,12 +182,14 @@             self.has_triggered_optimizers.clone(),
+             self.payload_index_schema.clone(),
+         )));
++
+         self.update_worker = Some(self.runtime_handle.spawn(Self::update_worker_fn(
+             update_receiver,
+             tx,
+             self.wal.clone(),
+             self.segments.clone(),
+         )));
++
+         let (flush_tx, flush_rx) = oneshot::channel();
+         self.flush_worker = Some(self.runtime_handle.spawn(Self::flush_worker(
+             self.segments.clone(),
+@@ -203,16 +203,9 @@         self.flush_stop = Some(flush_tx);
+     }
+ 
+-    pub fn stop_flush_worker(&mut self) {
+-        if let Some(flush_stop) = self.flush_stop.take() {
+-            if let Err(()) = flush_stop.send(()) {
+-                warn!("Failed to stop flush worker as it is already stopped.");
+-            }
+-        }
+-    }
+-
+     /// Gracefully wait before all optimizations stop
+     /// If some optimization is in progress - it will be finished before shutdown.
++    /// Blocking function.
+     pub async fn wait_workers_stops(&mut self) -> CollectionResult<()> {
+         let maybe_handle = self.update_worker.take();
+         if let Some(handle) = maybe_handle {
+@@ -222,11 +215,6 @@         if let Some(handle) = maybe_handle {
+             handle.await?;
+         }
+-        let maybe_handle = self.flush_worker.take();
+-        if let Some(handle) = maybe_handle {
+-            handle.await?;
+-        }
+-
+         let mut opt_handles_guard = self.optimization_handles.lock().await;
+         let opt_handles = std::mem::take(&mut *opt_handles_guard);
+         let stopping_handles = opt_handles
+@@ -237,7 +225,6 @@         for res in stopping_handles {
+             res.await?;
+         }
+-
+         Ok(())
+     }
+ 
+@@ -280,7 +267,6 @@     {
+         let mut scheduled_segment_ids = HashSet::<_>::default();
+         let mut handles = vec![];
+-
+         'outer: for optimizer in optimizers.iter() {
+             loop {
+                 // Return early if we reached the optimization job limit
+@@ -321,7 +307,6 @@                 );
+ 
+                 let permit_callback = callback.clone();
+-
+                 permit.set_on_release(move || {
+                     // Notify scheduler that resource budget changed
+                     permit_callback(false);
+@@ -339,7 +324,6 @@                     // Stoppable task
+                     {
+                         let resource_budget = optimizer_resource_budget.clone();
+-                        let segments = segments.clone();
+                         move |stopped| {
+                             // Track optimizer status
+                             let tracker = Tracker::start(optimizer.as_ref().name(), nsi.clone());
+@@ -409,8 +393,206 @@                 handles.push(handle);
+             }
+         }
+-
+         handles
++    }
++
++    pub(crate) async fn process_optimization(
++        optimizers: Arc<Vec<Arc<Optimizer>>>,
++        segments: LockedSegmentHolder,
++        optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
++        optimizers_log: Arc<Mutex<TrackerLog>>,
++        total_optimized_points: Arc<AtomicUsize>,
++        optimizer_resource_budget: &ResourceBudget,
++        sender: Sender<OptimizerSignal>,
++        limit: usize,
++    ) {
++        let mut new_handles = Self::launch_optimization(
++            optimizers.clone(),
++            optimizers_log,
++            total_optimized_points,
++            optimizer_resource_budget,
++            segments.clone(),
++            move |_optimization_result| {
++                // After optimization is finished, we still need to check if there are
++                // some further optimizations possible.
++                // If receiver is already dead - we do not care.
++                // If channel is full - optimization will be triggered by some other signal
++                let _ = sender.try_send(OptimizerSignal::Nop);
++            },
++            Some(limit),
++        );
++        let mut handles = optimization_handles.lock().await;
++        handles.append(&mut new_handles);
++        handles.retain(|h| !h.is_finished())
++    }
++
++    /// Cleanup finalized optimization task handles
++    ///
++    /// This finds and removes completed tasks from our list of optimization handles.
++    /// It also propagates any panics (and unknown errors) so we properly handle them if desired.
++    ///
++    /// It is essential to call this every once in a while for handling panics in time.
++    ///
++    /// Returns true if any optimization handle was finished, joined and removed.
++    async fn cleanup_optimization_handles(
++        optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
++    ) -> bool {
++        // Remove finished handles
++        let finished_handles: Vec<_> = {
++            let mut handles = optimization_handles.lock().await;
++            (0..handles.len())
++                .filter(|i| handles[*i].is_finished())
++                .collect::<Vec<_>>()
++                .into_iter()
++                .rev()
++                .map(|i| handles.swap_remove(i))
++                .collect()
++        };
++
++        let finished_any = !finished_handles.is_empty();
++
++        // Finalize all finished handles to propagate panics
++        for handle in finished_handles {
++            handle.join_and_handle_panic().await;
++        }
++
++        finished_any
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    async fn optimization_worker_fn(
++        optimizers: Arc<Vec<Arc<Optimizer>>>,
++        sender: Sender<OptimizerSignal>,
++        mut receiver: Receiver<OptimizerSignal>,
++        segments: LockedSegmentHolder,
++        wal: LockedWal,
++        optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
++        optimizers_log: Arc<Mutex<TrackerLog>>,
++        total_optimized_points: Arc<AtomicUsize>,
++        optimizer_resource_budget: ResourceBudget,
++        max_handles: Option<usize>,
++        has_triggered_optimizers: Arc<AtomicBool>,
++        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
++    ) {
++        let max_handles = max_handles.unwrap_or(usize::MAX);
++        let max_indexing_threads = optimizers
++            .first()
++            .map(|optimizer| optimizer.hnsw_config().max_indexing_threads)
++            .unwrap_or_default();
++
++        // Asynchronous task to trigger optimizers once CPU budget is available again
++        let mut resource_available_trigger: Option<JoinHandle<()>> = None;
++
++        loop {
++            let result = timeout(OPTIMIZER_CLEANUP_INTERVAL, receiver.recv()).await;
++
++            let cleaned_any =
++                Self::cleanup_optimization_handles(optimization_handles.clone()).await;
++
++            // Either continue below here with the worker, or reloop/break
++            // Decision logic doing one of three things:
++            // 1. run optimizers
++            // 2. reloop and wait for next signal
++            // 3. break here and stop the optimization worker
++            let ignore_max_handles = match result {
++                // Regular optimizer signal: run optimizers: do 1
++                Ok(Some(OptimizerSignal::Operation(_))) => false,
++                // Optimizer signal ignoring max handles: do 1
++                Ok(Some(OptimizerSignal::Nop)) => true,
++                // Hit optimizer cleanup interval, did clean up a task: do 1
++                Err(Elapsed { .. }) if cleaned_any => {
++                    // This branch prevents a race condition where optimizers would get stuck
++                    // If the optimizer cleanup interval was triggered and we did clean any task we
++                    // must run optimizers now. If we don't there may not be any other ongoing
++                    // tasks that'll trigger this for us. If we don't run optimizers here we might
++                    // get stuck into yellow state until a new update operation is received.
++                    // See: <https://github.com/qdrant/qdrant/pull/5111>
++                    log::warn!(
++                        "Cleaned a optimization handle after timeout, explicitly triggering optimizers",
++                    );
++                    true
++                }
++                // Hit optimizer cleanup interval, did not clean up a task: do 2
++                Err(Elapsed { .. }) => continue,
++                // Channel closed or received stop signal: do 3
++                Ok(None | Some(OptimizerSignal::Stop)) => break,
++            };
++
++            has_triggered_optimizers.store(true, Ordering::Relaxed);
++
++            // Ensure we have at least one appendable segment with enough capacity
++            // Source required parameters from first optimizer
++            if let Some(optimizer) = optimizers.first() {
++                let result = Self::ensure_appendable_segment_with_capacity(
++                    &segments,
++                    optimizer.segments_path(),
++                    &optimizer.collection_params(),
++                    optimizer.threshold_config(),
++                    &payload_index_schema.read(),
++                );
++                if let Err(err) = result {
++                    log::error!(
++                        "Failed to ensure there are appendable segments with capacity: {err}"
++                    );
++                    panic!("Failed to ensure there are appendable segments with capacity: {err}");
++                }
++            }
++
++            // If not forcing, wait on next signal if we have too many handles
++            if !ignore_max_handles && optimization_handles.lock().await.len() >= max_handles {
++                continue;
++            }
++
++            if Self::try_recover(segments.clone(), wal.clone())
++                .await
++                .is_err()
++            {
++                continue;
++            }
++
++            // Continue if we have enough resource budget available to start an optimization
++            // Otherwise skip now and start a task to trigger the optimizer again once resource
++            // budget becomes available
++            let desired_cpus = 0;
++            let desired_io = num_rayon_threads(max_indexing_threads);
++            if !optimizer_resource_budget.has_budget(desired_cpus, desired_io) {
++                let trigger_active = resource_available_trigger
++                    .as_ref()
++                    .is_some_and(|t| !t.is_finished());
++                if !trigger_active {
++                    resource_available_trigger.replace(trigger_optimizers_on_resource_budget(
++                        optimizer_resource_budget.clone(),
++                        desired_cpus,
++                        desired_io,
++                        sender.clone(),
++                    ));
++                }
++                continue;
++            }
++
++            // Determine optimization handle limit based on max handles we allow
++            // Not related to the CPU budget, but a different limit for the maximum number
++            // of concurrent concrete optimizations per shard as configured by the user in
++            // the Qdrant(configuration).
++            // Skip if we reached limit, an ongoing optimization that finishes will trigger this loop again
++            let limit = max_handles.saturating_sub(optimization_handles.lock().await.len());
++            if limit == 0 {
++                log::trace!("Skipping optimization check, we reached optimization thread limit");
++                continue;
++            }
++
++            Self::process_optimization(
++                optimizers.clone(),
++                segments.clone(),
++                optimization_handles.clone(),
++                optimizers_log.clone(),
++                total_optimized_points.clone(),
++                &optimizer_resource_budget,
++                sender.clone(),
++                limit,
++            )
++            .await;
++        }
+     }
+ 
+     /// Ensure there is at least one appendable segment with enough capacity
+@@ -477,205 +659,6 @@         (has_triggered_any_optimizers, has_suboptimal_optimizers)
+     }
+ 
+-    #[allow(clippy::too_many_arguments)]
+-    pub(crate) async fn process_optimization(
+-        optimizers: Arc<Vec<Arc<Optimizer>>>,
+-        segments: LockedSegmentHolder,
+-        optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
+-        optimizers_log: Arc<Mutex<TrackerLog>>,
+-        total_optimized_points: Arc<AtomicUsize>,
+-        optimizer_resource_budget: &ResourceBudget,
+-        sender: Sender<OptimizerSignal>,
+-        limit: usize,
+-    ) {
+-        let mut new_handles = Self::launch_optimization(
+-            optimizers.clone(),
+-            optimizers_log,
+-            total_optimized_points,
+-            optimizer_resource_budget,
+-            segments.clone(),
+-            move |_optimization_result| {
+-                // After optimization is finished, we still need to check if there are
+-                // some further optimizations possible.
+-                // If receiver is already dead - we do not care.
+-                // If channel is full - optimization will be triggered by some other signal
+-                let _ = sender.try_send(OptimizerSignal::Nop);
+-            },
+-            Some(limit),
+-        );
+-        let mut handles = optimization_handles.lock().await;
+-        handles.append(&mut new_handles);
+-    }
+-
+-    /// Cleanup finalized optimization task handles
+-    ///
+-    /// This finds and removes completed tasks from our list of optimization handles.
+-    /// It also propagates any panics (and unknown errors) so we properly handle them if desired.
+-    ///
+-    /// It is essential to call this every once in a while for handling panics in time.
+-    ///
+-    /// Returns true if any optimization handle was finished, joined and removed.
+-    async fn cleanup_optimization_handles(
+-        optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
+-    ) -> bool {
+-        // Remove finished handles
+-        let finished_handles: Vec<_> = {
+-            let mut handles = optimization_handles.lock().await;
+-            (0..handles.len())
+-                .filter(|i| handles[*i].is_finished())
+-                .collect::<Vec<_>>()
+-                .into_iter()
+-                .rev()
+-                .map(|i| handles.swap_remove(i))
+-                .collect()
+-        };
+-
+-        let finished_any = !finished_handles.is_empty();
+-
+-        // Finalize all finished handles to propagate panics
+-        for handle in finished_handles {
+-            handle.join_and_handle_panic().await;
+-        }
+-
+-        finished_any
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    async fn optimization_worker_fn(
+-        optimizers: Arc<Vec<Arc<Optimizer>>>,
+-        sender: Sender<OptimizerSignal>,
+-        mut receiver: Receiver<OptimizerSignal>,
+-        segments: LockedSegmentHolder,
+-        wal: LockedWal,
+-        optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
+-        optimizers_log: Arc<Mutex<TrackerLog>>,
+-        total_optimized_points: Arc<AtomicUsize>,
+-        optimizer_resource_budget: ResourceBudget,
+-        max_handles: Option<usize>,
+-        has_triggered_optimizers: Arc<AtomicBool>,
+-        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+-    ) {
+-        let max_handles = max_handles.unwrap_or(usize::MAX);
+-        let max_indexing_threads = optimizers
+-            .first()
+-            .map(|optimizer| optimizer.hnsw_config().max_indexing_threads)
+-            .unwrap_or_default();
+-
+-        // Asynchronous task to trigger optimizers once CPU budget is available again
+-        let mut resource_available_trigger: Option<JoinHandle<()>> = None;
+-
+-        loop {
+-            let result = timeout(OPTIMIZER_CLEANUP_INTERVAL, receiver.recv()).await;
+-
+-            let cleaned_any =
+-                Self::cleanup_optimization_handles(optimization_handles.clone()).await;
+-
+-            // Either continue below here with the worker, or reloop/break
+-            // Decision logic doing one of three things:
+-            // 1. run optimizers
+-            // 2. reloop and wait for next signal
+-            // 3. break here and stop the optimization worker
+-            let ignore_max_handles = match result {
+-                // Regular optimizer signal: run optimizers: do 1
+-                Ok(Some(OptimizerSignal::Operation(_))) => false,
+-                // Optimizer signal ignoring max handles: do 1
+-                Ok(Some(OptimizerSignal::Nop)) => true,
+-                // Hit optimizer cleanup interval, did clean up a task: do 1
+-                Err(Elapsed { .. }) if cleaned_any => {
+-                    // This branch prevents a race condition where optimizers would get stuck
+-                    // If the optimizer cleanup interval was triggered and we did clean any task we
+-                    // must run optimizers now. If we don't there may not be any other ongoing
+-                    // tasks that'll trigger this for us. If we don't run optimizers here we might
+-                    // get stuck into yellow state until a new update operation is received.
+-                    // See: <https://github.com/qdrant/qdrant/pull/5111>
+-                    log::warn!(
+-                        "Cleaned a optimization handle after timeout, explicitly triggering optimizers",
+-                    );
+-                    true
+-                }
+-                // Hit optimizer cleanup interval, did not clean up a task: do 2
+-                Err(Elapsed { .. }) => continue,
+-                // Channel closed or received stop signal: do 3
+-                Ok(None | Some(OptimizerSignal::Stop)) => break,
+-            };
+-
+-            has_triggered_optimizers.store(true, Ordering::Relaxed);
+-
+-            // Ensure we have at least one appendable segment with enough capacity
+-            // Source required parameters from first optimizer
+-            if let Some(optimizer) = optimizers.first() {
+-                let result = Self::ensure_appendable_segment_with_capacity(
+-                    &segments,
+-                    optimizer.segments_path(),
+-                    &optimizer.collection_params(),
+-                    optimizer.threshold_config(),
+-                    &payload_index_schema.read(),
+-                );
+-                if let Err(err) = result {
+-                    log::error!(
+-                        "Failed to ensure there are appendable segments with capacity: {err}"
+-                    );
+-                    panic!("Failed to ensure there are appendable segments with capacity: {err}");
+-                }
+-            }
+-
+-            // If not forcing, wait on next signal if we have too many handles
+-            if !ignore_max_handles && optimization_handles.lock().await.len() >= max_handles {
+-                continue;
+-            }
+-
+-            if Self::try_recover(segments.clone(), wal.clone())
+-                .await
+-                .is_err()
+-            {
+-                continue;
+-            }
+-
+-            // Continue if we have enough resource budget available to start an optimization
+-            // Otherwise skip now and start a task to trigger the optimizer again once resource
+-            // budget becomes available
+-            let desired_cpus = 0;
+-            let desired_io = num_rayon_threads(max_indexing_threads);
+-            if !optimizer_resource_budget.has_budget(desired_cpus, desired_io) {
+-                let trigger_active = resource_available_trigger
+-                    .as_ref()
+-                    .is_some_and(|t| !t.is_finished());
+-                if !trigger_active {
+-                    resource_available_trigger.replace(trigger_optimizers_on_resource_budget(
+-                        optimizer_resource_budget.clone(),
+-                        desired_cpus,
+-                        desired_io,
+-                        sender.clone(),
+-                    ));
+-                }
+-                continue;
+-            }
+-
+-            // Determine optimization handle limit based on max handles we allow
+-            // Not related to the CPU budget, but a different limit for the maximum number
+-            // of concurrent concrete optimizations per shard as configured by the user in
+-            // the Qdrant configuration.
+-            // Skip if we reached limit, an ongoing optimization that finishes will trigger this loop again
+-            let limit = max_handles.saturating_sub(optimization_handles.lock().await.len());
+-            if limit == 0 {
+-                log::trace!("Skipping optimization check, we reached optimization thread limit");
+-                continue;
+-            }
+-
+-            Self::process_optimization(
+-                optimizers.clone(),
+-                segments.clone(),
+-                optimization_handles.clone(),
+-                optimizers_log.clone(),
+-                total_optimized_points.clone(),
+-                &optimizer_resource_budget,
+-                sender.clone(),
+-                limit,
+-            )
+-            .await;
+-        }
+-    }
+-
+     async fn update_worker_fn(
+         mut receiver: Receiver<UpdateSignal>,
+         optimize_sender: Sender<OptimizerSignal>,
+@@ -772,7 +755,7 @@                     debug!("Stopping flush worker for shard {}", shard_path.display());
+                     return;
+                 }
+-            }
++            };
+ 
+             trace!("Attempting flushing");
+             let wal_flash_job = wal.lock().await.flush_async();
+@@ -823,7 +806,7 @@         }
+     }
+ 
+-    /// Returns confirmed version after flush of all segments
++    /// Returns confirmed version after flush of all segements
+     ///
+     /// # Errors
+     /// Returns an error on flush failure
+@@ -837,7 +820,7 @@     }
+ }
+ 
+-/// Trigger optimizers when CPU budget is available
++/// Trigger optimizers when resource budget is available
+ fn trigger_optimizers_on_resource_budget(
+     optimizer_resource_budget: ResourceBudget,
+     desired_cpus: usize,

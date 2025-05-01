@@ -1,0 +1,275 @@
+```rust
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::TelemetryDetail;
+
+use crate::common::operation_error::{OperationResult, SegmentFailedState};
+use crate::data_types::facets::{FacetParams, FacetValue};
+use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::order_by::{OrderBy, OrderValue};
+use crate::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
+use crate::data_types::vectors::{QueryVector, VectorInternal};
+use crate::entry::snapshot_entry::SnapshotEntry;
+use crate::index::field_index::{CardinalityEstimation, FieldIndex};
+use crate::json_path::JsonPath;
+use crate::telemetry::SegmentTelemetry;
+use crate::types::{
+    Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PointIdType,
+    ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType, VectorName,
+    VectorNameBuf, WithPayload, WithVector,
+};
+
+/// Define all operations which can be performed with Segment or Segment-like entity.
+///
+/// Assume all operations are idempotent – no matter how many times an operation is executed,
+/// the storage state will be the same.
+pub trait SegmentEntry: SnapshotEntry {
+    /// Current update version of the segment.
+    fn version(&self) -> SeqNumberType;
+
+    /// Version of a specific point.
+    fn point_version(&self, point_id: PointIdType) -> Option<SeqNumberType>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_batch(
+        &self,
+        vector_name: &VectorName,
+        query_vectors: &[&QueryVector],
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        filter: Option<&Filter>,
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &SegmentQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPoint>>>;
+
+    /// Rescore results with a formula.
+    fn rescore_with_formula(
+        &self,
+        formula_ctx: Arc<FormulaContext>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPoint>>;
+
+    // ---------- Update operations ----------
+    fn upsert_point(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn delete_point(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn update_vectors(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn delete_vector(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vector_name: &VectorName,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn set_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        payload: &Payload,
+        key: &Option<JsonPath>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn set_full_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        full_payload: &Payload,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn delete_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        key: PayloadKeyTypeRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    fn clear_payload(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    // ---------- Read operations ----------
+    fn vector(
+        &self,
+        vector_name: &VectorName,
+        point_id: PointIdType,
+    ) -> OperationResult<Option<VectorInternal>>;
+
+    fn all_vectors(&self, point_id: PointIdType) -> OperationResult<NamedVectors>;
+
+    /// Return empty payload if not found.
+    fn payload(
+        &self,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload>;
+
+    fn iter_points(&self) -> Box<dyn Iterator<Item = PointIdType> + '_>;
+
+    /// Paginate over points (cancel-able).
+    fn read_filtered<'a>(
+        &'a self,
+        offset: Option<PointIdType>,
+        limit: Option<usize>,
+        filter: Option<&'a Filter>,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Vec<PointIdType>;
+
+    /// Ordered pagination (cancel-able).
+    fn read_ordered_filtered<'a>(
+        &'a self,
+        limit: Option<usize>,
+        filter: Option<&'a Filter>,
+        order_by: &'a OrderBy,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<(OrderValue, PointIdType)>>;
+
+    /// Random sample (cancel-able).
+    fn read_random_filtered(
+        &self,
+        limit: usize,
+        filter: Option<&Filter>,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> Vec<PointIdType>;
+
+    fn read_range(&self, from: Option<PointIdType>, to: Option<PointIdType>) -> Vec<PointIdType>;
+
+    fn unique_values(
+        &self,
+        key: &JsonPath,
+        filter: Option<&Filter>,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<BTreeSet<FacetValue>>;
+
+    fn facet(
+        &self,
+        request: &FacetParams,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<HashMap<FacetValue, usize>>;
+
+    /// Check if a *non-deleted* point exists.
+    fn has_point(&self, point_id: PointIdType) -> bool;
+
+    /// Estimate available point count.
+    fn estimate_point_count<'a>(
+        &'a self,
+        filter: Option<&'a Filter>,
+        hw_counter: &HardwareCounterCell,
+    ) -> CardinalityEstimation;
+
+    fn vector_names(&self) -> HashSet<VectorNameBuf>;
+
+    /// Whether segment is completely empty (including deleted points).
+    fn is_empty(&self) -> bool;
+
+    fn available_point_count(&self) -> usize;
+    fn deleted_point_count(&self) -> usize;
+
+    fn available_vectors_size_in_bytes(&self, vector_name: &VectorName)
+        -> OperationResult<usize>;
+
+    fn max_available_vectors_size_in_bytes(&self) -> OperationResult<usize> {
+        self.vector_names()
+            .into_iter()
+            .map(|name| self.available_vectors_size_in_bytes(&name))
+            .collect::<OperationResult<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().max().unwrap_or_default())
+    }
+
+    fn segment_type(&self) -> SegmentType;
+
+    // ---------- Info / meta ----------
+    fn info(&self) -> SegmentInfo;
+
+    /// Size-only stats.
+    fn size_info(&self) -> SegmentInfo;
+
+    fn config(&self) -> &SegmentConfig;
+
+    // ---------- Persistence ----------
+    fn flush(&self, sync: bool, force: bool) -> OperationResult<SeqNumberType>;
+    fn drop_data(self) -> OperationResult<()>;
+    fn data_path(&self) -> PathBuf;
+
+    // ---------- Payload index ----------
+    fn delete_field_index(
+        &mut self,
+        op_num: SeqNumberType,
+        key: PayloadKeyTypeRef,
+    ) -> OperationResult<bool>;
+
+    fn build_field_index(
+        &self,
+        op_num: SeqNumberType,
+        key: PayloadKeyTypeRef,
+        field_type: Option<&PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<(PayloadFieldSchema, Vec<FieldIndex>)>>;
+
+    fn apply_field_index(
+        &mut self,
+        op_num: SeqNumberType,
+        key: PayloadKeyType,
+        field_schema: PayloadFieldSchema,
+        field_index: Vec<FieldIndex>,
+    ) -> OperationResult<bool>;
+
+    fn create_field_index(
+        &mut self,
+        op_num: SeqNumberType,
+        key: PayloadKeyTypeRef,
+        field_schema: Option<&PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool> {
+        if let Some((schema, index)) =
+            self.build_field_index(op_num, key, field_schema, hw_counter)?
+        {
+            self.apply_field_index(op_num, key.to_owned(), schema, index)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn get_indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema>;
+
+    // ---------- Telemetry ----------
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry;
+
+    fn fill_query_context(&self, query_context: &mut QueryContext);
+}
+```

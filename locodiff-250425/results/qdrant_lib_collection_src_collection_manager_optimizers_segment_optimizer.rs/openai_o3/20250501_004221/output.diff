@@ -1,0 +1,283 @@
+--- qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_extracted.txt (actual)@@ -1,8 +1,8 @@ use std::collections::{HashMap, HashSet};
+ use std::ops::Deref;
+ use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use common::budget::{ResourceBudget, ResourcePermit};
+ use common::counter::hardware_counter::HardwareCounterCell;
+@@ -10,23 +10,24 @@ use io::storage_version::StorageVersion;
+ use itertools::Itertools;
+ use parking_lot::{Mutex, RwLockUpgradableReadGuard};
+-use segment::common::operation_error::{OperationResult, check_process_stopped};
++use segment::common::operation_error::{check_process_stopped, OperationResult};
+ use segment::common::operation_time_statistics::{
+     OperationDurationsAggregator, ScopeDurationMeasurer,
+ };
+-use segment::entry::entry_point::SegmentEntry;
+ use segment::index::sparse_index::sparse_index_config::SparseIndexType;
+ use segment::segment::{Segment, SegmentVersion};
+ use segment::segment_constructor::build_segment;
+ use segment::segment_constructor::segment_builder::SegmentBuilder;
+-use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentConfig, VectorStorageType};
++use segment::types::{
++    HnswConfig, Indexes, PayloadFieldSchema, PayloadKeyType, PointIdType, QuantizationConfig,
++    SeqNumberType, SegmentConfig, VectorStorageType,
++};
+ 
+ use crate::collection_manager::holders::proxy_segment::{self, ProxyIndexChange, ProxySegment};
+ use crate::collection_manager::holders::segment_holder::{
+     LockedSegment, LockedSegmentHolder, SegmentId,
+ };
+ use crate::config::CollectionParams;
+-use crate::operations::config_diff::DiffConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
+ 
+ const BYTES_IN_KB: usize = 1024;
+@@ -92,31 +93,15 @@         )?))
+     }
+ 
+-    /// Build optimized segment
+     fn optimized_segment_builder(
+         &self,
+         optimizing_segments: &[LockedSegment],
+     ) -> CollectionResult<SegmentBuilder> {
+-        // Example:
+-        //
+-        // S1: {
+-        //     text_vectors: 10000,
+-        //     image_vectors: 100
+-        // }
+-        // S2: {
+-        //     text_vectors: 200,
+-        //     image_vectors: 10000
+-        // }
+-
+-        // Example: bytes_count_by_vector_name = {
+-        //     text_vectors: 10200 * dim * VECTOR_ELEMENT_SIZE
+-        //     image_vectors: 10100 * dim * VECTOR_ELEMENT_SIZE
+-        // }
+         let mut bytes_count_by_vector_name = HashMap::new();
+ 
+         // Counting up how much space do the segments being optimized actually take on the fs.
+         // If there was at least one error while reading the size, this will be `None`.
+-        let mut space_occupied = Some(0u64);
++        let mut space_occupied = Some(0_u64);
+ 
+         for segment in optimizing_segments {
+             let segment = match segment {
+@@ -152,7 +137,6 @@         let space_needed = space_occupied.map(|x| 2 * x);
+ 
+         // Ensure temp_path exists
+-
+         if !self.temp_path().exists() {
+             std::fs::create_dir_all(self.temp_path()).map_err(|err| {
+                 CollectionError::service_error(format!(
+@@ -248,8 +232,8 @@ 
+                 match config_on_disk {
+                     Some(true) => config.storage_type = VectorStorageType::Mmap, // Both agree, but prefer mmap storage type
+-                    Some(false) => {} // on_disk=false wins, do nothing
+-                    None => config.storage_type = VectorStorageType::Mmap, // Mmap threshold wins
++                    Some(false) => {}                                            // on_disk=false wins, do nothing
++                    None => config.storage_type = VectorStorageType::Mmap,       // Mmap threshold wins
+                 }
+ 
+                 // If we explicitly configure on_disk, but the segment storage type uses something
+@@ -262,6 +246,7 @@             });
+         }
+ 
++        // Sparse vector storage decision
+         sparse_vector_data
+             .iter_mut()
+             .for_each(|(vector_name, config)| {
+@@ -277,9 +262,9 @@                         let is_big = threshold_is_on_disk || threshold_is_indexed;
+ 
+                         let index_type = match (is_big, config_on_disk) {
+-                            (true, true) => SparseIndexType::Mmap, // Big and configured on disk
++                            (true, true) => SparseIndexType::Mmap,       // Big and configured on disk
+                             (true, false) => SparseIndexType::ImmutableRam, // Big and not on disk nor reached threshold
+-                            (false, _) => SparseIndexType::MutableRam,      // Small
++                            (false, _) => SparseIndexType::MutableRam,   // Small
+                         };
+ 
+                         config.index.index_type = index_type;
+@@ -301,17 +286,6 @@     }
+ 
+     /// Restores original segments from proxies
+-    ///
+-    /// # Arguments
+-    ///
+-    /// * `segments` - segment holder
+-    /// * `proxy_ids` - ids of poxy-wrapped segment to restore
+-    ///
+-    /// # Result
+-    ///
+-    /// Original segments are pushed into `segments`, proxies removed.
+-    /// Returns IDs on restored segments
+-    ///
+     fn unwrap_proxy(
+         &self,
+         segments: &LockedSegmentHolder,
+@@ -350,18 +324,6 @@     }
+ 
+     /// Unwraps proxy, adds temp segment into collection and returns a `Cancelled` error.
+-    ///
+-    /// # Arguments
+-    ///
+-    /// * `segments` - all registered segments of the collection
+-    /// * `proxy_ids` - currently used proxies
+-    /// * `temp_segment` - currently used temporary segment
+-    ///
+-    /// # Result
+-    ///
+-    /// Rolls back optimization state.
+-    /// All processed changes will still be there, but the collection should be returned into state
+-    /// before optimization.
+     fn handle_cancellation(
+         &self,
+         segments: &LockedSegmentHolder,
+@@ -379,20 +341,7 @@         Ok(())
+     }
+ 
+-    /// Function to wrap slow part of optimization. Performs proxy rollback in case of cancellation.
+-    /// Warn: this function might be _VERY_ CPU intensive,
+-    /// so it is necessary to avoid any locks inside this part of the code
+-    ///
+-    /// # Arguments
+-    ///
+-    /// * `optimizing_segments` - Segments to optimize
+-    /// * `proxy_deleted_points` - Holds a set of points, deleted while optimization was running
+-    /// * `proxy_changed_indexes` - Holds a set of indexes changes, created or deleted while optimization was running
+-    /// * `stopped` - flag to check if optimization was cancelled by external thread
+-    ///
+-    /// # Result
+-    ///
+-    /// Constructs optimized segment
++    /// Function to wrap slow part of optimization.
+     #[allow(clippy::too_many_arguments)]
+     fn build_new_segment(
+         &self,
+@@ -436,13 +385,13 @@             segment_builder.set_defragment_keys(defragmentation_keys.into_iter().collect());
+         }
+ 
+-        {
+-            let segment_guards = segments.iter().map(|segment| segment.read()).collect_vec();
+-            segment_builder.update(
+-                &segment_guards.iter().map(Deref::deref).collect_vec(),
+-                stopped,
+-            )?;
+-        }
++        segment_builder.update(
++            &segments.iter().map(|segment| segment.read()).collect_vec()
++                .iter()
++                .map(Deref::deref)
++                .collect_vec(),
++            stopped,
++        )?;
+ 
+         // Apply index changes to segment builder
+         // Indexes are only used for defragmentation in segment builder, so versions are ignored
+@@ -456,42 +405,6 @@                 }
+             }
+         }
+-
+-        // 000 - acquired
+-        // +++ - blocked on waiting
+-        //
+-        // Case: 1 indexation job at a time, long indexing
+-        //
+-        //  IO limit = 1
+-        // CPU limit = 2                         Next optimization
+-        //                                       │            loop
+-        //                                       │
+-        //                                       ▼
+-        //  IO 0  00000000000000                  000000000
+-        // CPU 1              00000000000000000
+-        //     2              00000000000000000
+-        //
+-        //
+-        //  IO 0  ++++++++++++++00000000000000000
+-        // CPU 1                       ++++++++0000000000
+-        //     2                       ++++++++0000000000
+-        //
+-        //
+-        //  Case: 1 indexing job at a time, short indexation
+-        //
+-        //
+-        //   IO limit = 1
+-        //  CPU limit = 2
+-        //
+-        //
+-        //   IO 0  000000000000   ++++++++0000000000
+-        //  CPU 1            00000
+-        //      2            00000
+-        //
+-        //   IO 0  ++++++++++++00000000000   +++++++
+-        //  CPU 1                       00000
+-        //      2                       00000
+-        // At this stage workload shifts from IO to CPU, so we can release IO permit
+ 
+         // Use same number of threads for indexing as for IO.
+         // This ensures that IO is equally distributed between optimization jobs.
+@@ -522,12 +435,7 @@             );
+             match change {
+                 ProxyIndexChange::Create(schema, version) => {
+-                    optimized_segment.create_field_index(
+-                        *version,
+-                        field_name,
+-                        Some(schema),
+-                        hw_counter,
+-                    )?;
++                    optimized_segment.create_field_index(*version, field_name, Some(schema), hw_counter)?;
+                 }
+                 ProxyIndexChange::Delete(version) => {
+                     optimized_segment.delete_field_index(*version, field_name)?;
+@@ -622,16 +530,6 @@             proxies.push(proxy);
+         }
+ 
+-        // Save segment version once all payload indices have been converted
+-        // If this ends up not being saved due to a crash, the segment will not be used
+-        match &tmp_segment {
+-            LockedSegment::Original(segment) => {
+-                let segment_path = &segment.read().current_path;
+-                SegmentVersion::save(segment_path)?;
+-            }
+-            LockedSegment::Proxy(_) => unreachable!(),
+-        }
+-
+         let proxy_ids: Vec<_> = {
+             // Exclusive lock for the segments operations.
+             let mut write_segments = RwLockUpgradableReadGuard::upgrade(segments_lock);
+@@ -653,7 +551,6 @@         }
+ 
+         // ---- SLOW PART -----
+-
+         let mut optimized_segment = match self.build_new_segment(
+             &optimizing_segments,
+             Arc::clone(&proxy_deleted_points),
+@@ -686,7 +583,6 @@         };
+ 
+         // ---- SLOW PART ENDS HERE -----
+-
+         if let Err(e) = check_process_stopped(stopped) {
+             self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
+             return Err(CollectionError::from(e));
+@@ -699,17 +595,9 @@             // Apply index changes before point deletions
+             // Point deletions bump the segment version, can cause index changes to be ignored
+             for (field_name, change) in proxy_index_changes.read().iter_ordered() {
+-                // Warn: change version might be lower than the segment version,
+-                // because we might already applied the change earlier in optimization.
+-                // Applied optimizations are not removed from `proxy_index_changes`.
+                 match change {
+                     ProxyIndexChange::Create(schema, version) => {
+-                        optimized_segment.create_field_index(
+-                            *version,
+-                            field_name,
+-                            Some(schema),
+-                            &hw_counter,
+-                        )?;
++                        optimized_segment.create_field_index(*version, field_name, Some(schema), &hw_counter)?;
+                     }
+                     ProxyIndexChange::Delete(version) => {
+                         optimized_segment.delete_field_index(*version, field_name)?;
