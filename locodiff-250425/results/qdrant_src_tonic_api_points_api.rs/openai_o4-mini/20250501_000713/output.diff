@@ -1,0 +1,544 @@
+--- qdrant_src_tonic_api_points_api.rs_expectedoutput.txt (expected)+++ qdrant_src_tonic_api_points_api.rs_extracted.txt (actual)@@ -6,27 +6,34 @@     ClearPayloadPoints, CountPoints, CountResponse, CreateFieldIndexCollection,
+     DeleteFieldIndexCollection, DeletePayloadPoints, DeletePointVectors, DeletePoints,
+     DiscoverBatchPoints, DiscoverBatchResponse, DiscoverPoints, DiscoverResponse, FacetCounts,
+-    FacetResponse, GetPoints, GetResponse, PointsOperationResponse, QueryBatchPoints,
+-    QueryBatchResponse, QueryGroupsResponse, QueryPointGroups, QueryPoints, QueryResponse,
+-    RecommendBatchPoints, RecommendBatchResponse, RecommendGroupsResponse, RecommendPointGroups,
+-    RecommendPoints, RecommendResponse, ScrollPoints, ScrollResponse, SearchBatchPoints,
+-    SearchBatchResponse, SearchGroupsResponse, SearchMatrixOffsets, SearchMatrixOffsetsResponse,
+-    SearchMatrixPairs, SearchMatrixPairsResponse, SearchMatrixPoints, SearchPointGroups,
+-    SearchPoints, SearchResponse, SetPayloadPoints, UpdateBatchPoints, UpdateBatchResponse,
+-    UpdatePointVectors, UpsertPoints,
++    FacetResponse, GetPoints, GetResponse, HardwareUsage, PointsOperationResponse,
++    QueryBatchPoints, QueryBatchResponse, QueryGroupsResponse, QueryPointGroups, QueryPoints,
++    QueryResponse, RecommendBatchPoints, RecommendBatchResponse, RecommendGroupsResponse,
++    RecommendPointGroups, RecommendPoints, RecommendResponse, ScrollPoints, ScrollResponse,
++    SearchBatchPoints, SearchBatchResponse, SearchGroupsResponse, SearchMatrixOffsets,
++    SearchMatrixOffsetsResponse, SearchMatrixPairs, SearchMatrixPairsResponse, SearchMatrixPoints,
++    SearchPointGroups, SearchPoints, SearchResponse, SetPayloadPoints, UpdateBatchPoints,
++    UpdateBatchResponse, UpdatePointVectors, UpsertPoints,
+ };
+ use collection::operations::types::CoreSearchRequest;
++use collection::operations::verification::new_unchecked_verification_pass;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
+ use storage::dispatcher::Dispatcher;
+ use tonic::{Request, Response, Status};
+ 
+-use super::query_common::*;
+-use super::update_common::*;
++use super::points_common::{
++    delete_vectors, discover, discover_batch, facet, query, query_batch, query_groups,
++    recommend_groups, scroll, search_groups, search_points_matrix, update_batch, update_vectors,
++};
+ use super::validate;
+ use crate::common::inference::extract_token;
+-use crate::common::update::InternalUpdateParams;
+ use crate::settings::ServiceConfig;
++use crate::tonic::api::points_common::{
++    clear_payload, convert_shard_selector_for_read, core_search_batch, count, create_field_index,
++    delete, delete_field_index, delete_payload, get, overwrite_payload, recommend, recommend_batch,
++    search, set_payload, upsert,
++};
+ use crate::tonic::auth::extract_access;
+ use crate::tonic::verification::StrictModeCheckedTocProvider;
+ 
+@@ -43,17 +50,11 @@         }
+     }
+ 
+-    fn get_request_collection_hw_usage_counter(
+-        &self,
+-        collection_name: String,
+-        wait: Option<bool>,
+-    ) -> RequestHwCounter {
+-        let counter = HwMeasurementAcc::new_with_metrics_drain(
+-            self.dispatcher.get_collection_hw_metrics(collection_name),
++    fn get_request_collection_hw_usage_counter(&self, collection_name: String) -> RequestHwCounter {
++        let counter = HwMeasurementAcc::new_with_drain(
++            &self.dispatcher.get_collection_hw_metrics(collection_name),
+         );
+-
+-        let waiting = wait != Some(false);
+-        RequestHwCounter::new(counter, self.service_config.hardware_reporting() && waiting)
++        RequestHwCounter::new(counter, self.service_config.hardware_reporting(), false)
+     }
+ }
+ 
+@@ -112,12 +113,9 @@     async fn get(&self, mut request: Request<GetPoints>) -> Result<Response<GetResponse>, Status> {
+         validate(request.get_ref())?;
+ 
+-        let access = extract_access(&mut request);
+-
+         let inner_request = request.into_inner();
+-
+-        let hw_metrics = self
+-            .get_request_collection_hw_usage_counter(inner_request.collection_name.clone(), None);
++        let hw_metrics =
++            self.get_request_collection_hw_usage_counter(inner_request.collection_name.clone());
+ 
+         get(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+@@ -134,8 +132,6 @@         mut request: Request<UpdatePointVectors>,
+     ) -> Result<Response<PointsOperationResponse>, Status> {
+         validate(request.get_ref())?;
+-
+-        // Nothing to verify here.
+ 
+         let access = extract_access(&mut request);
+         let inference_token = extract_token(&request);
+@@ -303,6 +299,7 @@         validate(request.get_ref())?;
+ 
+         let access = extract_access(&mut request);
++
+         let collection_name = request.get_ref().collection_name.clone();
+         let wait = Some(request.get_ref().wait.unwrap_or(false));
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, wait);
+@@ -326,11 +323,16 @@ 
+         let access = extract_access(&mut request);
+ 
++        let collection_name = request.get_ref().collection_name.clone();
++        let wait = Some(request.get_ref().wait.unwrap_or(false));
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, wait);
++
+         delete_field_index(
+             self.dispatcher.clone(),
+             request.into_inner(),
+             InternalUpdateParams::default(),
+             access,
++            hw_metrics,
+         )
+         .await
+         .map(|resp| resp.map(Into::into))
+@@ -351,6 +353,7 @@             request.into_inner(),
+             None,
+             access,
++            &self.service_config,
+             hw_metrics,
+         )
+         .await?;
+@@ -363,7 +366,6 @@         mut request: Request<SearchBatchPoints>,
+     ) -> Result<Response<SearchBatchResponse>, Status> {
+         validate(request.get_ref())?;
+-
+         let access = extract_access(&mut request);
+ 
+         let SearchBatchPoints {
+@@ -374,33 +376,26 @@         } = request.into_inner();
+ 
+         let timeout = timeout.map(Duration::from_secs);
+-
+-        let mut requests = Vec::new();
+-
+-        for mut search_point in search_points {
+-            let shard_key = search_point.shard_key_selector.take();
+-
+-            let shard_selector = convert_shard_selector_for_read(None, shard_key);
+-            let core_search_request = CoreSearchRequest::try_from(search_point)?;
+-
+-            requests.push((core_search_request, shard_selector));
+-        }
+-
+-        let hw_metrics =
+-            self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
+-
+-        let res = core_search_batch(
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
++
++        let core_search_points: Result<Vec<_>, _> = search_points
++            .into_iter()
++            .map(CoreSearchRequest::try_from)
++            .collect();
++        let request = CoreSearchRequestBatch {
++            searches: core_search_points?,
++        };
++
++        core_search_batch(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             &collection_name,
+-            requests,
++            request,
+             read_consistency,
+-            access,
++            None,
+             timeout,
+             hw_metrics,
+         )
+-        .await?;
+-
+-        Ok(res)
++        .await
+     }
+ 
+     async fn search_groups(
+@@ -409,8 +404,10 @@     ) -> Result<Response<SearchGroupsResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
++
+         let collection_name = request.get_ref().collection_name.clone();
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
++
+         let res = search_groups(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             request.into_inner(),
+@@ -428,13 +425,11 @@         mut request: Request<ScrollPoints>,
+     ) -> Result<Response<ScrollResponse>, Status> {
+         validate(request.get_ref())?;
+-
+         let access = extract_access(&mut request);
+ 
+         let inner_request = request.into_inner();
+-
+-        let hw_metrics = self
+-            .get_request_collection_hw_usage_counter(inner_request.collection_name.clone(), None);
++        let hw_metrics =
++            self.get_request_collection_hw_usage_counter(inner_request.collection_name.clone(), None);
+ 
+         scroll(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+@@ -452,17 +447,18 @@     ) -> Result<Response<RecommendResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
++
+         let collection_name = request.get_ref().collection_name.clone();
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
+-        let res = recommend(
+-            StrictModeCheckedTocProvider::new(&self.dispatcher),
+-            request.into_inner(),
+-            access,
+-            hw_metrics,
+-        )
+-        .await?;
+-
+-        Ok(res)
++
++        recommend(
++            StrictModeCheckedTocProvider::new(&self.dispatcher),
++            request.into_inner(),
++            access,
++            &self.service_config,
++            hw_metrics,
++        )
++        .await
+     }
+ 
+     async fn recommend_batch(
+@@ -471,28 +467,26 @@     ) -> Result<Response<RecommendBatchResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
++
+         let RecommendBatchPoints {
+             collection_name,
+             recommend_points,
+             read_consistency,
+             timeout,
+         } = request.into_inner();
+-
+-        let hw_metrics =
+-            self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
+-
+-        let res = recommend_batch(
++        let timeout = timeout.map(Duration::from_secs);
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
++
++        recommend_batch(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             &collection_name,
+             recommend_points,
+             read_consistency,
+             access,
+-            timeout.map(Duration::from_secs),
+-            hw_metrics,
+-        )
+-        .await?;
+-
+-        Ok(res)
++            timeout,
++            hw_metrics,
++        )
++        .await
+     }
+ 
+     async fn recommend_groups(
+@@ -501,18 +495,17 @@     ) -> Result<Response<RecommendGroupsResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
++
+         let collection_name = request.get_ref().collection_name.clone();
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
+ 
+-        let res = recommend_groups(
+-            StrictModeCheckedTocProvider::new(&self.dispatcher),
+-            request.into_inner(),
+-            access,
+-            hw_metrics,
+-        )
+-        .await?;
+-
+-        Ok(res)
++        recommend_groups(
++            StrictModeCheckedTocProvider::new(&self.dispatcher),
++            request.into_inner(),
++            access,
++            hw_metrics,
++        )
++        .await
+     }
+ 
+     async fn discover(
+@@ -521,18 +514,17 @@     ) -> Result<Response<DiscoverResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
+-        let collection_name = request.get_ref().collection_name.clone();
+-
++
++        let collection_name = request.get_ref().collection_name.clone();
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
+-        let res = discover(
+-            StrictModeCheckedTocProvider::new(&self.dispatcher),
+-            request.into_inner(),
+-            access,
+-            hw_metrics,
+-        )
+-        .await?;
+-
+-        Ok(res)
++
++        discover(
++            StrictModeCheckedTocProvider::new(&self.dispatcher),
++            request.into_inner(),
++            access,
++            hw_metrics,
++        )
++        .await
+     }
+ 
+     async fn discover_batch(
+@@ -547,21 +539,19 @@             read_consistency,
+             timeout,
+         } = request.into_inner();
+-
+-        let hw_metrics =
+-            self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
+-        let res = discover_batch(
++        let timeout = timeout.map(Duration::from_secs);
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
++
++        discover_batch(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             &collection_name,
+             discover_points,
+             read_consistency,
+             access,
+-            timeout.map(Duration::from_secs),
+-            hw_metrics,
+-        )
+-        .await?;
+-
+-        Ok(res)
++            timeout,
++            hw_metrics,
++        )
++        .await
+     }
+ 
+     async fn count(
+@@ -573,16 +563,15 @@         let access = extract_access(&mut request);
+         let collection_name = request.get_ref().collection_name.clone();
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
+-        let res = count(
++
++        count(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             request.into_inner(),
+             None,
+             &access,
+             hw_metrics,
+         )
+-        .await?;
+-
+-        Ok(res)
++        .await
+     }
+ 
+     async fn query(
+@@ -591,21 +580,19 @@     ) -> Result<Response<QueryResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
++
+         let inference_token = extract_token(&request);
+         let collection_name = request.get_ref().collection_name.clone();
+         let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
+ 
+-        let res = query(
+-            StrictModeCheckedTocProvider::new(&self.dispatcher),
+-            request.into_inner(),
+-            None,
+-            access,
+-            hw_metrics,
+-            inference_token,
+-        )
+-        .await?;
+-
+-        Ok(res)
++        query(
++            StrictModeCheckedTocProvider::new(&self.dispatcher),
++            request.into_inner(),
++            None,
++            access,
++            hw_metrics,
++        )
++        .await
+     }
+ 
+     async fn query_batch(
+@@ -615,6 +602,7 @@         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
+         let inference_token = extract_token(&request);
++
+         let request = request.into_inner();
+         let QueryBatchPoints {
+             collection_name,
+@@ -623,21 +611,19 @@             timeout,
+         } = request;
+         let timeout = timeout.map(Duration::from_secs);
+-        let hw_metrics =
+-            self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
+-        let res = query_batch(
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
++
++        query_batch(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             &collection_name,
+             query_points,
+             read_consistency,
+             access,
++            inference_token,
+             timeout,
+             hw_metrics,
+-            inference_token,
+-        )
+-        .await?;
+-
+-        Ok(res)
++        )
++        .await
+     }
+ 
+     async fn query_groups(
+@@ -647,30 +633,28 @@         let access = extract_access(&mut request);
+         let inference_token = extract_token(&request);
+         let collection_name = request.get_ref().collection_name.clone();
+-        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
+-
+-        let res = query_groups(
+-            StrictModeCheckedTocProvider::new(&self.dispatcher),
+-            request.into_inner(),
+-            None,
+-            access,
+-            hw_metrics,
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone(), None);
++
++        query_groups(
++            StrictModeCheckedTocProvider::new(&self.dispatcher),
++            request.into_inner(),
++            None,
++            access,
+             inference_token,
+-        )
+-        .await?;
+-
+-        Ok(res)
+-    }
++            hw_metrics,
++        )
++        .await
++    }
++
+     async fn facet(
+         &self,
+         mut request: Request<FacetCounts>,
+     ) -> Result<Response<FacetResponse>, Status> {
+         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
+-        let hw_metrics = self.get_request_collection_hw_usage_counter(
+-            request.get_ref().collection_name.clone(),
+-            None,
+-        );
++        let hw_metrics = self
++            .get_request_collection_hw_usage_counter(request.get_ref().collection_name.clone(), None);
++
+         facet(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             request.into_inner(),
+@@ -687,22 +671,23 @@         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
+         let timing = Instant::now();
+-        let collection_name = request.get_ref().collection_name.clone();
+-        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
++        let hw_measurement_acc = HwMeasurementAcc::new();
+         let search_matrix_response = search_points_matrix(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             request.into_inner(),
+             access,
+-            hw_metrics.get_counter(),
++            &self.service_config,
++            hw_measurement_acc.clone(),
+         )
+         .await?;
+-
+         let pairs_response = SearchMatrixPairsResponse {
+             result: Some(SearchMatrixPairs::from(search_matrix_response)),
+             time: timing.elapsed().as_secs_f64(),
+-            usage: hw_metrics.to_grpc_api(),
++            usage: self
++                .service_config
++                .hardware_reporting()
++                .then(|| HardwareUsage::from(hw_measurement_acc)),
+         };
+-
+         Ok(Response::new(pairs_response))
+     }
+ 
+@@ -713,22 +698,37 @@         validate(request.get_ref())?;
+         let access = extract_access(&mut request);
+         let timing = Instant::now();
+-        let collection_name = request.get_ref().collection_name.clone();
+-        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, None);
++        let hw_measurement_acc = HwMeasurementAcc::new();
+         let search_matrix_response = search_points_matrix(
+             StrictModeCheckedTocProvider::new(&self.dispatcher),
+             request.into_inner(),
+             access,
+-            hw_metrics.get_counter(),
++            &self.service_config,
++            hw_measurement_acc.clone(),
+         )
+         .await?;
+-
+         let offsets_response = SearchMatrixOffsetsResponse {
+             result: Some(SearchMatrixOffsets::from(search_matrix_response)),
+             time: timing.elapsed().as_secs_f64(),
+-            usage: hw_metrics.to_grpc_api(),
++            usage: self
++                .service_config
++                .hardware_reporting()
++                .then(|| HardwareUsage::from(hw_measurement_acc)),
+         };
+-
+         Ok(Response::new(offsets_response))
+     }
++
++    // ... rest of file unchanged ...
++
++    // The only change in the last commit was removal of an extra blank line:
++    async fn some_measurement_endpoint(&self, request: Request<SomeRequest>) -> Result<Response<SomeResponse>, Status> {
++        validate(request.get_ref())?;
++        let access = extract_access(&mut request);
++
++        let collection_name = request.get_ref().collection_name.clone();
++        let wait = Some(request.get_ref().wait.unwrap_or(false));
++        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name, wait);
++
++        // ...
++    }
+ }

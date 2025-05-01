@@ -1,0 +1,321 @@
+```rust
+use std::cmp::{Ordering, max, min};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
+
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::top_k::TopK;
+use common::types::{PointOffsetType, ScoredPointOffset};
+
+use super::posting_list_common::PostingListIter;
+use crate::common::scores_memory_pool::PooledScoresHandle;
+use crate::common::sparse_vector::{RemappedSparseVector, score_vectors};
+use crate::common::types::{DimId, DimWeight};
+use crate::index::inverted_index::InvertedIndex;
+use crate::index::posting_list::PostingListIterator;
+
+/// Iterator over posting lists with a reference to the corresponding query index and weight
+pub struct IndexedPostingListIterator<T: PostingListIter> {
+    posting_list_iterator: T,
+    query_index: DimId,
+    query_weight: DimWeight,
+}
+
+/// Making this larger makes the search faster but uses more (pooled) memory
+const ADVANCE_BATCH_SIZE: usize = 10_000;
+
+/// SearchContext holds the state needed to perform a sparse-vector top-k search
+pub struct SearchContext<'a, 'b, T: PostingListIter = PostingListIterator<'a>> {
+    postings_iterators: Vec<IndexedPostingListIterator<T>>,
+    query: RemappedSparseVector,
+    top: usize,
+    is_stopped: &'a AtomicBool,
+    top_results: TopK,
+    min_record_id: Option<PointOffsetType>,
+    max_record_id: PointOffsetType,
+    pooled: PooledScoresHandle<'b>,
+    use_pruning: bool,
+    hardware_counter: &'a HardwareCounterCell,
+}
+
+impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
+    /// Create a new search context for the given sparse query and inverted index.
+    pub fn new(
+        query: RemappedSparseVector,
+        top: usize,
+        inverted_index: &'a impl InvertedIndex<Iter<'a> = T>,
+        pooled: PooledScoresHandle<'b>,
+        is_stopped: &'a AtomicBool,
+        hardware_counter: &'a HardwareCounterCell,
+    ) -> SearchContext<'a, 'b, T> {
+        let mut postings_iterators = Vec::new();
+        // Track min and max record id across all postings
+        let mut max_record_id = 0;
+        let mut min_record_id = u32::MAX;
+        // Build a posting-list iterator for each nonempty query dimension
+        for (query_weight_offset, id) in query.indices.iter().enumerate() {
+            if let Some(mut it) = inverted_index.get(*id, hardware_counter) {
+                if let (Some(first), Some(last_id)) = (it.peek(), it.last_id()) {
+                    // Update global min/max record id
+                    min_record_id = min(min_record_id, first.record_id);
+                    max_record_id = max(max_record_id, last_id);
+                    // Record how to score from this posting list
+                    let query_index = *id;
+                    let query_weight = query.values[query_weight_offset];
+                    postings_iterators.push(IndexedPostingListIterator {
+                        posting_list_iterator: it,
+                        query_index,
+                        query_weight,
+                    });
+                }
+            }
+        }
+
+        let top_results = TopK::new(top);
+        // We only prune when all query weights are nonnegative and the posting lists support max_next_weight
+        let use_pruning = T::reliable_max_next_weight() && query.values.iter().all(|v| *v >= 0.0);
+
+        SearchContext {
+            postings_iterators,
+            query,
+            top,
+            is_stopped,
+            top_results,
+            min_record_id: Some(min_record_id),
+            max_record_id,
+            pooled,
+            use_pruning,
+            hardware_counter,
+        }
+    }
+
+    const DEFAULT_SCORE: f32 = 0.0;
+
+    /// Plain search over a list of explicit IDs, without using any posting-list merging or pruning.
+    /// Returns a Vec<ScoredPointOffset> of length <= ids.len(), in descending score order.
+    pub fn plain_search(&mut self, ids: &[PointOffsetType]) -> Vec<ScoredPointOffset> {
+        // sort IDs to traverse posting lists in increasing id order
+        let mut sorted_ids = ids.to_vec();
+        sorted_ids.sort_unstable();
+
+        let cpu_counter = self.hardware_counter.cpu_counter();
+        let mut indices = Vec::with_capacity(self.query.indices.len());
+        let mut values = Vec::with_capacity(self.query.values.len());
+
+        for id in sorted_ids {
+            if self.is_stopped.load(Relaxed) {
+                break;
+            }
+            indices.clear();
+            values.clear();
+            // Gather matching weights from each posting-list iterator
+            for posting in self.postings_iterators.iter_mut() {
+                if let Some(element) = posting.posting_list_iterator.skip_to(id) {
+                    indices.push(posting.query_index);
+                    values.push(element.weight);
+                }
+            }
+            if values.is_empty() {
+                continue;
+            }
+            // Measure CPU work: query length + returned vector length (in bytes of weights)
+            cpu_counter.incr_delta(self.query.indices.len() + values.len() * std::mem::size_of::<DimWeight>());
+
+            // Score the resulting sparse vector against the query
+            let score = score_vectors(&indices, &values, &self.query.indices, &self.query.values)
+                .unwrap_or(Self::DEFAULT_SCORE);
+            self.top_results.push(ScoredPointOffset { score, idx: id });
+        }
+        let top = std::mem::take(&mut self.top_results);
+        top.into_vec()
+    }
+
+    /// Advance through all postings in [batch_start_id ..= batch_last_id], accumulating scores in a pooled buffer.
+    fn advance_batch<F: Fn(PointOffsetType) -> bool>(
+        &mut self,
+        batch_start_id: PointOffsetType,
+        batch_last_id: PointOffsetType,
+        filter_condition: &F,
+    ) {
+        // Initialize batch scores
+        let batch_len = (batch_last_id - batch_start_id + 1) as usize;
+        let scores_buf = &mut self.pooled.scores;
+        scores_buf.clear();
+        scores_buf.resize(batch_len, 0.0);
+
+        // Traverse each posting list
+        for posting in self.postings_iterators.iter_mut() {
+            posting.posting_list_iterator.for_each_till_id(
+                batch_last_id,
+                scores_buf.as_mut_slice(),
+                #[inline(always)]
+                |buf, record_id, weight| {
+                    let contrib = weight * posting.query_weight;
+                    let offset = (record_id - batch_start_id) as usize;
+                    // SAFETY: offset in [0..batch_len)
+                    unsafe { *buf.get_unchecked_mut(offset) += contrib };
+                },
+            );
+        }
+
+        // Push qualified batch results
+        let threshold = if self.top_results.len() >= self.top {
+            self.top_results.threshold()
+        } else {
+            f32::MIN
+        };
+        for (i, &score) in scores_buf.iter().enumerate() {
+            if score != 0.0 && score > threshold {
+                let record_id = batch_start_id + i as PointOffsetType;
+                if filter_condition(record_id) {
+                    self.top_results.push(ScoredPointOffset { score, idx: record_id });
+                }
+            }
+        }
+    }
+
+    /// Quickly score the remaining elements of the single last posting list.
+    fn process_last_posting_list<F: Fn(PointOffsetType) -> bool>(&mut self, filter_condition: &F) {
+        debug_assert_eq!(self.postings_iterators.len(), 1);
+        let posting = &mut self.postings_iterators[0];
+        posting.posting_list_iterator.for_each_till_id(
+            PointOffsetType::MAX,
+            &mut (),
+            |(), record_id, weight| {
+                if filter_condition(record_id) {
+                    let score = weight * posting.query_weight;
+                    self.top_results.push(ScoredPointOffset { score, idx: record_id });
+                }
+            },
+        );
+    }
+
+    /// Find the minimum next record_id among all posting-list iterators.
+    fn next_min_id(a: &mut [IndexedPostingListIterator<T>]) -> Option<PointOffsetType> {
+        let mut min_id = None;
+        for it in a.iter_mut() {
+            if let Some(peek) = it.posting_list_iterator.peek() {
+                min_id = Some(match min_id {
+                    None => peek.record_id,
+                    Some(curr) => min(curr, peek.record_id),
+                });
+            }
+        }
+        min_id
+    }
+
+    /// Promote the longest posting list to the front of `self.postings_iterators`.
+    pub(crate) fn promote_longest_posting_lists_to_the_front(&mut self) {
+        if let Some((idx, _)) = self
+            .postings_iterators
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, p)| p.posting_list_iterator.len_to_end())
+        {
+            if idx != 0 {
+                self.postings_iterators.swap(0, idx);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn posting_list_len(&self, idx: usize) -> usize {
+        self.postings_iterators[idx].posting_list_iterator.len_to_end()
+    }
+
+    /// Prune the head (longest) posting list if it cannot raise the minimum top-k score.
+    pub fn prune_longest_posting_list(&mut self, min_score: f32) -> bool {
+        if self.postings_iterators.is_empty() {
+            return false;
+        }
+        let (head, rest) = self.postings_iterators.split_at_mut(1);
+        let head = &mut head[0];
+        if let Some(peek) = head.posting_list_iterator.peek() {
+            let nxt = Self::next_min_id(rest);
+            if let Some(nid) = nxt {
+                match nid.cmp(&peek.record_id) {
+                    Ordering::Less | Ordering::Equal => return false,
+                    Ordering::Greater => {
+                        let max_w = peek.weight.max(peek.max_next_weight);
+                        let bound = max_w * head.query_weight;
+                        if bound <= min_score {
+                            let before = head.posting_list_iterator.current_index();
+                            head.posting_list_iterator.skip_to(nid);
+                            let after = head.posting_list_iterator.current_index();
+                            return before != after;
+                        }
+                    }
+                }
+            } else {
+                // only one posting list remains
+                let max_w = peek.weight.max(peek.max_next_weight);
+                let bound = max_w * head.query_weight;
+                if bound <= min_score {
+                    head.posting_list_iterator.skip_to_end();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Perform the full top-k merge with optional pruning and cancellation.
+    pub fn search<F: Fn(PointOffsetType) -> bool>(
+        &mut self,
+        filter_condition: &F,
+    ) -> Vec<ScoredPointOffset> {
+        if self.postings_iterators.is_empty() {
+            return Vec::new();
+        }
+
+        if self.use_pruning {
+            // charge CPU cost proportional to remaining posting-list volume
+            let mut cost = 0;
+            for p in &self.postings_iterators {
+                cost += p.posting_list_iterator.len_to_end()
+                    * p.posting_list_iterator.element_size();
+            }
+            self.hardware_counter.cpu_counter().incr_delta(cost);
+        }
+
+        let mut best_min = f32::MIN;
+        loop {
+            if self.is_stopped.load(Relaxed) {
+                break;
+            }
+            let start = match self.min_record_id {
+                Some(x) => x,
+                None => break,
+            };
+            let end = min(start + ADVANCE_BATCH_SIZE as u32, self.max_record_id);
+            self.advance_batch(start, end, filter_condition);
+
+            // drop exhausted postings
+            self.postings_iterators.retain(|it| it.posting_list_iterator.len_to_end() != 0);
+
+            if self.postings_iterators.is_empty() {
+                break;
+            }
+            if self.postings_iterators.len() == 1 {
+                self.process_last_posting_list(filter_condition);
+                break;
+            }
+            if self.use_pruning && self.top_results.len() >= self.top {
+                let thr = self.top_results.threshold();
+                if thr != best_min {
+                    best_min = thr;
+                    self.promote_longest_posting_lists_to_the_front();
+                    let pruned = self.prune_longest_posting_list(thr);
+                    if pruned {
+                        self.min_record_id = Self::next_min_id(&mut self.postings_iterators);
+                    }
+                }
+            }
+            self.min_record_id = Self::next_min_id(&mut self.postings_iterators);
+        }
+
+        let out = std::mem::take(&mut self.top_results);
+        out.into_vec()
+    }
+}
+```
