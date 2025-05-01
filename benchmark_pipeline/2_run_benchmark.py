@@ -58,8 +58,6 @@ Outputs:
     - `output.diff`: A file showing the differences (unified diff format) between
       the `expected_output.txt` and the `extracted_output.txt`. If outputs match,
       it contains a "No differences found" message.
-  - Creates or updates `<benchmark_run_dir>/benchmark_history.log`: Records timestamps and command-line
-    arguments used for each script run.
   - Prints real-time status updates to the console for each benchmark case being run
     (starting, success/failure, cost).
   - Prints a summary table at the end showing overall statistics for the run
@@ -69,7 +67,6 @@ File Modifications:
   - Creates the results directory structure under `<benchmark_run_dir>/results/`.
   - Creates `metadata.json`, `raw_response.txt`, `extracted_output.txt`, and
     `output.diff` files within each specific run's timestamped directory.
-  - Creates or updates `benchmark_history.log` in the benchmark run directory.
   - Does *not* modify files in `<benchmark_run_dir>/prompts/` (the input prompts/expected outputs).
   - Does *not* modify files in `cached-repos`.
   - Reads the `.env` file to load the API key but does *not* modify it.
@@ -98,7 +95,6 @@ from dotenv import load_dotenv
 
 # Use path-based import to ensure it works regardless of how the script is invoked
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import log_script_run
 
 
 # --- Model Interaction ---
@@ -885,8 +881,7 @@ async def main():
 
     args = parser.parse_args()
 
-    # Log script execution
-    log_script_run(str(args.benchmark_run_dir), "2_run_benchmark.py", args)
+    # Start benchmark execution
 
     # Define prompts and results directories based on the run dir
     prompts_dir = args.benchmark_run_dir / "prompts"

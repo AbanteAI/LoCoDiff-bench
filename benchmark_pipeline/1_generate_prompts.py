@@ -50,8 +50,6 @@ Outputs:
     - `repo_path_expectedoutput.txt`: Contains the ground truth file content (filename format uses repo name and sanitized relative path).
   - Creates `<benchmark_run_dir>/prompts/metadata.json`: Contains metadata about the generation
     parameters and the final list of benchmark cases.
-  - Creates or updates `<benchmark_run_dir>/benchmark_history.log`: Records timestamps and command-line
-    arguments used for each script run.
   - Prints statistics about the generation process, filtering, and final sampling results to the console.
 
 File Modifications:
@@ -61,7 +59,6 @@ File Modifications:
   - Creates `*_expectedoutput.txt` files within `<benchmark_run_dir>/prompts_temp/` initially.
   - Copies selected `*_prompt.txt` and `*_expectedoutput.txt` files from `<benchmark_run_dir>/prompts_temp/` to `<benchmark_run_dir>/prompts/`.
   - Creates or overwrites `metadata.json` within `<benchmark_run_dir>/prompts/`.
-  - Creates or updates `benchmark_history.log` in the benchmark run directory.
   - Deletes the `<benchmark_run_dir>/prompts_temp/` directory after completion.
   - Creates the `cached-repos/` directory if it doesn't exist.
   - Clones repositories into the `cached-repos/` directory if they don't already exist there.
@@ -91,7 +88,6 @@ from urllib.parse import urlparse
 # Use path-based import to ensure it works regardless of how the script is invoked
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import log_script_run
 
 
 # --- Repository Cloning Functions ---
@@ -1395,8 +1391,7 @@ def main():
     )
     # --- End Config creation ---
 
-    # --- Log script execution ---
-    log_script_run(benchmark_run_dir, "1_generate_prompts.py", args)
+    # --- Script execution configuration ---
 
     # --- Handle add_prompts == 0 Case (Analyze and Exit) ---
     if cfg.add_prompts == 0:
