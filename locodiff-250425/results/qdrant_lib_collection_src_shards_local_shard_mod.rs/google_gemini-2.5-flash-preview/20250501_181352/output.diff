@@ -1,0 +1,332 @@
+--- qdrant_lib_collection_src_shards_local_shard_mod.rs_expectedoutput.txt (expected)+++ qdrant_lib_collection_src_shards_local_shard_mod.rs_extracted.txt (actual)@@ -86,7 +86,6 @@ pub struct LocalShard {
+     pub(super) segments: LockedSegmentHolder,
+     pub(super) collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
+-    pub(super) shared_storage_config: Arc<SharedStorageConfig>,
+     pub(crate) payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+     pub(super) wal: RecoverableWal,
+     pub(super) update_handler: Arc<Mutex<UpdateHandler>>,
+@@ -175,7 +174,7 @@ 
+         // default to 2x the WAL capacity
+         let disk_buffer_threshold_mb =
+-            2 * (collection_config.read().await.wal_config.wal_capacity_mb);
++            2 * (config.wal_config.wal_capacity_mb);
+ 
+         let disk_usage_watcher = disk_usage_watcher::DiskUsageWatcher::new(
+             shard_path.to_owned(),
+@@ -205,12 +204,11 @@ 
+         let update_tracker = segment_holder.read().update_tracker();
+ 
+-        let read_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
+-            strict_mode
+-                .read_rate_limit
+-                .map(RateLimiter::new_per_minute)
+-                .map(ParkingMutex::new)
+-        });
++        let read_rate_limiter = config
++            .strict_mode_config
++            .as_ref()
++            .and_then(|strict_mode| strict_mode.read_rate_limit.map(RateLimiter::new_per_minute))
++            .map(ParkingMutex::new);
+ 
+         drop(config); // release `shared_config` from borrow checker
+ 
+@@ -514,6 +512,7 @@         let vector_params = config.params.to_base_vector_data()?;
+         let sparse_vector_params = config.params.to_sparse_vector_data()?;
+         let segment_number = config.optimizer_config.get_number_segments();
++        let payload_index_schema_clone = payload_index_schema.read().clone();
+ 
+         for _sid in 0..segment_number {
+             let path_clone = segments_path.clone();
+@@ -524,7 +523,24 @@             };
+             let segment = thread::Builder::new()
+                 .name(format!("shard-build-{collection_id}-{id}"))
+-                .spawn(move || build_segment(&path_clone, &segment_config, true))
++                .spawn(move || {
++                    build_segment(&path_clone, &segment_config, true)
++                        .and_then(|segment| {
++                            // Create default payload indexes as specified in config
++                            segment.update_all_field_indices(&payload_index_schema_clone.schema)?;
++                            Ok(segment)
++                        })
++                        .map(|segment| {
++                            // Evict all pages from cache except metadata on creation
++                            if segment.disk_cache_enabled() {
++                                segment.clear_cache().unwrap_or_else(|err| {
++                                    log::error!("Failed to clear cache for segment {}: {}", segment.segment_path().display(), err);
++                                });
++                            }
++                            
++                            segment
++                        })
++                })
+                 .unwrap();
+             build_handlers.push(segment);
+         }
+@@ -557,6 +573,12 @@             &config.hnsw_config,
+             &config.quantization_config,
+         );
++
++        let read_rate_limiter = config
++            .strict_mode_config
++            .as_ref()
++            .and_then(|strict_mode| strict_mode.read_rate_limit.map(RateLimiter::new_per_minute))
++            .map(ParkingMutex::new);
+ 
+         drop(config); // release `shared_config` from borrow checker
+ 
+@@ -638,7 +660,7 @@             }
+ 
+             // Propagate `CollectionError::ServiceError`, but skip other error types.
+-            match &CollectionUpdater::update(
++            match CollectionUpdater::update(
+                 segments,
+                 op_num,
+                 update.operation,
+@@ -673,10 +695,10 @@             bar.inc(1);
+             if !show_progress_bar && last_progress_report.elapsed() >= WAL_LOAD_REPORT_EVERY {
+                 let progress = bar.position();
++                let total = wal.len(false);
+                 log::info!(
+-                    "{progress}/{} ({}%)",
+-                    wal.len(false),
+-                    (progress as f32 / wal.len(false) as f32 * 100.0) as usize,
++                    "{progress}/{total} ({}%)",
++                    (progress as f32 / total as f32 * 100.0) as usize,
+                 );
+                 last_progress_report = Instant::now();
+             }
+@@ -688,7 +710,7 @@             // It is possible, that after recovery, if WAL flush was not enforced.
+             // We could be left with some un-versioned points.
+             // To maintain consistency, we can either remove them or try to recover.
+-            for (_idx, segment) in segments.iter() {
++            for segment in segments.iter() {
+                 match segment {
+                     LockedSegment::Original(raw_segment) => {
+                         raw_segment.write().cleanup_versions()?;
+@@ -708,7 +730,8 @@         bar.finish();
+         if !show_progress_bar {
+             log::info!(
+-                "Recovered collection {collection_id}: {0}/{0} (100%)",
++                "Recovered shard {}: {0}/{0} (100%)",
++                self.path.display(),
+                 wal.len(false),
+             );
+         }
+@@ -723,10 +746,11 @@     /// Check data consistency for all segments
+     ///
+     /// Returns an error at the first inconsistent segment
++    #[cfg(feature = "data-consistency-check")]
+     pub fn check_data_consistency(&self) -> CollectionResult<()> {
+         log::info!("Checking data consistency for shard {:?}", self.path);
+         let segments = self.segments.read();
+-        for (_idx, segment) in segments.iter() {
++        for segment in segments.iter() {
+             match segment {
+                 LockedSegment::Original(raw_segment) => {
+                     let segment_guard = raw_segment.read();
+@@ -749,81 +773,11 @@         Ok(())
+     }
+ 
+-    pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
+-        let config = self.collection_config.read().await;
+-        let mut update_handler = self.update_handler.lock().await;
+-
+-        let (update_sender, update_receiver) =
+-            mpsc::channel(self.shared_storage_config.update_queue_size);
+-        // makes sure that the Stop signal is the last one in this channel
+-        let old_sender = self.update_sender.swap(Arc::new(update_sender));
+-        old_sender.send(UpdateSignal::Stop).await?;
+-        update_handler.stop_flush_worker();
+-
+-        update_handler.wait_workers_stops().await?;
+-        let new_optimizers = build_optimizers(
+-            &self.path,
+-            &config.params,
+-            &config.optimizer_config,
+-            &config.hnsw_config,
+-            &config.quantization_config,
+-        );
+-        update_handler.optimizers = new_optimizers;
+-        update_handler.flush_interval_sec = config.optimizer_config.flush_interval_sec;
+-        update_handler.max_optimization_threads = config.optimizer_config.max_optimization_threads;
+-        update_handler.run_workers(update_receiver);
+-
+-        self.update_sender.load().send(UpdateSignal::Nop).await?;
+-
+-        Ok(())
+-    }
+-
+-    /// Apply shard's strict mode configuration update
+-    /// - Update read rate limiter
+-    pub async fn on_strict_mode_config_update(&mut self) {
+-        let config = self.collection_config.read().await;
+-
+-        if let Some(strict_mode_config) = &config.strict_mode_config {
+-            if strict_mode_config.enabled == Some(true) {
+-                // update read rate limiter
+-                if let Some(read_rate_limit_per_min) = strict_mode_config.read_rate_limit {
+-                    let new_read_rate_limiter =
+-                        RateLimiter::new_per_minute(read_rate_limit_per_min);
+-                    self.read_rate_limiter
+-                        .replace(parking_lot::Mutex::new(new_read_rate_limiter));
+-                    return;
+-                }
+-            }
+-        }
+-        // remove read rate limiter for all other situations
+-        self.read_rate_limiter.take();
+-    }
+-
+-    pub fn trigger_optimizers(&self) {
+-        // Send a trigger signal and ignore errors because all error cases are acceptable:
+-        // - If receiver is already dead - we do not care
+-        // - If channel is full - optimization will be triggered by some other signal
+-        let _ = self.update_sender.load().try_send(UpdateSignal::Nop);
+-    }
+-
+-    /// Finishes ongoing update tasks
+-    pub async fn stop_gracefully(&self) {
+-        if let Err(err) = self.update_sender.load().send(UpdateSignal::Stop).await {
+-            log::warn!("Error sending stop signal to update handler: {err}");
+-        }
+-
+-        self.stop_flush_worker().await;
+-
+-        if let Err(err) = self.wait_update_workers_stop().await {
+-            log::warn!("Update workers failed with: {err}");
+-        }
+-    }
+-
+     pub fn restore_snapshot(snapshot_path: &Path) -> CollectionResult<()> {
+         log::info!("Restoring shard snapshot {}", snapshot_path.display());
+         // Read dir first as the directory contents would change during restore
+         let entries = std::fs::read_dir(LocalShard::segments_path(snapshot_path))?
+-            .collect::<Result<Vec<_>, _>>()?;
++            .collect::<Result<Vec<std::fs::DirEntry>, _>>()?;
+ 
+         // Filter out hidden entries
+         let entries = entries.into_iter().filter(|entry| {
+@@ -934,9 +888,13 @@         })?;
+ 
+         tar.blocking_append_dir_all(temp_dir.path(), Path::new(WAL_PATH))
+-            .map_err(|err| {
+-                CollectionError::service_error(format!("Error while archiving WAL: {err}"))
+-            })
++            .map_err(|err| CollectionError::service_error(format!("Error while archiving WAL: {err}")))?;
++
++        log::info!(
++            "Created snapshot of empty WAL for shard, starting at index {latest_op_num}",
++        );
++
++        Ok(())
+     }
+ 
+     /// snapshot WAL
+@@ -968,10 +926,11 @@             }
+ 
+             tar.blocking_append_file(&entry.path(), Path::new(&entry.file_name()))
+-                .map_err(|err| {
+-                    CollectionError::service_error(format!("Error while archiving WAL: {err}"))
+-                })?;
+-        }
++                .map_err(|err| CollectionError::service_error(format!("Error while archiving WAL: {err}")))?;
++        }
++
++        log::info!("Created snapshot of WAL for shard");
++
+         Ok(())
+     }
+ 
+@@ -1036,7 +995,7 @@             // TODO: snapshotting also creates temp proxy segments. should differentiate.
+             let has_special_segment = segments
+                 .iter()
+-                .map(|(_, segment)| segment.get().read().info().segment_type)
++                .map(|segment| segment.get().read().info().segment_type)
+                 .any(|segment_type| segment_type == SegmentType::Special);
+             if has_special_segment {
+                 return (ShardStatus::Yellow, OptimizersStatus::Ok);
+@@ -1074,7 +1033,7 @@ 
+         {
+             let segments = self.segments().read();
+-            for (_idx, segment) in segments.iter() {
++            for segment in segments.iter() {
+                 segments_count += 1;
+ 
+                 let segment_info = segment.get().read().info();
+@@ -1106,24 +1065,63 @@     }
+ 
+     pub fn update_tracker(&self) -> &UpdateTracker {
+-        &self.update_tracker
+-    }
+-
+-    /// Get the recovery point for the current shard
+-    ///
+-    /// This is sourced from the last seen clocks from other nodes that we know about.
++        self.update_tracker.deref()
++    }
++
+     pub async fn recovery_point(&self) -> RecoveryPoint {
+         self.wal.recovery_point().await
+     }
+ 
+     /// Update the cutoff point on the current shard
+     ///
+-    /// This also updates the highest seen clocks.
++    /// This also updates the newest seen clocks.
+     pub async fn update_cutoff(&self, cutoff: &RecoveryPoint) {
+         self.wal.update_cutoff(cutoff).await
+     }
+ 
++    /// Apply shard's strict mode configuration update
++    /// - Update read rate limiter
++    pub async fn on_strict_mode_config_update(&mut self) {
++        let config = self.collection_config.read().await;
++
++        if let Some(strict_mode_config) = &config.strict_mode_config {
++            if strict_mode_config.enabled == Some(true) {
++                // update read rate limiter
++                if let Some(read_rate_limit_per_min) = strict_mode_config.read_rate_limit {
++                    let new_read_rate_limiter =
++                        RateLimiter::new_per_minute(read_rate_limit_per_min);
++                    self.read_rate_limiter
++                        .replace(parking_lot::Mutex::new(new_read_rate_limiter));
++                    return;
++                }
++            }
++        }
++        // remove read rate limiter for all other situations
++        self.read_rate_limiter.take();
++    }
++
++    pub fn trigger_optimizers(&self) {
++        // Send a trigger signal and ignore errors because all error cases are acceptable:
++        // - If receiver is already dead - we do not care
++        // - If channel is full - optimization will be triggered by some other signal
++        let _ = self.update_sender.load().try_send(UpdateSignal::Nop);
++    }
++
++    /// Finishes ongoing update tasks
++    pub async fn stop_gracefully(&self) {
++        if let Err(err) = self.update_sender.load().send(UpdateSignal::Stop).await {
++            log::warn!("Error sending stop signal to update handler: {err}");
++        }
++
++        self.stop_flush_worker().await;
++
++        if let Err(err) = self.wait_update_workers_stop().await {
++            log::warn!("Update workers failed with: {err}");
++        }
++    }
++
+     /// Check if the read rate limiter allows the operation to proceed
++    /// - cost: the cost of the operation
+     /// - hw_measurement_acc: the current hardware measurement accumulator
+     /// - context: the context of the operation to add on the error message
+     /// - cost_fn: the cost of the operation called lazily
+@@ -1131,6 +1129,7 @@     /// Returns an error if the rate limit is exceeded.
+     fn check_read_rate_limiter<F>(
+         &self,
++        cost: usize,
+         hw_measurement_acc: &HwMeasurementAcc,
+         context: &str,
+         cost_fn: F,
