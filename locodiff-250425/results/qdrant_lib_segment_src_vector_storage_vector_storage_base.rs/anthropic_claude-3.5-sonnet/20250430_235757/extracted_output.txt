@@ -1,0 +1,171 @@
+use std::mem::MaybeUninit;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::maybe_uninit::maybe_uninit_fill_from;
+use common::types::PointOffsetType;
+use sparse::common::sparse_vector::SparseVector;
+
+use super::dense::memmap_dense_vector_storage::MemmapDenseVectorStorage;
+use super::dense::simple_dense_vector_storage::SimpleDenseVectorStorage;
+use super::multi_dense::appendable_mmap_multi_dense_vector_storage::{
+    AppendableMmapMultiDenseVectorStorage, MultivectorMmapOffset,
+};
+use super::multi_dense::simple_multi_dense_vector_storage::SimpleMultiDenseVectorStorage;
+use super::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
+use crate::common::operation_error::OperationResult;
+use crate::common::Flusher;
+use crate::data_types::named_vectors::CowVector;
+use crate::data_types::primitive::PrimitiveVectorElement;
+use crate::data_types::vectors::{
+    MultiDenseVectorInternal, TypedMultiDenseVectorRef, VectorElementType, VectorElementTypeByte,
+    VectorElementTypeHalf, VectorInternal, VectorRef,
+};
+use crate::types::{Distance, MultiVectorConfig, SeqNumberType, VectorStorageDatatype};
+use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
+use crate::vector_storage::dense::appendable_dense_vector_storage::AppendableMmapDenseVectorStorage;
+use crate::vector_storage::in_ram_persisted_vectors::InRamPersistedVectors;
+use crate::vector_storage::sparse::simple_sparse_vector_storage::SimpleSparseVectorStorage;
+
+/// Trait for vector storage
+/// El - type of vector element, expected numerical type
+/// Storage operates with internal IDs (`PointOffsetType`), which always starts with zero and have no skips
+pub trait VectorStorage {
+    fn distance(&self) -> Distance;
+
+    fn datatype(&self) -> VectorStorageDatatype;
+
+    /// If false - data is stored in RAM (and persisted on disk)
+    /// If true - data is stored on disk, and is not forced to be in RAM
+    fn is_on_disk(&self) -> bool;
+
+    /// Number of vectors
+    ///
+    /// - includes soft deleted vectors, as they are still stored
+    fn total_vector_count(&self) -> usize;
+
+    /// Get the number of available vectors, considering deleted points and vectors
+    ///
+    /// This uses [`VectorStorage::total_vector_count`] and [`VectorStorage::deleted_vector_count`] internally.
+    ///
+    /// # Warning
+    ///
+    /// This number may not always be accurate. See warning in [`VectorStorage::deleted_vector_count`] documentation.
+    fn available_vector_count(&self) -> usize {
+        self.total_vector_count()
+            .saturating_sub(self.deleted_vector_count())
+    }
+
+    /// Get the vector by the given key
+    fn get_vector(&self, key: PointOffsetType) -> CowVector;
+
+    /// Get the vector by the given key if it exists
+    fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector>;
+
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()>;
+
+    /// Add the given vectors to the storage.
+    ///
+    /// # Returns
+    /// The range of point offsets that were added to the storage.
+    ///
+    /// If stopped, the operation returns a cancellation error.
+    fn update_from<'a>(
+        &mut self,
+        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Range<PointOffsetType>>;
+
+    fn flusher(&self) -> Flusher;
+
+    fn files(&self) -> Vec<PathBuf>;
+
+    fn versioned_files(&self) -> Vec<(PathBuf, SeqNumberType)> {
+        Vec::new()
+    }
+
+    /// Flag the vector by the given key as deleted
+    ///
+    /// Returns true if the vector was not deleted before and is now deleted
+    fn delete_vector(&mut self, key: PointOffsetType) -> OperationResult<bool>;
+
+    /// Check whether the vector at the given key is flagged as deleted
+    fn is_deleted_vector(&self, key: PointOffsetType) -> bool;
+
+    /// Get the number of deleted vectors, considering deleted points and vectors
+    ///
+    /// Vectors may be deleted at two levels, as point or as vector. Deleted points should
+    /// propagate to deleting the vectors. That means that the deleted vector count includes the
+    /// number of deleted points as well.
+    ///
+    /// This includes any vectors that were deleted at creation.
+    ///
+    /// # Warning
+    ///
+    /// In some very exceptional cases it is possible for this count not to include some deleted
+    /// points. That may happen when flushing a segment to disk fails. This should be recovered
+    /// when loading/recovering the segment, but that isn't guaranteed. You should therefore use
+    /// the deleted count with care.
+    fn deleted_vector_count(&self) -> usize;
+
+    /// Get [`BitSlice`] representation for deleted vectors with deletion flags
+    ///
+    /// The size of this slice is not guaranteed. It may be smaller/larger than the number of
+    /// vectors in this segment.
+    fn deleted_vector_bitslice(&self) -> &BitSlice;
+}
+
+pub trait DenseVectorStorage<T: PrimitiveVectorElement>: VectorStorage {
+    fn vector_dim(&self) -> usize;
+    fn get_dense(&self, key: PointOffsetType) -> &[T];
+
+    /// Get the dense vectors by the given keys
+    ///
+    /// Implementation can assume that the keys are consecutive
+    fn get_dense_batch<'a>(
+        &'a self,
+        keys: &[PointOffsetType], 
+        vectors: &'a mut [MaybeUninit<&'a [T]>],
+    ) -> &'a [&'a [T]] {
+        maybe_uninit_fill_from(vectors, keys.iter().map(|key| self.get_dense(*key))).0
+    }
+
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
+        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
+    }
+}
+
+pub trait SparseVectorStorage: VectorStorage {
+    fn get_sparse(&self, key: PointOffsetType) -> OperationResult<SparseVector>;
+    fn get_sparse_opt(&self, key: PointOffsetType) -> OperationResult<Option<SparseVector>>;
+}
+
+pub trait MultiVectorStorage<T: PrimitiveVectorElement>: VectorStorage {
+    fn vector_dim(&self) -> usize;
+    fn get_multi(&self, key: PointOffsetType) -> TypedMultiDenseVectorRef<T>; 
+    fn get_multi_opt(&self, key: PointOffsetType) -> Option<TypedMultiDenseVectorRef<T>>;
+    fn get_batch_multi<'a>(
+        &'a self,
+        keys: &[PointOffsetType],
+        vectors: &'a mut [MaybeUninit<TypedMultiDenseVectorRef<'a, T>>],
+    ) -> &'a [TypedMultiDenseVectorRef<'a, T>] {
+        debug_assert_eq!(keys.len(), vectors.len());
+        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
+        maybe_uninit_fill_from(vectors, keys.iter().map(|key| self.get_multi(*key))).0
+    }
+    fn iterate_inner_vectors(&self) -> impl Iterator<Item = &[T]> + Clone + Send;
+    fn multi_vector_config(&self) -> &MultiVectorConfig;
+
+    fn size_of_available_vectors_in_bytes(&self) -> usize;
+}
+
+[further implementation of VectorStorageEnum...]
