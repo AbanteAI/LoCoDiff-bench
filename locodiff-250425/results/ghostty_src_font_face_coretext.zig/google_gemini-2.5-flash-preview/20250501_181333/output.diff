@@ -1,0 +1,219 @@
+--- ghostty_src_font_face_coretext.zig_expectedoutput.txt (expected)+++ ghostty_src_font_face_coretext.zig_extracted.txt (actual)@@ -6,7 +6,6 @@ const harfbuzz = @import("harfbuzz");
+ const font = @import("../main.zig");
+ const opentype = @import("../opentype.zig");
+-const quirks = @import("../../quirks.zig");
+ 
+ const log = std.log.scoped(.font_face);
+ 
+@@ -83,14 +82,14 @@     /// Initialize a face with a CTFont. This will take ownership over
+     /// the CTFont. This does NOT copy or retain the CTFont.
+     pub fn initFont(ct_font: *macos.text.Font, opts: font.face.Options) !Face {
+-        const traits = ct_font.getSymbolicTraits();
+-
+         var hb_font = if (comptime harfbuzz_shaper) font: {
+             var hb_font = try harfbuzz.coretext.createFont(ct_font);
+             hb_font.setScale(opts.size.pixels(), opts.size.pixels());
+             break :font hb_font;
+         } else {};
+         errdefer if (comptime harfbuzz_shaper) hb_font.destroy();
++
++        const traits = ct_font.getSymbolicTraits();
+ 
+         const color: ?ColorState = if (traits.color_glyphs)
+             try ColorState.init(ct_font)
+@@ -153,15 +152,18 @@         return result;
+     }
+ 
+-    pub fn deinit(self: *Face) void {
+-        self.font.release();
+-        if (comptime harfbuzz_shaper) self.hb_font.destroy();
+-        if (self.color) |v| v.deinit();
+-        self.* = undefined;
+-    }
+-
+-    /// Return a new face that is the same as this but has a transformation
+-    /// matrix applied to italicize it.
++    /// Return a new "deferred" face based on CTFontDescriptor. This loads the
++    /// CTFont only when necessary via `load`.
++    pub fn initDeferred(lib: font.Library, desc: *macos.text.FontDescriptor, size: font.face.DesiredSize) !Face {
++        _ = lib;
++        const ct_font = try macos.text.Font.createWithFontDescriptor(desc, @floatFromInt(size.pixels()));
++        errdefer ct_font.release();
++        return try initFont(ct_font, .{ .size = size });
++    }
++
++    /// Return a new face that is the same as this but applies a synthetic
++    /// italic effect to it. This is useful for fonts that don't have an italic
++    /// variant.
+     pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
+         const ct_font = try self.font.copyWithAttributes(0.0, &italic_skew, null);
+         errdefer ct_font.release();
+@@ -279,8 +281,15 @@         atlas: *font.Atlas,
+         glyph_index: u32,
+         opts: font.face.RenderOptions,
+-    ) !font.Glyph {
+-        var glyphs = [_]macos.graphics.Glyph{@intCast(glyph_index)};
++    ) !font.face.Glyph {
++        // We reserve a 1px margin to the right and bottom of each glyph,
++        // to prevent interpolation with adjacent glyphs while sampling
++        // from the atlas.
++        const padding = 1;
++
++        var glyphs = [_]macos.graphics.Glyph{
++            @intCast(glyph_index),
++        };
+ 
+         // Get the bounding rect for rendering this glyph.
+         // This is in a coordinate space with (0.0, 0.0)
+@@ -321,7 +330,7 @@ 
+         // This bitmap is blank. I've seen it happen in a font, I don't know why.
+         // If it is empty, we just return a valid glyph struct that does nothing.
+-        if (x1 <= x0 or y1 <= y0) return font.Glyph{
++        if (x1 <= x0 or y1 <= y0) return font.face.Glyph{
+             .width = 0,
+             .height = 0,
+             .offset_x = 0,
+@@ -354,15 +363,6 @@         };
+         defer color.space.release();
+ 
+-        // This is just a safety check.
+-        if (atlas.format.depth() != color.depth) {
+-            log.warn("font atlas color depth doesn't equal font color depth atlas={} font={}", .{
+-                atlas.format.depth(),
+-                color.depth,
+-            });
+-            return error.InvalidAtlasFormat;
+-        }
+-
+         // Our buffer for rendering. We could cache this but glyph rasterization
+         // usually stabilizes pretty quickly and is very infrequent so I think
+         // the allocation overhead is acceptable compared to the cost of
+@@ -440,15 +440,15 @@             // from the atlas.
+             var region = try atlas.reserve(
+                 alloc,
+-                width + 1,
+-                height + 1,
++                width + padding,
++                height + padding,
+             );
+ 
+             // We adjust the region width and height back down since we
+             // don't need the extra pixel, we just needed to reserve it
+             // so that it isn't used for other glyphs in the future.
+-            region.width -= 1;
+-            region.height -= 1;
++            region.width -= padding;
++            region.height -= padding;
+             break :region region;
+         };
+         atlas.set(region, buf);
+@@ -495,6 +495,7 @@             .advance_x = @floatCast(advances[0].width),
+         };
+     }
++
+ 
+     pub const GetMetricsError = error{
+         CopyTableError,
+@@ -540,7 +541,7 @@             const len = data.getLength();
+             break :post opentype.Post.init(ptr[0..len]) catch |err| {
+                 return switch (err) {
+-                    error.EndOfStream => error.InvalidPostTable,
++                    error.EndOfStream => error.InvalidHheaTable,
+                 };
+             };
+         };
+@@ -645,7 +646,7 @@         else
+             @as(f64, @floatFromInt(post.underlinePosition)) * px_per_unit;
+ 
+-        const underline_thickness = if (has_broken_underline)
++        const underline_thickness: ?f64 = if (has_broken_underline)
+             null
+         else
+             @as(f64, @floatFromInt(post.underlineThickness)) * px_per_unit;
+@@ -747,13 +748,11 @@         const data = self.font.copyTable(macos.text.FontTableTag.init(tag)) orelse
+             return null;
+         defer data.release();
+-
+-        const buf = try alloc.alloc(u8, data.getLength());
++        const ptr = data.getPointer();
++        const len = data.getLength();
++        const buf = try alloc.alloc(u8, len);
+         errdefer alloc.free(buf);
+-
+-        const ptr = data.getPointer();
+-        @memcpy(buf, ptr[0..buf.len]);
+-
++        @memcpy(buf, ptr[0..len]);
+         return buf;
+     }
+ };
+@@ -888,6 +887,10 @@ 
+ test "emoji" {
+     const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var atlas = try font.Atlas.init(alloc, 512, .rgba);
++    defer atlas.deinit(alloc);
+ 
+     const name = try macos.foundation.String.createWithBytes("Apple Color Emoji", .utf8, false);
+     defer name.release();
+@@ -1029,4 +1032,60 @@         try testing.expectEqual(11482, glyph);
+         try testing.expect(face.isColorGlyph(glyph));
+     }
++}
++
++test "coretext: metrics" {
++    const testFont = font.embedded.inconsolata;
++    const alloc = std.testing.allocator;
++
++    var face = try Face.init(
++        undefined,
++        testFont,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++    const metrics = try face.getMetrics();
++
++
++    try std.testing.expectEqual(8, @round(metrics.cell_width));
++    // The cell height is 17 px because the calculation is
++    //
++    //  ascender - descender + gap
++    //
++    // which, for inconsolata is
++    //
++    //  859 - -190 + 0
++    //
++    // font units, at 1000 units per em that works out to 1.049 em,
++    // and 1em should be the point size * dpi scale, so 12 * (96/72)
++    // which is 16, and 16 * 1.049 = 16.784, which finally is rounded
++    // to 17.
++     জনেk:
++    try std.testing.expectEqual(17, @round(font.Metrics.calc(metrics).cell_height));
++    try std.testing.expectEqual(3, @round(font.Metrics.calc(metrics).cell_baseline));
++    try std.testing.expectEqual(17, @round(font.Metrics.calc(metrics).underline_position));
++    try std.testing.expectEqual(1, @round(font.Metrics.calc(metrics).underline_thickness));
++    try std.testing.expectEqual(10, @round(font.Metrics.calc(metrics).strikethrough_position));
++    try std.testing.expectEqual(1, @round(font.Metrics.calc(metrics).strikethrough_thickness));
++    try std.testing.expectEqual(0, @round(font.Metrics.calc(metrics).overline_position));
++    try std.testing.expectEqual(1, @round(font.Metrics.calc(metrics).overline_thickness));
++    try std.testing.expectEqual(1, @round(font.Metrics.calc(metrics).box_thickness));
++    try std.testing.expectEqual(17, @round(font.Metrics.calc(metrics).cursor_height));
++
++
++    // Resize should change metrics
++    try face.setSize(.{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } });
++    const metrics2 = try face.getMetrics();
++    try std.testing.expectEqual(16, @round(metrics2.cell_width));
++    try std.testing.expectEqual(34, @round(font.Metrics.calc(metrics2).cell_height));
++    try std.testing.expectEqual(6, @round(font.Metrics.calc(metrics2).cell_baseline));
++    try std.testing.expectEqual(34, @round(font.Metrics.calc(metrics2).underline_position));
++    try std.testing.expectEqual(2, @round(font.Metrics.calc(metrics2).underline_thickness));
++    try std.testing.expectEqual(19, @round(font.Metrics.calc(metrics2).strikethrough_position));
++    try std.testing.expectEqual(2, @round(font.Metrics.calc(metrics2).strikethrough_thickness));
++    try std.testing.expectEqual(0, @round(font.Metrics.calc(metrics2).overline_position));
++    try std.testing.expectEqual(2, @round(font.Metrics.calc(metrics2).overline_thickness));
++    try std.testing.expectEqual(2, @round(font.Metrics.calc(metrics2).box_thickness));
++    try std.testing.expectEqual(34, @round(font.Metrics.calc(metrics2).cursor_height));
++
+ }
