@@ -716,8 +716,8 @@ def generate_chart_data(
     case_token_pairs.sort(key=lambda pair: pair[1])
 
     # Define bucket parameters
-    bucket_size = 30  # Number of cases in each bucket
-    bucket_step = 10  # Increment between buckets
+    bucket_size = 40  # Number of cases in each bucket
+    bucket_step = 40  # Increment between buckets (non-overlapping)
 
     # Initialize buckets
     buckets = []
@@ -1147,7 +1147,7 @@ function initializeChart(chartData) {
                                 const caseInfo = bucketData.case_indices ? `\nCases: ${bucketData.case_indices}` : '';
                                 
                                 // Calculate filtered bucket size based on selected languages
-                                let filteredBucketSize = 30; // Default size
+                                let filteredBucketSize = 40; // Default size
                                 if (bucketData.language_case_counts && currentSelectedLanguages.length > 0) {
                                     filteredBucketSize = 0;
                                     currentSelectedLanguages.forEach(language => {
@@ -1157,7 +1157,7 @@ function initializeChart(chartData) {
                                 
                                 // If we have a filtered size of 0, use the default
                                 if (filteredBucketSize === 0) {
-                                    filteredBucketSize = 30;
+                                    filteredBucketSize = 40;
                                 }
                                 
                                 // Calculate untested cases
@@ -1245,7 +1245,7 @@ function initializeChart(chartData) {
                     });
                 }
                 // Use filtered size as denominator if available, otherwise use default bucket size
-                const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                const denominator = filteredBucketSize > 0 ? filteredBucketSize : 40;
                 
                 // Calculate success rate - divide by appropriate denominator
                 // This assumes any prompt not tested was a failure
@@ -1282,7 +1282,7 @@ function initializeChart(chartData) {
                         });
                     }
                     // Use filtered size as denominator if available, otherwise use default bucket size
-                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 40;
                     
                     // Recalculate Wilson interval using the appropriate denominator
                     const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
@@ -1313,7 +1313,7 @@ function initializeChart(chartData) {
                         });
                     }
                     // Use filtered size as denominator if available, otherwise use default bucket size
-                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 40;
                     
                     // Recalculate Wilson interval using the appropriate denominator
                     const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
