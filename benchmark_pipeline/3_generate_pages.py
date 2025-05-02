@@ -33,6 +33,7 @@ File Modifications:
 """
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -689,9 +690,10 @@ def generate_chart_data(
     """
     Generates data for the token-based chart.
 
-    Creates data points at 1k token increments from 0k to 75k,
-    with each point representing a +/- 10k token bucket.
-    Each prompt is included in all buckets whose range covers its length.
+    Creates buckets based on case indices after sorting by prompt length:
+    - Each bucket contains 25 cases
+    - Buckets overlap and increment by 5 cases each
+    - Bucket position is the average token count of all prompts in the bucket
 
     Args:
         results_metadata: Dictionary mapping (case_prefix, model) to result metadata
@@ -704,54 +706,88 @@ def generate_chart_data(
         Dictionary containing the chart data
     """
 
-    # Find max token count (min is always 0)
-    token_counts = [meta.get("prompt_tokens", 0) for meta in prompt_metadata.values()]
-    max_tokens = 75000  # Default max
-    if token_counts:
-        max_tokens = max(
-            max(token_counts), max_tokens
-        )  # Use higher of actual max or default
+    # Create a list of (case_prefix, token_count) sorted by token count
+    case_token_pairs = []
+    for case_prefix, metadata in prompt_metadata.items():
+        token_count = metadata.get("prompt_tokens", 0)
+        case_token_pairs.append((case_prefix, token_count))
 
-    # Round max tokens up to the nearest thousand
-    max_tokens_k = (max_tokens + 999) // 1000
+    # Sort by token count
+    case_token_pairs.sort(key=lambda pair: pair[1])
 
-    # Initialize data structure - start from 0k, go to max_tokens_k
+    # Define bucket parameters
+    bucket_size = 30  # Number of cases in each bucket
+    bucket_step = 10  # Increment between buckets
+
+    # Initialize buckets
     buckets = []
-    for i in range(0, max_tokens_k + 1):  # Start from 0k
-        bucket_location = i * 1000  # Renamed from bucket_center to bucket_location
-        bucket_min = max(0, bucket_location - 10000)
-        bucket_max = bucket_location + 10000
 
-        # Initialize data for this bucket
-        bucket_data = {
-            "bucket_location": bucket_location,  # Renamed from bucket_center
-            "bucket_location_k": i,  # Renamed from bucket_center_k
-            "bucket_min": bucket_min,
-            "bucket_max": bucket_max,
-            "bucket_range": f"{bucket_min // 1000}k-{bucket_max // 1000}k",
-            "models": {},
-        }
+    # Create buckets only if we have enough cases
+    if len(case_token_pairs) >= bucket_size:
+        num_buckets = 1 + (len(case_token_pairs) - bucket_size) // bucket_step
 
-        # Initialize model data
-        for model in all_models:
-            bucket_data["models"][model] = {
-                "overall": {"attempts": 0, "successful": 0},
-                "languages": {},
+        for i in range(num_buckets):
+            # Get the case range for this bucket
+            start_idx = i * bucket_step
+            end_idx = start_idx + bucket_size
+            bucket_cases = case_token_pairs[start_idx:end_idx]
+
+            # Calculate average token count for bucket position
+            avg_token_count = sum(pair[1] for pair in bucket_cases) / len(bucket_cases)
+
+            # Get the actual token range for this bucket
+            min_tokens = min(pair[1] for pair in bucket_cases)
+            max_tokens = max(pair[1] for pair in bucket_cases)
+
+            # Calculate the bucket display value (for labels)
+            bucket_location_k = round(avg_token_count / 1000, 1)
+
+            # Create case set for quick membership testing
+            case_set = {pair[0] for pair in bucket_cases}
+
+            # Get the cases in this bucket with their languages
+            bucket_case_languages = {
+                case_prefix: case_languages.get(case_prefix, "unknown")
+                for case_prefix in case_set
             }
 
-        buckets.append(bucket_data)
+            # Count cases per language in this bucket
+            language_case_counts = defaultdict(int)
+            for lang in bucket_case_languages.values():
+                language_case_counts[lang] += 1
+
+            # Initialize data for this bucket
+            bucket_data = {
+                "bucket_location": avg_token_count,
+                "bucket_location_k": bucket_location_k,
+                "bucket_min": min_tokens,
+                "bucket_max": max_tokens,
+                "bucket_range": f"{min_tokens // 1000}k-{max_tokens // 1000}k",
+                "case_indices": f"{start_idx + 1}-{end_idx}",
+                "models": {},
+                "case_prefixes": case_set,  # Store set of cases in this bucket
+                "language_case_counts": dict(
+                    language_case_counts
+                ),  # Store counts per language
+            }
+
+            # Initialize model data
+            for model in all_models:
+                bucket_data["models"][model] = {
+                    "overall": {"attempts": 0, "successful": 0},
+                    "languages": {},
+                }
+
+            buckets.append(bucket_data)
 
     # Populate buckets with result data
     for (case_prefix, model), result_metadata in results_metadata.items():
-        # Get token count for this case
-        token_count = prompt_metadata.get(case_prefix, {}).get("prompt_tokens", 0)
-
         # Get language for this case
         language = case_languages.get(case_prefix, "unknown")
 
-        # Add this case to all buckets that cover its token count
+        # Add this case to all buckets that contain it
         for bucket in buckets:
-            if bucket["bucket_min"] <= token_count <= bucket["bucket_max"]:
+            if case_prefix in bucket["case_prefixes"]:
                 # Initialize language if needed
                 if language not in bucket["models"][model]["languages"]:
                     bucket["models"][model]["languages"][language] = {
@@ -766,8 +802,6 @@ def generate_chart_data(
                 if result_metadata.get("success", False):
                     bucket["models"][model]["overall"]["successful"] += 1
                     bucket["models"][model]["languages"][language]["successful"] += 1
-
-                # Note: No break here, so we continue to add this case to all matching buckets
 
     # Calculate confidence intervals for all data points
     for bucket in buckets:
@@ -800,6 +834,15 @@ def generate_chart_data(
         if model in model_display_names:
             model_display_map[model] = model_display_names[model]
 
+    # Calculate max tokens from buckets or use default
+    max_tokens_k = 75  # Default if no buckets
+    if buckets:
+        # Find the bucket with the highest average token count
+        max_tokens = max(bucket["bucket_location"] for bucket in buckets)
+        max_tokens_k = round(
+            max_tokens / 1000, 1
+        )  # Convert to k and round to 1 decimal
+
     # Create the chart data object
     chart_data = {
         "buckets": buckets,
@@ -826,10 +869,19 @@ def write_chart_data_to_file(chart_data: Dict[str, Any], output_dir: Path) -> No
     """Writes chart data to a JSON file in the specified directory."""
     output_path = output_dir / "chart_data.json"
     try:
+        # Process chart data to make it JSON serializable
+        chart_data_copy = copy.deepcopy(chart_data)
+
+        # Remove the case_prefixes set from each bucket as it's not JSON serializable
+        # and only used internally for processing
+        for bucket in chart_data_copy["buckets"]:
+            if "case_prefixes" in bucket:
+                del bucket["case_prefixes"]
+
         # Create a wrapper object that includes the warning
         wrapper = {
             "_warning": get_auto_generation_warning().strip(),
-            "data": chart_data,
+            "data": chart_data_copy,
         }
 
         with open(output_path, "w", encoding="utf-8") as f:
@@ -909,6 +961,10 @@ function initializeChart(chartData) {
         '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'
     ];
     
+    // Create global variables for chart state that need to be accessed by callbacks
+    let currentSelectedLanguages = [];
+    let currentSelectedModels = [];
+    
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
@@ -957,7 +1013,6 @@ function initializeChart(chartData) {
     const chart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: chartData.buckets.map(bucket => bucket.bucket_location_k + 'k'),
             datasets: []
         },
         options: {
@@ -965,6 +1020,18 @@ function initializeChart(chartData) {
             maintainAspectRatio: false,
             scales: {
                 x: {
+                    type: 'linear',
+                    // Set axis limits based on actual data
+                    min: chartData.buckets.length > 0 ? 
+                         Math.floor(chartData.buckets[0].bucket_location / 1000) : 0,
+                    max: chartData.buckets.length > 0 ? 
+                         Math.ceil(chartData.buckets[chartData.buckets.length - 1].bucket_location / 1000) : 100,
+                    ticks: {
+                        precision: 1,
+                        callback: function(value) {
+                            return value + 'k';
+                        }
+                    },
                     title: {
                         display: true,
                         text: 'Prompt Token Length (k)'
@@ -980,6 +1047,17 @@ function initializeChart(chartData) {
                 }
             },
             plugins: {
+                title: {
+                    display: true,
+                    text: 'LoCoDiff: Natural Long Context Code Bench',
+                    font: {
+                        size: 18
+                    },
+                    padding: {
+                        top: 10,
+                        bottom: 30
+                    }
+                },
                 legend: {
                     labels: {
                         // Custom filter function to exclude datasets with display: false from the legend
@@ -1008,12 +1086,19 @@ function initializeChart(chartData) {
                                 // Use originalModel property we added to dataset for data lookup
                                 const originalModel = context.dataset.originalModel || displayName;
                                 
-                                // Safety check for dataIndex
-                                if (context.dataIndex === undefined || !chartData.buckets[context.dataIndex]) {
+                                // With x,y coordinates, we need to find the bucket by x value (token count)
+                                // rather than by index
+                                const xValue = context.raw.x; // This is the token count in thousands
+                                
+                                // Find the bucket with matching token count
+                                const bucketData = chartData.buckets.find(bucket => 
+                                    Math.abs((bucket.bucket_location / 1000) - xValue) < 0.01
+                                );
+                                
+                                // Safety check for bucket
+                                if (!bucketData) {
                                     return [`${displayName}`];
                                 }
-                                
-                                const bucketData = chartData.buckets[context.dataIndex];
                                 
                                 // Safety check for model data
                                 if (!bucketData.models || !bucketData.models[originalModel]) {
@@ -1022,8 +1107,8 @@ function initializeChart(chartData) {
                                 
                                 const modelData = bucketData.models[originalModel];
                                 
-                                // Get basic stats
-                                const successRate = context.raw;
+                                // Get basic stats - with x,y coordinate objects, y is the success rate
+                                const successRate = context.raw.y;
                                 
                                 // Use filtered data if available, otherwise fall back to overall data
                                 let successful, attempts;
@@ -1047,9 +1132,33 @@ function initializeChart(chartData) {
                                     ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
                                 }
                                 
+                                // Add case indices information
+                                const caseInfo = bucketData.case_indices ? `\nCases: ${bucketData.case_indices}` : '';
+                                
+                                // Calculate filtered bucket size based on selected languages
+                                let filteredBucketSize = 30; // Default size
+                                if (bucketData.language_case_counts && currentSelectedLanguages.length > 0) {
+                                    filteredBucketSize = 0;
+                                    currentSelectedLanguages.forEach(language => {
+                                        filteredBucketSize += bucketData.language_case_counts[language] || 0;
+                                    });
+                                }
+                                
+                                // If we have a filtered size of 0, use the default
+                                if (filteredBucketSize === 0) {
+                                    filteredBucketSize = 30;
+                                }
+                                
+                                // Calculate untested cases
+                                const untestedCases = filteredBucketSize - attempts;
+                                let untestedInfo = '';
+                                if (untestedCases > 0) {
+                                    untestedInfo = `\nModel did not return result for ${untestedCases} case${untestedCases > 1 ? 's' : ''} in this bucket`;
+                                }
+                                
                                 return [
-                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${attempts})`,
-                                    `Token Range: ${bucketData.bucket_range}${ciInfo}`
+                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${filteredBucketSize})`,
+                                    `Token Range: ${bucketData.bucket_range} (avg: ${(bucketData.bucket_location/1000).toFixed(1)}k)${caseInfo}${untestedInfo}${ciInfo}`
                                 ];
                             } catch (error) {
                                 console.error('Error in tooltip callback:', error);
@@ -1065,10 +1174,10 @@ function initializeChart(chartData) {
     // Function to update chart based on selected models and languages
     function updateChart() {
         // Get selected models and languages
-        const selectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
+        currentSelectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
             .map(checkbox => checkbox.getAttribute('data-model'));
         
-        const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
+        currentSelectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
             .map(checkbox => checkbox.getAttribute('data-language'));
         
         // Clear filteredData from previous filter selections
@@ -1080,7 +1189,7 @@ function initializeChart(chartData) {
         chart.data.datasets = [];
         
         // Create datasets for each selected model
-        selectedModels.forEach((model) => {
+        currentSelectedModels.forEach((model) => {
             // Use the consistent color from our color map
             const color = modelColorMap[model];
             
@@ -1092,12 +1201,12 @@ function initializeChart(chartData) {
                 let successful = 0;
                 let attempts = 0;
                 
-                if (selectedLanguages.length === 0) {
+                if (currentSelectedLanguages.length === 0) {
                     // No languages selected, show empty chart (consistent with model selection behavior)
                     return null;
                 } else {
                     // Use only selected languages
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         if (modelData.languages[language]) {
                             successful += modelData.languages[language].successful;
                             attempts += modelData.languages[language].attempts;
@@ -1118,35 +1227,60 @@ function initializeChart(chartData) {
                     attempts: attempts
                 };
                 
-                // Calculate success rate
-                return attempts > 0 ? (successful / attempts * 100) : null;
+                // Calculate the filtered bucket size based on selected languages
+                let filteredBucketSize = 0;
+                if (bucket.language_case_counts) {
+                    currentSelectedLanguages.forEach(language => {
+                        filteredBucketSize += bucket.language_case_counts[language] || 0;
+                    });
+                }
+                // Use filtered size as denominator if available, otherwise use default bucket size
+                const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                
+                // Calculate success rate - divide by appropriate denominator
+                // This assumes any prompt not tested was a failure
+                const y = successful > 0 ? (successful / denominator * 100) : 0;
+                // Return x,y coordinates where x is the bucket location in thousands
+                return {
+                    x: bucket.bucket_location / 1000, // Convert to k
+                    y: y
+                };
             });
             
             // Calculate confidence interval data points if languages are selected
             let lowerBoundPoints = null;
             let upperBoundPoints = null;
             
-            if (selectedLanguages.length > 0) {
+            if (currentSelectedLanguages.length > 0) {
                 lowerBoundPoints = chartData.buckets.map(bucket => {
                     const modelData = bucket.models[model];
                     
                     // Use only selected languages
                     let langSuccessful = 0;
-                    let langAttempts = 0;
                     
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         if (modelData.languages[language]) {
                             langSuccessful += modelData.languages[language].successful;
-                            langAttempts += modelData.languages[language].attempts;
                         }
                     });
                     
-                    if (langAttempts > 0) {
-                        // Recalculate Wilson interval for the combined languages
-                        const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
-                        return lower * 100; // Convert to percentage
+                    // Calculate bucket size based on selected languages
+                    let filteredBucketSize = 0;
+                    if (bucket.language_case_counts) {
+                        currentSelectedLanguages.forEach(language => {
+                            filteredBucketSize += bucket.language_case_counts[language] || 0;
+                        });
                     }
-                    return null;
+                    // Use filtered size as denominator if available, otherwise use default bucket size
+                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                    
+                    // Recalculate Wilson interval using the appropriate denominator
+                    const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
+                    // Return x,y coordinates for lower bound
+                    return {
+                        x: bucket.bucket_location / 1000, // Convert to k
+                        y: lower * 100 // Convert to percentage
+                    };
                 });
                 
                 upperBoundPoints = chartData.buckets.map(bucket => {
@@ -1154,21 +1288,30 @@ function initializeChart(chartData) {
                     
                     // Use only selected languages
                     let langSuccessful = 0;
-                    let langAttempts = 0;
                     
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         if (modelData.languages[language]) {
                             langSuccessful += modelData.languages[language].successful;
-                            langAttempts += modelData.languages[language].attempts;
                         }
                     });
                     
-                    if (langAttempts > 0) {
-                        // Recalculate Wilson interval for the combined languages
-                        const [lower, upper] = wilson_score_interval(langSuccessful, langAttempts);
-                        return upper * 100; // Convert to percentage
+                    // Calculate bucket size based on selected languages
+                    let filteredBucketSize = 0;
+                    if (bucket.language_case_counts) {
+                        currentSelectedLanguages.forEach(language => {
+                            filteredBucketSize += bucket.language_case_counts[language] || 0;
+                        });
                     }
-                    return null;
+                    // Use filtered size as denominator if available, otherwise use default bucket size
+                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                    
+                    // Recalculate Wilson interval using the appropriate denominator
+                    const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
+                    // Return x,y coordinates for upper bound
+                    return {
+                        x: bucket.bucket_location / 1000, // Convert to k
+                        y: upper * 100 // Convert to percentage
+                    };
                 });
             }
             
@@ -1187,13 +1330,14 @@ function initializeChart(chartData) {
                 fill: false,
                 tension: 0.1,
                 pointRadius: 4,
-                pointHoverRadius: 6
+                pointHoverRadius: 6,
+                parsing: false  // Tell Chart.js we're using x,y objects directly
             });
             
             // Add confidence interval datasets if enabled
             const showConfidenceIntervals = document.getElementById('show-confidence-intervals').checked;
             
-            if (showConfidenceIntervals && selectedLanguages.length > 0) {
+            if (showConfidenceIntervals && currentSelectedLanguages.length > 0) {
                 // Add lower bound line first (needed for reference by the area dataset)
                 const lowerBoundIndex = chart.data.datasets.length;
                 chart.data.datasets.push({
@@ -1204,6 +1348,7 @@ function initializeChart(chartData) {
                     pointRadius: 0,
                     tension: 0.1,
                     fill: false,
+                    parsing: false,  // Tell Chart.js we're using x,y objects directly
                     showLine: false, // Don't draw a line for this dataset
                     display: false   // Completely exclude from legend
                 });
@@ -1216,6 +1361,7 @@ function initializeChart(chartData) {
                     backgroundColor: color + '22', // Very transparent version of the line color
                     pointRadius: 0,
                     tension: 0.1,
+                    parsing: false,  // Tell Chart.js we're using x,y objects directly
                     fill: lowerBoundIndex, // Fill to the specific dataset index (the lower bound)
                     display: false         // Completely exclude from legend
                 });
