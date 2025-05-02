@@ -1027,22 +1027,26 @@ function initializeChart(chartData) {
                     // use bucket locations (averages) for exact alignment with data points
                     min: firstBucket.bucket_location / 1000,   // Use first bucket average
                     max: lastBucket.bucket_location / 1000,   // Use last bucket average
+                    // Override the tick generation completely to ensure we get exactly what we want
+                    afterFit: function(scaleInstance) {
+                        // Make sure our exact list of ticks is used
+                        const tickValues = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75];
+                        
+                        // Create proper tick objects with value and label
+                        scaleInstance.ticks = tickValues.map(value => ({
+                            value: value,
+                            label: value + 'k',
+                            major: false
+                        }));
+                    },
                     ticks: {
-                        // Force a smaller distance between ticks
-                        maxTicksLimit: 20,
-                        // Custom callback that controls which ticks are displayed and how
+                        // Only format ticks that were explicitly added
                         callback: function(value, index, values) {
-                            // Use a wider range (9-76) to make sure we catch values close to 10 and 75
-                            // This ensures we include the boundary values of our desired tick range
-                            if (value >= 9 && value <= 76 && Math.round(value % 5 * 10) / 10 === 0) {
-                                // Round to nearest 5 to ensure exact tick values
-                                const roundedValue = Math.round(value / 5) * 5;
-                                // Only show values between 10 and 75 inclusive
-                                if (roundedValue >= 10 && roundedValue <= 75) {
-                                    return roundedValue + 'k';
-                                }
+                            // Return value + 'k' for our desired ticks
+                            if ([10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75].includes(parseFloat(value))) {
+                                return value + 'k';
                             }
-                            // Return null for any other values to hide them
+                            // Return null to hide any other ticks
                             return null;
                         },
                         precision: 1
