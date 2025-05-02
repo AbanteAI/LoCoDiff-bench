@@ -1028,16 +1028,21 @@ function initializeChart(chartData) {
                     min: firstBucket.bucket_location / 1000,   // Use first bucket average
                     max: lastBucket.bucket_location / 1000,   // Use last bucket average
                     ticks: {
+                        // Force Chart.js to only use our specific values
+                        source: 'data',
                         // Explicitly define the tick values we want to show (5k intervals from 10k to 75k)
                         values: [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75],
+                        // Format the ticks
                         callback: function(value) {
                             return value + 'k';
                         },
-                        precision: 1
+                        precision: 1,
+                        // Disable auto-skipping ticks
+                        autoSkip: false
                     },
                     title: {
                         display: true,
-                        text: 'Prompt Token Length (k)'
+                        text: 'Prompt Token Length'
                     }
                 },
                 y: {
