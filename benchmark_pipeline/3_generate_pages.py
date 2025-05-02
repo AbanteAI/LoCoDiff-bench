@@ -1021,15 +1021,11 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    afterBuildTicks: function(scale) {
-                        // Create custom ticks at each bucket position
-                        const ticks = chartData.buckets.map(bucket => bucket.bucket_location / 1000);
-                        scale.ticks = ticks;
-                        return scale;
-                    },
+                    // Simpler approach with basic configuration
                     ticks: {
+                        precision: 1,
                         callback: function(value) {
-                            return value.toFixed(1) + 'k';
+                            return value + 'k';
                         }
                     },
                     title: {
