@@ -315,15 +315,17 @@ def collect_results_metadata(
             if metadata_path.exists():
                 metadata = read_json_file(metadata_path)
 
-                # Get the model name from metadata
+                # Get the model name from metadata - this is required
                 if "model" in metadata:
                     model_name = metadata["model"]
                     all_models.add(model_name)
                     results_metadata[(case_prefix, model_name)] = metadata
                 else:
-                    # If model is missing from metadata, report an error and skip this result
-                    print(f"Error: Missing 'model' field in metadata: {metadata_path}")
-                    # Continue to next model dir, skipping this one
+                    # If model is missing from metadata, raise an error to crash the build
+                    # This is critical metadata and we need to know if it's missing
+                    raise ValueError(
+                        f"Missing required 'model' field in metadata: {metadata_path}"
+                    )
 
     return results_metadata, all_models
 
