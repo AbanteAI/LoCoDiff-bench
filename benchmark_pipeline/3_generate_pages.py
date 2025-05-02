@@ -1021,7 +1021,11 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    // Simpler approach with basic configuration
+                    // Set axis limits based on actual data
+                    min: chartData.buckets.length > 0 ? 
+                         Math.floor(chartData.buckets[0].bucket_location / 1000) : 0,
+                    max: chartData.buckets.length > 0 ? 
+                         Math.ceil(chartData.buckets[chartData.buckets.length - 1].bucket_location / 1000) : 100,
                     ticks: {
                         precision: 1,
                         callback: function(value) {
