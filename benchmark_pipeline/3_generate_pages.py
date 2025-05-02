@@ -961,6 +961,10 @@ function initializeChart(chartData) {
         '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'
     ];
     
+    // Create global variables for chart state that need to be accessed by callbacks
+    let currentSelectedLanguages = [];
+    let currentSelectedModels = [];
+    
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
@@ -1104,9 +1108,9 @@ function initializeChart(chartData) {
                                 
                                 // Calculate filtered bucket size based on selected languages
                                 let filteredBucketSize = 30; // Default size
-                                if (bucketData.language_case_counts && selectedLanguages.length > 0) {
+                                if (bucketData.language_case_counts && currentSelectedLanguages.length > 0) {
                                     filteredBucketSize = 0;
-                                    selectedLanguages.forEach(language => {
+                                    currentSelectedLanguages.forEach(language => {
                                         filteredBucketSize += bucketData.language_case_counts[language] || 0;
                                     });
                                 }
@@ -1141,10 +1145,10 @@ function initializeChart(chartData) {
     // Function to update chart based on selected models and languages
     function updateChart() {
         // Get selected models and languages
-        const selectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
+        currentSelectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
             .map(checkbox => checkbox.getAttribute('data-model'));
         
-        const selectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
+        currentSelectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
             .map(checkbox => checkbox.getAttribute('data-language'));
         
         // Clear filteredData from previous filter selections
@@ -1156,7 +1160,7 @@ function initializeChart(chartData) {
         chart.data.datasets = [];
         
         // Create datasets for each selected model
-        selectedModels.forEach((model) => {
+        currentSelectedModels.forEach((model) => {
             // Use the consistent color from our color map
             const color = modelColorMap[model];
             
@@ -1168,12 +1172,12 @@ function initializeChart(chartData) {
                 let successful = 0;
                 let attempts = 0;
                 
-                if (selectedLanguages.length === 0) {
+                if (currentSelectedLanguages.length === 0) {
                     // No languages selected, show empty chart (consistent with model selection behavior)
                     return null;
                 } else {
                     // Use only selected languages
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         if (modelData.languages[language]) {
                             successful += modelData.languages[language].successful;
                             attempts += modelData.languages[language].attempts;
@@ -1197,7 +1201,7 @@ function initializeChart(chartData) {
                 // Calculate the filtered bucket size based on selected languages
                 let filteredBucketSize = 0;
                 if (bucket.language_case_counts) {
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         filteredBucketSize += bucket.language_case_counts[language] || 0;
                     });
                 }
@@ -1213,14 +1217,14 @@ function initializeChart(chartData) {
             let lowerBoundPoints = null;
             let upperBoundPoints = null;
             
-            if (selectedLanguages.length > 0) {
+            if (currentSelectedLanguages.length > 0) {
                 lowerBoundPoints = chartData.buckets.map(bucket => {
                     const modelData = bucket.models[model];
                     
                     // Use only selected languages
                     let langSuccessful = 0;
                     
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         if (modelData.languages[language]) {
                             langSuccessful += modelData.languages[language].successful;
                         }
@@ -1247,7 +1251,7 @@ function initializeChart(chartData) {
                     // Use only selected languages
                     let langSuccessful = 0;
                     
-                    selectedLanguages.forEach(language => {
+                    currentSelectedLanguages.forEach(language => {
                         if (modelData.languages[language]) {
                             langSuccessful += modelData.languages[language].successful;
                         }
@@ -1290,7 +1294,7 @@ function initializeChart(chartData) {
             // Add confidence interval datasets if enabled
             const showConfidenceIntervals = document.getElementById('show-confidence-intervals').checked;
             
-            if (showConfidenceIntervals && selectedLanguages.length > 0) {
+            if (showConfidenceIntervals && currentSelectedLanguages.length > 0) {
                 // Add lower bound line first (needed for reference by the area dataset)
                 const lowerBoundIndex = chart.data.datasets.length;
                 chart.data.datasets.push({
