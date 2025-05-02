@@ -1,0 +1,865 @@
+```js
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @flow
+ */
+
+import type {Fiber} from './ReactInternalTypes';
+import {NoMode, ConcurrentMode} from './ReactTypeOfMode';
+import type {
+  Instance,
+  TextInstance,
+  HydratableInstance,
+  ActivityInstance,
+  SuspenseInstance,
+  Container,
+  HostContext,
+} from './ReactFiberConfig';
+import type {ActivityState} from './ReactFiberActivityComponent';
+import type {SuspenseState} from './ReactFiberSuspenseComponent';
+import type {TreeContext} from './ReactFiberTreeContext';
+import type {CapturedValue} from './ReactCapturedValue';
+import type {HydrationDiffNode} from './ReactFiberHydrationDiffs';
+
+import {
+  HostComponent,
+  HostSingleton,
+  HostText,
+  HostRoot,
+  ActivityComponent,
+  SuspenseComponent,
+} from './ReactWorkTags';
+import {
+  ChildDeletion,
+  Placement,
+  Hydrating,
+  NoFlags,
+  DidCapture,
+} from './ReactFiberFlags';
+import {
+  enableClientRenderFallbackOnTextMismatch,
+  favorSafetyOverHydrationPerf,
+} from 'shared/ReactFeatureFlags';
+import {createCapturedValueAtFiber} from './ReactCapturedValue';
+
+import {createFiberFromHostInstanceForDeletion} from './ReactFiber';
+import {
+  shouldSetTextContent,
+  supportsHydration,
+  supportsSingletons,
+  getNextHydratableSibling,
+  getNextHydratableSiblingAfterSingleton,
+  getFirstHydratableChild,
+  getFirstHydratableChildWithinContainer,
+  getFirstHydratableChildWithinSingleton,
+  getFirstHydratableChildWithinActivityInstance,
+  getFirstHydratableChildWithinSuspenseInstance,
+  hydrateInstance,
+  diffHydratedPropsForDevWarnings,
+  describeHydratableInstanceForDevWarnings,
+  hydrateTextInstance,
+  diffHydratedTextForDevWarnings,
+  hydrateActivityInstance,
+  hydrateSuspenseInstance,
+  getNextHydratableInstanceAfterActivityInstance,
+  getNextHydratableInstanceAfterSuspenseInstance,
+  shouldDeleteUnhydratedTailInstances,
+  canHydrateInstance,
+  canHydrateTextInstance,
+  canHydrateActivityInstance,
+  canHydrateSuspenseInstance,
+  canHydrateFormStateMarker,
+  isFormStateMarkerMatching,
+  isHydratableText,
+  resolveSingletonInstance,
+} from './ReactFiberConfig';
+import {OffscreenLane} from './ReactFiberLane';
+import {
+  getSuspendedTreeContext,
+  restoreSuspendedTreeContext,
+} from './ReactFiberTreeContext';
+import {queueRecoverableErrors} from './ReactFiberWorkLoop';
+import {getRootHostContainer, getHostContext} from './ReactFiberHostContext';
+import {describeDiff} from './ReactFiberHydrationDiffs';
+import {runWithFiberInDEV} from './ReactCurrentFiber';
+
+// The deepest Fiber on the stack involved in a hydration context.
+// This may have been an insertion or a hydration.
+let hydrationParentFiber: null | Fiber = null;
+let nextHydratableInstance: null | HydratableInstance = null;
+let isHydrating: boolean = false;
+
+// This flag allows for warning suppression when we expect there to be mismatches
+// due to earlier mismatches or a suspended fiber.
+let didSuspendOrErrorDEV: boolean = false;
+
+// Hydration errors that were thrown inside this boundary
+let hydrationErrors: Array<CapturedValue<mixed>> | null = null;
+
+// Hydration differences found that haven't yet been logged.
+let hydrationDiffRootDEV: null | HydrationDiffNode = null;
+
+// The root or singleton context flag
+let rootOrSingletonContext = false;
+
+function warnIfHydrating() {
+  if (__DEV__) {
+    if (isHydrating) {
+      console.error(
+        'We should not be hydrating here. This is a bug in React. Please file a bug.'
+      );
+    }
+  }
+}
+
+export function markDidThrowWhileHydratingDEV() {
+  if (__DEV__) {
+    didSuspendOrErrorDEV = true;
+  }
+}
+
+function buildHydrationDiffNode(
+  fiber: Fiber,
+  distanceFromLeaf: number,
+): HydrationDiffNode {
+  if (fiber.return === null) {
+    // We're at the root.
+    if (hydrationDiffRootDEV === null) {
+      hydrationDiffRootDEV = {
+        fiber,
+        children: [],
+        serverProps: undefined,
+        serverTail: [],
+        distanceFromLeaf,
+      };
+    } else {
+      if (
+        hydrationDiffRootDEV.fiber !== fiber ||
+        hydrationDiffRootDEV.distanceFromLeaf > distanceFromLeaf
+      ) {
+        hydrationDiffRootDEV = {
+          fiber,
+          children: hydrationDiffRootDEV.children,
+          serverProps: hydrationDiffRootDEV.serverProps,
+          serverTail: hydrationDiffRootDEV.serverTail,
+          distanceFromLeaf,
+        };
+      }
+    }
+    return hydrationDiffRootDEV;
+  }
+  const parentNode = buildHydrationDiffNode(
+    fiber.return,
+    distanceFromLeaf + 1,
+  );
+  const siblings = parentNode.children;
+  const last = siblings[siblings.length - 1];
+  if (last !== undefined && last.fiber === fiber) {
+    if (last.distanceFromLeaf > distanceFromLeaf) {
+      last.distanceFromLeaf = distanceFromLeaf;
+    }
+    return last;
+  }
+  const newNode: HydrationDiffNode = {
+    fiber,
+    children: [],
+    serverProps: undefined,
+    serverTail: [],
+    distanceFromLeaf,
+  };
+  siblings.push(newNode);
+  return newNode;
+}
+
+function enterHydrationState(fiber: Fiber): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+  const parentInstance: Container = fiber.stateNode.containerInfo;
+  nextHydratableInstance = getFirstHydratableChildWithinContainer(
+    parentInstance
+  );
+  hydrationParentFiber = fiber;
+  isHydrating = true;
+  hydrationErrors = null;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+  rootOrSingletonContext = true;
+  return true;
+}
+
+function reenterHydrationStateFromDehydratedActivityInstance(
+  fiber: Fiber,
+  activityInstance: ActivityInstance,
+  treeContext: TreeContext | null,
+): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+  nextHydratableInstance =
+    getFirstHydratableChildWithinActivityInstance(activityInstance);
+  hydrationParentFiber = fiber;
+  isHydrating = true;
+  hydrationErrors = null;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+  rootOrSingletonContext = false;
+  if (treeContext !== null) {
+    restoreSuspendedTreeContext(fiber, treeContext);
+  }
+  return true;
+}
+
+function reenterHydrationStateFromDehydratedSuspenseInstance(
+  fiber: Fiber,
+  suspenseInstance: SuspenseInstance,
+  treeContext: TreeContext | null,
+): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+  nextHydratableInstance =
+    getFirstHydratableChildWithinSuspenseInstance(suspenseInstance);
+  hydrationParentFiber = fiber;
+  isHydrating = true;
+  hydrationErrors = null;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+  rootOrSingletonContext = false;
+  if (treeContext !== null) {
+    restoreSuspendedTreeContext(fiber, treeContext);
+  }
+  return true;
+}
+
+function deleteHydratableInstance(
+  returnFiber: Fiber,
+  instance: HydratableInstance,
+) {
+  if (__DEV__) {
+    // no-op: warnings are collected in diffs
+  }
+  const childToDelete = createFiberFromHostInstanceForDeletion();
+  childToDelete.stateNode = instance;
+  childToDelete.return = returnFiber;
+  returnFiber.deletions = returnFiber.deletions || [];
+  returnFiber.deletions.push(childToDelete);
+  returnFiber.flags |= ChildDeletion;
+}
+
+function warnNonHydratedInstance(
+  fiber: Fiber,
+  rejectedCandidate: null | HydratableInstance,
+) {
+  if (__DEV__) {
+    if (didSuspendOrErrorDEV) {
+      return;
+    }
+    const diffNode = buildHydrationDiffNode(fiber, 0);
+    diffNode.serverProps = null;
+    if (rejectedCandidate !== null) {
+      const desc = describeHydratableInstanceForDevWarnings(
+        rejectedCandidate
+      );
+      diffNode.serverTail.push(desc);
+    }
+  }
+}
+
+function tryHydrateInstance(
+  fiber: Fiber,
+  nextInstance: any,
+  hostContext: HostContext,
+) {
+  const instance = canHydrateInstance(
+    nextInstance,
+    fiber.type,
+    fiber.pendingProps,
+    hostContext,
+    rootOrSingletonContext
+  );
+  if (instance !== null) {
+    fiber.stateNode = (instance: Instance);
+    hydrationParentFiber = fiber;
+    nextHydratableInstance = getFirstHydratableChild(instance);
+    rootOrSingletonContext = false;
+
+    if (__DEV__ && !didSuspendOrErrorDEV) {
+      const diffs = diffHydratedPropsForDevWarnings(
+        instance,
+        fiber.type,
+        fiber.memoizedProps,
+        hostContext
+      );
+      if (diffs !== null) {
+        const diffNode = buildHydrationDiffNode(fiber, 0);
+        diffNode.serverProps = diffs;
+      }
+    }
+
+    return true;
+  }
+  return false;
+}
+
+function tryHydrateText(
+  fiber: Fiber,
+  nextInstance: any,
+) {
+  const text = fiber.pendingProps;
+  const textInstance = canHydrateTextInstance(
+    nextInstance,
+    text,
+    rootOrSingletonContext
+  );
+  if (textInstance !== null) {
+    fiber.stateNode = (textInstance: TextInstance);
+    hydrationParentFiber = fiber;
+    nextHydratableInstance = null;
+
+    if (__DEV__ && !didSuspendOrErrorDEV) {
+      const diff = diffHydratedTextForDevWarnings(
+        textInstance,
+        text,
+        fiber.memoizedProps
+      );
+      if (diff !== null) {
+        const diffNode = buildHydrationDiffNode(fiber, 0);
+        diffNode.serverProps = diff;
+      }
+    }
+
+    return true;
+  }
+  return false;
+}
+
+function tryHydrateActivity(
+  fiber: Fiber,
+  nextInstance: any,
+): null | ActivityInstance {
+  const activityInstance = canHydrateActivityInstance(
+    nextInstance,
+    rootOrSingletonContext
+  );
+  if (activityInstance !== null) {
+    const activityState: ActivityState = {
+      dehydrated: activityInstance,
+      treeContext: getSuspendedTreeContext(),
+      retryLane: OffscreenLane,
+      hydrationErrors: null,
+    };
+    fiber.memoizedState = activityState;
+    const dehydratedFrag = createFiberFromDehydratedFragment(
+      activityInstance
+    );
+    dehydratedFrag.return = fiber;
+    fiber.child = dehydratedFrag;
+    hydrationParentFiber = fiber;
+    nextHydratableInstance = null;
+    return activityInstance;
+  }
+  return null;
+}
+
+function tryHydrateSuspense(
+  fiber: Fiber,
+  nextInstance: any,
+): null | SuspenseInstance {
+  const suspenseInstance = canHydrateSuspenseInstance(
+    nextInstance,
+    rootOrSingletonContext
+  );
+  if (suspenseInstance !== null) {
+    const suspenseState: SuspenseState = {
+      dehydrated: suspenseInstance,
+      treeContext: getSuspendedTreeContext(),
+      retryLane: OffscreenLane,
+    };
+    fiber.memoizedState = suspenseState;
+    const dehydratedFrag = createFiberFromDehydratedFragment(
+      suspenseInstance
+    );
+    dehydratedFrag.return = fiber;
+    fiber.child = dehydratedFrag;
+    hydrationParentFiber = fiber;
+    nextHydratableInstance = null;
+    return suspenseInstance;
+  }
+  return null;
+}
+
+function claimNextHydratableActivityInstance(fiber: Fiber): ActivityInstance {
+  const nextInstance = nextHydratableInstance;
+  const activityInstance = nextInstance
+    ? tryHydrateActivity(fiber, nextInstance)
+    : null;
+  if (activityInstance === null) {
+    warnNonHydratedInstance(fiber, nextInstance);
+    throw throwOnHydrationMismatch(fiber, false);
+  }
+  return activityInstance;
+}
+
+function claimNextHydratableSuspenseInstance(fiber: Fiber): SuspenseInstance {
+  const nextInstance = nextHydratableInstance;
+  const suspenseInstance = nextInstance
+    ? tryHydrateSuspense(fiber, nextInstance)
+    : null;
+  if (suspenseInstance === null) {
+    warnNonHydratedInstance(fiber, nextInstance);
+    throw throwOnHydrationMismatch(fiber, false);
+  }
+  return suspenseInstance;
+}
+
+export function tryToClaimNextHydratableFormMarkerInstance(
+  fiber: Fiber,
+): boolean {
+  if (!isHydrating) {
+    return false;
+  }
+  if (nextHydratableInstance) {
+    const marker = canHydrateFormStateMarker(
+      nextHydratableInstance,
+      rootOrSingletonContext
+    );
+    if (marker) {
+      nextHydratableInstance = getNextHydratableSibling(marker);
+      return isFormStateMarkerMatching(marker);
+    }
+  }
+  throw throwOnHydrationMismatch(fiber, false);
+}
+
+function claimHydratableSingleton(fiber: Fiber): void {
+  if (supportsSingletons) {
+    if (!isHydrating) {
+      return;
+    }
+    const currentRootContainer = getRootHostContainer();
+    const currentHostContext = getHostContext();
+    const instance: Instance = resolveSingletonInstance(
+      fiber.type,
+      fiber.pendingProps,
+      currentRootContainer,
+      currentHostContext,
+      false
+    );
+
+    if (__DEV__ && !didSuspendOrErrorDEV) {
+      const diffs = diffHydratedPropsForDevWarnings(
+        instance,
+        fiber.type,
+        fiber.pendingProps,
+        currentHostContext
+      );
+      if (diffs !== null) {
+        const diffNode = buildHydrationDiffNode(fiber, 0);
+        diffNode.serverProps = diffs;
+      }
+    }
+
+    fiber.stateNode = instance;
+    hydrationParentFiber = fiber;
+    rootOrSingletonContext = true;
+    nextHydratableInstance = getFirstHydratableChildWithinSingleton(
+      fiber.type,
+      instance,
+      nextHydratableInstance
+    );
+  }
+}
+
+function tryToClaimNextHydratableInstance(fiber: Fiber): void {
+  if (!isHydrating) {
+    return;
+  }
+  let nextInstance = nextHydratableInstance;
+  if (!nextInstance) {
+    warnNonHydratedInstance(fiber, null);
+    throw throwOnHydrationMismatch(fiber, false);
+  }
+  const firstAttempt = nextInstance;
+  if (!tryHydrateInstance(
+    fiber,
+    nextInstance,
+    getHostContext()
+  )) {
+    nextHydratableInstance = getNextHydratableSibling(firstAttempt);
+    const prevParent = (hydrationParentFiber: any);
+    if (
+      !nextHydratableInstance ||
+      !tryHydrateInstance(
+        fiber,
+        nextHydratableInstance,
+        getHostContext()
+      )
+    ) {
+      warnNonHydratedInstance(fiber, null);
+      throw throwOnHydrationMismatch(fiber, false);
+    }
+    deleteHydratableInstance(prevParent, firstAttempt);
+  }
+}
+
+function tryToClaimNextHydratableTextInstance(fiber: Fiber): void {
+  if (!isHydrating) {
+    return;
+  }
+  const text = fiber.pendingProps;
+  let nextInstance = nextHydratableInstance;
+  if (!nextInstance || !tryHydrateText(fiber, nextInstance)) {
+    warnNonHydratedInstance(fiber, nextInstance);
+    throw throwOnHydrationMismatch(fiber, true);
+  }
+}
+
+function prepareToHydrateHostInstance(
+  fiber: Fiber,
+  hostContext: HostContext,
+): void {
+  if (!supportsHydration) {
+    throw new Error(
+      'Expected prepareToHydrateHostInstance() to never be called. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+
+  const instance: Instance = fiber.stateNode;
+  if (__DEV__ && !didSuspendOrErrorDEV) {
+    const diffs = diffHydratedPropsForDevWarnings(
+      instance,
+      fiber.type,
+      fiber.memoizedProps,
+      hostContext
+    );
+    if (diffs !== null) {
+      const diffNode = buildHydrationDiffNode(fiber, 0);
+      diffNode.serverProps = diffs;
+    }
+  }
+
+  const didHydrate = hydrateInstance(
+    instance,
+    fiber.type,
+    fiber.memoizedProps,
+    hostContext,
+    fiber,
+    !didSuspendOrErrorDEV
+  );
+  if (!didHydrate && favorSafetyOverHydrationPerf) {
+    throw throwOnHydrationMismatch(fiber, false);
+  }
+}
+
+function prepareToHydrateHostTextInstance(fiber: Fiber): void {
+  if (!supportsHydration) {
+    throw new Error(
+      'Expected prepareToHydrateHostTextInstance() to never be called. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+
+  const textIns: TextInstance = fiber.stateNode;
+  const textContent: string = fiber.memoizedProps;
+  const parentFiber = hydrationParentFiber;
+  let parentProps = null;
+  if (parentFiber !== null && parentFiber.tag === HostComponent) {
+    parentProps = parentFiber.memoizedProps;
+  }
+  if (__DEV__ && !didSuspendOrErrorDEV) {
+    const difference = diffHydratedTextForDevWarnings(
+      textIns,
+      textContent,
+      parentProps
+    );
+    if (difference !== null) {
+      const diffNode = buildHydrationDiffNode(fiber, 0);
+      diffNode.serverProps = difference;
+    }
+  }
+
+  const didHydrate = hydrateTextInstance(
+    textIns,
+    textContent,
+    fiber,
+    parentProps,
+  );
+  if (!didHydrate && favorSafetyOverHydrationPerf) {
+    throw throwOnHydrationMismatch(fiber, true);
+  }
+}
+
+function prepareToHydrateHostActivityInstance(fiber: Fiber): void {
+  if (!supportsHydration) {
+    throw new Error(
+      'Expected prepareToHydrateHostActivityInstance() to never be called. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+  const activityState: null | ActivityState = fiber.memoizedState;
+  const activityIns: null | ActivityInstance =
+    activityState !== null ? activityState.dehydrated : null;
+  if (!activityIns) {
+    throw new Error(
+      'Expected to have a hydrated activity instance. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+  hydrateActivityInstance(activityIns, fiber);
+}
+
+function prepareToHydrateHostSuspenseInstance(fiber: Fiber): void {
+  if (!supportsHydration) {
+    throw new Error(
+      'Expected prepareToHydrateHostSuspenseInstance() to never be called. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+  const state: null | SuspenseState = fiber.memoizedState;
+  const suspenseIns: null | SuspenseInstance =
+    state !== null ? state.dehydrated : null;
+  if (!suspenseIns) {
+    throw new Error(
+      'Expected to have a hydrated suspense instance. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+  hydrateSuspenseInstance(suspenseIns, fiber);
+}
+
+function skipPastDehydratedActivityInstance(
+  fiber: Fiber,
+): null | HydratableInstance {
+  const state: null | ActivityState = fiber.memoizedState;
+  const activityIns: null | ActivityInstance =
+    state !== null ? state.dehydrated : null;
+  if (!activityIns) {
+    throw new Error(
+      'Expected to have a hydrated activity instance. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+  return getNextHydratableInstanceAfterActivityInstance(activityIns);
+}
+
+function skipPastDehydratedSuspenseInstance(
+  fiber: Fiber,
+): null | HydratableInstance {
+  const state: null | SuspenseState = fiber.memoizedState;
+  const suspenseIns: null | SuspenseInstance =
+    state !== null ? state.dehydrated : null;
+  if (!suspenseIns) {
+    throw new Error(
+      'Expected to have a hydrated suspense instance. ' +
+        'This error is likely caused by a bug in React. Please file an issue.',
+    );
+  }
+  return getNextHydratableInstanceAfterSuspenseInstance(suspenseIns);
+}
+
+function popToNextHostParent(fiber: Fiber): void {
+  hydrationParentFiber = fiber.return;
+  while (hydrationParentFiber) {
+    switch (hydrationParentFiber.tag) {
+      case HostComponent:
+      case ActivityComponent:
+      case SuspenseComponent:
+        rootOrSingletonContext = false;
+        return;
+      case HostSingleton:
+      case HostRoot:
+        rootOrSingletonContext = true;
+        return;
+      default:
+        hydrationParentFiber = hydrationParentFiber.return;
+    }
+  }
+  hydrationParentFiber = null;
+}
+
+function throwOnHydrationMismatch(
+  fiber: Fiber,
+  fromText: boolean = false
+): Error {
+  let diff = '';
+  if (__DEV__) {
+    const root = hydrationDiffRootDEV;
+    if (root !== null) {
+      hydrationDiffRootDEV = null;
+      diff = describeDiff(root);
+    }
+  }
+  const cause = new Error(
+    `Hydration failed because the server rendered ${
+      fromText ? 'text' : 'HTML'
+    } didn't match the client. This tree will be regenerated on the client. ` +
+      'This can happen if a SSR-ed Client Component used:\n' +
+      '\n' +
+      "- A server/client branch `if (typeof window !== 'undefined')`.\n" +
+      "- Variable input such as `Date.now()` or `Math.random()`.\n" +
+      "- Date formatting in a user's locale that differs.\n" +
+      '- External changing data without sending a snapshot.\n' +
+      '- Invalid HTML tag nesting.\n' +
+      '\n' +
+      'It can also happen if a browser extension modified the HTML.\n\n' +
+      'https://react.dev/link/hydration-mismatch' +
+      diff
+  );
+  queueHydrationError(createCapturedValueAtFiber(cause, fiber));
+  throw HydrationMismatchException;
+}
+
+function popHydrationState(fiber: Fiber): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+  if (fiber !== hydrationParentFiber) {
+    return false;
+  }
+  if (!isHydrating) {
+    popToNextHostParent(fiber);
+    isHydrating = true;
+    return false;
+  }
+
+  const tag = fiber.tag;
+  if (supportsSingletons) {
+    if (
+      tag !== HostRoot &&
+      tag !== HostSingleton &&
+      !(tag === HostComponent &&
+        (!shouldDeleteUnhydratedTailInstances(
+          fiber.type
+        ) ||
+          shouldSetTextContent(
+            fiber.type,
+            fiber.memoizedProps
+          )))
+    ) {
+      const inst = nextHydratableInstance;
+      if (inst) {
+        warnNonHydratedInstance(fiber, inst);
+        throw throwOnHydrationMismatch(fiber, false);
+      }
+    }
+  } else {
+    if (
+      tag !== HostRoot &&
+      (tag !== HostComponent ||
+        (shouldDeleteUnhydratedTailInstances(fiber.type) &&
+          !shouldSetTextContent(
+            fiber.type,
+            fiber.memoizedProps
+          )))
+    ) {
+      const inst = nextHydratableInstance;
+      if (inst) {
+        warnNonHydratedInstance(fiber, inst);
+        throw throwOnHydrationMismatch(fiber, false);
+      }
+    }
+  }
+
+  popToNextHostParent(fiber);
+
+  if (tag === SuspenseComponent) {
+    nextHydratableInstance = skipPastDehydratedSuspenseInstance(fiber);
+  } else if (tag === ActivityComponent) {
+    nextHydratableInstance = skipPastDehydratedActivityInstance(fiber);
+  } else if (supportsSingletons && tag === HostSingleton) {
+    nextHydratableInstance = getNextHydratableSiblingAfterSingleton(
+      fiber.type,
+      nextHydratableInstance
+    );
+  } else {
+    nextHydratableInstance = hydrationParentFiber
+      ? getNextHydratableSibling(fiber.stateNode)
+      : null;
+  }
+  return true;
+}
+
+function resetHydrationState(): void {
+  if (!supportsHydration) {
+    return;
+  }
+  hydrationParentFiber = null;
+  nextHydratableInstance = null;
+  isHydrating = false;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+}
+
+export function queueHydrationError(error: CapturedValue<mixed>): void {
+  if (hydrationErrors === null) {
+    hydrationErrors = [error];
+  } else {
+    hydrationErrors.push(error);
+  }
+}
+
+export function upgradeHydrationErrorsToRecoverable(): Array<
+  CapturedValue<mixed>
+> | null {
+  const errs = hydrationErrors;
+  if (errs !== null) {
+    queueRecoverableErrors(errs);
+    hydrationErrors = null;
+  }
+  return errs;
+}
+
+export function emitPendingHydrationWarnings(): void {
+  if (__DEV__) {
+    const root = hydrationDiffRootDEV;
+    if (root !== null) {
+      hydrationDiffRootDEV = null;
+      const diff = describeDiff(root);
+      const diffOwner = root.children.length
+        ? root.children[0]
+        : root;
+      runWithFiberInDEV(diffOwner.fiber, () => {
+        console.error(
+          "A tree hydrated but some attributes of the server rendered HTML didn't match the client. This won't be patched up. " +
+            'This can happen if a SSR-ed Client Component used:\n' +
+            '\n' +
+            "- A server/client branch `if (typeof window !== 'undefined')`.\n" +
+            "- Variable input such as `Date.now()` or `Math.random()`.\n" +
+            "- Date formatting in a user's locale that differs.\n" +
+            '- External changing data without sending a snapshot.\n' +
+            '- Invalid HTML tag nesting.\n' +
+            '\n' +
+            'It can also happen if a browser extension modified the HTML.\n\n' +
+            'https://react.dev/link/hydration-mismatch' +
+            diff
+        );
+      });
+    }
+  }
+}
+
+export {
+  warnIfHydrating,
+  enterHydrationState,
+  reenterHydrationStateFromDehydratedActivityInstance,
+  reenterHydrationStateFromDehydratedSuspenseInstance,
+  resetHydrationState,
+  claimHydratableSingleton,
+  tryToClaimNextHydratableInstance,
+  tryToClaimNextHydratableTextInstance,
+  claimNextHydratableActivityInstance,
+  claimNextHydratableSuspenseInstance,
+  tryToClaimNextHydratableFormMarkerInstance,
+  prepareToHydrateHostInstance,
+  prepareToHydrateHostTextInstance,
+  prepareToHydrateHostActivityInstance,
+  prepareToHydrateHostSuspenseInstance,
+  popHydrationState,
+};
+```

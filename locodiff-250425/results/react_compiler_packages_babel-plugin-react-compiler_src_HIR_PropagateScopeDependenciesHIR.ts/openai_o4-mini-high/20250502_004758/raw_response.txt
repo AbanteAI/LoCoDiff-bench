@@ -1,0 +1,702 @@
+```typescript
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+import {
+  ScopeId,
+  HIRFunction,
+  Place,
+  Instruction,
+  ReactiveScopeDependency,
+  Identifier,
+  ReactiveScope,
+  isObjectMethodType,
+  isRefValueType,
+  isUseRefType,
+  makeInstructionId,
+  InstructionId,
+  InstructionKind,
+  GeneratedSource,
+  DeclarationId,
+  areEqualPaths,
+  IdentifierId,
+  Terminal,
+  InstructionValue,
+  LoadContext,
+  TInstruction,
+  FunctionExpression,
+  ObjectMethod,
+  PropertyLiteral,
+  convertHoistedLValueKind,
+} from './HIR';
+import {
+  collectHoistablePropertyLoads,
+  keyByScopeId,
+} from './CollectHoistablePropertyLoads';
+import {collectOptionalChainSidemap} from './CollectOptionalChainDependencies';
+import {
+  ScopeBlockTraversal,
+  eachInstructionOperand,
+  eachInstructionValueOperand,
+  eachPatternOperand,
+  eachTerminalOperand,
+} from './visitors';
+import {Stack, empty} from '../Utils/Stack';
+import {CompilerError} from '../CompilerError';
+import {Iterable_some} from '../Utils/utils';
+import {ReactiveScopeDependencyTreeHIR} from './DeriveMinimalDependenciesHIR';
+
+export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
+  const usedOutsideDeclaringScope =
+    findTemporariesUsedOutsideDeclaringScope(fn);
+  const temporaries = collectTemporariesSidemap(
+    fn,
+    usedOutsideDeclaringScope,
+  );
+  const {
+    temporariesReadInOptional,
+    processedInstrsInOptional,
+    hoistableObjects,
+  } = collectOptionalChainSidemap(fn);
+
+  const hoistablePropertyLoads = keyByScopeId(
+    fn,
+    collectHoistablePropertyLoads(
+      fn,
+      temporaries,
+      hoistableObjects,
+    ),
+  );
+
+  const scopeDeps = collectDependencies(
+    fn,
+    usedOutsideDeclaringScope,
+    new Map([...temporaries, ...temporariesReadInOptional]),
+    processedInstrsInOptional,
+  );
+
+  /**
+   * Derive the minimal set of hoistable dependencies for each scope.
+   */
+  for (const [scope, deps] of scopeDeps) {
+    if (deps.length === 0) {
+      continue;
+    }
+    /**
+     * Step 1: Find hoistable accesses, given the basic block in which the scope
+     * begins.
+     */
+    const hoistables = hoistablePropertyLoads.get(scope.id);
+    CompilerError.invariant(hoistables != null, {
+      reason: '[PropagateScopeDependencies] Scope not found in tracked blocks',
+      loc: GeneratedSource,
+    });
+    /**
+     * Step 2: Calculate hoistable dependencies.
+     */
+    const tree = new ReactiveScopeDependencyTreeHIR(
+      [...hoistables.assumedNonNullObjects].map(o => o.fullPath),
+    );
+    for (const dep of deps) {
+      tree.addDependency({...dep});
+    }
+    /**
+     * Step 3: Reduce dependencies to a minimal set.
+     */
+    const candidates = tree.deriveMinimalDependencies();
+    for (const candidateDep of candidates) {
+      if (
+        !Iterable_some(
+          scope.dependencies,
+          existingDep =>
+            existingDep.identifier.declarationId ===
+              candidateDep.identifier.declarationId &&
+            areEqualPaths(existingDep.path, candidateDep.path),
+        )
+      ) {
+        scope.dependencies.add(candidateDep);
+      }
+    }
+  }
+}
+
+export function findTemporariesUsedOutsideDeclaringScope(
+  fn: HIRFunction,
+): ReadonlySet<DeclarationId> {
+  /*
+   * tracks all relevant LoadLocal and PropertyLoad lvalues
+   * and the scope where they are defined
+   */
+  const declarations = new Map<DeclarationId, ScopeId>();
+  const prunedScopes = new Set<ScopeId>();
+  const scopeTraversal = new ScopeBlockTraversal();
+  const usedOutsideDeclaringScope = new Set<DeclarationId>();
+
+  function handlePlace(place: Place): void {
+    const declaringScope = declarations.get(place.identifier.declarationId);
+    if (
+      declaringScope != null &&
+      !scopeTraversal.isScopeActive(declaringScope) &&
+      !prunedScopes.has(declaringScope)
+    ) {
+      // Declaring scope is not active === used outside declaring scope
+      usedOutsideDeclaringScope.add(place.identifier.declarationId);
+    }
+  }
+
+  function handleInstruction(instr: Instruction): void {
+    const scope = scopeTraversal.currentScope;
+    if (scope == null || prunedScopes.has(scope)) {
+      return;
+    }
+    switch (instr.value.kind) {
+      case 'LoadLocal':
+      case 'LoadContext':
+      case 'PropertyLoad': {
+        declarations.set(instr.lvalue.identifier.declarationId, scope);
+        break;
+      }
+      default: {
+        break;
+      }
+    }
+  }
+
+  for (const [blockId, block] of fn.body.blocks) {
+    scopeTraversal.recordScopes(block);
+    const scopeStartInfo = scopeTraversal.blockInfos.get(blockId);
+    if (scopeStartInfo?.kind === 'begin' && scopeStartInfo.pruned) {
+      prunedScopes.add(scopeStartInfo.scope.id);
+    }
+    for (const instr of block.instructions) {
+      for (const place of eachInstructionOperand(instr)) {
+        handlePlace(place);
+      }
+      handleInstruction(instr);
+    }
+    for (const place of eachTerminalOperand(block.terminal)) {
+      handlePlace(place);
+    }
+  }
+  return usedOutsideDeclaringScope;
+}
+
+export function collectTemporariesSidemap(
+  fn: HIRFunction,
+  usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+): ReadonlyMap<IdentifierId, ReactiveScopeDependency> {
+  const temporaries = new Map<IdentifierId, ReactiveScopeDependency>();
+  collectTemporariesSidemapImpl(
+    fn,
+    usedOutsideDeclaringScope,
+    temporaries,
+    null,
+  );
+  return temporaries;
+}
+
+/**
+ * Recursive collect a sidemap of all `LoadLocal` and `PropertyLoads` with a
+ * function and all nested functions.
+ *
+ * Note that IdentifierIds are currently unique, so we can use a single
+ * Map<IdentifierId, ...> across all nested functions.
+ */
+function collectTemporariesSidemapImpl(
+  fn: HIRFunction,
+  usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+  temporaries: Map<IdentifierId, ReactiveScopeDependency>,
+  innerFnContext: {instrId: InstructionId} | null,
+): void {
+  for (const [, block] of fn.body.blocks) {
+    for (const instr of block.instructions) {
+      const {value, lvalue, id: origInstrId} = instr;
+      const instrId = innerFnContext != null
+        ? innerFnContext.instrId
+        : origInstrId;
+      const usedOutside = usedOutsideDeclaringScope.has(
+        lvalue.identifier.declarationId,
+      );
+
+      if (value.kind === 'PropertyLoad' && !usedOutside) {
+        if (
+          innerFnContext == null ||
+          temporaries.has(value.object.identifier.id)
+        ) {
+          /**
+           * All dependencies of a inner / nested function must have a base
+           * identifier from the outermost component / hook. This is because the
+           * compiler cannot break an inner function into multiple granular
+           * scopes.
+           */
+          const property = getProperty(
+            value.object,
+            value.property,
+            false,
+            temporaries,
+          );
+          temporaries.set(lvalue.identifier.id, property);
+        }
+      } else if (
+        (value.kind === 'LoadLocal' ||
+          isLoadContextMutable(value, instrId)) &&
+        lvalue.identifier.name == null &&
+        value.place.identifier.name !== null &&
+        !usedOutside
+      ) {
+        if (
+          innerFnContext == null ||
+          fn.context.some(
+            ctx => ctx.identifier.id === value.place.identifier.id,
+          )
+        ) {
+          temporaries.set(lvalue.identifier.id, {
+            identifier: value.place.identifier,
+            path: [],
+          });
+        }
+      } else if (
+        value.kind === 'FunctionExpression' ||
+        value.kind === 'ObjectMethod'
+      ) {
+        collectTemporariesSidemapImpl(
+          value.loweredFunc.func,
+          usedOutsideDeclaringScope,
+          temporaries,
+          innerFnContext ?? {instrId},
+        );
+      }
+    }
+  }
+}
+
+function isLoadContextMutable(
+  instrValue: InstructionValue,
+  id: InstructionId,
+): instrValue is LoadContext {
+  if (instrValue.kind === 'LoadContext') {
+    /**
+     * Not all context variables currently have scopes due to limitations of
+     * mutability analysis for function expressions.
+     *
+     * Currently, many function expressions references are inferred to be
+     * 'Read' | 'Freeze' effects which don't replay mutable effects of captured
+     * context.
+     */
+    return (
+      instrValue.place.identifier.scope != null &&
+      id >= instrValue.place.identifier.scope.range.end
+    );
+  }
+  return false;
+}
+
+function getProperty(
+  object: Place,
+  propertyName: PropertyLiteral,
+  optional: boolean,
+  temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+): ReactiveScopeDependency {
+  /*
+   * (1) Get the base object either from the temporary sidemap (e.g. a LoadLocal)
+   * or a deep copy of an existing property dependency.
+   *  Example 1:
+   *    $0 = LoadLocal x
+   *    $1 = PropertyLoad $0.y
+   *  getProperty($0, ...) -> resolvedObject = x, resolvedDependency = null
+   *
+   *  Example 2:
+   *    $0 = LoadLocal x
+   *    $1 = PropertyLoad $0.y
+   *    $2 = PropertyLoad $1.z
+   *  getProperty($1, ...) -> resolvedObject = null, resolvedDependency = x.y
+   *
+   *  Example 3:
+   *    $0 = Call(...)
+   *    $1 = PropertyLoad $0.y
+   *  getProperty($0, ...) -> resolvedObject = null, resolvedDependency = null
+   */
+  const resolvedDependency = temporaries.get(object.identifier.id);
+
+  /**
+   * (2) Push the last PropertyLoad
+   * TODO(mofeiZ): understand optional chaining
+   */
+  let property: ReactiveScopeDependency;
+  if (resolvedDependency == null) {
+    property = {
+      identifier: object.identifier,
+      path: [{property: propertyName, optional}],
+    };
+  } else {
+    property = {
+      identifier: resolvedDependency.identifier,
+      path: [...resolvedDependency.path, {property: propertyName, optional}],
+    };
+  }
+  return property;
+}
+
+type Decl = {
+  id: InstructionId;
+  scope: Stack<ReactiveScope>;
+};
+
+export class DependencyCollectionContext {
+  #declarations: Map<DeclarationId, Decl> = new Map();
+  #reassignments: Map<Identifier, Decl> = new Map();
+
+  #scopes: Stack<ReactiveScope> = empty();
+  // Reactive dependencies used in the current reactive scope.
+  #dependencies: Stack<Array<ReactiveScopeDependency>> = empty();
+  deps: Map<ReactiveScope, Array<ReactiveScopeDependency>> = new Map();
+
+  #temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>;
+  #temporariesUsedOutsideScope: ReadonlySet<DeclarationId>;
+  #processedInstrsInOptional: ReadonlySet<Instruction | Terminal>;
+  #innerFnContext: {outerInstrId: InstructionId} | null = null;
+
+  constructor(
+    temporariesUsedOutsideScope: ReadonlySet<DeclarationId>,
+    temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+    processedInstrsInOptional: ReadonlySet<Instruction | Terminal>,
+  ) {
+    this.#temporariesUsedOutsideScope = temporariesUsedOutsideScope;
+    this.#temporaries = temporaries;
+    this.#processedInstrsInOptional = processedInstrsInOptional;
+  }
+
+  enterScope(scope: ReactiveScope): void {
+    // Set context for new scope
+    this.#dependencies = this.#dependencies.push([]);
+    this.#scopes = this.#scopes.push(scope);
+  }
+
+  exitScope(scope: ReactiveScope, pruned: boolean): void {
+    const scopedDependencies = this.#dependencies.value;
+    CompilerError.invariant(scopedDependencies != null, {
+      reason: '[PropagateScopeDeps]: Unexpected scope mismatch',
+      loc: scope.loc,
+    });
+
+    this.#scopes = this.#scopes.pop();
+    this.#dependencies = this.#dependencies.pop();
+
+    for (const dep of scopedDependencies) {
+      if (this.#checkValidDependency(dep)) {
+        this.#dependencies.value?.push(dep);
+      }
+    }
+    if (!pruned) {
+      this.deps.set(scope, scopedDependencies);
+    }
+  }
+
+  isUsedOutsideDeclaringScope(place: Place): boolean {
+    return this.#temporariesUsedOutsideScope.has(
+      place.identifier.declarationId,
+    );
+  }
+
+  declare(identifier: Identifier, decl: Decl): void {
+    if (this.#innerFnContext != null) return;
+    if (!this.#declarations.has(identifier.declarationId)) {
+      this.#declarations.set(identifier.declarationId, decl);
+    }
+    this.#reassignments.set(identifier, decl);
+  }
+
+  hasDeclared(identifier: Identifier): boolean {
+    return this.#declarations.has(identifier.declarationId);
+  }
+
+  #checkValidDependency(maybeDependency: ReactiveScopeDependency): boolean {
+    if (isRefValueType(maybeDependency.identifier)) {
+      return false;
+    }
+    if (isObjectMethodType(maybeDependency.identifier)) {
+      return false;
+    }
+    const identifier = maybeDependency.identifier;
+    const currentDeclaration =
+      this.#reassignments.get(identifier) ??
+      this.#declarations.get(identifier.declarationId);
+    const currentScope = this.currentScope.value;
+    return (
+      currentScope != null &&
+      currentDeclaration !== undefined &&
+      currentDeclaration.id < currentScope.range.start
+    );
+  }
+
+  visitOperand(place: Place): void {
+    this.visitDependency(
+      this.#temporaries.get(place.identifier.id) ?? {
+        identifier: place.identifier,
+        path: [],
+      },
+    );
+  }
+
+  visitProperty(
+    object: Place,
+    property: PropertyLiteral,
+    optional: boolean,
+  ): void {
+    const nextDependency = getProperty(
+      object,
+      property,
+      optional,
+      this.#temporaries,
+    );
+    this.visitDependency(nextDependency);
+  }
+
+  visitDependency(maybeDependency: ReactiveScopeDependency): void {
+    const originalDeclaration = this.#declarations.get(
+      maybeDependency.identifier.declarationId,
+    );
+    if (
+      originalDeclaration !== undefined &&
+      originalDeclaration.scope.value !== null
+    ) {
+      originalDeclaration.scope.each(scope => {
+        if (
+          !this.#scopes.find(state => state === scope) &&
+          !Iterable_some(
+            scope.declarations.values(),
+            decl =>
+              decl.identifier.declarationId ===
+              maybeDependency.identifier.declarationId,
+          )
+        ) {
+          scope.declarations.set(maybeDependency.identifier.id, {
+            identifier: maybeDependency.identifier,
+            scope: originalDeclaration.scope.value!,
+          });
+        }
+      });
+    }
+
+    if (
+      isUseRefType(maybeDependency.identifier) &&
+      maybeDependency.path.at(0)?.property === 'current'
+    ) {
+      maybeDependency = {
+        identifier: maybeDependency.identifier,
+        path: [],
+      };
+    }
+    if (this.#checkValidDependency(maybeDependency)) {
+      this.#dependencies.value!.push(maybeDependency);
+    }
+  }
+
+  visitReassignment(place: Place): void {
+    const currentScope = this.currentScope.value;
+    if (
+      currentScope != null &&
+      !Iterable_some(
+        currentScope.reassignments,
+        id => id.declarationId === place.identifier.declarationId,
+      ) &&
+      this.#checkValidDependency({identifier: place.identifier, path: []})
+    ) {
+      currentScope.reassignments.add(place.identifier);
+    }
+  }
+
+  enterInnerFn<T>(
+    innerFn: TInstruction<FunctionExpression> | TInstruction<ObjectMethod>,
+    cb: () => T,
+  ): T {
+    const prev = this.#innerFnContext;
+    this.#innerFnContext =
+      this.#innerFnContext ?? {outerInstrId: innerFn.id};
+    const result = cb();
+    this.#innerFnContext = prev;
+    return result;
+  }
+
+  isDeferredDependency(
+    instr:
+      | {kind: HIRValue.Instruction; value: Instruction}
+      | {kind: HIRValue.Terminal; value: Terminal},
+  ): boolean {
+    return (
+      this.#processedInstrsInOptional.has(instr.value) ||
+      (instr.kind === HIRValue.Instruction &&
+        this.#temporaries.has(instr.value.lvalue.identifier.id))
+    );
+  }
+
+  get currentScope(): Stack<ReactiveScope> {
+    return this.#scopes;
+  }
+}
+
+enum HIRValue {
+  Instruction = 1,
+  Terminal,
+}
+
+export function handleInstruction(
+  instr: Instruction,
+  context: DependencyCollectionContext,
+): void {
+  const {id, value, lvalue} = instr;
+  context.declare(lvalue.identifier, {
+    id,
+    scope: context.currentScope,
+  });
+  if (
+    context.isDeferredDependency({
+      kind: HIRValue.Instruction,
+      value: instr,
+    })
+  ) {
+    return;
+  }
+  if (value.kind === 'PropertyLoad') {
+    context.visitProperty(value.object, value.property, false);
+  } else if (value.kind === 'StoreLocal') {
+    context.visitOperand(value.value);
+    if (value.lvalue.kind === InstructionKind.Reassign) {
+      context.visitReassignment(value.lvalue.place);
+    }
+    context.declare(value.lvalue.place.identifier, {
+      id,
+      scope: context.currentScope,
+    });
+  } else if (
+    value.kind === 'DeclareLocal' ||
+    value.kind === 'DeclareContext'
+  ) {
+    if (convertHoistedLValueKind(value.lvalue.kind) === null) {
+      context.declare(value.lvalue.place.identifier, {
+        id,
+        scope: context.currentScope,
+      });
+    }
+  } else if (value.kind === 'Destructure') {
+    context.visitOperand(value.value);
+    for (const place of eachPatternOperand(value.lvalue.pattern)) {
+      if (value.lvalue.kind === InstructionKind.Reassign) {
+        context.visitReassignment(place);
+      }
+      context.declare(place.identifier, {
+        id,
+        scope: context.currentScope,
+      });
+    }
+  } else if (value.kind === 'StoreContext') {
+    if (
+      !context.hasDeclared(value.lvalue.place.identifier) ||
+      value.lvalue.kind !== InstructionKind.Reassign
+    ) {
+      context.declare(value.lvalue.place.identifier, {
+        id,
+        scope: context.currentScope,
+      });
+    }
+    for (const operand of eachInstructionValueOperand(value)) {
+      context.visitOperand(operand);
+    }
+  } else {
+    for (const operand of eachInstructionValueOperand(value)) {
+      context.visitOperand(operand);
+    }
+  }
+}
+
+export function collectDependencies(
+  fn: HIRFunction,
+  usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+  temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+  processedInstrsInOptional: ReadonlySet<Instruction | Terminal>,
+): Map<ReactiveScope, Array<ReactiveScopeDependency>> {
+  const context = new DependencyCollectionContext(
+    usedOutsideDeclaringScope,
+    temporaries,
+    processedInstrsInOptional,
+  );
+
+  for (const param of fn.params) {
+    if (param.kind === 'Identifier') {
+      context.declare(param.identifier, {
+        id: makeInstructionId(0),
+        scope: empty(),
+      });
+    } else {
+      context.declare(param.place.identifier, {
+        id: makeInstructionId(0),
+        scope: empty(),
+      });
+    }
+  }
+
+  const scopeTraversal = new ScopeBlockTraversal();
+
+  const handleFunction = (fn: HIRFunction): void => {
+    for (const [blockId, block] of fn.body.blocks) {
+      scopeTraversal.recordScopes(block);
+      const scopeBlockInfo = scopeTraversal.blockInfos.get(blockId);
+      if (scopeBlockInfo?.kind === 'begin') {
+        context.enterScope(scopeBlockInfo.scope);
+      } else if (scopeBlockInfo?.kind === 'end') {
+        context.exitScope(scopeBlockInfo.scope, scopeBlockInfo.pruned);
+      }
+
+      for (const phi of block.phis) {
+        for (const operand of phi.operands) {
+          const maybeOptionalChain = temporaries.get(operand[1].identifier.id);
+          if (maybeOptionalChain) {
+            context.visitDependency(maybeOptionalChain);
+          }
+        }
+      }
+
+      for (const instr of block.instructions) {
+        if (
+          instr.value.kind === 'FunctionExpression' ||
+          instr.value.kind === 'ObjectMethod'
+        ) {
+          context.declare(instr.lvalue.identifier, {
+            id: instr.id,
+            scope: context.currentScope,
+          });
+          const innerFn = instr.value.loweredFunc.func;
+          context.enterInnerFn(
+            instr as
+              | TInstruction<FunctionExpression>
+              | TInstruction<ObjectMethod>,
+            () => {
+              handleFunction(innerFn);
+            },
+          );
+        } else {
+          handleInstruction(instr, context);
+        }
+      }
+
+      if (
+        !context.isDeferredDependency({
+          kind: HIRValue.Terminal,
+          value: block.terminal,
+        })
+      ) {
+        for (const place of eachTerminalOperand(block.terminal)) {
+          context.visitOperand(place);
+        }
+      }
+    }
+  };
+
+  handleFunction(fn);
+  return context.deps;
+}
+```

@@ -1,0 +1,503 @@
+--- react_compiler_packages_babel-plugin-react-compiler_src_HIR_PropagateScopeDependenciesHIR.ts_expectedoutput.txt (expected)+++ react_compiler_packages_babel-plugin-react-compiler_src_HIR_PropagateScopeDependenciesHIR.ts_extracted.txt (actual)@@ -36,6 +36,7 @@   collectHoistablePropertyLoads,
+   keyByScopeId,
+ } from './CollectHoistablePropertyLoads';
++import {collectOptionalChainSidemap} from './CollectOptionalChainDependencies';
+ import {
+   ScopeBlockTraversal,
+   eachInstructionOperand,
+@@ -47,12 +48,14 @@ import {CompilerError} from '../CompilerError';
+ import {Iterable_some} from '../Utils/utils';
+ import {ReactiveScopeDependencyTreeHIR} from './DeriveMinimalDependenciesHIR';
+-import {collectOptionalChainSidemap} from './CollectOptionalChainDependencies';
+ 
+ export function propagateScopeDependenciesHIR(fn: HIRFunction): void {
+   const usedOutsideDeclaringScope =
+     findTemporariesUsedOutsideDeclaringScope(fn);
+-  const temporaries = collectTemporariesSidemap(fn, usedOutsideDeclaringScope);
++  const temporaries = collectTemporariesSidemap(
++    fn,
++    usedOutsideDeclaringScope,
++  );
+   const {
+     temporariesReadInOptional,
+     processedInstrsInOptional,
+@@ -61,7 +64,11 @@ 
+   const hoistablePropertyLoads = keyByScopeId(
+     fn,
+-    collectHoistablePropertyLoads(fn, temporaries, hoistableObjects),
++    collectHoistablePropertyLoads(
++      fn,
++      temporaries,
++      hoistableObjects,
++    ),
+   );
+ 
+   const scopeDeps = collectDependencies(
+@@ -78,7 +85,6 @@     if (deps.length === 0) {
+       continue;
+     }
+-
+     /**
+      * Step 1: Find hoistable accesses, given the basic block in which the scope
+      * begins.
+@@ -97,7 +103,6 @@     for (const dep of deps) {
+       tree.addDependency({...dep});
+     }
+-
+     /**
+      * Step 3: Reduce dependencies to a minimal set.
+      */
+@@ -111,8 +116,9 @@               candidateDep.identifier.declarationId &&
+             areEqualPaths(existingDep.path, candidateDep.path),
+         )
+-      )
++      ) {
+         scope.dependencies.add(candidateDep);
++      }
+     }
+   }
+ }
+@@ -171,7 +177,6 @@       }
+       handleInstruction(instr);
+     }
+-
+     for (const place of eachTerminalOperand(block.terminal)) {
+       handlePlace(place);
+     }
+@@ -179,60 +184,11 @@   return usedOutsideDeclaringScope;
+ }
+ 
+-/**
+- * @returns mapping of LoadLocal and PropertyLoad to the source of the load.
+- * ```js
+- * // source
+- * foo(a.b);
+- *
+- * // HIR: a potential sidemap is {0: a, 1: a.b, 2: foo}
+- * $0 = LoadLocal 'a'
+- * $1 = PropertyLoad $0, 'b'
+- * $2 = LoadLocal 'foo'
+- * $3 = CallExpression $2($1)
+- * ```
+- * @param usedOutsideDeclaringScope is used to check the correctness of
+- * reordering LoadLocal / PropertyLoad calls. We only track a LoadLocal /
+- * PropertyLoad in the returned temporaries map if reordering the read (from the
+- * time-of-load to time-of-use) is valid.
+- *
+- * If a LoadLocal or PropertyLoad instruction is within the reactive scope range
+- * (a proxy for mutable range) of the load source, later instructions may
+- * reassign / mutate the source value. Since it's incorrect to reorder these
+- * load instructions to after their scope ranges, we also do not store them in
+- * identifier sidemaps.
+- *
+- * Take this example (from fixture
+- * `evaluation-order-mutate-call-after-dependency-load`)
+- * ```js
+- * // source
+- * function useFoo(arg) {
+- *   const arr = [1, 2, 3, ...arg];
+- *   return [
+- *     arr.length,
+- *     arr.push(0)
+- *   ];
+- * }
+- *
+- * // IR pseudocode
+- * scope @0 {
+- *   $0 = arr = ArrayExpression [1, 2, 3, ...arg]
+- *   $1 = arr.length
+- *   $2 = arr.push(0)
+- * }
+- * scope @1 {
+- *   $3 = ArrayExpression [$1, $2]
+- * }
+- * ```
+- * Here, it's invalid for scope@1 to take `arr.length` as a dependency instead
+- * of $1, as the evaluation of `arr.length` changes between instructions $1 and
+- * $3. We do not track $1 -> arr.length in this case.
+- */
+ export function collectTemporariesSidemap(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+ ): ReadonlyMap<IdentifierId, ReactiveScopeDependency> {
+-  const temporaries = new Map();
++  const temporaries = new Map<IdentifierId, ReactiveScopeDependency>();
+   collectTemporariesSidemapImpl(
+     fn,
+     usedOutsideDeclaringScope,
+@@ -242,26 +198,6 @@   return temporaries;
+ }
+ 
+-function isLoadContextMutable(
+-  instrValue: InstructionValue,
+-  id: InstructionId,
+-): instrValue is LoadContext {
+-  if (instrValue.kind === 'LoadContext') {
+-    /**
+-     * Not all context variables currently have scopes due to limitations of
+-     * mutability analysis for function expressions.
+-     *
+-     * Currently, many function expressions references are inferred to be
+-     * 'Read' | 'Freeze' effects which don't replay mutable effects of captured
+-     * context.
+-     */
+-    return (
+-      instrValue.place.identifier.scope != null &&
+-      id >= instrValue.place.identifier.scope.range.end
+-    );
+-  }
+-  return false;
+-}
+ /**
+  * Recursive collect a sidemap of all `LoadLocal` and `PropertyLoads` with a
+  * function and all nested functions.
+@@ -275,10 +211,12 @@   temporaries: Map<IdentifierId, ReactiveScopeDependency>,
+   innerFnContext: {instrId: InstructionId} | null,
+ ): void {
+-  for (const [_, block] of fn.body.blocks) {
+-    for (const {value, lvalue, id: origInstrId} of block.instructions) {
+-      const instrId =
+-        innerFnContext != null ? innerFnContext.instrId : origInstrId;
++  for (const [, block] of fn.body.blocks) {
++    for (const instr of block.instructions) {
++      const {value, lvalue, id: origInstrId} = instr;
++      const instrId = innerFnContext != null
++        ? innerFnContext.instrId
++        : origInstrId;
+       const usedOutside = usedOutsideDeclaringScope.has(
+         lvalue.identifier.declarationId,
+       );
+@@ -303,7 +241,8 @@           temporaries.set(lvalue.identifier.id, property);
+         }
+       } else if (
+-        (value.kind === 'LoadLocal' || isLoadContextMutable(value, instrId)) &&
++        (value.kind === 'LoadLocal' ||
++          isLoadContextMutable(value, instrId)) &&
+         lvalue.identifier.name == null &&
+         value.place.identifier.name !== null &&
+         !usedOutside
+@@ -311,7 +250,7 @@         if (
+           innerFnContext == null ||
+           fn.context.some(
+-            context => context.identifier.id === value.place.identifier.id,
++            ctx => ctx.identifier.id === value.place.identifier.id,
+           )
+         ) {
+           temporaries.set(lvalue.identifier.id, {
+@@ -332,6 +271,27 @@       }
+     }
+   }
++}
++
++function isLoadContextMutable(
++  instrValue: InstructionValue,
++  id: InstructionId,
++): instrValue is LoadContext {
++  if (instrValue.kind === 'LoadContext') {
++    /**
++     * Not all context variables currently have scopes due to limitations of
++     * mutability analysis for function expressions.
++     *
++     * Currently, many function expressions references are inferred to be
++     * 'Read' | 'Freeze' effects which don't replay mutable effects of captured
++     * context.
++     */
++    return (
++      instrValue.place.identifier.scope != null &&
++      id >= instrValue.place.identifier.scope.range.end
++    );
++  }
++  return false;
+ }
+ 
+ function getProperty(
+@@ -397,11 +357,6 @@   #temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>;
+   #temporariesUsedOutsideScope: ReadonlySet<DeclarationId>;
+   #processedInstrsInOptional: ReadonlySet<Instruction | Terminal>;
+-
+-  /**
+-   * Tracks the traversal state. See Context.declare for explanation of why this
+-   * is needed.
+-   */
+   #innerFnContext: {outerInstrId: InstructionId} | null = null;
+ 
+   constructor(
+@@ -421,29 +376,20 @@   }
+ 
+   exitScope(scope: ReactiveScope, pruned: boolean): void {
+-    // Save dependencies we collected from the exiting scope
+     const scopedDependencies = this.#dependencies.value;
+     CompilerError.invariant(scopedDependencies != null, {
+       reason: '[PropagateScopeDeps]: Unexpected scope mismatch',
+       loc: scope.loc,
+     });
+ 
+-    // Restore context of previous scope
+     this.#scopes = this.#scopes.pop();
+     this.#dependencies = this.#dependencies.pop();
+ 
+-    /*
+-     * Collect dependencies we recorded for the exiting scope and propagate
+-     * them upward using the same rules as normal dependency collection.
+-     * Child scopes may have dependencies on values created within the outer
+-     * scope, which necessarily cannot be dependencies of the outer scope.
+-     */
+     for (const dep of scopedDependencies) {
+       if (this.#checkValidDependency(dep)) {
+         this.#dependencies.value?.push(dep);
+       }
+     }
+-
+     if (!pruned) {
+       this.deps.set(scope, scopedDependencies);
+     }
+@@ -455,22 +401,6 @@     );
+   }
+ 
+-  /*
+-   * Records where a value was declared, and optionally, the scope where the
+-   * value originated from. This is later used to determine if a dependency
+-   * should be added to a scope; if the current scope we are visiting is the
+-   * same scope where the value originates, it can't be a dependency on itself.
+-   *
+-   * Note that we do not track declarations or reassignments within inner
+-   * functions for the following reasons:
+-   *   - inner functions cannot be split by scope boundaries and are guaranteed
+-   *     to consume their own declarations
+-   *   - reassignments within inner functions are tracked as context variables,
+-   *     which already have extended mutable ranges to account for reassignments
+-   *   - *most importantly* it's currently simply incorrect to compare inner
+-   *     function instruction ids (tracked by `decl`) with outer ones (as stored
+-   *     by root identifier mutable ranges).
+-   */
+   declare(identifier: Identifier, decl: Decl): void {
+     if (this.#innerFnContext != null) return;
+     if (!this.#declarations.has(identifier.declarationId)) {
+@@ -478,30 +408,19 @@     }
+     this.#reassignments.set(identifier, decl);
+   }
++
+   hasDeclared(identifier: Identifier): boolean {
+     return this.#declarations.has(identifier.declarationId);
+   }
+ 
+-  // Checks if identifier is a valid dependency in the current scope
+   #checkValidDependency(maybeDependency: ReactiveScopeDependency): boolean {
+-    // ref value is not a valid dep
+     if (isRefValueType(maybeDependency.identifier)) {
+       return false;
+     }
+-
+-    /*
+-     * object methods are not deps because they will be codegen'ed back in to
+-     * the object literal.
+-     */
+     if (isObjectMethodType(maybeDependency.identifier)) {
+       return false;
+     }
+-
+     const identifier = maybeDependency.identifier;
+-    /*
+-     * If this operand is used in a scope, has a dynamic value, and was defined
+-     * before this scope, then its a dependency of the scope.
+-     */
+     const currentDeclaration =
+       this.#reassignments.get(identifier) ??
+       this.#declarations.get(identifier.declarationId);
+@@ -513,22 +432,7 @@     );
+   }
+ 
+-  #isScopeActive(scope: ReactiveScope): boolean {
+-    if (this.#scopes === null) {
+-      return false;
+-    }
+-    return this.#scopes.find(state => state === scope);
+-  }
+-
+-  get currentScope(): Stack<ReactiveScope> {
+-    return this.#scopes;
+-  }
+-
+   visitOperand(place: Place): void {
+-    /*
+-     * if this operand is a temporary created for a property load, try to resolve it to
+-     * the expanded Place. Fall back to using the operand as-is.
+-     */
+     this.visitDependency(
+       this.#temporaries.get(place.identifier.id) ?? {
+         identifier: place.identifier,
+@@ -552,18 +456,6 @@   }
+ 
+   visitDependency(maybeDependency: ReactiveScopeDependency): void {
+-    /*
+-     * Any value used after its originally defining scope has concluded must be added as an
+-     * output of its defining scope. Regardless of whether its a const or not,
+-     * some later code needs access to the value. If the current
+-     * scope we are visiting is the same scope where the value originates, it can't be a dependency
+-     * on itself.
+-     */
+-
+-    /*
+-     * if originalDeclaration is undefined here, then this is not a local var
+-     * (all decls e.g. `let x;` should be initialized in BuildHIR)
+-     */
+     const originalDeclaration = this.#declarations.get(
+       maybeDependency.identifier.declarationId,
+     );
+@@ -573,7 +465,7 @@     ) {
+       originalDeclaration.scope.each(scope => {
+         if (
+-          !this.#isScopeActive(scope) &&
++          !this.#scopes.find(state => state === scope) &&
+           !Iterable_some(
+             scope.declarations.values(),
+             decl =>
+@@ -589,7 +481,6 @@       });
+     }
+ 
+-    // ref.current access is not a valid dep
+     if (
+       isUseRefType(maybeDependency.identifier) &&
+       maybeDependency.path.at(0)?.property === 'current'
+@@ -604,40 +495,32 @@     }
+   }
+ 
+-  /*
+-   * Record a variable that is declared in some other scope and that is being reassigned in the
+-   * current one as a {@link ReactiveScope.reassignments}
+-   */
+   visitReassignment(place: Place): void {
+     const currentScope = this.currentScope.value;
+     if (
+       currentScope != null &&
+       !Iterable_some(
+         currentScope.reassignments,
+-        identifier =>
+-          identifier.declarationId === place.identifier.declarationId,
++        id => id.declarationId === place.identifier.declarationId,
+       ) &&
+       this.#checkValidDependency({identifier: place.identifier, path: []})
+     ) {
+       currentScope.reassignments.add(place.identifier);
+     }
+   }
++
+   enterInnerFn<T>(
+     innerFn: TInstruction<FunctionExpression> | TInstruction<ObjectMethod>,
+     cb: () => T,
+   ): T {
+-    const prevContext = this.#innerFnContext;
+-    this.#innerFnContext = this.#innerFnContext ?? {outerInstrId: innerFn.id};
++    const prev = this.#innerFnContext;
++    this.#innerFnContext =
++      this.#innerFnContext ?? {outerInstrId: innerFn.id};
+     const result = cb();
+-    this.#innerFnContext = prevContext;
++    this.#innerFnContext = prev;
+     return result;
+   }
+ 
+-  /**
+-   * Skip dependencies that are subexpressions of other dependencies. e.g. if a
+-   * dependency is tracked in the temporaries sidemap, it can be added at
+-   * site-of-use
+-   */
+   isDeferredDependency(
+     instr:
+       | {kind: HIRValue.Instruction; value: Instruction}
+@@ -649,7 +532,12 @@         this.#temporaries.has(instr.value.lvalue.identifier.id))
+     );
+   }
+-}
++
++  get currentScope(): Stack<ReactiveScope> {
++    return this.#scopes;
++  }
++}
++
+ enum HIRValue {
+   Instruction = 1,
+   Terminal,
+@@ -665,7 +553,10 @@     scope: context.currentScope,
+   });
+   if (
+-    context.isDeferredDependency({kind: HIRValue.Instruction, value: instr})
++    context.isDeferredDependency({
++      kind: HIRValue.Instruction,
++      value: instr,
++    })
+   ) {
+     return;
+   }
+@@ -680,17 +571,10 @@       id,
+       scope: context.currentScope,
+     });
+-  } else if (value.kind === 'DeclareLocal' || value.kind === 'DeclareContext') {
+-    /*
+-     * Some variables may be declared and never initialized. We need to retain
+-     * (and hoist) these declarations if they are included in a reactive scope.
+-     * One approach is to simply add all `DeclareLocal`s as scope declarations.
+-     *
+-     * Context variables with hoisted declarations only become live after their
+-     * first assignment. We only declare real DeclareLocal / DeclareContext
+-     * instructions (not hoisted ones) to avoid generating dependencies on
+-     * hoisted declarations.
+-     */
++  } else if (
++    value.kind === 'DeclareLocal' ||
++    value.kind === 'DeclareContext'
++  ) {
+     if (convertHoistedLValueKind(value.lvalue.kind) === null) {
+       context.declare(value.lvalue.place.identifier, {
+         id,
+@@ -709,12 +593,6 @@       });
+     }
+   } else if (value.kind === 'StoreContext') {
+-    /**
+-     * Some StoreContext variables have hoisted declarations. If we're storing
+-     * to a context variable that hasn't yet been declared, the StoreContext is
+-     * the declaration.
+-     * (see corresponding logic in PruneHoistedContext)
+-     */
+     if (
+       !context.hasDeclared(value.lvalue.place.identifier) ||
+       value.lvalue.kind !== InstructionKind.Reassign
+@@ -724,7 +602,6 @@         scope: context.currentScope,
+       });
+     }
+-
+     for (const operand of eachInstructionValueOperand(value)) {
+       context.visitOperand(operand);
+     }
+@@ -735,7 +612,7 @@   }
+ }
+ 
+-function collectDependencies(
++export function collectDependencies(
+   fn: HIRFunction,
+   usedOutsideDeclaringScope: ReadonlySet<DeclarationId>,
+   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+@@ -772,7 +649,7 @@       } else if (scopeBlockInfo?.kind === 'end') {
+         context.exitScope(scopeBlockInfo.scope, scopeBlockInfo.pruned);
+       }
+-      // Record referenced optional chains in phis
++
+       for (const phi of block.phis) {
+         for (const operand of phi.operands) {
+           const maybeOptionalChain = temporaries.get(operand[1].identifier.id);
+@@ -781,6 +658,7 @@           }
+         }
+       }
++
+       for (const instr of block.instructions) {
+         if (
+           instr.value.kind === 'FunctionExpression' ||
+@@ -790,9 +668,6 @@             id: instr.id,
+             scope: context.currentScope,
+           });
+-          /**
+-           * Recursively visit the inner function to extract dependencies there
+-           */
+           const innerFn = instr.value.loweredFunc.func;
+           context.enterInnerFn(
+             instr as
