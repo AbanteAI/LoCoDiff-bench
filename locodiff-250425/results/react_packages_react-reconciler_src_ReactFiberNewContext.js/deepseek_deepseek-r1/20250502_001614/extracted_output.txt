@@ -1,0 +1,461 @@
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @flow
+ */
+
+import type {ReactContext} from 'shared/ReactTypes';
+import type {
+  Fiber,
+  ContextDependency,
+  Dependencies,
+} from './ReactInternalTypes';
+import type {StackCursor} from './ReactFiberStack';
+import type {Lanes} from './ReactFiberLane';
+import type {TransitionStatus} from './ReactFiberConfig';
+import type {Hook} from './ReactFiberHooks';
+
+import {isPrimaryRenderer, HostTransitionContext} from './ReactFiberConfig';
+import {createCursor, push, pop} from './ReactFiberStack';
+import {ContextProvider, DehydratedFragment} from './ReactWorkTags';
+import {NoLanes, isSubsetOfLanes, mergeLanes} from './ReactFiberLane';
+import {
+  NoFlags,
+  DidPropagateContext,
+  NeedsPropagation,
+} from './ReactFiberFlags';
+
+import is from 'shared/objectIs';
+import {enableRenderableContext} from 'shared/ReactFeatureFlags';
+import {getHostTransitionProvider} from './ReactFiberHostContext';
+
+const valueCursor: StackCursor<mixed> = createCursor(null);
+
+let rendererCursorDEV: StackCursor<Object | null>;
+if (__DEV__) {
+  rendererCursorDEV = createCursor(null);
+}
+let renderer2CursorDEV: StackCursor<Object | null>;
+if (__DEV__) {
+  renderer2CursorDEV = createCursor(null);
+}
+
+let rendererSigil;
+if (__DEV__) {
+  // Use this to detect multiple renderers using the same context
+  rendererSigil = {};
+}
+
+let currentlyRenderingFiber: Fiber | null = null;
+let lastContextDependency: ContextDependency<mixed> | null = null;
+
+let isDisallowedContextReadInDEV: boolean = false;
+
+export function resetContextDependencies(): void {
+  currentlyRenderingFiber = null;
+  lastContextDependency = null;
+  if (__DEV__) {
+    isDisallowedContextReadInDEV = false;
+  }
+}
+
+export function enterDisallowedContextReadInDEV(): void {
+  if (__DEV__) {
+    isDisallowedContextReadInDEV = true;
+  }
+}
+
+export function exitDisallowedContextReadInDEV(): void {
+  if (__DEV__) {
+    isDisallowedContextReadInDEV = false;
+  }
+}
+
+export function pushProvider<T>(
+  providerFiber: Fiber,
+  context: ReactContext<T>,
+  nextValue: T,
+): void {
+  if (isPrimaryRenderer) {
+    push(valueCursor, context._currentValue, providerFiber);
+
+    context._currentValue = nextValue;
+    if (__DEV__) {
+      push(rendererCursorDEV, context._currentRenderer, providerFiber);
+
+      if (
+        context._currentRenderer !== undefined &&
+        context._currentRenderer !== null &&
+        context._currentRenderer !== rendererSigil
+      ) {
+        console.error(
+          'Detected multiple renderers concurrently rendering the ' +
+            'same context provider. This is currently unsupported.',
+        );
+      }
+      context._currentRenderer = rendererSigil;
+    }
+  } else {
+    push(valueCursor, context._currentValue2, providerFiber);
+
+    context._currentValue2 = nextValue;
+    if (__DEV__) {
+      push(renderer2CursorDEV, context._currentRenderer2, providerFiber);
+
+      if (
+        context._currentRenderer2 !== undefined &&
+        context._currentRenderer2 !== null &&
+        context._currentRenderer2 !== rendererSigil
+      ) {
+        console.error(
+          'Detected multiple renderers concurrently rendering the ' +
+            'same context provider. This is currently unsupported.',
+        );
+      }
+      context._currentRenderer2 = rendererSigil;
+    }
+  }
+}
+
+export function popProvider(
+  context: ReactContext<any>,
+  providerFiber: Fiber,
+): void {
+  const currentValue = valueCursor.current;
+
+  if (isPrimaryRenderer) {
+    context._currentValue = currentValue;
+    if (__DEV__) {
+      const currentRenderer = rendererCursorDEV.current;
+      pop(rendererCursorDEV, providerFiber);
+      context._currentRenderer = currentRenderer;
+    }
+  } else {
+    context._currentValue2 = currentValue;
+    if (__DEV__) {
+      const currentRenderer2 = renderer2CursorDEV.current;
+      pop(renderer2CursorDEV, providerFiber);
+      context._currentRenderer2 = currentRenderer2;
+    }
+  }
+
+  pop(valueCursor, providerFiber);
+}
+
+export function scheduleContextWorkOnParentPath(
+  parent: Fiber | null,
+  renderLanes: Lanes,
+  propagationRoot: Fiber,
+) {
+  let node = parent;
+  while (node !== null) {
+    const alternate = node.alternate;
+    if (!isSubsetOfLanes(node.childLanes, renderLanes)) {
+      node.childLanes = mergeLanes(node.childLanes, renderLanes);
+      if (alternate !== null) {
+        alternate.childLanes = mergeLanes(alternate.childLanes, renderLanes);
+      }
+    } else if (
+      alternate !== null &&
+      !isSubsetOfLanes(alternate.childLanes, renderLanes)
+    ) {
+      alternate.childLanes = mergeLanes(alternate.childLanes, renderLanes);
+    } else {
+      break;
+    }
+    if (node === propagationRoot) {
+      break;
+    }
+    node = node.return;
+  }
+  if (__DEV__) {
+    if (node !== propagationRoot) {
+      console.error(
+        'Expected to find the propagation root when scheduling context work. ' +
+          'This error is likely caused by a bug in React. Please file an issue.',
+      );
+    }
+  }
+}
+
+export function propagateContextChange<T>(
+  workInProgress: Fiber,
+  context: ReactContext<T>,
+  renderLanes: Lanes,
+): void {
+  const forcePropagateEntireTree = true;
+  propagateContextChanges(
+    workInProgress,
+    [context],
+    renderLanes,
+    forcePropagateEntireTree,
+  );
+}
+
+function propagateContextChanges<T>(
+  workInProgress: Fiber,
+  contexts: Array<any>,
+  renderLanes: Lanes,
+  forcePropagateEntireTree: boolean,
+): void {
+  let fiber = workInProgress.child;
+  if (fiber !== null) {
+    fiber.return = workInProgress;
+  }
+  while (fiber !== null) {
+    let nextFiber;
+
+    const list = fiber.dependencies;
+    if (list !== null) {
+      nextFiber = fiber.child;
+
+      let dep = list.firstContext;
+      while (dep !== null) {
+        const dependency = dep;
+        for (let i = 0; i < contexts.length; i++) {
+          const context: ReactContext<T> = contexts[i];
+          if (dependency.context === context) {
+            fiber.lanes = mergeLanes(fiber.lanes, renderLanes);
+            const alternate = fiber.alternate;
+            if (alternate !== null) {
+              alternate.lanes = mergeLanes(alternate.lanes, renderLanes);
+            }
+            scheduleContextWorkOnParentPath(
+              fiber.return,
+              renderLanes,
+              workInProgress,
+            );
+
+            if (!forcePropagateEntireTree) {
+              nextFiber = null;
+            }
+            break;
+          }
+        }
+        dep = dependency.next;
+      }
+    } else if (fiber.tag === DehydratedFragment) {
+      const parentSuspense = fiber.return;
+      if (parentSuspense === null) {
+        throw new Error(
+          'We just came from a parent so we must have had a parent. This is a bug in React.',
+        );
+      }
+
+      parentSuspense.lanes = mergeLanes(parentSuspense.lanes, renderLanes);
+      const alternate = parentSuspense.alternate;
+      if (alternate !== null) {
+        alternate.lanes = mergeLanes(alternate.lanes, renderLanes);
+      }
+      scheduleContextWorkOnParentPath(
+        parentSuspense,
+        renderLanes,
+        workInProgress,
+      );
+      nextFiber = null;
+    } else {
+      nextFiber = fiber.child;
+    }
+
+    if (nextFiber !== null) {
+      nextFiber.return = fiber;
+    } else {
+      nextFiber = fiber;
+      while (nextFiber !== null) {
+        if (nextFiber === workInProgress) {
+          nextFiber = null;
+          break;
+        }
+        const sibling = nextFiber.sibling;
+        if (sibling !== null) {
+          sibling.return = nextFiber.return;
+          nextFiber = sibling;
+          break;
+        }
+        nextFiber = nextFiber.return;
+      }
+    }
+    fiber = nextFiber;
+  }
+}
+
+export function propagateParentContextChanges(
+  current: Fiber,
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+  forcePropagateEntireTree: boolean,
+) {
+  let contexts = null;
+  let parent: null | Fiber = workInProgress;
+  let isInsidePropagationBailout = false;
+  while (parent !== null) {
+    if (!isInsidePropagationBailout) {
+      if ((parent.flags & NeedsPropagation) !== NoFlags) {
+        isInsidePropagationBailout = true;
+      } else if ((parent.flags & DidPropagateContext) !== NoFlags) {
+        break;
+      }
+    }
+
+    if (parent.tag === ContextProvider) {
+      const currentParent = parent.alternate;
+      if (currentParent === null) {
+        throw new Error('Should have a current fiber. This is a bug in React.');
+      }
+
+      const oldProps = currentParent.memoizedProps;
+      if (oldProps !== null) {
+        let context: ReactContext<any>;
+        if (enableRenderableContext) {
+          context = parent.type;
+        } else {
+          context = parent.type._context;
+        }
+
+        const newProps = parent.pendingProps;
+        const newValue = newProps.value;
+        const oldValue = oldProps.value;
+
+        if (!is(newValue, oldValue)) {
+          if (contexts !== null) {
+            contexts.push(context);
+          } else {
+            contexts = [context];
+          }
+        }
+      }
+    } else if (parent === getHostTransitionProvider()) {
+      const currentParent = parent.alternate;
+      if (currentParent === null) {
+        throw new Error('Should have a current fiber. This is a bug in React.');
+      }
+
+      const oldStateHook: Hook = currentParent.memoizedState;
+      const oldState: TransitionStatus = oldStateHook.memoizedState;
+
+      const newStateHook: Hook = parent.memoizedState;
+      const newState: TransitionStatus = newStateHook.memoizedState;
+
+      if (oldState !== newState) {
+        if (contexts !== null) {
+          contexts.push(HostTransitionContext);
+        } else {
+          contexts = [HostTransitionContext];
+        }
+      }
+    }
+    parent = parent.return;
+  }
+
+  if (contexts !== null) {
+    propagateContextChanges(
+      workInProgress,
+      contexts,
+      renderLanes,
+      forcePropagateEntireTree,
+    );
+  }
+
+  workInProgress.flags |= DidPropagateContext;
+}
+
+export function checkIfContextChanged(
+  currentDependencies: Dependencies,
+): boolean {
+  let dependency = currentDependencies.firstContext;
+  while (dependency !== null) {
+    const context = dependency.context;
+    const newValue = isPrimaryRenderer
+      ? context._currentValue
+      : context._currentValue2;
+    const oldValue = dependency.memoizedValue;
+    if (!is(newValue, oldValue)) {
+      return true;
+    }
+    dependency = dependency.next;
+  }
+  return false;
+}
+
+export function prepareToReadContext(
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+): void {
+  currentlyRenderingFiber = workInProgress;
+  lastContextDependency = null;
+
+  const dependencies = workInProgress.dependencies;
+  if (dependencies !== null) {
+    dependencies.firstContext = null;
+  }
+}
+
+export function readContext<T>(context: ReactContext<T>): T {
+  if (__DEV__) {
+    if (isDisallowedContextReadInDEV) {
+      console.error(
+        'Context can only be read while React is rendering. ' +
+          'In classes, you can read it in the render method or getDerivedStateFromProps. ' +
+          'In function components, you can read it directly in the function body, but not ' +
+          'inside Hooks like useReducer() or useMemo().',
+      );
+    }
+  }
+  return readContextForConsumer(currentlyRenderingFiber, context);
+}
+
+export function readContextDuringReconciliation<T>(
+  consumer: Fiber,
+  context: ReactContext<T>,
+  renderLanes: Lanes,
+): T {
+  if (currentlyRenderingFiber === null) {
+    prepareToReadContext(consumer, renderLanes);
+  }
+  return readContextForConsumer(consumer, context);
+}
+
+function readContextForConsumer<T>(
+  consumer: Fiber | null,
+  context: ReactContext<T>,
+): T {
+  const value = isPrimaryRenderer
+    ? context._currentValue
+    : context._currentValue2;
+
+  const contextItem = {
+    context: ((context: any): ReactContext<mixed>),
+    memoizedValue: value,
+    next: null,
+  };
+
+  if (lastContextDependency === null) {
+    if (consumer === null) {
+      throw new Error(
+        'Context can only be read while React is rendering. ' +
+          'In classes, you can read it in the render method or getDerivedStateFromProps. ' +
+          'In function components, you can read it directly in the function body, but not ' +
+          'inside Hooks like useReducer() or useMemo().',
+      );
+    }
+
+    lastContextDependency = contextItem;
+    consumer.dependencies = __DEV__
+      ? {
+          lanes: NoLanes,
+          firstContext: contextItem,
+          _debugThenableState: null,
+        }
+      : {
+          lanes: NoLanes,
+          firstContext: contextItem,
+        };
+    consumer.flags |= NeedsPropagation;
+  } else {
+    lastContextDependency = lastContextDependency.next = contextItem;
+  }
+  return value;
+}
