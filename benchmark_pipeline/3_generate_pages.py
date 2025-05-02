@@ -745,6 +745,17 @@ def generate_chart_data(
             # Create case set for quick membership testing
             case_set = {pair[0] for pair in bucket_cases}
 
+            # Get the cases in this bucket with their languages
+            bucket_case_languages = {
+                case_prefix: case_languages.get(case_prefix, "unknown")
+                for case_prefix in case_set
+            }
+
+            # Count cases per language in this bucket
+            language_case_counts = defaultdict(int)
+            for lang in bucket_case_languages.values():
+                language_case_counts[lang] += 1
+
             # Initialize data for this bucket
             bucket_data = {
                 "bucket_location": avg_token_count,
@@ -755,6 +766,9 @@ def generate_chart_data(
                 "case_indices": f"{start_idx + 1}-{end_idx}",
                 "models": {},
                 "case_prefixes": case_set,  # Store set of cases in this bucket
+                "language_case_counts": dict(
+                    language_case_counts
+                ),  # Store counts per language
             }
 
             # Initialize model data
@@ -1088,16 +1102,29 @@ function initializeChart(chartData) {
                                 // Add case indices information
                                 const caseInfo = bucketData.case_indices ? `\nCases: ${bucketData.case_indices}` : '';
                                 
+                                // Calculate filtered bucket size based on selected languages
+                                let filteredBucketSize = 30; // Default size
+                                if (bucketData.language_case_counts && selectedLanguages.length > 0) {
+                                    filteredBucketSize = 0;
+                                    selectedLanguages.forEach(language => {
+                                        filteredBucketSize += bucketData.language_case_counts[language] || 0;
+                                    });
+                                }
+                                
+                                // If we have a filtered size of 0, use the default
+                                if (filteredBucketSize === 0) {
+                                    filteredBucketSize = 30;
+                                }
+                                
                                 // Calculate untested cases
-                                const bucketSize = 30;
-                                const untestedCases = bucketSize - attempts;
+                                const untestedCases = filteredBucketSize - attempts;
                                 let untestedInfo = '';
                                 if (untestedCases > 0) {
                                     untestedInfo = `\nModel did not return result for ${untestedCases} case${untestedCases > 1 ? 's' : ''} in this bucket`;
                                 }
                                 
                                 return [
-                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/30)`,
+                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${filteredBucketSize})`,
                                     `Token Range: ${bucketData.bucket_range} (avg: ${(bucketData.bucket_location/1000).toFixed(1)}k)${caseInfo}${untestedInfo}${ciInfo}`
                                 ];
                             } catch (error) {
@@ -1167,9 +1194,19 @@ function initializeChart(chartData) {
                     attempts: attempts
                 };
                 
-                // Calculate success rate - always divide by 30 (bucket size)
+                // Calculate the filtered bucket size based on selected languages
+                let filteredBucketSize = 0;
+                if (bucket.language_case_counts) {
+                    selectedLanguages.forEach(language => {
+                        filteredBucketSize += bucket.language_case_counts[language] || 0;
+                    });
+                }
+                // Use filtered size as denominator if available, otherwise use default bucket size
+                const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
+                
+                // Calculate success rate - divide by appropriate denominator
                 // This assumes any prompt not tested was a failure
-                return successful > 0 ? (successful / 30 * 100) : 0;
+                return successful > 0 ? (successful / denominator * 100) : 0;
             });
             
             // Calculate confidence interval data points if languages are selected
@@ -1189,11 +1226,18 @@ function initializeChart(chartData) {
                         }
                     });
                     
-                    // Always use 30 as the denominator (bucket size)
-                    const bucketSize = 30;
+                    // Calculate bucket size based on selected languages
+                    let filteredBucketSize = 0;
+                    if (bucket.language_case_counts) {
+                        selectedLanguages.forEach(language => {
+                            filteredBucketSize += bucket.language_case_counts[language] || 0;
+                        });
+                    }
+                    // Use filtered size as denominator if available, otherwise use default bucket size
+                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
                     
-                    // Recalculate Wilson interval using fixed bucket size
-                    const [lower, upper] = wilson_score_interval(langSuccessful, bucketSize);
+                    // Recalculate Wilson interval using the appropriate denominator
+                    const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
                     return lower * 100; // Convert to percentage
                 });
                 
@@ -1209,11 +1253,18 @@ function initializeChart(chartData) {
                         }
                     });
                     
-                    // Always use 30 as the denominator (bucket size)
-                    const bucketSize = 30;
+                    // Calculate bucket size based on selected languages
+                    let filteredBucketSize = 0;
+                    if (bucket.language_case_counts) {
+                        selectedLanguages.forEach(language => {
+                            filteredBucketSize += bucket.language_case_counts[language] || 0;
+                        });
+                    }
+                    // Use filtered size as denominator if available, otherwise use default bucket size
+                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
                     
-                    // Recalculate Wilson interval using fixed bucket size
-                    const [lower, upper] = wilson_score_interval(langSuccessful, bucketSize);
+                    // Recalculate Wilson interval using the appropriate denominator
+                    const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
                     return upper * 100; // Convert to percentage
                 });
             }
