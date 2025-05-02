@@ -688,12 +688,10 @@ def generate_chart_data(
     model_display_names: Dict[str, str] = {},
 ) -> Dict[str, Any]:
     """
-    Generates data for the token-based chart.
+    Generates raw case data for the token-based chart.
 
-    Creates buckets based on case indices after sorting by prompt length:
-    - Each bucket contains 25 cases
-    - Buckets overlap and increment by 5 cases each
-    - Bucket position is the average token count of all prompts in the bucket
+    Instead of pre-calculating buckets, provides the raw case data for JavaScript
+    to process with dynamic bucketing based on user selection.
 
     Args:
         results_metadata: Dictionary mapping (case_prefix, model) to result metadata
@@ -703,130 +701,42 @@ def generate_chart_data(
         model_display_names: Optional dictionary mapping model names to display names
 
     Returns:
-        Dictionary containing the chart data
+        Dictionary containing the raw case data for chart generation
     """
 
-    # Create a list of (case_prefix, token_count) sorted by token count
-    case_token_pairs = []
-    for case_prefix, metadata in prompt_metadata.items():
-        token_count = metadata.get("prompt_tokens", 0)
-        case_token_pairs.append((case_prefix, token_count))
-
-    # Sort by token count
-    case_token_pairs.sort(key=lambda pair: pair[1])
-
-    # Define bucket parameters
-    bucket_size = 30  # Number of cases in each bucket
-    bucket_step = 10  # Increment between buckets
-
-    # Initialize buckets
-    buckets = []
-
-    # Create buckets only if we have enough cases
-    if len(case_token_pairs) >= bucket_size:
-        num_buckets = 1 + (len(case_token_pairs) - bucket_size) // bucket_step
-
-        for i in range(num_buckets):
-            # Get the case range for this bucket
-            start_idx = i * bucket_step
-            end_idx = start_idx + bucket_size
-            bucket_cases = case_token_pairs[start_idx:end_idx]
-
-            # Calculate average token count for bucket position
-            avg_token_count = sum(pair[1] for pair in bucket_cases) / len(bucket_cases)
-
-            # Get the actual token range for this bucket
-            min_tokens = min(pair[1] for pair in bucket_cases)
-            max_tokens = max(pair[1] for pair in bucket_cases)
-
-            # Calculate the bucket display value (for labels)
-            bucket_location_k = round(avg_token_count / 1000, 1)
-
-            # Create case set for quick membership testing
-            case_set = {pair[0] for pair in bucket_cases}
-
-            # Get the cases in this bucket with their languages
-            bucket_case_languages = {
-                case_prefix: case_languages.get(case_prefix, "unknown")
-                for case_prefix in case_set
-            }
-
-            # Count cases per language in this bucket
-            language_case_counts = defaultdict(int)
-            for lang in bucket_case_languages.values():
-                language_case_counts[lang] += 1
-
-            # Initialize data for this bucket
-            bucket_data = {
-                "bucket_location": avg_token_count,
-                "bucket_location_k": bucket_location_k,
-                "bucket_min": min_tokens,
-                "bucket_max": max_tokens,
-                "bucket_range": f"{min_tokens // 1000}k-{max_tokens // 1000}k",
-                "case_indices": f"{start_idx + 1}-{end_idx}",
-                "models": {},
-                "case_prefixes": case_set,  # Store set of cases in this bucket
-                "language_case_counts": dict(
-                    language_case_counts
-                ),  # Store counts per language
-            }
-
-            # Initialize model data
-            for model in all_models:
-                bucket_data["models"][model] = {
-                    "overall": {"attempts": 0, "successful": 0},
-                    "languages": {},
-                }
-
-            buckets.append(bucket_data)
-
-    # Populate buckets with result data
-    for (case_prefix, model), result_metadata in results_metadata.items():
-        # Get language for this case
+    # Create a list of case data entries with token counts and results
+    cases = []
+    for case_prefix, case_metadata in prompt_metadata.items():
+        token_count = case_metadata.get("prompt_tokens", 0)
         language = case_languages.get(case_prefix, "unknown")
 
-        # Add this case to all buckets that contain it
-        for bucket in buckets:
-            if case_prefix in bucket["case_prefixes"]:
-                # Initialize language if needed
-                if language not in bucket["models"][model]["languages"]:
-                    bucket["models"][model]["languages"][language] = {
-                        "attempts": 0,
-                        "successful": 0,
-                    }
+        # Create case entry with basic info
+        case_entry = {
+            "prefix": case_prefix,
+            "token_count": token_count,
+            "language": language,
+            "results": {},
+        }
 
-                # Add to counts
-                bucket["models"][model]["overall"]["attempts"] += 1
-                bucket["models"][model]["languages"][language]["attempts"] += 1
+        # Add results for each model
+        for model in all_models:
+            result_key = (case_prefix, model)
+            if result_key in results_metadata:
+                result_metadata = results_metadata[result_key]
+                case_entry["results"][model] = {
+                    "success": result_metadata.get("success", False),
+                    "attempted": True,
+                }
+            else:
+                case_entry["results"][model] = {"success": False, "attempted": False}
 
-                if result_metadata.get("success", False):
-                    bucket["models"][model]["overall"]["successful"] += 1
-                    bucket["models"][model]["languages"][language]["successful"] += 1
+        cases.append(case_entry)
 
-    # Calculate confidence intervals for all data points
-    for bucket in buckets:
-        for model, model_data in bucket["models"].items():
-            # Calculate confidence intervals for overall data
-            successful = model_data["overall"]["successful"]
-            attempts = model_data["overall"]["attempts"]
-            lower, upper = wilson_score_interval(successful, attempts)
-            model_data["overall"]["lower_bound"] = lower
-            model_data["overall"]["upper_bound"] = upper
+    # Sort cases by token count
+    cases.sort(key=lambda case: case["token_count"])
 
-            # Calculate confidence intervals for each language
-            for language_data in model_data["languages"].values():
-                successful = language_data["successful"]
-                attempts = language_data["attempts"]
-                lower, upper = wilson_score_interval(successful, attempts)
-                language_data["lower_bound"] = lower
-                language_data["upper_bound"] = upper
-
-    # Calculate all unique languages across all data
-    all_languages = set()
-    for bucket in buckets:
-        for model_data in bucket["models"].values():
-            for language in model_data["languages"].keys():
-                all_languages.add(language)
+    # Calculate all unique languages
+    all_languages = set(case_languages.values())
 
     # Create model display name mapping for the chart
     model_display_map = {}
@@ -834,23 +744,24 @@ def generate_chart_data(
         if model in model_display_names:
             model_display_map[model] = model_display_names[model]
 
-    # Calculate max tokens from buckets or use default
-    max_tokens_k = 75  # Default if no buckets
-    if buckets:
-        # Find the bucket with the highest average token count
-        max_tokens = max(bucket["bucket_location"] for bucket in buckets)
+    # Calculate max tokens or use default
+    max_tokens_k = 75  # Default
+    if cases:
+        # Find the case with the highest token count
+        max_tokens = max(case["token_count"] for case in cases)
         max_tokens_k = round(
             max_tokens / 1000, 1
         )  # Convert to k and round to 1 decimal
 
     # Create the chart data object
     chart_data = {
-        "buckets": buckets,
+        "cases": cases,
         "models": list(sorted(all_models)),
-        "model_display_names": model_display_map,  # Add model display names to chart data
+        "model_display_names": model_display_map,
         "languages": list(sorted(all_languages)),
         "min_tokens_k": 0,  # Always start at 0k
         "max_tokens_k": max_tokens_k,
+        "default_bucket_count": 5,  # Default number of buckets
     }
 
     return chart_data
@@ -904,6 +815,13 @@ def create_token_chart_section() -> str:
             <div class="language-selection">
                 <h3>Languages</h3>
                 <div id="language-checkboxes"></div>
+            </div>
+            <div class="bucketing-options">
+                <h3>Bucketing Options</h3>
+                <div class="bucket-count-control">
+                    <label for="bucket-count">Number of Buckets: <span id="bucket-count-display">5</span></label>
+                    <input type="range" id="bucket-count" min="1" max="20" value="5" step="1">
+                </div>
             </div>
             <div class="display-options">
                 <h3>Display Options</h3>
@@ -2181,7 +2099,7 @@ tbody tr:hover {
     gap: 30px;
 }
 
-.model-selection, .language-selection, .display-options {
+.model-selection, .language-selection, .display-options, .bucketing-options {
     flex: 1;
     min-width: 200px;
 }
@@ -2206,6 +2124,24 @@ tbody tr:hover {
     height: 12px;
     margin-right: 8px;
     border-radius: 2px;
+}
+
+.bucket-count-control {
+    margin: 15px 0;
+}
+
+.bucket-count-control label {
+    display: block;
+    margin-bottom: 8px;
+}
+
+.bucket-count-control input[type="range"] {
+    width: 100%;
+    cursor: pointer;
+}
+
+#bucket-count-display {
+    font-weight: bold;
 }
 
 .chart-container {
