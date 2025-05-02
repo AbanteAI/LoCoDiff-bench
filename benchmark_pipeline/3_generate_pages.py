@@ -33,6 +33,7 @@ File Modifications:
 """
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -854,10 +855,19 @@ def write_chart_data_to_file(chart_data: Dict[str, Any], output_dir: Path) -> No
     """Writes chart data to a JSON file in the specified directory."""
     output_path = output_dir / "chart_data.json"
     try:
+        # Process chart data to make it JSON serializable
+        chart_data_copy = copy.deepcopy(chart_data)
+
+        # Remove the case_prefixes set from each bucket as it's not JSON serializable
+        # and only used internally for processing
+        for bucket in chart_data_copy["buckets"]:
+            if "case_prefixes" in bucket:
+                del bucket["case_prefixes"]
+
         # Create a wrapper object that includes the warning
         wrapper = {
             "_warning": get_auto_generation_warning().strip(),
-            "data": chart_data,
+            "data": chart_data_copy,
         }
 
         with open(output_path, "w", encoding="utf-8") as f:
