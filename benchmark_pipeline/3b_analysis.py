@@ -12,6 +12,7 @@ Purpose:
   - How many extraction failures were due to empty model outputs
   - The total number of benchmark cases run for that model
   - The percentage of cases with extraction failures
+  - A detailed list of all cases where extraction failed but output wasn't empty
 
 Arguments:
   --benchmark-run-dir (required): Path to the directory containing the benchmark run data
@@ -26,6 +27,7 @@ Outputs:
   - Distinguishes between empty output failures and other extraction failures.
   - Lists models in descending order of extraction failure rate.
   - Includes counts and percentages for each model.
+  - Lists all model/case pairs where extraction failed but output wasn't empty.
 """
 
 import argparse
@@ -33,7 +35,7 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,21 +69,29 @@ def find_metadata_files(results_dir: Path) -> List[Path]:
     return metadata_files
 
 
-def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
+def analyze_extraction_failures(
+    metadata_files: List[Path],
+) -> Tuple[Dict[str, Dict], Dict[str, List]]:
     """
     Analyze metadata files to count extraction failures by model,
     distinguishing between empty outputs and other extraction failures.
+    Also collects detailed information about each failure.
 
     Args:
         metadata_files: List of paths to metadata.json files.
 
     Returns:
-        Dictionary with model name as key and statistics as value.
+        A tuple containing:
+        - Dictionary with model name as key and statistics as value
+        - Dictionary with model name as key and a list of failure details
     """
-    # Initialize a dictionary to store counts for each model
+    # Initialize dictionaries to store counts and details for each model
     model_stats = defaultdict(
         lambda: {"total": 0, "extraction_failures": 0, "empty_output_failures": 0}
     )
+
+    # Store details about each failure for reporting
+    failure_details = defaultdict(list)
 
     for metadata_path in metadata_files:
         try:
@@ -92,6 +102,8 @@ def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
             if not model:
                 continue
 
+            benchmark_case = metadata.get("benchmark_case", "Unknown")
+
             # Increment total count for this model
             model_stats[model]["total"] += 1
 
@@ -100,12 +112,16 @@ def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
             if error and "backticks not found" in error:
                 model_stats[model]["extraction_failures"] += 1
 
+                # Assume it's not empty by default
+                is_empty = False
+
                 # Check if it was due to empty output
                 raw_response_length = metadata.get("raw_response_length", 0)
                 if raw_response_length == 0 or (
                     raw_response_length < 10
                     and "raw_response.txt" in str(metadata_path)
                 ):
+                    is_empty = True
                     model_stats[model]["empty_output_failures"] += 1
 
                     # Check the actual raw response file for more accurate detection
@@ -115,21 +131,26 @@ def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
                             content = raw_response_path.read_text(
                                 encoding="utf-8"
                             ).strip()
-                            if not content:
-                                # Confirm it's truly empty
-                                model_stats[model]["empty_output_failures"] = (
-                                    model_stats[model]["empty_output_failures"]
-                                )
+                            is_empty = not content
                         except Exception:
                             # If we can't read the file, rely on the metadata
                             pass
+
+                # Store details about this failure
+                failure_details[model].append(
+                    {
+                        "benchmark_case": benchmark_case,
+                        "is_empty": is_empty,
+                        "results_dir": str(metadata_path.parent),
+                    }
+                )
 
         except (json.JSONDecodeError, IOError) as e:
             print(f"Error reading metadata file {metadata_path}: {e}")
         except Exception as e:
             print(f"Unexpected error processing {metadata_path}: {e}")
 
-    return model_stats
+    return model_stats, failure_details
 
 
 def calculate_percentages(model_stats: Dict[str, Dict]) -> List[Tuple[str, Dict]]:
@@ -137,7 +158,7 @@ def calculate_percentages(model_stats: Dict[str, Dict]) -> List[Tuple[str, Dict]
     Calculate extraction failure percentages and sort models by failure rate.
 
     Args:
-        model_stats: Dictionary with model statistics.
+        model_stats: Dictionary with model name as key and statistics as value.
 
     Returns:
         List of (model, stats) tuples sorted by extraction failure percentage.
@@ -213,6 +234,48 @@ def display_results(sorted_stats: List[Tuple[str, Dict]]):
     print("=" * 120)
 
 
+def display_non_empty_failures(failure_details: Dict[str, List[Dict[str, Any]]]):
+    """
+    Display a list of all model/case pairs where extraction failed but output wasn't empty.
+
+    Args:
+        failure_details: Dictionary with model name as key and list of failure details as value.
+    """
+    # Count non-empty failures
+    non_empty_count = 0
+    for model_failures in failure_details.values():
+        for failure in model_failures:
+            if not failure["is_empty"]:
+                non_empty_count += 1
+
+    if non_empty_count == 0:
+        print("\nNo non-empty extraction failures found.")
+        return
+
+    print(f"\nList of Non-Empty Extraction Failures ({non_empty_count} total)")
+    print("=" * 100)
+    print(f"{'Model':<40} {'Benchmark Case':<40} {'Results Directory'}")
+    print("-" * 100)
+
+    # Sort by model name for consistent output
+    for model in sorted(failure_details.keys()):
+        # Filter to only non-empty failures
+        non_empty_failures = [f for f in failure_details[model] if not f["is_empty"]]
+
+        if non_empty_failures:
+            # Sort by benchmark case for consistent output
+            for failure in sorted(
+                non_empty_failures, key=lambda f: f["benchmark_case"]
+            ):
+                print(
+                    f"{model:<40} "
+                    f"{failure['benchmark_case']:<40} "
+                    f"{failure['results_dir']}"
+                )
+
+    print("=" * 100)
+
+
 def main():
     """Main function to analyze extraction failures."""
     args = parse_args()
@@ -234,13 +297,16 @@ def main():
         return 1
 
     # Analyze the metadata files
-    model_stats = analyze_extraction_failures(metadata_files)
+    model_stats, failure_details = analyze_extraction_failures(metadata_files)
 
     # Calculate percentages and sort
     sorted_stats = calculate_percentages(model_stats)
 
-    # Display results
+    # Display summary results
     display_results(sorted_stats)
+
+    # Display list of non-empty extraction failures
+    display_non_empty_failures(failure_details)
 
     return 0
 
