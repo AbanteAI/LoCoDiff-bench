@@ -783,12 +783,6 @@ def write_chart_data_to_file(chart_data: Dict[str, Any], output_dir: Path) -> No
         # Process chart data to make it JSON serializable
         chart_data_copy = copy.deepcopy(chart_data)
 
-        # Remove the case_prefixes set from each bucket as it's not JSON serializable
-        # and only used internally for processing
-        for bucket in chart_data_copy["buckets"]:
-            if "case_prefixes" in bucket:
-                del bucket["case_prefixes"]
-
         # Create a wrapper object that includes the warning
         wrapper = {
             "_warning": get_auto_generation_warning().strip(),
