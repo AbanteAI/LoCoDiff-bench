@@ -964,11 +964,13 @@ function initializeChart(chartData) {
     // Create global variables for chart state that need to be accessed by callbacks
     let currentSelectedLanguages = [];
     let currentSelectedModels = [];
+    let currentBucketCount = chartData.default_bucket_count || 5;
+    let buckets = []; // Will be calculated dynamically
     
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
-    // Create model checkboxes without color squares
+    // Create model checkboxes
     const modelCheckboxes = document.getElementById('model-checkboxes');
     chartData.models.forEach((model) => {
         // Use display name if available, otherwise use original model name
@@ -1001,8 +1003,19 @@ function initializeChart(chartData) {
         languageCheckboxes.appendChild(checkbox);
     });
     
-    const firstBucket = chartData.buckets[0];
-    const lastBucket = chartData.buckets.at(-1);
+    // Setup bucket count slider
+    const bucketCountSlider = document.getElementById('bucket-count');
+    const bucketCountDisplay = document.getElementById('bucket-count-display');
+    
+    bucketCountSlider.value = currentBucketCount;
+    bucketCountDisplay.textContent = currentBucketCount;
+    
+    bucketCountSlider.addEventListener('input', function() {
+        currentBucketCount = parseInt(this.value);
+        bucketCountDisplay.textContent = currentBucketCount;
+        calculateBuckets();
+        updateChart();
+    });
     
     // Create chart
     const chart = new Chart(ctx, {
@@ -1016,32 +1029,12 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    // use bucket locations (averages) for exact alignment with data points
-                    min: firstBucket.bucket_location / 1000,   // Use first bucket average
-                    max: lastBucket.bucket_location / 1000,   // Use last bucket average
-                    // Override the tick generation completely to ensure we get exactly what we want
-                    afterFit: function(scaleInstance) {
-                        // Make sure our exact list of ticks is used
-                        const tickValues = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75];
-                        
-                        // Create proper tick objects with value and label
-                        scaleInstance.ticks = tickValues.map(value => ({
-                            value: value,
-                            label: value + 'k',
-                            major: false
-                        }));
-                    },
+                    min: 0,
+                    max: chartData.max_tokens_k,
                     ticks: {
-                        // Only format ticks that were explicitly added
-                        callback: function(value, index, values) {
-                            // Return value + 'k' for our desired ticks
-                            if ([10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75].includes(parseFloat(value))) {
-                                return value + 'k';
-                            }
-                            // Return null to hide any other ticks
-                            return null;
-                        },
-                        precision: 1
+                        callback: function(value) {
+                            return value + 'k';
+                        }
                     },
                     title: {
                         display: true,
@@ -1071,7 +1064,6 @@ function initializeChart(chartData) {
                 },
                 legend: {
                     labels: {
-                        // Custom filter function to exclude datasets with display: false from the legend
                         filter: (legendItem, data) => {
                             const dataset = data.datasets[legendItem.datasetIndex];
                             return dataset && dataset.display !== false;
@@ -1081,95 +1073,57 @@ function initializeChart(chartData) {
                 tooltip: {
                     callbacks: {
                         label: function(context) {
-                            // Safety check - make sure context and dataset exist
                             if (!context || !context.dataset || !context.dataset.label) {
                                 return null;
                             }
                             
-                            // Don't show tooltips for confidence interval datasets
                             if (context.dataset.label.includes('CI')) {
                                 return null;
                             }
                             
                             try {
-                                // Get display name (which is the label) and the original model name for data lookup
                                 const displayName = context.dataset.label;
-                                // Use originalModel property we added to dataset for data lookup
                                 const originalModel = context.dataset.originalModel || displayName;
-                                
-                                // With x,y coordinates, we need to find the bucket by x value (token count)
-                                // rather than by index
-                                const xValue = context.raw.x; // This is the token count in thousands
+                                const xValue = context.raw.x; // Token count in thousands
                                 
                                 // Find the bucket with matching token count
-                                const bucketData = chartData.buckets.find(bucket => 
-                                    Math.abs((bucket.bucket_location / 1000) - xValue) < 0.01
+                                const bucketData = buckets.find(bucket => 
+                                    Math.abs((bucket.avgTokens / 1000) - xValue) < 0.01
                                 );
                                 
-                                // Safety check for bucket
                                 if (!bucketData) {
                                     return [`${displayName}`];
                                 }
                                 
-                                // Safety check for model data
-                                if (!bucketData.models || !bucketData.models[originalModel]) {
+                                const modelStats = bucketData.modelStats[originalModel];
+                                if (!modelStats) {
                                     return [`${displayName}: No data available`];
                                 }
                                 
-                                const modelData = bucketData.models[originalModel];
-                                
-                                // Get basic stats - with x,y coordinate objects, y is the success rate
                                 const successRate = context.raw.y;
-                                
-                                // Use filtered data if available, otherwise fall back to overall data
-                                let successful, attempts;
-                                
-                                // Check if we have filtered data for this bucket and model
-                                if (bucketData.filteredData && bucketData.filteredData[originalModel]) {
-                                    successful = bucketData.filteredData[originalModel].successful;
-                                    attempts = bucketData.filteredData[originalModel].attempts;
-                                } else {
-                                    // Fall back to overall data (before filtering)
-                                    successful = modelData.overall.successful;
-                                    attempts = modelData.overall.attempts;
-                                }
+                                const successful = modelStats.successful;
+                                const attempts = modelStats.attempts;
+                                const caseCount = bucketData.caseCount;
                                 
                                 // Get confidence interval
                                 let ciInfo = '';
                                 const ciElement = document.getElementById('show-confidence-intervals');
                                 if (ciElement && ciElement.checked && attempts > 0) {
-                                    // Use the filtered counts we already have for CI calculation
-                                    const [lower, upper] = wilson_score_interval(successful, attempts);
+                                    const [lower, upper] = wilson_score_interval(successful, caseCount);
                                     ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
                                 }
                                 
-                                // Add case indices information
-                                const caseInfo = bucketData.case_indices ? `\nCases: ${bucketData.case_indices}` : '';
-                                
-                                // Calculate filtered bucket size based on selected languages
-                                let filteredBucketSize = 30; // Default size
-                                if (bucketData.language_case_counts && currentSelectedLanguages.length > 0) {
-                                    filteredBucketSize = 0;
-                                    currentSelectedLanguages.forEach(language => {
-                                        filteredBucketSize += bucketData.language_case_counts[language] || 0;
-                                    });
-                                }
-                                
-                                // If we have a filtered size of 0, use the default
-                                if (filteredBucketSize === 0) {
-                                    filteredBucketSize = 30;
-                                }
-                                
                                 // Calculate untested cases
-                                const untestedCases = filteredBucketSize - attempts;
+                                const untestedCases = caseCount - attempts;
                                 let untestedInfo = '';
                                 if (untestedCases > 0) {
                                     untestedInfo = `\nModel did not return result for ${untestedCases} case${untestedCases > 1 ? 's' : ''} in this bucket`;
                                 }
                                 
                                 return [
-                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/${filteredBucketSize})`,
-                                    `Token Range: ${bucketData.bucket_range} (avg: ${(bucketData.bucket_location/1000).toFixed(1)}k)${caseInfo}${untestedInfo}${ciInfo}`
+                                    `${displayName}: ${successRate.toFixed(2)}% (${successful}/${caseCount})`,
+                                    `Token Range: ${bucketData.minTokens/1000}k-${bucketData.maxTokens/1000}k (avg: ${(bucketData.avgTokens/1000).toFixed(1)}k)
+Cases: ${bucketData.caseCount}${untestedInfo}${ciInfo}`
                                 ];
                             } catch (error) {
                                 console.error('Error in tooltip callback:', error);
@@ -1182,7 +1136,89 @@ function initializeChart(chartData) {
         }
     });
     
-    // Function to update chart based on selected models and languages
+    // Function to filter cases based on selected languages
+    function getFilteredCases() {
+        if (currentSelectedLanguages.length === 0) {
+            return [];
+        }
+        
+        return chartData.cases.filter(caseData => 
+            currentSelectedLanguages.includes(caseData.language)
+        );
+    }
+    
+    // Function to calculate buckets based on filtered cases
+    function calculateBuckets() {
+        const filteredCases = getFilteredCases();
+        if (filteredCases.length === 0) {
+            buckets = [];
+            return;
+        }
+        
+        // Sort cases by token count (should already be sorted, but just to be safe)
+        filteredCases.sort((a, b) => a.token_count - b.token_count);
+        
+        // Calculate cases per bucket
+        const casesPerBucket = Math.floor(filteredCases.length / currentBucketCount);
+        const extraCases = filteredCases.length % currentBucketCount;
+        
+        // Create new buckets array
+        buckets = [];
+        
+        let caseIndex = 0;
+        for (let i = 0; i < currentBucketCount; i++) {
+            // Calculate how many cases go in this bucket
+            // Last bucket gets the extra cases if count isn't evenly divisible
+            const bucketSize = (i === currentBucketCount - 1) 
+                ? casesPerBucket + extraCases 
+                : casesPerBucket;
+            
+            if (bucketSize === 0) continue;
+            
+            // Get cases for this bucket
+            const bucketCases = filteredCases.slice(caseIndex, caseIndex + bucketSize);
+            caseIndex += bucketSize;
+            
+            // Calculate token stats
+            const minTokens = bucketCases[0].token_count;
+            const maxTokens = bucketCases[bucketCases.length - 1].token_count;
+            const avgTokens = bucketCases.reduce((sum, c) => sum + c.token_count, 0) / bucketCases.length;
+            
+            // Initialize bucket data
+            const bucket = {
+                minTokens,
+                maxTokens,
+                avgTokens,
+                caseCount: bucketCases.length,
+                cases: bucketCases,
+                modelStats: {}
+            };
+            
+            // Calculate model statistics for this bucket
+            chartData.models.forEach(model => {
+                const modelStats = {
+                    successful: 0,
+                    attempts: 0
+                };
+                
+                bucketCases.forEach(caseData => {
+                    const result = caseData.results[model];
+                    if (result.attempted) {
+                        modelStats.attempts++;
+                        if (result.success) {
+                            modelStats.successful++;
+                        }
+                    }
+                });
+                
+                bucket.modelStats[model] = modelStats;
+            });
+            
+            buckets.push(bucket);
+        }
+    }
+    
+    // Function to update chart based on selected models, languages, and bucket count
     function updateChart() {
         // Get selected models and languages
         currentSelectedModels = Array.from(document.querySelectorAll('input[data-model]:checked'))
@@ -1191,136 +1227,72 @@ function initializeChart(chartData) {
         currentSelectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
             .map(checkbox => checkbox.getAttribute('data-language'));
         
-        // Clear filteredData from previous filter selections
-        chartData.buckets.forEach(bucket => {
-            bucket.filteredData = {};
-        });
+        // Recalculate buckets based on selected languages and bucket count
+        calculateBuckets();
         
         // Clear current datasets
         chart.data.datasets = [];
+        
+        // If no buckets (e.g., no languages selected), don't update further
+        if (buckets.length === 0) {
+            chart.update();
+            return;
+        }
+        
+        // Update x-axis scale based on actual data
+        const minToken = buckets[0].minTokens / 1000;
+        const maxToken = buckets[buckets.length - 1].maxTokens / 1000;
+        
+        chart.options.scales.x.min = Math.floor(minToken);
+        chart.options.scales.x.max = Math.ceil(maxToken);
         
         // Create datasets for each selected model
         currentSelectedModels.forEach((model, index) => {
             const color = colors[index % colors.length];
             
-            // Calculate data points and store filtered data for tooltip
-            const dataPoints = chartData.buckets.map((bucket, bucketIndex) => {
-                const modelData = bucket.models[model];
+            // Calculate data points for this model
+            const dataPoints = buckets.map(bucket => {
+                const modelStats = bucket.modelStats[model];
+                const successful = modelStats.successful;
+                const caseCount = bucket.caseCount;
                 
-                // Filter by selected languages
-                let successful = 0;
-                let attempts = 0;
+                // Calculate success rate
+                const successRate = (caseCount > 0) ? (successful / caseCount) * 100 : 0;
                 
-                if (currentSelectedLanguages.length === 0) {
-                    // No languages selected, show empty chart (consistent with model selection behavior)
-                    return null;
-                } else {
-                    // Use only selected languages
-                    currentSelectedLanguages.forEach(language => {
-                        if (modelData.languages[language]) {
-                            successful += modelData.languages[language].successful;
-                            attempts += modelData.languages[language].attempts;
-                        }
-                    });
-                }
-                
-                // Store filtered data for this bucket and model for tooltip access
-                if (!bucket.filteredData) {
-                    bucket.filteredData = {};
-                }
-                if (!bucket.filteredData[model]) {
-                    bucket.filteredData[model] = {};
-                }
-                
-                bucket.filteredData[model] = {
-                    successful: successful,
-                    attempts: attempts
-                };
-                
-                // Calculate the filtered bucket size based on selected languages
-                let filteredBucketSize = 0;
-                if (bucket.language_case_counts) {
-                    currentSelectedLanguages.forEach(language => {
-                        filteredBucketSize += bucket.language_case_counts[language] || 0;
-                    });
-                }
-                // Use filtered size as denominator if available, otherwise use default bucket size
-                const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
-                
-                // Calculate success rate - divide by appropriate denominator
-                // This assumes any prompt not tested was a failure
-                const y = successful > 0 ? (successful / denominator * 100) : 0;
-                // Return x,y coordinates where x is the bucket location in thousands
                 return {
-                    x: bucket.bucket_location / 1000, // Convert to k
-                    y: y
+                    x: bucket.avgTokens / 1000, // Convert to k
+                    y: successRate
                 };
             });
             
-            // Calculate confidence interval data points if languages are selected
+            // Calculate confidence interval data points
             let lowerBoundPoints = null;
             let upperBoundPoints = null;
             
-            if (currentSelectedLanguages.length > 0) {
-                lowerBoundPoints = chartData.buckets.map(bucket => {
-                    const modelData = bucket.models[model];
+            if (document.getElementById('show-confidence-intervals').checked) {
+                lowerBoundPoints = buckets.map(bucket => {
+                    const modelStats = bucket.modelStats[model];
+                    const successful = modelStats.successful;
+                    const caseCount = bucket.caseCount;
                     
-                    // Use only selected languages
-                    let langSuccessful = 0;
+                    const [lower, upper] = wilson_score_interval(successful, caseCount);
                     
-                    currentSelectedLanguages.forEach(language => {
-                        if (modelData.languages[language]) {
-                            langSuccessful += modelData.languages[language].successful;
-                        }
-                    });
-                    
-                    // Calculate bucket size based on selected languages
-                    let filteredBucketSize = 0;
-                    if (bucket.language_case_counts) {
-                        currentSelectedLanguages.forEach(language => {
-                            filteredBucketSize += bucket.language_case_counts[language] || 0;
-                        });
-                    }
-                    // Use filtered size as denominator if available, otherwise use default bucket size
-                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
-                    
-                    // Recalculate Wilson interval using the appropriate denominator
-                    const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
-                    // Return x,y coordinates for lower bound
                     return {
-                        x: bucket.bucket_location / 1000, // Convert to k
-                        y: lower * 100 // Convert to percentage
+                        x: bucket.avgTokens / 1000,
+                        y: lower * 100
                     };
                 });
                 
-                upperBoundPoints = chartData.buckets.map(bucket => {
-                    const modelData = bucket.models[model];
+                upperBoundPoints = buckets.map(bucket => {
+                    const modelStats = bucket.modelStats[model];
+                    const successful = modelStats.successful;
+                    const caseCount = bucket.caseCount;
                     
-                    // Use only selected languages
-                    let langSuccessful = 0;
+                    const [lower, upper] = wilson_score_interval(successful, caseCount);
                     
-                    currentSelectedLanguages.forEach(language => {
-                        if (modelData.languages[language]) {
-                            langSuccessful += modelData.languages[language].successful;
-                        }
-                    });
-                    
-                    // Calculate bucket size based on selected languages
-                    let filteredBucketSize = 0;
-                    if (bucket.language_case_counts) {
-                        currentSelectedLanguages.forEach(language => {
-                            filteredBucketSize += bucket.language_case_counts[language] || 0;
-                        });
-                    }
-                    // Use filtered size as denominator if available, otherwise use default bucket size
-                    const denominator = filteredBucketSize > 0 ? filteredBucketSize : 30;
-                    
-                    // Recalculate Wilson interval using the appropriate denominator
-                    const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
-                    // Return x,y coordinates for upper bound
                     return {
-                        x: bucket.bucket_location / 1000, // Convert to k
-                        y: upper * 100 // Convert to percentage
+                        x: bucket.avgTokens / 1000,
+                        y: upper * 100
                     };
                 });
             }
@@ -1333,7 +1305,7 @@ function initializeChart(chartData) {
             // Add main dataset
             chart.data.datasets.push({
                 label: displayName,
-                originalModel: model, // Store original model name for data lookup
+                originalModel: model,
                 data: dataPoints,
                 borderColor: color,
                 backgroundColor: color + '33',
@@ -1341,14 +1313,12 @@ function initializeChart(chartData) {
                 tension: 0.1,
                 pointRadius: 4,
                 pointHoverRadius: 6,
-                parsing: false  // Tell Chart.js we're using x,y objects directly
+                parsing: false
             });
             
             // Add confidence interval datasets if enabled
-            const showConfidenceIntervals = document.getElementById('show-confidence-intervals').checked;
-            
-            if (showConfidenceIntervals && currentSelectedLanguages.length > 0) {
-                // Add lower bound line first (needed for reference by the area dataset)
+            if (document.getElementById('show-confidence-intervals').checked) {
+                // Add lower bound line (needed for reference by the area dataset)
                 const lowerBoundIndex = chart.data.datasets.length;
                 chart.data.datasets.push({
                     label: `${displayName} (95% CI lower)`,
@@ -1358,9 +1328,9 @@ function initializeChart(chartData) {
                     pointRadius: 0,
                     tension: 0.1,
                     fill: false,
-                    parsing: false,  // Tell Chart.js we're using x,y objects directly
-                    showLine: false, // Don't draw a line for this dataset
-                    display: false   // Completely exclude from legend
+                    parsing: false,
+                    showLine: false,
+                    display: false
                 });
                 
                 // Add confidence interval area
@@ -1368,12 +1338,12 @@ function initializeChart(chartData) {
                     label: `${displayName} (95% CI)`,
                     data: upperBoundPoints,
                     borderColor: 'transparent',
-                    backgroundColor: color + '22', // Very transparent version of the line color
+                    backgroundColor: color + '22',
                     pointRadius: 0,
                     tension: 0.1,
-                    parsing: false,  // Tell Chart.js we're using x,y objects directly
-                    fill: lowerBoundIndex, // Fill to the specific dataset index (the lower bound)
-                    display: false         // Completely exclude from legend
+                    parsing: false,
+                    fill: lowerBoundIndex,
+                    display: false
                 });
             }
         });
@@ -1382,17 +1352,18 @@ function initializeChart(chartData) {
         chart.update();
     }
     
-    // Add event listeners to model and language checkboxes
+    // Add event listeners
     document.querySelectorAll('input[data-model], input[data-language]').forEach(checkbox => {
         checkbox.addEventListener('change', updateChart);
     });
     
-    // Add event listener to confidence interval checkbox
     document.getElementById('show-confidence-intervals').addEventListener('change', updateChart);
     
-    // Initial chart update
+    // Calculate initial buckets and update chart
+    calculateBuckets();
     updateChart();
 }
+
 </script>
 """
 
