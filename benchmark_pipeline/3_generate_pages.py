@@ -1021,10 +1021,7 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    min: 0,
-                    max: 100,
                     ticks: {
-                        stepSize: 10,
                         callback: function(value) {
                             return value + 'k';
                         }
@@ -1046,7 +1043,7 @@ function initializeChart(chartData) {
             plugins: {
                 title: {
                     display: true,
-                    text: 'LoCoDiff Benchmark Results by Prompt Size',
+                    text: 'LoCoDiff: Natural Long Context Code Bench',
                     font: {
                         size: 18
                     },
@@ -1083,12 +1080,19 @@ function initializeChart(chartData) {
                                 // Use originalModel property we added to dataset for data lookup
                                 const originalModel = context.dataset.originalModel || displayName;
                                 
-                                // Safety check for dataIndex
-                                if (context.dataIndex === undefined || !chartData.buckets[context.dataIndex]) {
+                                // With x,y coordinates, we need to find the bucket by x value (token count)
+                                // rather than by index
+                                const xValue = context.raw.x; // This is the token count in thousands
+                                
+                                // Find the bucket with matching token count
+                                const bucketData = chartData.buckets.find(bucket => 
+                                    Math.abs((bucket.bucket_location / 1000) - xValue) < 0.01
+                                );
+                                
+                                // Safety check for bucket
+                                if (!bucketData) {
                                     return [`${displayName}`];
                                 }
-                                
-                                const bucketData = chartData.buckets[context.dataIndex];
                                 
                                 // Safety check for model data
                                 if (!bucketData.models || !bucketData.models[originalModel]) {
@@ -1097,8 +1101,8 @@ function initializeChart(chartData) {
                                 
                                 const modelData = bucketData.models[originalModel];
                                 
-                                // Get basic stats
-                                const successRate = context.raw;
+                                // Get basic stats - with x,y coordinate objects, y is the success rate
+                                const successRate = context.raw.y;
                                 
                                 // Use filtered data if available, otherwise fall back to overall data
                                 let successful, attempts;
