@@ -948,14 +948,17 @@ function initializeChart(chartData) {
                     type: 'linear',
                     min: 0,
                     max: chartData.max_tokens_k,
+                    // We'll override ticks in updateChart
                     ticks: {
-                        callback: function(value) {
-                            return value + 'k';
-                        }
+                        // Empty default ticks configuration - will be set dynamically
                     },
                     title: {
                         display: true,
-                        text: 'Prompt Token Length'
+                        text: 'Prompt Token Length (k)'
+                    },
+                    grid: {
+                        // Make grid lines match our ticks
+                        z: -1 // Draw grid lines behind the data
                     }
                 },
                 y: {
@@ -1156,12 +1159,44 @@ Cases: ${bucketData.caseCount}${untestedInfo}${ciInfo}`
             return;
         }
         
-        // Update x-axis scale based on actual data
+        // Update x-axis scale and ticks based on actual data
         const minToken = buckets[0].minTokens / 1000;
         const maxToken = buckets[buckets.length - 1].maxTokens / 1000;
         
-        chart.options.scales.x.min = Math.floor(minToken);
-        chart.options.scales.x.max = Math.ceil(maxToken);
+        // Create custom ticks for each bucket
+        const customTicks = buckets.map(bucket => {
+            // Position tick at the bucket's average token count
+            const tickValue = bucket.avgTokens / 1000;
+            
+            // Label shows the token range for this bucket
+            const minK = (bucket.minTokens / 1000).toFixed(1);
+            const maxK = (bucket.maxTokens / 1000).toFixed(1);
+            const tickLabel = `${minK}k-${maxK}k`;
+            
+            return {
+                value: tickValue,
+                label: tickLabel
+            };
+        });
+        
+        // Set precise min/max values with small padding for visual appeal
+        chart.options.scales.x.min = Math.max(0, minToken - 0.5);
+        chart.options.scales.x.max = maxToken + 0.5;
+        
+        // Use our custom ticks
+        chart.options.scales.x.ticks = {
+            callback: function(val, index) {
+                // Find the tick with this value
+                const tick = customTicks.find(t => Math.abs(t.value - val) < 0.01);
+                return tick ? tick.label : '';
+            }
+        };
+        
+        // Set up explicit ticks array to ensure our ticks are used
+        chart.options.scales.x.afterBuildTicks = function(scale) {
+            scale.ticks = customTicks;
+            return;
+        };
         
         // Create datasets for each selected model
         currentSelectedModels.forEach((model, index) => {
@@ -2140,8 +2175,10 @@ tbody tr:hover {
 
 .chart-container {
     width: 100%;
-    height: 400px;
+    height: 450px;  /* Slightly taller for better visibility with many buckets */
     margin-bottom: 30px;
+    padding: 0 10px; /* Add small padding to prevent labels from being cut off */
+    box-sizing: border-box;
 }
 
 /* Explore Benchmarks Section */
