@@ -1028,12 +1028,12 @@ function initializeChart(chartData) {
                     min: firstBucket.bucket_min / 1000,   // 8.2  → 8.2
                     max: lastBucket.bucket_max / 1000,   // 78   → 78
                     ticks: {
-                        stepSize: 10,         // 10-k cadence
-                        includeBounds: false, // ✨ skip 8 k and 78 k themselves
-                        precision: 1,
+                        // Explicitly define the tick values we want to show (5k intervals from 10k to 75k)
+                        values: [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75],
                         callback: function(value) {
                             return value + 'k';
-                        }
+                        },
+                        precision: 1
                     },
                     title: {
                         display: true,
