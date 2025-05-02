@@ -1013,7 +1013,6 @@ function initializeChart(chartData) {
     const chart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: chartData.buckets.map(bucket => bucket.bucket_location_k + 'k'),
             datasets: []
         },
         options: {
@@ -1021,9 +1020,18 @@ function initializeChart(chartData) {
             maintainAspectRatio: false,
             scales: {
                 x: {
+                    type: 'linear',
+                    min: 0,
+                    max: 100,
+                    ticks: {
+                        stepSize: 10,
+                        callback: function(value) {
+                            return value + 'k';
+                        }
+                    },
                     title: {
                         display: true,
-                        text: 'Avg Prompt Token Length (k) - Buckets of 30 cases'
+                        text: 'Prompt Token Length (k)'
                     }
                 },
                 y: {
@@ -1036,6 +1044,17 @@ function initializeChart(chartData) {
                 }
             },
             plugins: {
+                title: {
+                    display: true,
+                    text: 'LoCoDiff Benchmark Results by Prompt Size',
+                    font: {
+                        size: 18
+                    },
+                    padding: {
+                        top: 10,
+                        bottom: 30
+                    }
+                },
                 legend: {
                     labels: {
                         // Custom filter function to exclude datasets with display: false from the legend
@@ -1210,7 +1229,12 @@ function initializeChart(chartData) {
                 
                 // Calculate success rate - divide by appropriate denominator
                 // This assumes any prompt not tested was a failure
-                return successful > 0 ? (successful / denominator * 100) : 0;
+                const y = successful > 0 ? (successful / denominator * 100) : 0;
+                // Return x,y coordinates where x is the bucket location in thousands
+                return {
+                    x: bucket.bucket_location / 1000, // Convert to k
+                    y: y
+                };
             });
             
             // Calculate confidence interval data points if languages are selected
@@ -1242,7 +1266,11 @@ function initializeChart(chartData) {
                     
                     // Recalculate Wilson interval using the appropriate denominator
                     const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
-                    return lower * 100; // Convert to percentage
+                    // Return x,y coordinates for lower bound
+                    return {
+                        x: bucket.bucket_location / 1000, // Convert to k
+                        y: lower * 100 // Convert to percentage
+                    };
                 });
                 
                 upperBoundPoints = chartData.buckets.map(bucket => {
@@ -1269,7 +1297,11 @@ function initializeChart(chartData) {
                     
                     // Recalculate Wilson interval using the appropriate denominator
                     const [lower, upper] = wilson_score_interval(langSuccessful, denominator);
-                    return upper * 100; // Convert to percentage
+                    // Return x,y coordinates for upper bound
+                    return {
+                        x: bucket.bucket_location / 1000, // Convert to k
+                        y: upper * 100 // Convert to percentage
+                    };
                 });
             }
             
@@ -1288,7 +1320,8 @@ function initializeChart(chartData) {
                 fill: false,
                 tension: 0.1,
                 pointRadius: 4,
-                pointHoverRadius: 6
+                pointHoverRadius: 6,
+                parsing: false  // Tell Chart.js we're using x,y objects directly
             });
             
             // Add confidence interval datasets if enabled
@@ -1305,6 +1338,7 @@ function initializeChart(chartData) {
                     pointRadius: 0,
                     tension: 0.1,
                     fill: false,
+                    parsing: false,  // Tell Chart.js we're using x,y objects directly
                     showLine: false, // Don't draw a line for this dataset
                     display: false   // Completely exclude from legend
                 });
@@ -1317,6 +1351,7 @@ function initializeChart(chartData) {
                     backgroundColor: color + '22', // Very transparent version of the line color
                     pointRadius: 0,
                     tension: 0.1,
+                    parsing: false,  // Tell Chart.js we're using x,y objects directly
                     fill: lowerBoundIndex, // Fill to the specific dataset index (the lower bound)
                     display: false         // Completely exclude from legend
                 });
