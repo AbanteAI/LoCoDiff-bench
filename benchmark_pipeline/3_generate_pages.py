@@ -819,6 +819,15 @@ def generate_chart_data(
         if model in model_display_names:
             model_display_map[model] = model_display_names[model]
 
+    # Calculate max tokens from buckets or use default
+    max_tokens_k = 75  # Default if no buckets
+    if buckets:
+        # Find the bucket with the highest average token count
+        max_tokens = max(bucket["bucket_location"] for bucket in buckets)
+        max_tokens_k = round(
+            max_tokens / 1000, 1
+        )  # Convert to k and round to 1 decimal
+
     # Create the chart data object
     chart_data = {
         "buckets": buckets,
