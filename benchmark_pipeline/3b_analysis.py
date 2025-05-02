@@ -9,6 +9,7 @@ Purpose:
 
   For each model found in the benchmark results, it reports:
   - The number of benchmark cases that failed due to extraction issues
+  - How many extraction failures were due to empty model outputs
   - The total number of benchmark cases run for that model
   - The percentage of cases with extraction failures
 
@@ -22,6 +23,7 @@ Inputs:
 
 Outputs:
   - Prints a summary table showing extraction failures by model.
+  - Distinguishes between empty output failures and other extraction failures.
   - Lists models in descending order of extraction failure rate.
   - Includes counts and percentages for each model.
 """
@@ -67,7 +69,8 @@ def find_metadata_files(results_dir: Path) -> List[Path]:
 
 def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
     """
-    Analyze metadata files to count extraction failures by model.
+    Analyze metadata files to count extraction failures by model,
+    distinguishing between empty outputs and other extraction failures.
 
     Args:
         metadata_files: List of paths to metadata.json files.
@@ -76,7 +79,9 @@ def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
         Dictionary with model name as key and statistics as value.
     """
     # Initialize a dictionary to store counts for each model
-    model_stats = defaultdict(lambda: {"total": 0, "extraction_failures": 0})
+    model_stats = defaultdict(
+        lambda: {"total": 0, "extraction_failures": 0, "empty_output_failures": 0}
+    )
 
     for metadata_path in metadata_files:
         try:
@@ -94,6 +99,30 @@ def analyze_extraction_failures(metadata_files: List[Path]) -> Dict[str, Dict]:
             error = metadata.get("error")
             if error and "backticks not found" in error:
                 model_stats[model]["extraction_failures"] += 1
+
+                # Check if it was due to empty output
+                raw_response_length = metadata.get("raw_response_length", 0)
+                if raw_response_length == 0 or (
+                    raw_response_length < 10
+                    and "raw_response.txt" in str(metadata_path)
+                ):
+                    model_stats[model]["empty_output_failures"] += 1
+
+                    # Check the actual raw response file for more accurate detection
+                    raw_response_path = metadata_path.parent / "raw_response.txt"
+                    if raw_response_path.exists():
+                        try:
+                            content = raw_response_path.read_text(
+                                encoding="utf-8"
+                            ).strip()
+                            if not content:
+                                # Confirm it's truly empty
+                                model_stats[model]["empty_output_failures"] = (
+                                    model_stats[model]["empty_output_failures"]
+                                )
+                        except Exception:
+                            # If we can't read the file, rely on the metadata
+                            pass
 
         except (json.JSONDecodeError, IOError) as e:
             print(f"Error reading metadata file {metadata_path}: {e}")
@@ -118,11 +147,16 @@ def calculate_percentages(model_stats: Dict[str, Dict]) -> List[Tuple[str, Dict]
     for model, stats in model_stats.items():
         total = stats["total"]
         failures = stats["extraction_failures"]
+        empty_failures = stats["empty_output_failures"]
 
         if total > 0:
             percentage = (failures / total) * 100
+            empty_percentage = (
+                (empty_failures / total) * 100 if empty_failures > 0 else 0
+            )
         else:
             percentage = 0
+            empty_percentage = 0
 
         result.append(
             (
@@ -130,7 +164,9 @@ def calculate_percentages(model_stats: Dict[str, Dict]) -> List[Tuple[str, Dict]
                 {
                     "total": total,
                     "extraction_failures": failures,
+                    "empty_output_failures": empty_failures,
                     "percentage": percentage,
+                    "empty_percentage": empty_percentage,
                 },
             )
         )
@@ -152,22 +188,29 @@ def display_results(sorted_stats: List[Tuple[str, Dict]]):
 
     # Print header
     print("\nExtraction Failures by Model")
-    print("=" * 80)
+    print("=" * 120)
     print(
-        f"{'Model':<40} {'Extraction Failures':<20} {'Total Cases':<15} {'Percentage':<10}"
+        f"{'Model':<40} {'Total Extraction':<15} {'Empty Output':<15} {'Other Extraction':<15} {'Total Cases':<12} {'% Failed':<8} {'% Empty':<8}"
     )
-    print("-" * 80)
+    print("-" * 120)
 
     # Print data rows
     for model, stats in sorted_stats:
+        total_failures = stats["extraction_failures"]
+        empty_failures = stats["empty_output_failures"]
+        other_failures = total_failures - empty_failures
+
         print(
             f"{model:<40} "
-            f"{stats['extraction_failures']:<20} "
-            f"{stats['total']:<15} "
-            f"{stats['percentage']:.2f}%"
+            f"{total_failures:<15} "
+            f"{empty_failures:<15} "
+            f"{other_failures:<15} "
+            f"{stats['total']:<12} "
+            f"{stats['percentage']:.2f}%{' ':<2} "
+            f"{stats['empty_percentage']:.2f}%"
         )
 
-    print("=" * 80)
+    print("=" * 120)
 
 
 def main():
