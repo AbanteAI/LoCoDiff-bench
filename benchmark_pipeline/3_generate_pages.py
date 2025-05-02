@@ -1233,7 +1233,7 @@ function initializeChart(chartData) {
                     // Calculate bucket size based on selected languages
                     let filteredBucketSize = 0;
                     if (bucket.language_case_counts) {
-                        selectedLanguages.forEach(language => {
+                        currentSelectedLanguages.forEach(language => {
                             filteredBucketSize += bucket.language_case_counts[language] || 0;
                         });
                     }
@@ -1260,7 +1260,7 @@ function initializeChart(chartData) {
                     // Calculate bucket size based on selected languages
                     let filteredBucketSize = 0;
                     if (bucket.language_case_counts) {
-                        selectedLanguages.forEach(language => {
+                        currentSelectedLanguages.forEach(language => {
                             filteredBucketSize += bucket.language_case_counts[language] || 0;
                         });
                     }
