@@ -1009,6 +1009,9 @@ function initializeChart(chartData) {
         languageCheckboxes.appendChild(checkbox);
     });
     
+    const firstBucket = chartData.buckets[0];
+    const lastBucket = chartData.buckets.at(-1);
+    
     // Create chart
     const chart = new Chart(ctx, {
         type: 'line',
@@ -1021,12 +1024,12 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    // Set axis limits based on actual data
-                    min: chartData.buckets.length > 0 ? 
-                         Math.floor(chartData.buckets[0].bucket_location / 1000) : 0,
-                    max: chartData.buckets.length > 0 ? 
-                         Math.ceil(chartData.buckets[chartData.buckets.length - 1].bucket_location / 1000) : 100,
+                    // keep the real data limits (no rounding)
+                    min: firstBucket.bucket_min / 1000,   // 8.2  → 8.2
+                    max: lastBucket.bucket_max / 1000,   // 78   → 78
                     ticks: {
+                        stepSize: 10,         // 10-k cadence
+                        includeBounds: false, // ✨ skip 8 k and 78 k themselves
                         precision: 1,
                         callback: function(value) {
                             return value + 'k';
