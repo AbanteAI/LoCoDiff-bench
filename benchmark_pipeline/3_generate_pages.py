@@ -1001,6 +1001,9 @@ function initializeChart(chartData) {
         languageCheckboxes.appendChild(checkbox);
     });
     
+    const firstBucket = chartData.buckets[0];
+    const lastBucket = chartData.buckets.at(-1);
+    
     // Create chart
     const chart = new Chart(ctx, {
         type: 'line',
@@ -1013,20 +1016,36 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    // Set axis limits based on actual data
-                    min: chartData.buckets.length > 0 ? 
-                         Math.floor(chartData.buckets[0].bucket_location / 1000) : 0,
-                    max: chartData.buckets.length > 0 ? 
-                         Math.ceil(chartData.buckets[chartData.buckets.length - 1].bucket_location / 1000) : 100,
+                    // use bucket locations (averages) for exact alignment with data points
+                    min: firstBucket.bucket_location / 1000,   // Use first bucket average
+                    max: lastBucket.bucket_location / 1000,   // Use last bucket average
+                    // Override the tick generation completely to ensure we get exactly what we want
+                    afterFit: function(scaleInstance) {
+                        // Make sure our exact list of ticks is used
+                        const tickValues = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75];
+                        
+                        // Create proper tick objects with value and label
+                        scaleInstance.ticks = tickValues.map(value => ({
+                            value: value,
+                            label: value + 'k',
+                            major: false
+                        }));
+                    },
                     ticks: {
-                        precision: 1,
-                        callback: function(value) {
-                            return value + 'k';
-                        }
+                        // Only format ticks that were explicitly added
+                        callback: function(value, index, values) {
+                            // Return value + 'k' for our desired ticks
+                            if ([10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75].includes(parseFloat(value))) {
+                                return value + 'k';
+                            }
+                            // Return null to hide any other ticks
+                            return null;
+                        },
+                        precision: 1
                     },
                     title: {
                         display: true,
-                        text: 'Prompt Token Length (k)'
+                        text: 'Prompt Token Length'
                     }
                 },
                 y: {
