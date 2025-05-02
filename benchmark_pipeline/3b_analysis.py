@@ -237,6 +237,7 @@ def display_results(sorted_stats: List[Tuple[str, Dict]]):
 def display_non_empty_failures(failure_details: Dict[str, List[Dict[str, Any]]]):
     """
     Display a list of all model/case pairs where extraction failed but output wasn't empty.
+    Formats output as clickable links for terminal use that point to the HTML visualization.
 
     Args:
         failure_details: Dictionary with model name as key and list of failure details as value.
@@ -252,10 +253,11 @@ def display_non_empty_failures(failure_details: Dict[str, List[Dict[str, Any]]])
         print("\nNo non-empty extraction failures found.")
         return
 
-    print(f"\nList of Non-Empty Extraction Failures ({non_empty_count} total)")
-    print("=" * 100)
-    print(f"{'Model':<40} {'Benchmark Case':<40} {'Results Directory'}")
-    print("-" * 100)
+    print(f"\nNon-Empty Extraction Failures ({non_empty_count} total)")
+    print(
+        "Click on any link below to open in browser (localhost:8000 must be running):"
+    )
+    print()
 
     # Sort by model name for consistent output
     for model in sorted(failure_details.keys()):
@@ -267,13 +269,20 @@ def display_non_empty_failures(failure_details: Dict[str, List[Dict[str, Any]]])
             for failure in sorted(
                 non_empty_failures, key=lambda f: f["benchmark_case"]
             ):
+                # Extract sanitized model name from the results directory path
+                # Results dir format is typically: .../results/benchmark_case/sanitized_model/timestamp/
+                results_path = Path(failure["results_dir"])
+                # The parent of the timestamp directory should be the sanitized model name
+                sanitized_model = results_path.parent.name
+                benchmark_case = failure["benchmark_case"]
+
+                # Generate the URL in the format:
+                # http://localhost:8000/content/openai_o3/tldraw_packages_editor_src_index.ts/actual.html
                 print(
-                    f"{model:<40} "
-                    f"{failure['benchmark_case']:<40} "
-                    f"{failure['results_dir']}"
+                    f"http://localhost:8000/content/{sanitized_model}/{benchmark_case}/actual.html"
                 )
 
-    print("=" * 100)
+    print()
 
 
 def main():
