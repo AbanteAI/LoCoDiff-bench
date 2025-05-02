@@ -968,16 +968,9 @@ function initializeChart(chartData) {
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
-    // Create a fixed color mapping for all models first
-    const modelColorMap = {};
-    chartData.models.forEach((model, index) => {
-        modelColorMap[model] = colors[index % colors.length];
-    });
-    
-    // Create model checkboxes using the fixed color mapping
+    // Create model checkboxes without color squares
     const modelCheckboxes = document.getElementById('model-checkboxes');
     chartData.models.forEach((model) => {
-        const color = modelColorMap[model]; // Use consistent color from the mapping
         // Use display name if available, otherwise use original model name
         const displayName = chartData.model_display_names && chartData.model_display_names[model] 
             ? chartData.model_display_names[model] 
@@ -988,7 +981,6 @@ function initializeChart(chartData) {
         checkbox.innerHTML = `
             <label>
                 <input type="checkbox" data-model="${model}" checked>
-                <span class="checkbox-color" style="background-color: ${color};"></span>
                 ${displayName}
             </label>
         `;
@@ -1189,9 +1181,10 @@ function initializeChart(chartData) {
         chart.data.datasets = [];
         
         // Create datasets for each selected model
-        currentSelectedModels.forEach((model) => {
-            // Use the consistent color from our color map
-            const color = modelColorMap[model];
+        currentSelectedModels.forEach((model, index) => {
+            // Assign color based on the index in the current selection
+            // This ensures colors are contrastive when only a few models are selected
+            const color = colors[index % colors.length];
             
             // Calculate data points and store filtered data for tooltip
             const dataPoints = chartData.buckets.map((bucket, bucketIndex) => {
