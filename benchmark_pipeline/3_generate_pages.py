@@ -1168,10 +1168,10 @@ Cases: ${bucketData.caseCount}${untestedInfo}${ciInfo}`
             // Position tick at the bucket's average token count
             const tickValue = bucket.avgTokens / 1000;
             
-            // Label shows the token range for this bucket
-            const minK = (bucket.minTokens / 1000).toFixed(1);
-            const maxK = (bucket.maxTokens / 1000).toFixed(1);
-            const tickLabel = `${minK}k-${maxK}k`;
+            // Label shows the token range for this bucket (rounded to whole numbers)
+            const minK = Math.round(bucket.minTokens / 1000);
+            const maxK = Math.round(bucket.maxTokens / 1000);
+            const tickLabel = `${minK}-${maxK}k`;
             
             return {
                 value: tickValue,
@@ -1179,9 +1179,13 @@ Cases: ${bucketData.caseCount}${untestedInfo}${ciInfo}`
             };
         });
         
+        // Calculate min/max from bucket averages (not the absolute min/max prompt values)
+        const firstBucketAvg = buckets[0].avgTokens / 1000;
+        const lastBucketAvg = buckets[buckets.length - 1].avgTokens / 1000;
+        
         // Set precise min/max values with small padding for visual appeal
-        chart.options.scales.x.min = Math.max(0, minToken - 0.5);
-        chart.options.scales.x.max = maxToken + 0.5;
+        chart.options.scales.x.min = Math.max(0, firstBucketAvg - 1.5);
+        chart.options.scales.x.max = lastBucketAvg + 1.5;
         
         // Use our custom ticks
         chart.options.scales.x.ticks = {
