@@ -716,8 +716,8 @@ def generate_chart_data(
     case_token_pairs.sort(key=lambda pair: pair[1])
 
     # Define bucket parameters
-    bucket_size = 30  # Number of cases in each bucket
-    bucket_step = 10  # Increment between buckets
+    bucket_size = 40  # Number of cases in each bucket
+    bucket_step = 20  # Increment between buckets
 
     # Initialize buckets
     buckets = []
