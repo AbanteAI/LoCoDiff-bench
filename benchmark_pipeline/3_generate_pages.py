@@ -716,8 +716,8 @@ def generate_chart_data(
     case_token_pairs.sort(key=lambda pair: pair[1])
 
     # Define bucket parameters
-    bucket_size = 25  # Number of cases in each bucket
-    bucket_step = 5  # Increment between buckets
+    bucket_size = 30  # Number of cases in each bucket
+    bucket_step = 10  # Increment between buckets
 
     # Initialize buckets
     buckets = []
@@ -1005,7 +1005,7 @@ function initializeChart(chartData) {
                 x: {
                     title: {
                         display: true,
-                        text: 'Avg Prompt Token Length (k) - Buckets of 25 cases'
+                        text: 'Avg Prompt Token Length (k) - Buckets of 30 cases'
                     }
                 },
                 y: {
@@ -1089,7 +1089,7 @@ function initializeChart(chartData) {
                                 const caseInfo = bucketData.case_indices ? `\nCases: ${bucketData.case_indices}` : '';
                                 
                                 // Calculate untested cases
-                                const bucketSize = 25;
+                                const bucketSize = 30;
                                 const untestedCases = bucketSize - attempts;
                                 let untestedInfo = '';
                                 if (untestedCases > 0) {
@@ -1097,7 +1097,7 @@ function initializeChart(chartData) {
                                 }
                                 
                                 return [
-                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/25)`,
+                                    `${displayName}: ${successRate !== null && successRate !== undefined ? successRate.toFixed(2) : 'N/A'}% (${successful}/30)`,
                                     `Token Range: ${bucketData.bucket_range} (avg: ${(bucketData.bucket_location/1000).toFixed(1)}k)${caseInfo}${untestedInfo}${ciInfo}`
                                 ];
                             } catch (error) {
@@ -1167,9 +1167,9 @@ function initializeChart(chartData) {
                     attempts: attempts
                 };
                 
-                // Calculate success rate - always divide by 25 (bucket size)
+                // Calculate success rate - always divide by 30 (bucket size)
                 // This assumes any prompt not tested was a failure
-                return successful > 0 ? (successful / 25 * 100) : 0;
+                return successful > 0 ? (successful / 30 * 100) : 0;
             });
             
             // Calculate confidence interval data points if languages are selected
@@ -1189,8 +1189,8 @@ function initializeChart(chartData) {
                         }
                     });
                     
-                    // Always use 25 as the denominator (bucket size)
-                    const bucketSize = 25;
+                    // Always use 30 as the denominator (bucket size)
+                    const bucketSize = 30;
                     
                     // Recalculate Wilson interval using fixed bucket size
                     const [lower, upper] = wilson_score_interval(langSuccessful, bucketSize);
@@ -1209,8 +1209,8 @@ function initializeChart(chartData) {
                         }
                     });
                     
-                    // Always use 25 as the denominator (bucket size)
-                    const bucketSize = 25;
+                    // Always use 30 as the denominator (bucket size)
+                    const bucketSize = 30;
                     
                     // Recalculate Wilson interval using fixed bucket size
                     const [lower, upper] = wilson_score_interval(langSuccessful, bucketSize);
