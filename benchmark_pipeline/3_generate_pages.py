@@ -1024,9 +1024,9 @@ function initializeChart(chartData) {
             scales: {
                 x: {
                     type: 'linear',
-                    // keep the real data limits (no rounding)
-                    min: firstBucket.bucket_min / 1000,   // 8.2  → 8.2
-                    max: lastBucket.bucket_max / 1000,   // 78   → 78
+                    // use bucket locations (averages) for exact alignment with data points
+                    min: firstBucket.bucket_location / 1000,   // Use first bucket average
+                    max: lastBucket.bucket_location / 1000,   // Use last bucket average
                     ticks: {
                         // Explicitly define the tick values we want to show (5k intervals from 10k to 75k)
                         values: [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75],
