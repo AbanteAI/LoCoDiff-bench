@@ -1032,9 +1032,15 @@ function initializeChart(chartData) {
                         maxTicksLimit: 20,
                         // Custom callback that controls which ticks are displayed and how
                         callback: function(value, index, values) {
-                            // Only show specific values (multiples of 5 between 10 and 75)
-                            if (value >= 10 && value <= 75 && value % 5 === 0) {
-                                return value + 'k';
+                            // Use a wider range (9-76) to make sure we catch values close to 10 and 75
+                            // This ensures we include the boundary values of our desired tick range
+                            if (value >= 9 && value <= 76 && Math.round(value % 5 * 10) / 10 === 0) {
+                                // Round to nearest 5 to ensure exact tick values
+                                const roundedValue = Math.round(value / 5) * 5;
+                                // Only show values between 10 and 75 inclusive
+                                if (roundedValue >= 10 && roundedValue <= 75) {
+                                    return roundedValue + 'k';
+                                }
                             }
                             // Return null for any other values to hide them
                             return null;
