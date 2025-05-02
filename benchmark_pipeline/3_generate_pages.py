@@ -1182,8 +1182,6 @@ function initializeChart(chartData) {
         
         // Create datasets for each selected model
         currentSelectedModels.forEach((model, index) => {
-            // Assign color based on the index in the current selection
-            // This ensures colors are contrastive when only a few models are selected
             const color = colors[index % colors.length];
             
             // Calculate data points and store filtered data for tooltip
