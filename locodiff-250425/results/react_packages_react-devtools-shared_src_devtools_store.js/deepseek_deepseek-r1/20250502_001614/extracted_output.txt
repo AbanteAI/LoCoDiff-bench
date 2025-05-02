@@ -1,0 +1,858 @@
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @flow
+ */
+
+import {copy} from 'clipboard-js';
+import EventEmitter from '../events';
+import {inspect} from 'util';
+import {
+  PROFILING_FLAG_BASIC_SUPPORT,
+  PROFILING_FLAG_TIMELINE_SUPPORT,
+  TREE_OPERATION_ADD,
+  TREE_OPERATION_REMOVE,
+  TREE_OPERATION_REMOVE_ROOT,
+  TREE_OPERATION_REORDER_CHILDREN,
+  TREE_OPERATION_SET_SUBTREE_MODE,
+  TREE_OPERATION_UPDATE_ERRORS_OR_WARNINGS,
+  TREE_OPERATION_UPDATE_TREE_BASE_DURATION,
+} from '../constants';
+import {ElementTypeRoot} from '../frontend/types';
+import {
+  getSavedComponentFilters,
+  setSavedComponentFilters,
+  parseElementDisplayNameFromBackend,
+  shallowDiffers,
+  utfDecodeStringWithRanges,
+} from '../utils';
+import {localStorageGetItem, localStorageSetItem} from '../storage';
+import {__DEBUG__} from '../constants';
+import {printStore} from './utils';
+import ProfilerStore from './ProfilerStore';
+import {
+  BRIDGE_PROTOCOL,
+  currentBridgeProtocol,
+} from 'react-devtools-shared/src/bridge';
+import {StrictMode} from 'react-devtools-shared/src/frontend/types';
+import {withPermissionsCheck} from 'react-devtools-shared/src/frontend/utils/withPermissionsCheck';
+
+import type {Element, ComponentFilter, ElementType} from 'react-devtools-shared/src/frontend/types';
+import type {FrontendBridge, BridgeProtocol} from 'react-devtools-shared/src/bridge';
+import UnsupportedBridgeOperationError from 'react-devtools-shared/src/UnsupportedBridgeOperationError';
+import type {DevToolsHookSettings} from '../backend/types';
+
+const debug = (methodName: string, ...args: Array<string>) => {
+  if (__DEBUG__) {
+    console.log(
+      `%cStore %c${methodName}`,
+      'color: green; font-weight: bold;',
+      'font-weight: bold;',
+      ...args,
+    );
+  }
+};
+
+const LOCAL_STORAGE_COLLAPSE_ROOTS_BY_DEFAULT_KEY =
+  'React::DevTools::collapseNodesByDefault';
+const LOCAL_STORAGE_RECORD_CHANGE_DESCRIPTIONS_KEY =
+  'React::DevTools::recordChangeDescriptions';
+
+type ErrorAndWarningTuples = Array<{id: number, index: number}>;
+
+export type Config = {
+  checkBridgeProtocolCompatibility?: boolean,
+  isProfiling?: boolean,
+  supportsInspectMatchingDOMElement?: boolean,
+  supportsClickToInspect?: boolean,
+  supportsReloadAndProfile?: boolean,
+  supportsTimeline?: boolean,
+  supportsTraceUpdates?: boolean,
+};
+
+export type Capabilities = {
+  supportsBasicProfiling: boolean,
+  hasOwnerMetadata: boolean,
+  supportsStrictMode: boolean,
+  supportsTimeline: boolean,
+};
+
+export default class Store extends EventEmitter<{
+  backendVersion: [],
+  collapseNodesByDefault: [],
+  componentFilters: [],
+  error: [Error],
+  hookSettings: [$ReadOnly<DevToolsHookSettings>],
+  hostInstanceSelected: [Element['id']],
+  settingsUpdated: [$ReadOnly<DevToolsHookSettings>],
+  mutated: [[Array<number>, Map<number, number>]],
+  recordChangeDescriptions: [],
+  roots: [],
+  rootSupportsBasicProfiling: [],
+  rootSupportsTimelineProfiling: [],
+  supportsNativeStyleEditor: [],
+  supportsReloadAndProfile: [],
+  unsupportedBridgeProtocolDetected: [],
+  unsupportedRendererVersionDetected: [],
+}> {
+  _backendVersion: string | null = null;
+  _bridge: FrontendBridge;
+  _cachedComponentWithErrorCount: number = 0;
+  _cachedComponentWithWarningCount: number = 0;
+  _cachedErrorAndWarningTuples: ErrorAndWarningTuples | null = null;
+  _collapseNodesByDefault: boolean = true;
+  _componentFilters: Array<ComponentFilter>;
+  _errorsAndWarnings: Map<number, {errorCount: number, warningCount: number}> = new Map();
+  _hasOwnerMetadata: boolean = false;
+  _idToElement: Map<number, Element> = new Map();
+  _isNativeStyleEditorSupported: boolean = false;
+  _nativeStyleEditorValidAttributes: $ReadOnlyArray<string> | null = null;
+  _onBridgeProtocolTimeoutID: TimeoutID | null = null;
+  _ownersMap: Map<number, Set<number>> = new Map();
+  _profilerStore: ProfilerStore;
+  _recordChangeDescriptions: boolean = false;
+  _revision: number = 0;
+  _roots: $ReadOnlyArray<number> = [];
+  _rootIDToCapabilities: Map<number, Capabilities> = new Map();
+  _rootIDToRendererID: Map<number, number> = new Map();
+  _isReloadAndProfileFrontendSupported: boolean = false;
+  _isReloadAndProfileBackendSupported: boolean = false;
+  _supportsTimeline: boolean = false;
+  _supportsTraceUpdates: boolean = false;
+  _rootSupportsBasicProfiling: boolean = false;
+  _rootSupportsTimelineProfiling: boolean = false;
+  _unsupportedBridgeProtocol: BridgeProtocol | null = null;
+  _unsupportedRendererVersionDetected: boolean = false;
+  _weightAcrossRoots: number = 0;
+  _shouldCheckBridgeProtocolCompatibility: boolean = false;
+  _hookSettings: $ReadOnly<DevToolsHookSettings> | null = null;
+  _shouldShowWarningsAndErrors: boolean = false;
+  _lastSelectedHostInstanceElementId: Element['id'] | null = null;
+
+  constructor(bridge: FrontendBridge, config?: Config) {
+    super();
+
+    if (__DEBUG__) {
+      debug('constructor', 'subscribing to Bridge');
+    }
+
+    this._collapseNodesByDefault =
+      localStorageGetItem(LOCAL_STORAGE_COLLAPSE_ROOTS_BY_DEFAULT_KEY) === 'true';
+
+    this._recordChangeDescriptions =
+      localStorageGetItem(LOCAL_STORAGE_RECORD_CHANGE_DESCRIPTIONS_KEY) === 'true';
+
+    this._componentFilters = getSavedComponentFilters();
+
+    let isProfiling = false;
+    if (config != null) {
+      isProfiling = config.isProfiling === true;
+
+      const {
+        supportsInspectMatchingDOMElement,
+        supportsClickToInspect,
+        supportsReloadAndProfile,
+        supportsTimeline,
+        supportsTraceUpdates,
+        checkBridgeProtocolCompatibility,
+      } = config;
+      if (supportsInspectMatchingDOMElement) {
+        this._supportsInspectMatchingDOMElement = true;
+      }
+      if (supportsClickToInspect) {
+        this._supportsClickToInspect = true;
+      }
+      if (supportsReloadAndProfile) {
+        this._isReloadAndProfileFrontendSupported = true;
+      }
+      if (supportsTimeline) {
+        this._supportsTimeline = true;
+      }
+      if (supportsTraceUpdates) {
+        this._supportsTraceUpdates = true;
+      }
+      if (checkBridgeProtocolCompatibility) {
+        this._shouldCheckBridgeProtocolCompatibility = true;
+      }
+    }
+
+    this._bridge = bridge;
+    bridge.addListener('operations', this.onBridgeOperations);
+    bridge.addListener(
+      'overrideComponentFilters',
+      this.onBridgeOverrideComponentFilters,
+    );
+    bridge.addListener('shutdown', this.onBridgeShutdown);
+    bridge.addListener(
+      'isReloadAndProfileSupportedByBackend',
+      this.onBackendReloadAndProfileSupported,
+    );
+    bridge.addListener(
+      'isNativeStyleEditorSupported',
+      this.onBridgeNativeStyleEditorSupported,
+    );
+    bridge.addListener(
+      'unsupportedRendererVersion',
+      this.onBridgeUnsupportedRendererVersion,
+    );
+    bridge.addListener('backendVersion', this.onBridgeBackendVersion);
+    bridge.addListener('saveToClipboard', this.onSaveToClipboard);
+    bridge.addListener('hookSettings', this.onHookSettings);
+    bridge.addListener('backendInitialized', this.onBackendInitialized);
+    bridge.addListener('selectElement', this.onHostInstanceSelected);
+
+    this._profilerStore = new ProfilerStore(bridge, this, isProfiling);
+  }
+
+  assertExpectedRootMapSizes() {
+    if (this.roots.length === 0) {
+      this.assertMapSizeMatchesRootCount(this._idToElement, '_idToElement');
+      this.assertMapSizeMatchesRootCount(this._ownersMap, '_ownersMap');
+    }
+    this.assertMapSizeMatchesRootCount(this._rootIDToCapabilities, '_rootIDToCapabilities');
+    this.assertMapSizeMatchesRootCount(this._rootIDToRendererID, '_rootIDToRendererID');
+  }
+
+  assertMapSizeMatchesRootCount(map: Map<any, any>, mapName: string) {
+    const expectedSize = this.roots.length;
+    if (map.size !== expectedSize) {
+      this._throwAndEmitError(
+        Error(
+          `Expected ${mapName} to contain ${expectedSize} items, but it contains ${map.size} items\n\n${inspect(map, {
+            depth: 20,
+          })}`,
+        ),
+      );
+    }
+  }
+
+  get collapseNodesByDefault(): boolean {
+    return this._collapseNodesByDefault;
+  }
+
+  set collapseNodesByDefault(value: boolean): void {
+    this._collapseNodesByDefault = value;
+    localStorageSetItem(LOCAL_STORAGE_COLLAPSE_ROOTS_BY_DEFAULT_KEY, value ? 'true' : 'false');
+    this.emit('collapseNodesByDefault');
+  }
+
+  get componentFilters(): Array<ComponentFilter> {
+    return this._componentFilters;
+  }
+
+  set componentFilters(value: Array<ComponentFilter>): void {
+    if (this._profilerStore.isProfilingBasedOnUserInput) {
+      this._throwAndEmitError(Error('Cannot modify filter preferences while profiling'));
+    }
+
+    const prevEnabledComponentFilters = this._componentFilters.filter(filter => filter.isEnabled);
+    const nextEnabledComponentFilters = value.filter(filter => filter.isEnabled);
+    let haveEnabledFiltersChanged = prevEnabledComponentFilters.length !== nextEnabledComponentFilters.length;
+
+    if (!haveEnabledFiltersChanged) {
+      for (let i = 0; i < nextEnabledComponentFilters.length; i++) {
+        if (shallowDiffers(prevEnabledComponentFilters[i], nextEnabledComponentFilters[i])) {
+          haveEnabledFiltersChanged = true;
+          break;
+        }
+      }
+    }
+
+    this._componentFilters = value;
+    setSavedComponentFilters(value);
+
+    if (haveEnabledFiltersChanged) {
+      this._bridge.send('updateComponentFilters', value);
+    }
+
+    this.emit('componentFilters');
+  }
+
+  get componentWithErrorCount(): number {
+    return this._shouldShowWarningsAndErrors ? this._cachedComponentWithErrorCount : 0;
+  }
+
+  get componentWithWarningCount(): number {
+    return this._shouldShowWarningsAndErrors ? this._cachedComponentWithWarningCount : 0;
+  }
+
+  get displayingErrorsAndWarningsEnabled(): boolean {
+    return this._shouldShowWarningsAndErrors;
+  }
+
+  get hasOwnerMetadata(): boolean {
+    return this._hasOwnerMetadata;
+  }
+
+  get nativeStyleEditorValidAttributes(): $ReadOnlyArray<string> | null {
+    return this._nativeStyleEditorValidAttributes;
+  }
+
+  get numElements(): number {
+    return this._weightAcrossRoots;
+  }
+
+  get profilerStore(): ProfilerStore {
+    return this._profilerStore;
+  }
+
+  get recordChangeDescriptions(): boolean {
+    return this._recordChangeDescriptions;
+  }
+
+  set recordChangeDescriptions(value: boolean): void {
+    this._recordChangeDescriptions = value;
+    localStorageSetItem(LOCAL_STORAGE_RECORD_CHANGE_DESCRIPTIONS_KEY, value ? 'true' : 'false');
+    this.emit('recordChangeDescriptions');
+  }
+
+  get revision(): number {
+    return this._revision;
+  }
+
+  get rootIDToRendererID(): Map<number, number> {
+    return this._rootIDToRendererID;
+  }
+
+  get roots(): $ReadOnlyArray<number> {
+    return this._roots;
+  }
+
+  get rootSupportsBasicProfiling(): boolean {
+    return this._rootSupportsBasicProfiling;
+  }
+
+  get rootSupportsTimelineProfiling(): boolean {
+    return this._rootSupportsTimelineProfiling;
+  }
+
+  get supportsInspectMatchingDOMElement(): boolean {
+    return this._supportsInspectMatchingDOMElement;
+  }
+
+  get supportsClickToInspect(): boolean {
+    return this._supportsClickToInspect;
+  }
+
+  get supportsNativeStyleEditor(): boolean {
+    return this._isNativeStyleEditorSupported;
+  }
+
+  get supportsReloadAndProfile(): boolean {
+    return this._isReloadAndProfileFrontendSupported && this._isReloadAndProfileBackendSupported;
+  }
+
+  get supportsTimeline(): boolean {
+    return this._supportsTimeline;
+  }
+
+  get supportsTraceUpdates(): boolean {
+    return this._supportsTraceUpdates;
+  }
+
+  get unsupportedBridgeProtocol(): BridgeProtocol | null {
+    return this._unsupportedBridgeProtocol;
+  }
+
+  get unsupportedRendererVersionDetected(): boolean {
+    return this._unsupportedRendererVersionDetected;
+  }
+
+  get lastSelectedHostInstanceElementId(): Element['id'] | null {
+    return this._lastSelectedHostInstanceElementId;
+  }
+
+  containsElement(id: number): boolean {
+    return this._idToElement.has(id);
+  }
+
+  getElementAtIndex(index: number): Element | null {
+    if (index < 0 || index >= this.numElements) {
+      console.warn(`Invalid index ${index} specified; store contains ${this.numElements} items.`);
+      return null;
+    }
+
+    let root;
+    let rootWeight = 0;
+    for (let i = 0; i < this._roots.length; i++) {
+      const rootID = this._roots[i];
+      root = this._idToElement.get(rootID);
+      if (!root) continue;
+      if (rootWeight + root.weight > index) break;
+      rootWeight += root.weight;
+    }
+
+    if (!root) return null;
+    let currentElement: Element = root;
+    let currentWeight = rootWeight - 1;
+
+    while (index !== currentWeight) {
+      for (const childID of currentElement.children) {
+        const child = this._idToElement.get(childID);
+        if (!child) continue;
+        const childWeight = child.isCollapsed ? 1 : child.weight;
+        if (index <= currentWeight + childWeight) {
+          currentWeight++;
+          currentElement = child;
+          break;
+        } else {
+          currentWeight += childWeight;
+        }
+      }
+    }
+
+    return currentElement;
+  }
+
+  getElementIDAtIndex(index: number): number | null {
+    const element = this.getElementAtIndex(index);
+    return element?.id ?? null;
+  }
+
+  getElementByID(id: number): Element | null {
+    const element = this._idToElement.get(id);
+    return element ?? null;
+  }
+
+  getElementsWithErrorsAndWarnings(): ErrorAndWarningTuples {
+    if (!this._shouldShowWarningsAndErrors) return [];
+    if (this._cachedErrorAndWarningTuples) return this._cachedErrorAndWarningTuples;
+
+    const errorAndWarningTuples: ErrorAndWarningTuples = [];
+    this._errorsAndWarnings.forEach((_, id) => {
+      const index = this.getIndexOfElementID(id);
+      if (index !== null) {
+        let low = 0;
+        let high = errorAndWarningTuples.length;
+        while (low < high) {
+          const mid = (low + high) >> 1;
+          errorAndWarningTuples[mid].index > index ? (high = mid) : (low = mid + 1);
+        }
+        errorAndWarningTuples.splice(low, 0, {id, index});
+      }
+    });
+
+    this._cachedErrorAndWarningTuples = errorAndWarningTuples;
+    return errorAndWarningTuples;
+  }
+
+  getErrorAndWarningCountForElementID(id: number): {errorCount: number, warningCount: number} {
+    return this._shouldShowWarningsAndErrors 
+      ? this._errorsAndWarnings.get(id) ?? {errorCount: 0, warningCount: 0}
+      : {errorCount: 0, warningCount: 0};
+  }
+
+  getIndexOfElementID(id: number): number | null {
+    const element = this.getElementByID(id);
+    if (!element || element.parentID === 0) return null;
+
+    let previousID = id;
+    let currentID = element.parentID;
+    let index = 0;
+
+    while (true) {
+      const current = this._idToElement.get(currentID);
+      if (!current) return null;
+
+      for (const childID of current.children) {
+        if (childID === previousID) break;
+        const child = this._idToElement.get(childID);
+        if (child) index += child.isCollapsed ? 1 : child.weight;
+      }
+
+      if (current.parentID === 0) break;
+      index++;
+      previousID = current.id;
+      currentID = current.parentID;
+    }
+
+    for (const rootID of this._roots) {
+      if (rootID === currentID) break;
+      const root = this._idToElement.get(rootID);
+      if (root) index += root.weight;
+    }
+
+    return index;
+  }
+
+  getOwnersListForElement(ownerID: number): Array<Element> {
+    const list: Array<Element> = [];
+    const element = this._idToElement.get(ownerID);
+    if (!element) return list;
+
+    list.push({...element, depth: 0});
+    const unsortedIDs = this._ownersMap.get(ownerID);
+    if (!unsortedIDs) return list;
+
+    const sortedIDs = Array.from(unsortedIDs).sort(
+      (idA, idB) => (this.getIndexOfElementID(idA) || 0) - (this.getIndexOfElementID(idB) || 0),
+    );
+
+    const depthMap = new Map([[ownerID, 0]]);
+    sortedIDs.forEach(id => {
+      const innerElement = this._idToElement.get(id);
+      if (!innerElement) return;
+
+      let parentID = innerElement.parentID;
+      let depth = 0;
+      while (parentID > 0) {
+        if (parentID === ownerID || unsortedIDs.has(parentID)) {
+          depth = (depthMap.get(parentID) || 0) + 1;
+          depthMap.set(id, depth);
+          break;
+        }
+        const parent = this._idToElement.get(parentID);
+        if (!parent) break;
+        parentID = parent.parentID;
+      }
+
+      if (depth === 0) this._throwAndEmitError(Error('Invalid owners list'));
+      list.push({...innerElement, depth});
+    });
+
+    return list;
+  }
+
+  getRendererIDForElement(id: number): number | null {
+    let current = this._idToElement.get(id);
+    while (current) {
+      if (current.parentID === 0) {
+        return this._rootIDToRendererID.get(current.id) ?? null;
+      }
+      current = this._idToElement.get(current.parentID);
+    }
+    return null;
+  }
+
+  getRootIDForElement(id: number): number | null {
+    let current = this._idToElement.get(id);
+    while (current) {
+      if (current.parentID === 0) return current.id;
+      current = this._idToElement.get(current.parentID);
+    }
+    return null;
+  }
+
+  isInsideCollapsedSubTree(id: number): boolean {
+    let current = this._idToElement.get(id);
+    while (current) {
+      if (current.parentID === 0) return false;
+      current = this._idToElement.get(current.parentID);
+      if (current?.isCollapsed) return true;
+    }
+    return false;
+  }
+
+  toggleIsCollapsed(id: number, isCollapsed: boolean): void {
+    let didMutate = false;
+    const element = this.getElementByID(id);
+    if (!element) return;
+
+    if (isCollapsed) {
+      if (element.type === ElementTypeRoot) {
+        this._throwAndEmitError(Error('Root nodes cannot be collapsed'));
+      }
+
+      if (!element.isCollapsed) {
+        didMutate = true;
+        element.isCollapsed = true;
+        const weightDelta = 1 - element.weight;
+        let parentElement = this._idToElement.get(element.parentID);
+        while (parentElement) {
+          parentElement.weight += weightDelta;
+          parentElement = this._idToElement.get(parentElement.parentID);
+        }
+      }
+    } else {
+      let currentElement: Element | null = element;
+      while (currentElement) {
+        const oldWeight = currentElement.isCollapsed ? 1 : currentElement.weight;
+        if (currentElement.isCollapsed) {
+          didMutate = true;
+          currentElement.isCollapsed = false;
+          const newWeight = currentElement.isCollapsed ? 1 : currentElement.weight;
+          const weightDelta = newWeight - oldWeight;
+          let parentElement = this._idToElement.get(currentElement.parentID);
+          while (parentElement) {
+            parentElement.weight += weightDelta;
+            if (parentElement.isCollapsed) break;
+            parentElement = this._idToElement.get(parentElement.parentID);
+          }
+        }
+        currentElement = currentElement.parentID !== 0 ? this.getElementByID(currentElement.parentID) : null;
+      }
+    }
+
+    if (didMutate) {
+      this._weightAcrossRoots = this._roots.reduce((sum, rootID) => {
+        const root = this._idToElement.get(rootID);
+        return sum + (root?.weight || 0);
+      }, 0);
+      this.emit('mutated', [[], new Map()]);
+    }
+  }
+
+  _adjustParentTreeWeight = (parentElement: Element | null, weightDelta: number) => {
+    let isInsideCollapsedSubTree = false;
+    while (parentElement) {
+      parentElement.weight += weightDelta;
+      if (parentElement.isCollapsed) {
+        isInsideCollapsedSubTree = true;
+        break;
+      }
+      parentElement = this._idToElement.get(parentElement.parentID);
+    }
+    if (!isInsideCollapsedSubTree) this._weightAcrossRoots += weightDelta;
+  };
+
+  onBridgeNativeStyleEditorSupported = ({
+    isSupported,
+    validAttributes,
+  }: {
+    isSupported: boolean,
+    validAttributes: ?$ReadOnlyArray<string>,
+  }) => {
+    this._isNativeStyleEditorSupported = isSupported;
+    this._nativeStyleEditorValidAttributes = validAttributes;
+    this.emit('supportsNativeStyleEditor');
+  };
+
+  onBridgeOperations = (operations: Array<number>) => {
+    if (__DEBUG__) console.groupCollapsed('onBridgeOperations');
+    let haveRootsChanged = false;
+    let haveErrorsOrWarningsChanged = false;
+    const rendererID = operations[0];
+    const addedElementIDs: Array<number> = [];
+    const removedElementIDs: Map<number, number> = new Map();
+    let i = 2;
+
+    const stringTable: Array<string | null> = [null];
+    const stringTableSize = operations[i++];
+    const stringTableEnd = i + stringTableSize;
+    while (i < stringTableEnd) {
+      const nextLength = operations[i++];
+      const nextString = utfDecodeStringWithRanges(operations, i, i + nextLength - 1);
+      stringTable.push(nextString);
+      i += nextLength;
+    }
+
+    while (i < operations.length) {
+      const operation = operations[i];
+      switch (operation) {
+        case TREE_OPERATION_ADD: {
+          const id = operations[i + 1];
+          const type = operations[i + 2];
+          i += 3;
+
+          if (this._idToElement.has(id)) {
+            this._throwAndEmitError(Error(`Cannot add node "${id}" already in Store`));
+          }
+
+          if (type === ElementTypeRoot) {
+            const isStrictModeCompliant = operations[i++];
+            const supportsBasicProfiling = (operations[i++] & PROFILING_FLAG_BASIC_SUPPORT) !== 0;
+            const supportsTimeline = (operations[i++] & PROFILING_FLAG_TIMELINE_SUPPORT) !== 0;
+            const supportsStrictMode = operations[i++] > 0;
+            const hasOwnerMetadata = operations[i++] > 0;
+
+            this._roots = [...this._roots, id];
+            this._rootIDToRendererID.set(id, rendererID);
+            this._rootIDToCapabilities.set(id, {
+              supportsBasicProfiling,
+              hasOwnerMetadata,
+              supportsStrictMode,
+              supportsTimeline,
+            });
+
+            this._idToElement.set(id, {
+              children: [],
+              depth: -1,
+              displayName: null,
+              hocDisplayNames: null,
+              id,
+              isCollapsed: false,
+              isStrictModeNonCompliant: !isStrictModeCompliant && supportsStrictMode,
+              key: null,
+              ownerID: 0,
+              parentID: 0,
+              type,
+              weight: 0,
+              compiledWithForget: false,
+            });
+
+            haveRootsChanged = true;
+          } else {
+            const parentID = operations[i++];
+            const ownerID = operations[i++];
+            const displayName = stringTable[operations[i++]];
+            const key = stringTable[operations[i++]];
+
+            const parentElement = this._idToElement.get(parentID);
+            if (!parentElement) {
+              this._throwAndEmitError(Error(`Cannot add child "${id}" to missing parent "${parentID}"`));
+              continue;
+            }
+
+            parentElement.children.push(id);
+            const {formattedDisplayName, hocDisplayNames, compiledWithForget} =
+              parseElementDisplayNameFromBackend(displayName, type);
+
+            const element: Element = {
+              children: [],
+              depth: parentElement.depth + 1,
+              displayName: formattedDisplayName,
+              hocDisplayNames,
+              id,
+              isCollapsed: this._collapseNodesByDefault,
+              isStrictModeNonCompliant: parentElement.isStrictModeNonCompliant,
+              key,
+              ownerID,
+              parentID,
+              type,
+              weight: 1,
+              compiledWithForget,
+            };
+
+            this._idToElement.set(id, element);
+            addedElementIDs.push(id);
+            this._adjustParentTreeWeight(parentElement, 1);
+
+            if (ownerID > 0) {
+              let set = this._ownersMap.get(ownerID);
+              if (!set) {
+                set = new Set();
+                this._ownersMap.set(ownerID, set);
+              }
+              set.add(id);
+            }
+          }
+          break;
+        }
+
+        case TREE_OPERATION_REMOVE: {
+          const removeLength = operations[i + 1];
+          i += 2;
+          for (let removeIndex = 0; removeIndex < removeLength; removeIndex++) {
+            const id = operations[i++];
+            const element = this._idToElement.get(id);
+            if (!element) {
+              this._throwAndEmitError(Error(`Cannot remove missing node "${id}"`));
+              continue;
+            }
+
+            if (element.children.length > 0) {
+              this._throwAndEmitError(Error(`Node "${id}" removed before children`));
+            }
+
+            this._idToElement.delete(id);
+            let parentElement = null;
+            if (element.parentID === 0) {
+              this._roots = this._roots.filter(rootID => rootID !== id);
+              this._rootIDToRendererID.delete(id);
+              this._rootIDToCapabilities.delete(id);
+              haveRootsChanged = true;
+            } else {
+              parentElement = this._idToElement.get(element.parentID);
+              if (parentElement) {
+                const index = parentElement.children.indexOf(id);
+                parentElement.children.splice(index, 1);
+              }
+            }
+
+            this._adjustParentTreeWeight(parentElement, -element.weight);
+            removedElementIDs.set(id, element.parentID);
+            this._ownersMap.delete(id);
+            if (element.ownerID > 0) {
+              this._ownersMap.get(element.ownerID)?.delete(id);
+            }
+            if (this._errorsAndWarnings.has(id)) {
+              this._errorsAndWarnings.delete(id);
+              haveErrorsOrWarningsChanged = true;
+            }
+          }
+          break;
+        }
+
+        case TREE_OPERATION_REORDER_CHILDREN: {
+          const id = operations[i + 1];
+          const numChildren = operations[i + 2];
+          i += 3;
+          const element = this._idToElement.get(id);
+          if (!element) {
+            this._throwAndEmitError(Error(`Cannot reorder children for missing node "${id}"`));
+            break;
+          }
+
+          if (element.children.length !== numChildren) {
+            this._throwAndEmitError(Error("Children count mismatch during reorder"));
+          }
+
+          for (let j = 0; j < numChildren; j++) {
+            element.children[j] = operations[i + j];
+          }
+          i += numChildren;
+          break;
+        }
+
+        case TREE_OPERATION_SET_SUBTREE_MODE: {
+          const id = operations[i + 1];
+          const mode = operations[i + 2];
+          i += 3;
+          if (mode === StrictMode) {
+            this._recursivelyUpdateSubtree(id, element => {
+              element.isStrictModeNonCompliant = false;
+            });
+          }
+          break;
+        }
+
+        case TREE_OPERATION_UPDATE_ERRORS_OR_WARNINGS: {
+          const id = operations[i + 1];
+          const errorCount = operations[i + 2];
+          const warningCount = operations[i + 3];
+          i += 4;
+          if (errorCount > 0 || warningCount > 0) {
+            this._errorsAndWarnings.set(id, {errorCount, warningCount});
+          } else {
+            this._errorsAndWarnings.delete(id);
+          }
+          haveErrorsOrWarningsChanged = true;
+          break;
+        }
+
+        default:
+          this._throwAndEmitError(Error(`Unsupported Bridge operation "${operation}"`));
+      }
+    }
+
+    this._revision++;
+    this._cachedErrorAndWarningTuples = null;
+
+    if (haveErrorsOrWarningsChanged) {
+      let componentWithErrorCount = 0;
+      let componentWithWarningCount = 0;
+      this._errorsAndWarnings.forEach(({errorCount, warningCount}) => {
+        if (errorCount > 0) componentWithErrorCount++;
+        if (warningCount > 0) componentWithWarningCount++;
+      });
+      this._cachedComponentWithErrorCount = componentWithErrorCount;
+      this._cachedComponentWithWarningCount = componentWithWarningCount;
+    }
+
+    if (haveRootsChanged) {
+      this._hasOwnerMetadata = false;
+      this._rootSupportsBasicProfiling = false;
+      this._rootSupportsTimelineProfiling = false;
+      this._rootIDToCapabilities.forEach(({supportsBasicProfiling, hasOwnerMetadata, supportsTimeline}) => {
+        if (supportsBasicProfiling) this._rootSupportsBasicProfiling = true;
+        if (hasOwnerMetadata) this._hasOwnerMetadata = true;
+        if (supportsTimeline) this._rootSupportsTimelineProfiling = true;
+      });
+      this.emit('roots');
+    }
+
+    if (__DEBUG__) {
+      console.log(printStore(this, true));
