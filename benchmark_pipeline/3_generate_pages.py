@@ -1007,15 +1007,20 @@ function initializeChart(chartData) {
     const bucketCountSlider = document.getElementById('bucket-count');
     const bucketCountDisplay = document.getElementById('bucket-count-display');
     
-    bucketCountSlider.value = currentBucketCount;
-    bucketCountDisplay.textContent = currentBucketCount;
-    
-    bucketCountSlider.addEventListener('input', function() {
-        currentBucketCount = parseInt(this.value);
+    // Make sure the elements exist before trying to access them
+    if (bucketCountSlider && bucketCountDisplay) {
+        bucketCountSlider.value = currentBucketCount;
         bucketCountDisplay.textContent = currentBucketCount;
-        calculateBuckets();
-        updateChart();
-    });
+        
+        bucketCountSlider.addEventListener('input', function() {
+            currentBucketCount = parseInt(this.value);
+            bucketCountDisplay.textContent = currentBucketCount;
+            calculateBuckets();
+            updateChart();
+        });
+    } else {
+        console.warn('Bucket count slider elements not found. Check that the HTML includes the proper elements.');
+    }
     
     // Create chart
     const chart = new Chart(ctx, {
