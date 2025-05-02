@@ -315,16 +315,15 @@ def collect_results_metadata(
             if metadata_path.exists():
                 metadata = read_json_file(metadata_path)
 
-                # Get the model name from metadata if available, or try to reconstruct it
+                # Get the model name from metadata
                 if "model" in metadata:
                     model_name = metadata["model"]
+                    all_models.add(model_name)
+                    results_metadata[(case_prefix, model_name)] = metadata
                 else:
-                    # As a fallback, try to recreate the model name from the directory name
-                    # This is not perfect but better than nothing
-                    model_name = model_dir.name.replace("_", "/")
-
-                all_models.add(model_name)
-                results_metadata[(case_prefix, model_name)] = metadata
+                    # If model is missing from metadata, report an error and skip this result
+                    print(f"Error: Missing 'model' field in metadata: {metadata_path}")
+                    # Continue to next model dir, skipping this one
 
     return results_metadata, all_models
 
