@@ -1765,7 +1765,6 @@ def generate_model_page(
             case_data = {
                 "prefix": case_prefix,
                 "success": metadata.get("success", False),
-                "runtime_seconds": metadata.get("runtime_seconds", 0),
                 "cost_usd": metadata.get("cost_usd", 0),
                 "prompt_tokens": prompt_metadata.get(case_prefix, {}).get(
                     "prompt_tokens", 0
@@ -1814,7 +1813,6 @@ def generate_model_page(
                         <th>Case</th>
                         <th>Prompt Tokens</th>
                         <th>Status</th>
-                        <th>Runtime</th>
                         <th>Cost</th>
                         <th>Actions</th>
                     </tr>
@@ -1835,7 +1833,6 @@ def generate_model_page(
                         <td>{case["original_filename"]}</td>
                         <td>{case["prompt_tokens"]}</td>
                         <td class="{status_class}">{status_text}</td>
-                        <td>{case["runtime_seconds"]:.2f}s</td>
                         <td>${case["cost_usd"]:.6f}</td>
                         <td>
                             <a href="../cases/{safe_model}/{safe_case}.html" class="view-button">View Details</a>
@@ -2078,7 +2075,6 @@ def generate_case_page(
                 <p><strong>Native Completion Tokens:</strong> {result_metadata.get("native_completion_tokens", "N/A")}</p>
                 <p><strong>Native Tokens Reasoning:</strong> {result_metadata.get("native_tokens_reasoning", "N/A")}</p>
                 <p><strong>Native Finish Reason:</strong> {result_metadata.get("native_finish_reason", "N/A")}</p>
-                <p><strong>Runtime:</strong> {result_metadata.get("runtime_seconds", "N/A")}s</p>
                 <p><strong>Cost:</strong> ${result_metadata.get("cost_usd", "N/A")}</p>
             </div>
             
