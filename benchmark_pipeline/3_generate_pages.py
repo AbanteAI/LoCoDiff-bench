@@ -927,13 +927,47 @@ def create_chart_javascript() -> str:
     return """
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-// Load chart data
+// Add an error message container to the chart section
+const chartContainer = document.querySelector('.chart-container');
+const errorMessageDiv = document.createElement('div');
+errorMessageDiv.className = 'chart-error-message';
+errorMessageDiv.style.display = 'none';
+chartContainer.appendChild(errorMessageDiv);
+
+// Load chart data with proper error handling
 fetch('chart_data.json')
-    .then(response => response.json())
+    .then(response => {
+        if (!response.ok) {
+            throw new Error(`Failed to load chart data: ${response.status} ${response.statusText}`);
+        }
+        return response.json();
+    })
     .then(wrapper => {
         // Use the data property which contains the actual chart data
         // The _warning property contains the auto-generation warning
         initializeChart(wrapper.data);
+    })
+    .catch(error => {
+        console.error('Error loading chart data:', error);
+        
+        // Show a helpful error message
+        errorMessageDiv.style.display = 'block';
+        errorMessageDiv.innerHTML = `
+            <h3>Error Loading Chart Data</h3>
+            <p>${error.message}</p>
+            <p>This error often occurs when viewing the HTML file directly from your filesystem.</p>
+            <p>To fix this issue, try one of these options:</p>
+            <ol>
+                <li>Use a local web server to view these files:
+                    <pre>cd docs<br>python -m http.server 8000</pre>
+                    Then visit <a href="http://localhost:8000">http://localhost:8000</a>
+                </li>
+                <li>For Chrome, launch with: <code>chrome --allow-file-access-from-files</code></li>
+            </ol>
+        `;
+        
+        // Hide the chart canvas
+        document.getElementById('token-success-chart').style.display = 'none';
     });
 
 // JavaScript implementation of Wilson score interval for confidence intervals
@@ -2425,6 +2459,36 @@ tr.success:hover, tr.failure:hover {
     color: #24292e;
     background-color: #f6f8fa;
     font-weight: bold;
+}
+
+/* Chart error message */
+.chart-error-message {
+    background-color: #fffbdd;
+    border: 1px solid #eea20b;
+    border-radius: 4px;
+    padding: 20px;
+    margin: 20px 0;
+    color: #735c0f;
+}
+
+.chart-error-message h3 {
+    color: #b08800;
+    margin-bottom: 10px;
+}
+
+.chart-error-message pre {
+    background-color: #f6f8fa;
+    padding: 10px;
+    border-radius: 3px;
+    margin: 10px 0;
+    overflow-x: auto;
+}
+
+.chart-error-message code {
+    background-color: #f6f8fa;
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-family: monospace;
 }
 
 /* Footer */
