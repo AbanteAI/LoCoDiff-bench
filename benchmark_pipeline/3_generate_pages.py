@@ -1027,15 +1027,17 @@ function initializeChart(chartData) {
                     // use bucket locations (averages) for exact alignment with data points
                     min: firstBucket.bucket_location / 1000,   // Use first bucket average
                     max: lastBucket.bucket_location / 1000,   // Use last bucket average
-                    afterBuildTicks: function(scale) {
-                        // Replace all ticks with our own specific values
-                        scale.ticks = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75];
-                        return;
-                    },
                     ticks: {
-                        // Format the ticks with 'k' suffix
-                        callback: function(value) {
-                            return value + 'k';
+                        // Force a smaller distance between ticks
+                        maxTicksLimit: 20,
+                        // Custom callback that controls which ticks are displayed and how
+                        callback: function(value, index, values) {
+                            // Only show specific values (multiples of 5 between 10 and 75)
+                            if (value >= 10 && value <= 75 && value % 5 === 0) {
+                                return value + 'k';
+                            }
+                            // Return null for any other values to hide them
+                            return null;
                         },
                         precision: 1
                     },
