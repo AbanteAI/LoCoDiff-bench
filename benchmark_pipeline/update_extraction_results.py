@@ -282,6 +282,8 @@ def main():
     # Process each benchmark case
     success_count = 0
     failure_count = 0
+    empty_output_count = 0
+    output_mismatch_count = 0
     error_count = 0
 
     for case, run_paths in runs_by_case.items():
@@ -314,12 +316,37 @@ def main():
                 success_count += 1
             else:
                 failure_count += 1
+                # Track specific failure types
+                if "Model returned empty output" in message:
+                    empty_output_count += 1
+                elif "Output mismatch" in message:
+                    output_mismatch_count += 1
 
     # Print summary
     print("\n--- Update Summary ---")
-    print(f"Total affected runs: {len(affected_runs)}")
+    print(f"Total affected metadata files: {len(affected_runs)}")
+
+    # Count unique benchmark cases
+    unique_cases = set()
+    for run_path in affected_runs:
+        try:
+            with open(run_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            case = metadata.get("benchmark_case")
+            if case:
+                unique_cases.add(case)
+        except Exception:
+            pass
+
+    # Count model runs processed
+    total_runs_processed = sum(len(run_paths) for run_paths in runs_by_case.values())
+
+    print(f"Representing {len(unique_cases)} unique benchmark cases")
+    print(f"Total processing actions performed: {total_runs_processed}")
     print(f"  Now successful: {success_count}")
     print(f"  Still failing: {failure_count}")
+    print(f"    - Empty output failures: {empty_output_count}")
+    print(f"    - Output mismatch failures: {output_mismatch_count}")
     print(f"  Errors during update: {error_count}")
 
     if args.dry_run:
