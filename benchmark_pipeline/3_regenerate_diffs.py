@@ -320,7 +320,7 @@ def main():
         "\nNote: After regenerating the diffs, you should regenerate the visualization pages:"
     )
     print(
-        f"python benchmark_pipeline/3_generate_pages.py --benchmark-run-dir {args.benchmark_run_dir}"
+        f"python benchmark_pipeline/4_generate_pages.py --benchmark-run-dir {args.benchmark_run_dir}"
     )
 
     return 0
