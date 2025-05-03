@@ -418,12 +418,23 @@ def extract_code_from_backticks(text: str) -> str | None:
     Extracts content between the first and the last triple backticks (```).
     Handles optional language identifiers after the first backticks and strips
     leading/trailing whitespace from the extracted content.
+
+    If no backticks are found, returns the entire text as is (instead of None).
+    Returns empty string only if the input text is empty.
     """
+    if not text or text.isspace():
+        # Return empty string only if input is empty or only whitespace
+        return ""
+
     try:
         # Find the start of the first ``` block
         start_outer = text.find("```")
         if start_outer == -1:
-            return None  # No opening backticks found
+            # No backticks found, return the entire text
+            print(
+                "Note: No backticks found in response. Using entire response as extracted content."
+            )
+            return text.strip()
 
         # Find the end of the first ``` marker (including optional language and newline)
         # Use regex to find the end position after ```, optional language, and optional newline
@@ -435,9 +446,6 @@ def extract_code_from_backticks(text: str) -> str | None:
             # Fallback if regex fails (e.g., ``` immediately followed by content without newline)
             # Find the end of the initial ``` marker itself
             start_inner = start_outer + 3  # Length of ```
-
-        # Find the start of the last ``` block using rfind
-        end_outer = text.rfind("```")
 
         # Find the start of the last ``` block using rfind
         end_outer = text.rfind("```")
@@ -460,7 +468,8 @@ def extract_code_from_backticks(text: str) -> str | None:
     except Exception as e:
         # Log unexpected errors during extraction
         print(f"Error during backtick extraction: {e}")
-        return None
+        # Return the whole text on error instead of None
+        return text.strip()
 
 
 def find_benchmark_cases(prompts_dir: str) -> list[str]:
@@ -687,8 +696,10 @@ async def run_single_benchmark(
 
             # --- 9. Extract Content ---
             extracted_content = extract_code_from_backticks(raw_model_response)
-            if extracted_content is None:
-                run_metadata["error"] = "Extraction backticks not found"
+
+            # Special case: check if model returned empty output
+            if not extracted_content:
+                run_metadata["error"] = "Model returned empty output"
                 # Continue to save metadata and diff (which will show full expected)
             else:
                 run_metadata["extracted_output_length"] = len(extracted_content)
@@ -1013,8 +1024,8 @@ async def main():
                     error_type = "IO Error"
                 elif "Runtime Error:" in error_msg:
                     error_type = "Runtime Error"
-                elif "Extraction backticks not found" in error_msg:
-                    error_type = "Extraction Error"
+                elif "Model returned empty output" in error_msg:
+                    error_type = "Empty Output Error"
                 elif "Output mismatch" in error_msg:
                     error_type = "Output Mismatch"
                 else:
