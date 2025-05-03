@@ -280,7 +280,6 @@ def main():
     # Process each benchmark case
     success_count = 0
     failure_count = 0
-    unchanged_count = 0
     error_count = 0
 
     for case, run_paths in runs_by_case.items():
