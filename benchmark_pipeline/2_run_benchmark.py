@@ -729,7 +729,7 @@ async def run_single_benchmark(
                     extracted_for_diff.splitlines(keepends=True),
                     fromfile=f"{expected_filename} (expected)",
                     tofile=f"{benchmark_case_prefix}_extracted.txt (actual)",
-                    lineterm="",
+                    lineterm="\n",  # Using newline to ensure proper line separation for visualization
                 )
                 diff_content = "".join(diff_lines)
                 if (

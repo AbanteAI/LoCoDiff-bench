@@ -198,7 +198,7 @@ def update_run(
                 extracted_stripped.splitlines(keepends=True),
                 fromfile=f"{metadata['benchmark_case']}_expectedoutput.txt (expected)",
                 tofile=f"{metadata['benchmark_case']}_extracted.txt (actual)",
-                lineterm="",
+                lineterm="\n",  # Using newline to ensure proper line separation for visualization
             )
             diff_content = "".join(diff_lines)
             if not diff_content:
