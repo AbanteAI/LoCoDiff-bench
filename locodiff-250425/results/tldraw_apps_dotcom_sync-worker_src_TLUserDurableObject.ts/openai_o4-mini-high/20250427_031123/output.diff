@@ -1,18 +1,25 @@
---- tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_expectedoutput.txt (expected)+++ tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_extracted.txt (actual)@@ -2,6 +2,7 @@ 	DB,
+
+index e49f6e87..03fc3cb3 100644
+--- a/tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_expectedoutput.txt (expected):tmp/tmpb4fxfazr_expected.txt	
++++ b/tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_extracted.txt (actual):tmp/tmplw_yqr5e_actual.txt	
+@@ -2,6 +2,7 @@ import {
+ 	DB,
  	isColumnMutable,
  	MAX_NUMBER_OF_FILES,
 +	ROOM_PREFIX,
  	TlaFile,
  	TlaFilePartial,
  	TlaFileState,
-@@ -13,7 +14,6 @@ 	ZRowUpdate,
+@@ -13,7 +14,6 @@ import {
+ 	ZRowUpdate,
  	ZServerSentMessage,
  } from '@tldraw/dotcom-shared'
 -import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from '@tldraw/sync-core'
  import { assert, ExecutionQueue, sleep } from '@tldraw/utils'
  import { createSentry } from '@tldraw/worker-shared'
  import { DurableObject } from 'cloudflare:workers'
-@@ -21,7 +21,12 @@ import { Kysely, sql, Transaction } from 'kysely'
+@@ -21,7 +21,12 @@ import { IRequest, Router } from 'itty-router'
+ import { Kysely, sql, Transaction } from 'kysely'
  import { Logger } from './Logger'
  import { createPostgresConnectionPool } from './postgres'
 -import { Analytics, Environment, getUserDoSnapshotKey, TLUserDurableObjectEvent } from './types'
@@ -25,7 +32,8 @@
  import { UserDataSyncer, ZReplicationEvent } from './UserDataSyncer'
  import { EventData, writeDataPoint } from './utils/analytics'
  import { getRoomDurableObject } from './utils/durableObjects'
-@@ -31,36 +36,9 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+@@ -31,36 +36,9 @@ import { retryOnConnectionFailure } from './utils/retryOnConnectionFailure'
+ export class TLUserDurableObject extends DurableObject<Environment> {
  	private readonly db: Kysely<DB>
  	private measure: Analytics | undefined
 -
@@ -61,7 +69,8 @@
  	private userId: string | null = null
  	private coldStartStartTime: number | null = null
  
-@@ -75,33 +53,118 @@ 				this.logEvent({ type: 'rate_limited', id: this.userId })
+@@ -75,40 +53,37 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				this.logEvent({ type: 'rate_limited', id: this.userId })
  				throw new Error('Rate limited')
  			}
 -			if (!this.cache) {
@@ -94,6 +103,23 @@
  		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
  
 -	// Handle a request to the Durable Object.
+-	override async fetch(req: IRequest) {
+-		const sentry = createSentry(this.ctx, this.env, req)
+-		try {
+-			// Using storage pins the location of the DO
+-			this.ctx.storage.get('pin-the-do')
+-			return await this.router.fetch(req)
+-		} catch (err) {
+-			if (sentry) {
+-				// eslint-disable-next-line @typescript-eslint/no-deprecated
+-				sentry?.captureException(err)
+-			} else {
+-				console.error(err)
+-			}
+-			return new Response('Something went wrong', {
+-				status: 500,
+-				statusText: 'Internal Server Error',
+-			})
 +	constructor(ctx: DurableObjectState, env: Environment) {
 +		super(ctx, env)
 +		this.sentry = createSentry(ctx, env)
@@ -109,41 +135,42 @@
 +		})
 +		if (!this.sentry) {
 +			console.error(`[TLUserDurableObject]: `, exception)
-+		}
-+	}
-+
-+	private assertCache(): asserts this is { cache: UserDataSyncer } {
-+		assert(this.cache, 'no cache')
-+	}
-+
-+	interval: NodeJS.Timeout | null = null
+ 		}
+ 	}
+ 
+@@ -117,16 +92,18 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	interval: NodeJS.Timeout | null = null
 +	nextMutationTimestamp = Date.now()
-+
-+	private maybeStartInterval() {
-+		if (!this.interval) {
-+			this.interval = setInterval(() => {
-+				this.cache?.onInterval()
-+
-+				for (const socket of this.sockets) {
+ 
+ 	private maybeStartInterval() {
+ 		if (!this.interval) {
+ 			this.interval = setInterval(() => {
+-				// do cache persist + cleanup
+ 				this.cache?.onInterval()
+ 
+-				// clean up closed sockets if there are any
+ 				for (const socket of this.sockets) {
+-					if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
 +					if (
 +						socket.readyState === WebSocket.CLOSED ||
 +						socket.readyState === WebSocket.CLOSING
 +					) {
-+						this.sockets.delete(socket)
-+					}
-+				}
-+
-+				if (this.sockets.size === 0 && typeof this.interval === 'number') {
-+					clearInterval(this.interval)
-+					this.interval = null
-+				}
-+			}, 2000)
-+		}
-+	}
-+
-+	private readonly sockets = new Set<WebSocket>()
+ 						this.sockets.delete(socket)
+ 					}
+ 				}
+@@ -140,57 +117,96 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	private readonly sockets = new Set<WebSocket>()
 +	private readonly messageQueue = new ExecutionQueue()
-+
+ 
+-	maybeReportColdStartTime(type: ZServerSentMessage['type']) {
+-		if (type !== 'initial_data' || !this.coldStartStartTime) return
+-		const time = Date.now() - this.coldStartStartTime
+-		this.coldStartStartTime = null
+-		this.logEvent({ type: 'cold_start_time', id: this.userId!, duration: time })
 +	private writeEvent(eventData: EventData) {
 +		try {
 +			writeDataPoint(
@@ -156,8 +183,20 @@
 +		} catch {
 +			// swallow
 +		}
-+	}
-+
+ 	}
+ 
+-	broadcast(message: ZServerSentMessage) {
+-		this.logEvent({ type: 'broadcast_message', id: this.userId! })
+-		this.maybeReportColdStartTime(message.type)
+-		const msg = JSON.stringify(message)
+-		for (const socket of this.sockets) {
+-			if (socket.readyState === WebSocket.OPEN) {
+-				socket.send(msg)
+-			} else if (
+-				socket.readyState === WebSocket.CLOSED ||
+-				socket.readyState === WebSocket.CLOSING
+-			) {
+-				this.sockets.delete(socket)
 +	logEvent(event: TLUserDurableObjectEvent) {
 +		try {
 +			switch (event.type) {
@@ -175,83 +214,32 @@
 +					break
 +				default:
 +					this.writeEvent({ blobs: [event.type, event.id] })
-+			}
+ 			}
 +		} catch {
 +			// swallow
 +		}
 +	}
 +
- 	override async fetch(req: IRequest) {
- 		const sentry = createSentry(this.ctx, this.env, req)
- 		try {
- 			// Using storage pins the location of the DO
- 			this.ctx.storage.get('pin-the-do')
- 			return await this.router.fetch(req)
--		} catch (err) {
++	override async fetch(req: IRequest) {
++		const sentry = createSentry(this.ctx, this.env, req)
++		try {
++			// Using storage pins the location of the DO
++			this.ctx.storage.get('pin-the-do')
++			return await this.router.fetch(req)
 +		} catch (err: any) {
- 			if (sentry) {
--				// eslint-disable-next-line @typescript-eslint/no-deprecated
--				sentry?.captureException(err)
++			if (sentry) {
 +				sentry.captureException(err, { extras: err })
- 			} else {
- 				console.error(err)
- 			}
-@@ -112,85 +175,38 @@ 		}
++			} else {
++				console.error(err)
++			}
++			return new Response('Something went wrong', {
++				status: 500,
++				statusText: 'Internal Server Error',
++			})
+ 		}
  	}
- 
--	private assertCache(): asserts this is { cache: UserDataSyncer } {
--		assert(this.cache, 'no cache')
--	}
--
--	interval: NodeJS.Timeout | null = null
--
--	private maybeStartInterval() {
--		if (!this.interval) {
--			this.interval = setInterval(() => {
--				// do cache persist + cleanup
--				this.cache?.onInterval()
--
--				// clean up closed sockets if there are any
--				for (const socket of this.sockets) {
--					if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
--						this.sockets.delete(socket)
--					}
--				}
--
--				if (this.sockets.size === 0 && typeof this.interval === 'number') {
--					clearInterval(this.interval)
--					this.interval = null
--				}
--			}, 2000)
--		}
--	}
--
--	private readonly sockets = new Set<WebSocket>()
--
--	maybeReportColdStartTime(type: ZServerSentMessage['type']) {
--		if (type !== 'initial_data' || !this.coldStartStartTime) return
--		const time = Date.now() - this.coldStartStartTime
--		this.coldStartStartTime = null
--		this.logEvent({ type: 'cold_start_time', id: this.userId!, duration: time })
--	}
--
--	broadcast(message: ZServerSentMessage) {
--		this.logEvent({ type: 'broadcast_message', id: this.userId! })
--		this.maybeReportColdStartTime(message.type)
--		const msg = JSON.stringify(message)
--		for (const socket of this.sockets) {
--			if (socket.readyState === WebSocket.OPEN) {
--				socket.send(msg)
--			} else if (
--				socket.readyState === WebSocket.CLOSED ||
--				socket.readyState === WebSocket.CLOSING
--			) {
--				this.sockets.delete(socket)
--			}
--		}
--	}
 -	private readonly messageQueue = new ExecutionQueue()
--
+ 
  	async onRequest(req: IRequest) {
  		assert(this.userId, 'User ID not set')
 -		// handle legacy param names
@@ -270,13 +258,12 @@
 -		assert(Number.isFinite(protocolVersion), `Invalid protocol version ${params.protocolVersion}`)
 -
 -		this.assertCache()
--
--		// Create the websocket pair for the client
 +		assert(
 +			Number.isFinite(protocolVersion),
 +			`Invalid protocol version ${params.protocolVersion}`
 +		)
-+
+ 
+-		// Create the websocket pair for the client
  		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
  		serverWebSocket.accept()
  
@@ -301,7 +288,8 @@
  		)
  		serverWebSocket.addEventListener('close', () => {
  			this.sockets.delete(serverWebSocket)
-@@ -203,43 +219,71 @@ 		this.sockets.add(serverWebSocket)
+@@ -203,43 +219,71 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		this.sockets.add(serverWebSocket)
  		this.maybeStartInterval()
  
 -		const initialData = this.cache.store.getCommittedData()
@@ -335,10 +323,9 @@
 +	) {
  		const rateLimited = await isRateLimited(this.env, this.userId!)
  		this.assertCache()
--
--		const msg = JSON.parse(message) as any as ZClientSentMessage
 +		await this.cache.waitUntilConnected()
-+
+ 
+-		const msg = JSON.parse(message) as any as ZClientSentMessage
 +		const msg = JSON.parse(message) as ZClientSentMessage
  		switch (msg.type) {
  			case 'mutate':
@@ -357,16 +344,13 @@
  				break
  			default:
 -				this.captureException(new Error('Unhandled message'), { message })
--		}
--	}
--
--	async bumpMutationNumber(db: Kysely<DB> | Transaction<DB>) {
 +				this.captureException(new Error('Unhandled message'), {
 +					message,
 +				})
-+		}
-+	}
-+
+ 		}
+ 	}
+ 
+-	async bumpMutationNumber(db: Kysely<DB> | Transaction<DB>) {
 +	private async rejectMutation(
 +		socket: WebSocket,
 +		mutationId: string,
@@ -393,7 +377,8 @@
  		return db
  			.insertInto('user_mutation_number')
  			.values({
-@@ -255,45 +299,284 @@ 			.executeTakeFirstOrThrow()
+@@ -255,45 +299,284 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			.executeTakeFirstOrThrow()
  	}
  
 -	private async rejectMutation(socket: WebSocket, mutationId: string, errorCode: ZErrorCode) {
@@ -412,13 +397,6 @@
 -				errorCode,
 -			} satisfies ZServerSentMessage)
 -		)
--	}
--
--	private async assertValidMutation(update: ZRowUpdate, tx: Transaction<DB>) {
--		// s is the entire set of data that the user has access to
--		// and is up to date with all committed mutations so far.
--		// we commit each mutation one at a time before handling the next.
--		const s = this.cache!.store.getFullData()
 +		try {
 +			await retryOnConnectionFailure(
 +				() => this._doMutate(msg),
@@ -438,8 +416,13 @@
 +			})
 +			await this.rejectMutation(socket, msg.mutationId, code)
 +		}
-+	}
-+
+ 	}
+ 
+-	private async assertValidMutation(update: ZRowUpdate, tx: Transaction<DB>) {
+-		// s is the entire set of data that the user has access to
+-		// and is up to date with all committed mutations so far.
+-		// we commit each mutation one at a time before handling the next.
+-		const s = this.cache!.store.getFullData()
 +	private async _doMutate(
 +		msg: ZClientSentMessage
 +	) {
@@ -681,11 +664,10 @@
  					throw new ZMutationError(
  						ZErrorCode.forbidden,
 -						'Cannot update user record that is not our own: ' + (update.row as TlaUser).id
--					)
--				// todo: prevent user from updating their email?
 +						'Cannot update user record that is not our own: ' +
 +							(update.row as TlaUser).id
-+					)
+ 					)
+-				// todo: prevent user from updating their email?
  				return
  			}
  			case 'file': {
@@ -704,7 +686,8 @@
  					if (isOwner) return
  					throw new ZMutationError(
  						ZErrorCode.forbidden,
-@@ -301,14 +584,23 @@ 					)
+@@ -301,14 +584,23 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					)
  				}
  				if (prevFile.isDeleted)
 -					throw new ZMutationError(ZErrorCode.forbidden, 'Cannot update a deleted file')
@@ -735,7 +718,8 @@
  					throw new ZMutationError(
  						ZErrorCode.forbidden,
  						'Cannot update fields other than updatedAt on a shared file'
-@@ -316,32 +608,45 @@ 				}
+@@ -316,32 +608,45 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
  				throw new ZMutationError(
  					ZErrorCode.forbidden,
 -					'Cannot update file that is not our own and not shared in edit mode' +
@@ -769,13 +753,12 @@
  				}
  				if (!file) {
 -					throw new ZMutationError(ZErrorCode.bad_request, `File not found ${nextFileState.fileId}`)
--				}
--				if (nextFileState.userId !== this.userId) {
 +					throw new ZMutationError(
 +						ZErrorCode.bad_request,
 +						`File not found ${nextFileState.fileId}`
 +					)
-+				}
+ 				}
+-				if (nextFileState.userId !== this.userId) {
 +				if (
 +					nextFileState.userId !==
 +					this.userId
@@ -791,7 +774,8 @@
  				if (file.shared) return
  
  				throw new ZMutationError(
-@@ -352,169 +657,29 @@ 		}
+@@ -352,169 +657,29 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
  	}
  
 -	private async _doMutate(msg: ZClientSentMessage) {
@@ -974,7 +958,8 @@
  		return 'ok'
  	}
  
-@@ -522,50 +687,17 @@ 		return !this.cache
+@@ -522,50 +687,17 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		return !this.cache
  	}
  
 -	/* --------------  */
@@ -1032,7 +1017,8 @@
  		}
  	}
  
-@@ -581,10 +713,29 @@ 				() => {},
+@@ -581,11 +713,30 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				() => {},
  				this.log
  			)
 -		while (!cache.store.getCommittedData()) {
@@ -1042,7 +1028,7 @@
  			await sleep(100)
  		}
  		return cache.store.getCommittedData()
-+	}
+ 	}
 +
 +	/** sneaky test stuff */
 +	// this allows us to test the 'your client is out of date please refresh' flow
@@ -1059,6 +1045,7 @@
 +		this.sockets.forEach((socket) => {
 +			socket.close()
 +		})
- 	}
++	}
  }
  
+ class ZMutationError extends Error {
