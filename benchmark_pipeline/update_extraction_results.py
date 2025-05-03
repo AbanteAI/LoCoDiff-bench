@@ -151,6 +151,10 @@ def update_run(
         # Apply new extraction logic
         extracted_content = extract_code_from_backticks(raw_response)
 
+        # Initialize stripped variables to avoid "possibly unbound" errors
+        extracted_stripped = extracted_content.strip() if extracted_content else ""
+        expected_stripped = expected_content.strip()
+
         # Check if extracted content would be empty
         if not extracted_content:
             new_error = "Model returned empty output"
@@ -162,8 +166,6 @@ def update_run(
             )
         else:
             # Check if output would match expected
-            extracted_stripped = extracted_content.strip()
-            expected_stripped = expected_content.strip()
             new_success = extracted_stripped == expected_stripped
 
             if new_success:
@@ -184,7 +186,7 @@ def update_run(
         # Create or update extraction file
         extracted_output_path = results_dir / "extracted_output.txt"
         if not dry_run:
-            _save_text_file(extracted_output_path, extracted_content)
+            _save_text_file(extracted_output_path, extracted_content or "")
 
         # Generate new diff
         diff_path = results_dir / "output.diff"
