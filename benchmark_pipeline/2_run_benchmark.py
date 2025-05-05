@@ -74,13 +74,14 @@ File Modifications:
 
 import argparse
 import asyncio
-import difflib
 import glob
 import json
 import os
 import random
 import re
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -724,20 +725,67 @@ async def run_single_benchmark(
             if run_metadata["success"]:
                 diff_content = "No differences found.\n"
             else:
-                diff_lines = difflib.unified_diff(
-                    expected_for_diff.splitlines(keepends=True),
-                    extracted_for_diff.splitlines(keepends=True),
-                    fromfile=f"{expected_filename} (expected)",
-                    tofile=f"{benchmark_case_prefix}_extracted.txt (actual)",
-                    lineterm="\n",  # Using newline to ensure proper line separation for visualization
-                )
-                diff_content = "".join(diff_lines)
-                if (
-                    not diff_content
-                ):  # Handle case where both are empty or identical after strip
-                    diff_content = (
-                        "No differences found (after stripping whitespace).\n"
+                # Generate diff using git for better formatting
+                expected_label = f"{expected_filename} (expected)"
+                actual_label = f"{benchmark_case_prefix}_extracted.txt (actual)"
+
+                # Create temporary files for git diff
+                with tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, suffix="_expected.txt"
+                ) as expected_file:
+                    expected_file.write(expected_for_diff)
+                    expected_file_path = expected_file.name
+
+                with tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, suffix="_actual.txt"
+                ) as actual_file:
+                    actual_file.write(extracted_for_diff)
+                    actual_file_path = actual_file.name
+
+                try:
+                    # Use git diff for proper formatting
+                    process = subprocess.run(
+                        [
+                            "git",
+                            "diff",
+                            "--no-index",
+                            "--no-color",
+                            f"--src-prefix=a/{expected_label}:",
+                            f"--dst-prefix=b/{actual_label}:",
+                            expected_file_path,
+                            actual_file_path,
+                        ],
+                        capture_output=True,
+                        text=True,
                     )
+
+                    # git diff returns exit code 1 if there are differences (which is expected)
+                    diff_output = process.stdout
+
+                    # Remove the temp file paths from the output if present
+                    diff_output = re.sub(
+                        r"a/[^:]*:", f"a/{expected_label}:", diff_output
+                    )
+                    diff_output = re.sub(r"b/[^:]*:", f"b/{actual_label}:", diff_output)
+
+                    # Remove the "diff --git" line if present
+                    diff_output = re.sub(
+                        r"^diff --git .*$", "", diff_output, flags=re.MULTILINE
+                    )
+
+                    # Consolidate empty lines
+                    diff_output = re.sub(r"\n\n+", "\n\n", diff_output)
+
+                    if diff_output.strip():
+                        diff_content = diff_output
+                    else:
+                        diff_content = (
+                            "No differences found (after stripping whitespace).\n"
+                        )
+                finally:
+                    # Clean up temp files
+                    os.unlink(expected_file_path)
+                    os.unlink(actual_file_path)
 
             _save_text_file(diff_path, diff_content)  # Will raise IOError on failure
 
