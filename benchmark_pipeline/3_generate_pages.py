@@ -1336,8 +1336,11 @@ def create_cases_section(
     html = """
     <section id="explore-benchmarks">
         <h2>Explore Benchmark Prompts and Model Outputs</h2>
-        <p>Select a model below to view its benchmark cases:</p>
-        <ul class="model-list">
+        <div class="explore-options">
+            <div class="model-view">
+                <h3>View by Model</h3>
+                <p>Select a model to view all its benchmark cases:</p>
+                <ul class="model-list">
     """
 
     # Add links to model pages
@@ -1347,15 +1350,22 @@ def create_cases_section(
         # Use display name if available
         display_name = model_display_names.get(model, model)
         html += f"""
-            <li>
-                <a href="models/{safe_model}.html" class="model-link">
-                    {display_name}
-                </a>
-            </li>
+                    <li>
+                        <a href="models/{safe_model}.html" class="model-link">
+                            {display_name}
+                        </a>
+                    </li>
         """
 
     html += """
-        </ul>
+                </ul>
+            </div>
+            <div class="case-view">
+                <h3>View by Case</h3>
+                <p>View all benchmark cases with their results across models:</p>
+                <a href="cases.html" class="view-all-cases-button">View All Cases</a>
+            </div>
+        </div>
     </section>
     """
     return html
@@ -1657,6 +1667,232 @@ def generate_actual_output_page(
 
     with open(actual_page_path, "w", encoding="utf-8") as f:
         f.write(html_content)
+
+
+def generate_cases_overview_page(
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
+    all_models: Set[str],
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page showing all benchmark cases with their results across all models.
+
+    Args:
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        all_models: Set of all model names
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    # Define the path for the cases overview page
+    cases_page_path = docs_dir / "cases.html"
+
+    # Extract all cases and sort by prompt token count
+    cases = []
+    for case_prefix, metadata in prompt_metadata.items():
+        token_count = metadata.get("prompt_tokens", 0)
+        original_filename = metadata.get("original_filename", case_prefix)
+
+        # Create case data structure
+        case_data = {
+            "prefix": case_prefix,
+            "original_filename": original_filename,
+            "token_count": token_count,
+            "model_results": {},
+        }
+
+        # Collect results for this case across all models
+        for model in all_models:
+            result_key = (case_prefix, model)
+            if result_key in results_metadata:
+                result_metadata = results_metadata[result_key]
+                case_data["model_results"][model] = {
+                    "success": result_metadata.get("success", False),
+                    "tested": True,
+                }
+            else:
+                case_data["model_results"][model] = {"success": False, "tested": False}
+
+        cases.append(case_data)
+
+    # Sort cases by token count
+    cases.sort(key=lambda x: x["token_count"])
+
+    # Start building the HTML content
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>All Benchmark Cases - LoCoDiff Benchmark</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        /* Custom styles for the cases page specifically */
+        body {{
+            max-width: 95%; /* Use more of the screen width */
+        }}
+        #cases-table td.fixed-col {{
+            white-space: normal; /* Allow wrapping of text in fixed columns */
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+            min-width: 250px;
+            max-width: 400px;
+        }}
+        #cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {{
+            left: auto; /* Override the fixed position for the second column */
+            width: 100px;
+        }}
+    </style>
+</head>
+<body>
+    <header>
+        <h1>All Benchmark Cases</h1>
+        <p><a href="index.html">← Back to Overview</a></p>
+        <p>Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+    </header>
+    <main>
+        <section>
+            <h2>Benchmark Cases by Prompt Size</h2>
+            <p>{len(cases)} cases sorted by prompt token size (smallest to largest)</p>
+            
+            <div class="model-selection">
+                <h3>Select Models to Display</h3>
+                <div id="model-checkboxes">
+"""
+
+    # Add model selection checkboxes - initialized as unchecked
+    sorted_models = sorted(all_models)
+    for model in sorted_models:
+        display_name = model_display_names.get(model, model)
+        safe_model = model.replace("/", "_")
+        html_content += f"""
+                    <div class="checkbox-item">
+                        <label>
+                            <input type="checkbox" data-model="{safe_model}">
+                            {display_name}
+                        </label>
+                    </div>
+"""
+
+    html_content += """
+                </div>
+            </div>
+            
+            <table id="cases-table">
+                <thead>
+                    <tr>
+                        <th class="fixed-col">Case</th>
+                        <th class="fixed-col">Prompt Tokens</th>
+"""
+
+    # Add column headers for each model
+    for model in sorted_models:
+        display_name = model_display_names.get(model, model)
+        safe_model = model.replace("/", "_")
+        html_content += f"""
+                        <th class="model-col" data-model="{safe_model}">{display_name}</th>
+"""
+
+    html_content += """
+                    </tr>
+                </thead>
+                <tbody>
+"""
+
+    # Add case rows
+    for case in cases:
+        case_prefix = case["prefix"]
+        safe_case = case_prefix.replace("/", "_")
+        html_content += f"""
+                    <tr>
+                        <td class="fixed-col">{case["original_filename"]}</td>
+                        <td class="fixed-col">{case["token_count"]}</td>
+"""
+
+        # Add status buttons for each model
+        for model in sorted_models:
+            safe_model = model.replace("/", "_")
+            result = case["model_results"][model]
+
+            if result["tested"]:
+                if result["success"]:
+                    button_class = "success-button"
+                    button_text = "Success"
+                    html_content += f"""
+                        <td class="model-col" data-model="{safe_model}">
+                            <a href="cases/{safe_model}/{safe_case}.html" class="{button_class}">
+                                {button_text}
+                            </a>
+                        </td>
+"""
+                else:
+                    button_class = "failure-button"
+                    button_text = "Failure"
+                    html_content += f"""
+                        <td class="model-col" data-model="{safe_model}">
+                            <a href="cases/{safe_model}/{safe_case}.html" class="{button_class}">
+                                {button_text}
+                            </a>
+                        </td>
+"""
+            else:
+                # Don't add a link for untested cases
+                button_class = "untested-button"
+                button_text = "Not Tested"
+                html_content += f"""
+                        <td class="model-col" data-model="{safe_model}">
+                            <span class="{button_class}">{button_text}</span>
+                        </td>
+"""
+
+    # Complete the HTML
+    html_content += """
+                </tbody>
+            </table>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        // Add model column toggling functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            // Handle checkbox changes
+            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    const modelId = this.getAttribute('data-model');
+                    const isVisible = this.checked;
+                    
+                    // Toggle visibility of corresponding table cells
+                    document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
+                        cell.style.display = isVisible ? '' : 'none';
+                    });
+                });
+            });
+            
+            // Initial setup - ensure all columns are properly set (hidden by default)
+            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                const modelId = checkbox.getAttribute('data-model');
+                const isVisible = checkbox.checked;
+                
+                document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
+                    cell.style.display = isVisible ? '' : 'none';
+                });
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+    # Write the HTML file
+    with open(cases_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"Generated cases overview page: {cases_page_path}")
 
 
 def generate_model_page(
@@ -2216,6 +2452,105 @@ tbody tr:hover {
     text-decoration: none;
 }
 
+/* Explore options layout */
+.explore-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 30px;
+}
+
+.model-view, .case-view {
+    flex: 1;
+    min-width: 300px;
+}
+
+.view-all-cases-button {
+    display: inline-block;
+    padding: 12px 20px;
+    background-color: #2ea44f;
+    color: white;
+    border-radius: 4px;
+    font-size: 16px;
+    font-weight: 500;
+    text-decoration: none;
+    text-align: center;
+    transition: background-color 0.2s;
+    margin-top: 15px;
+}
+
+.view-all-cases-button:hover {
+    background-color: #2c974b;
+    text-decoration: none;
+}
+
+/* Cases overview table */
+#cases-table {
+    table-layout: fixed;
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+}
+
+#cases-table th, #cases-table td {
+    padding: 8px;
+    text-align: center;
+    white-space: nowrap;
+}
+
+#cases-table th.fixed-col, #cases-table td.fixed-col {
+    text-align: left;
+    position: sticky;
+    left: 0;
+    background-color: white;
+    z-index: 10;
+}
+
+#cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {
+    left: 250px; /* Adjust based on width of first column */
+}
+
+#cases-table th.model-col, #cases-table td.model-col {
+    min-width: 120px;
+}
+
+.success-button, .failure-button, .untested-button {
+    display: inline-block;
+    width: 100px;
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    text-align: center;
+    text-decoration: none;
+    transition: opacity 0.2s;
+}
+
+.success-button {
+    background-color: #22863a;
+    color: white;
+}
+
+.failure-button {
+    background-color: #cb2431;
+    color: white;
+}
+
+.untested-button {
+    background-color: #6a737d;
+    color: white;
+}
+
+.success-button:hover, .failure-button:hover {
+    opacity: 0.9;
+    text-decoration: none;
+    color: white;
+}
+
+.untested-button:hover {
+    cursor: not-allowed;
+    text-decoration: none;
+    color: white;
+}
+
 /* Case status indicators */
 .success {
     color: #22863a;
@@ -2512,6 +2847,16 @@ def main():
     )
     html_content += create_cases_section(all_models, model_display_names)
     html_content += create_html_footer(include_chart_js=True)
+
+    # Generate cases overview page
+    print("Generating cases overview page...")
+    generate_cases_overview_page(
+        prompt_metadata,
+        results_metadata,
+        all_models,
+        docs_dir,
+        model_display_names,
+    )
 
     # Generate model pages and case pages
     print("Generating model and case pages...")
