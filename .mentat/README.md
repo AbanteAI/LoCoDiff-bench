@@ -6,7 +6,7 @@ This document provides instructions for running benchmarks with Mentat on the Lo
 
 The benchmarking process involves three main steps:
 1. **Generate Prompts**: Create benchmark prompts from GitHub repositories
-2. **Run Benchmark**: Test models against these prompts
+2. **Run Benchmark**: Test models against these prompts and generate properly formatted diffs
 3. **Generate Visualizations**: Create visualizations of benchmark results
 
 ## Generating Benchmark Prompts
@@ -136,19 +136,13 @@ To benchmark Claude 3.7 Sonnet with thinking mode:
 python benchmark_pipeline/2_run_benchmark.py --concurrency 10 --num-runs -1 --model anthropic/claude-3.7-sonnet:thinking --benchmark-run-dir locodiff-250425
 ```
 
-### Step 3: Regenerate Diffs (if needed)
-
-```
-python benchmark_pipeline/3_regenerate_diffs.py --benchmark-run-dir locodiff-250425
-```
-
-### Step 4: Generate Visualizations
+### Step 3: Generate Visualizations
 
 ```
 python benchmark_pipeline/4_generate_pages.py --benchmark-run-dir locodiff-250425
 ```
 
-### Step 5: Create PR with Results
+### Step 4: Create PR with Results
 
 ```
 git checkout -b claude-3.7-sonnet-benchmark
