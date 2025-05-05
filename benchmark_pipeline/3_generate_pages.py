@@ -1042,8 +1042,13 @@ function initializeChart(chartData) {
                                 
                                 return [
                                     `${displayName}: ${successRate.toFixed(2)}% (${successful}/${caseCount})`,
-                                    `Token Range: ${bucketData.minTokens/1000}k-${bucketData.maxTokens/1000}k (avg: ${(bucketData.avgTokens/1000).toFixed(1)}k)
-Cases: ${bucketData.caseCount}${untestedInfo}${ciInfo}`
+                                    `Token Statistics:`,
+                                    `  • Range: ${bucketData.minTokens/1000}k–${bucketData.maxTokens/1000}k`,
+                                    `  • Average: ${(bucketData.avgTokens/1000).toFixed(1)}k`,
+                                    `Case Information:`,
+                                    `  • Total Cases: ${bucketData.caseCount}`
+                                    + (untestedInfo ? `\n  • Note: ${untestedInfo.trim()}` : '')
+                                    + (ciInfo ? `\n\nConfidence Interval:\n  • ${ciInfo.trim().replace('95% CI: ', '')}` : '')
                                 ];
                             } catch (error) {
                                 console.error('Error in tooltip callback:', error);
