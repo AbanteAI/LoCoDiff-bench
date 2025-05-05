@@ -1689,15 +1689,15 @@ def generate_cases_overview_page(
     for case_prefix, metadata in prompt_metadata.items():
         token_count = metadata.get("prompt_tokens", 0)
         original_filename = metadata.get("original_filename", case_prefix)
-        
+
         # Create case data structure
         case_data = {
             "prefix": case_prefix,
             "original_filename": original_filename,
             "token_count": token_count,
-            "model_results": {}
+            "model_results": {},
         }
-        
+
         # Collect results for this case across all models
         for model in all_models:
             result_key = (case_prefix, model)
@@ -1705,19 +1705,16 @@ def generate_cases_overview_page(
                 result_metadata = results_metadata[result_key]
                 case_data["model_results"][model] = {
                     "success": result_metadata.get("success", False),
-                    "tested": True
+                    "tested": True,
                 }
             else:
-                case_data["model_results"][model] = {
-                    "success": False,
-                    "tested": False
-                }
-        
+                case_data["model_results"][model] = {"success": False, "tested": False}
+
         cases.append(case_data)
-    
+
     # Sort cases by token count
     cases.sort(key=lambda x: x["token_count"])
-    
+
     # Start building the HTML content
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1813,7 +1810,7 @@ def generate_cases_overview_page(
         for model in sorted_models:
             safe_model = model.replace("/", "_")
             result = case["model_results"][model]
-            
+
             if result["tested"]:
                 if result["success"]:
                     button_class = "success-button"
@@ -1889,7 +1886,7 @@ def generate_cases_overview_page(
     # Write the HTML file
     with open(cases_page_path, "w", encoding="utf-8") as f:
         f.write(html_content)
-    
+
     print(f"Generated cases overview page: {cases_page_path}")
 
 
