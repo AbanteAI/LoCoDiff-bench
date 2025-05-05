@@ -80,9 +80,9 @@ After generating or with existing prompts, follow these steps to run benchmarks:
    
    The script will automatically detect and retry only the benchmarks that had API errors or were not completed due to technical issues. It will NOT retry benchmarks where the model produced incorrect output (those are considered completed runs with failed results).
 
-4. **Generate visualization pages** (step 3 in the pipeline) after the benchmark is complete:
+4. **Generate visualization pages** (step 4 in the pipeline) after the benchmark is complete:
    ```
-   python benchmark_pipeline/3_generate_pages.py --benchmark-run-dir BENCHMARK_DIR
+   python benchmark_pipeline/4_generate_pages.py --benchmark-run-dir BENCHMARK_DIR
    ```
    
    This creates/updates files in the `docs/` directory with visualizations and statistics.
@@ -108,7 +108,7 @@ After generating or with existing prompts, follow these steps to run benchmarks:
 ## Important Notes
 
 - Benchmark runs can be expensive depending on the model used. Always verify costs in the benchmark summary.
-- Always run the 3rd script (generate_pages.py) after completing benchmarks to update visualizations.
+- Always run the 4th script (4_generate_pages.py) after completing benchmarks to update visualizations.
 - Include key metrics in your PR description (success rate, costs, comparison to other models).
 - The benchmark script handles sanitizing model names in directories (replacing `/` with `_`).
 - **Never manually modify** the files created by running the benchmark, as this would compromise the integrity of the results. All benchmark files should be the direct, unmodified output of the benchmark scripts.
@@ -136,13 +136,19 @@ To benchmark Claude 3.7 Sonnet with thinking mode:
 python benchmark_pipeline/2_run_benchmark.py --concurrency 10 --num-runs -1 --model anthropic/claude-3.7-sonnet:thinking --benchmark-run-dir locodiff-250425
 ```
 
-### Step 3: Generate Visualizations
+### Step 3: Regenerate Diffs (if needed)
 
 ```
-python benchmark_pipeline/3_generate_pages.py --benchmark-run-dir locodiff-250425
+python benchmark_pipeline/3_regenerate_diffs.py --benchmark-run-dir locodiff-250425
 ```
 
-### Step 4: Create PR with Results
+### Step 4: Generate Visualizations
+
+```
+python benchmark_pipeline/4_generate_pages.py --benchmark-run-dir locodiff-250425
+```
+
+### Step 5: Create PR with Results
 
 ```
 git checkout -b claude-3.7-sonnet-benchmark
