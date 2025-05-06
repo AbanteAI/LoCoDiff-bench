@@ -2270,6 +2270,210 @@ def generate_case_page(
         f.write(html_content)
 
 
+def generate_cases_overview_page(
+    prompt_metadata: Dict[str, Dict[str, Any]],
+    results_metadata: Dict[Any, Dict[str, Any]],
+    all_models: Set[str],
+    docs_dir: Path,
+    model_display_names: Dict[str, str] = {},
+) -> None:
+    """
+    Generates a page showing all benchmark cases with their results across all models.
+
+    This page provides a case-centric view complementing the model-centric organization,
+    allowing users to see which cases are challenging across models.
+
+    Args:
+        prompt_metadata: Dictionary of prompt metadata by case prefix
+        results_metadata: Dictionary mapping (case_prefix, model) to result metadata
+        all_models: Set of all model names
+        docs_dir: Path to the docs directory
+        model_display_names: Optional mapping of model names to display names
+    """
+    # Define the path for the cases overview page
+    cases_page_path = docs_dir / "cases.html"
+
+    # Extract all cases and sort by prompt token count
+    cases = []
+    for case_prefix, metadata in prompt_metadata.items():
+        token_count = metadata.get("prompt_tokens", 0)
+        original_filename = metadata.get("original_filename", case_prefix)
+
+        # Create case data structure
+        case_data = {
+            "prefix": case_prefix,
+            "original_filename": original_filename,
+            "token_count": token_count,
+            "model_results": {},
+        }
+
+        # Collect results for this case across all models
+        for model in all_models:
+            result_key = (case_prefix, model)
+            if result_key in results_metadata:
+                result_metadata = results_metadata[result_key]
+                case_data["model_results"][model] = {
+                    "success": result_metadata.get("success", False),
+                    "tested": True,
+                }
+            else:
+                case_data["model_results"][model] = {"success": False, "tested": False}
+
+        cases.append(case_data)
+
+    # Sort cases by token count
+    cases.sort(key=lambda x: x["token_count"])
+
+    # Start building the HTML content
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>All Benchmark Cases - LoCoDiff Benchmark</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>All Benchmark Cases</h1>
+        <p><a href="index.html">← Back to Overview</a></p>
+        <p>Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+    </header>
+    <main>
+        <section>
+            <h2>Benchmark Cases by Prompt Size</h2>
+            <p>{len(cases)} cases sorted by prompt token size (smallest to largest)</p>
+            
+            <div class="model-selection">
+                <h3>Select Models to Display</h3>
+                <div id="model-checkboxes">
+"""
+
+    # Add model selection checkboxes
+    sorted_models = sorted(all_models)
+    for model in sorted_models:
+        display_name = model_display_names.get(model, model)
+        safe_model = model.replace("/", "_")
+        html_content += f"""
+                    <div class="checkbox-item">
+                        <label>
+                            <input type="checkbox" data-model="{safe_model}" checked>
+                            {display_name}
+                        </label>
+                    </div>
+"""
+
+    html_content += """
+                </div>
+            </div>
+            
+            <table id="cases-table">
+                <thead>
+                    <tr>
+                        <th class="fixed-col">Case</th>
+                        <th class="fixed-col">Prompt Tokens</th>
+"""
+
+    # Add column headers for each model
+    for model in sorted_models:
+        display_name = model_display_names.get(model, model)
+        safe_model = model.replace("/", "_")
+        html_content += f"""
+                        <th class="model-col" data-model="{safe_model}">{display_name}</th>
+"""
+
+    html_content += """
+                    </tr>
+                </thead>
+                <tbody>
+"""
+
+    # Add case rows
+    for case in cases:
+        case_prefix = case["prefix"]
+        safe_case = case_prefix.replace("/", "_")
+        html_content += f"""
+                    <tr>
+                        <td class="fixed-col">{case["original_filename"]}</td>
+                        <td class="fixed-col">{case["token_count"]}</td>
+"""
+
+        # Add status buttons for each model
+        for model in sorted_models:
+            safe_model = model.replace("/", "_")
+            result = case["model_results"][model]
+
+            if result["tested"]:
+                if result["success"]:
+                    button_class = "success-button"
+                    button_text = "Success"
+                else:
+                    button_class = "failure-button"
+                    button_text = "Failure"
+            else:
+                button_class = "untested-button"
+                button_text = "Not Tested"
+
+            html_content += f"""
+                        <td class="model-col" data-model="{safe_model}">
+                            <a href="cases/{safe_model}/{safe_case}.html" class="{button_class}">
+                                {button_text}
+                            </a>
+                        </td>
+"""
+
+        html_content += """
+                    </tr>
+"""
+
+    # Complete the HTML
+    html_content += """
+                </tbody>
+            </table>
+        </section>
+    </main>
+    <footer>
+        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+    </footer>
+    
+    <script>
+        // Add model column toggling functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            // Handle checkbox changes
+            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    const modelId = this.getAttribute('data-model');
+                    const isVisible = this.checked;
+                    
+                    // Toggle visibility of corresponding table cells
+                    document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
+                        cell.style.display = isVisible ? '' : 'none';
+                    });
+                });
+            });
+            
+            // Initial setup - ensure all columns are properly set
+            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                const modelId = checkbox.getAttribute('data-model');
+                const isVisible = checkbox.checked;
+                
+                document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
+                    cell.style.display = isVisible ? '' : 'none';
+                });
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+    # Write the HTML file
+    with open(cases_page_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"Generated cases overview page: {cases_page_path}")
+
+
 def create_css_file() -> str:
     """Creates a basic CSS stylesheet for the GitHub Pages site."""
     warning = get_auto_generation_warning()
