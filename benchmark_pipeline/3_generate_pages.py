@@ -2185,7 +2185,6 @@ def generate_model_page(
         /* Custom styles for model-specific pages */
         .case-name {max - width: 300px;
             white-space: normal;
-            word-wrap: break-word;
             overflow-wrap: break-word;
         }
     </style>
