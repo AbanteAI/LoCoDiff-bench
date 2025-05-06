@@ -2051,28 +2051,63 @@ def generate_cases_overview_page(
     <script>
         // Add model column toggling functionality
         document.addEventListener('DOMContentLoaded', function() {
-            // Handle checkbox changes
-            document.querySelectorAll('input[data-model]').forEach(checkbox => {
-                checkbox.addEventListener('change', function() {
-                    const modelId = this.getAttribute('data-model');
-                    const isVisible = this.checked;
-                    
-                    // Toggle visibility of corresponding table cells
-                    document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
-                        cell.style.display = isVisible ? '' : 'none';
-                    });
+            // Function to save selected models to localStorage
+            function saveSelectedModels() {
+                const selectedModels = [];
+                document.querySelectorAll('input[data-model]:checked').forEach(checkbox => {
+                    selectedModels.push(checkbox.getAttribute('data-model'));
                 });
-            });
-            
-            // Initial setup - ensure all columns are properly set (hidden by default)
-            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                localStorage.setItem('locodiff_selected_models', JSON.stringify(selectedModels));
+            }
+                
+            // Function to update visibility based on checkbox state
+            function updateVisibility(checkbox) {
                 const modelId = checkbox.getAttribute('data-model');
                 const isVisible = checkbox.checked;
-                
+                    
+                // Toggle visibility of corresponding table cells
                 document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
                     cell.style.display = isVisible ? '' : 'none';
                 });
+            }
+                
+            // Handle checkbox changes
+            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    updateVisibility(this);
+                    saveSelectedModels();
+                });
             });
+                
+            // Restore selections from localStorage and apply visibility
+            try {
+                const savedModels = JSON.parse(localStorage.getItem('locodiff_selected_models') || '[]');
+                    
+                // First, uncheck all by default (in case there are no saved selections)
+                document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                    checkbox.checked = false;
+                });
+                    
+                // Check boxes for saved models
+                if (savedModels.length > 0) {
+                    savedModels.forEach(modelId => {
+                        const checkbox = document.querySelector(`input[data-model="${modelId}"]`);
+                        if (checkbox) checkbox.checked = true;
+                    });
+                }
+                    
+                // Apply visibility based on current checkbox states
+                document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                    updateVisibility(checkbox);
+                });
+            } catch (error) {
+                console.error('Error restoring model selections:', error);
+                    
+                // Fallback: ensure all columns have proper visibility
+                document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                    updateVisibility(checkbox);
+                });
+            }
         });
     </script>
 </body>
