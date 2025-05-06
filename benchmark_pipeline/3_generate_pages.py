@@ -2738,7 +2738,14 @@ tbody tr:hover {
 #cases-table th, #cases-table td {
     padding: 8px;
     text-align: center;
-    white-space: nowrap;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    white-space: normal;
+}
+
+#cases-table td:first-child {
+    word-break: break-all; /* Allow breaks within file paths */
+    text-align: left;
 }
 
 #cases-table th.fixed-col, #cases-table td.fixed-col {
