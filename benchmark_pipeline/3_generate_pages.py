@@ -1933,7 +1933,7 @@ def generate_cases_overview_page(
         }}
         #cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {{
             left: auto; /* Override the fixed position for the second column */
-            width: 100px;
+            width: 125px; /* Increased from 100px to fit "Prompt Tokens" text */
         }}
     </style>
 </head>
