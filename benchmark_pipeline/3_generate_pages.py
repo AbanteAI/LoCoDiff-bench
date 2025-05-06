@@ -995,7 +995,7 @@ def create_token_chart_section() -> str:
                 <h3>Display Options</h3>
                 <div class="checkbox-item">
                     <label>
-                        <input type="checkbox" id="show-confidence-intervals" checked>
+                        <input type="checkbox" id="show-confidence-intervals">
                         Show 95% Confidence Intervals
                     </label>
                 </div>
