@@ -992,6 +992,33 @@ function initializeChart(chartData) {
                 },
                 tooltip: {
                     callbacks: {
+                        // Add title callback to display bucket information once at the top
+                        title: function(tooltipItems) {
+                            if (!tooltipItems || tooltipItems.length === 0) return '';
+                            
+                            try {
+                                const xValue = tooltipItems[0].raw.x; // Token count in thousands
+                                
+                                // Find the bucket with matching token count
+                                const bucketData = buckets.find(bucket => 
+                                    Math.abs((bucket.avgTokens / 1000) - xValue) < 0.01
+                                );
+                                
+                                if (!bucketData) return 'Bucket Information';
+                                
+                                // Format bucket information
+                                return [
+                                    `Token Range: ${bucketData.minTokens/1000}k–${bucketData.maxTokens/1000}k`,
+                                    `Average Tokens: ${(bucketData.avgTokens/1000).toFixed(1)}k`,
+                                    `Total Cases: ${bucketData.caseCount}`
+                                ];
+                            } catch (error) {
+                                console.error('Error in tooltip title callback:', error);
+                                return 'Bucket Information';
+                            }
+                        },
+                        
+                        // Modify label callback to show only model-specific information
                         label: function(context) {
                             if (!context || !context.dataset || !context.dataset.label) {
                                 return null;
@@ -1012,12 +1039,12 @@ function initializeChart(chartData) {
                                 );
                                 
                                 if (!bucketData) {
-                                    return [`${displayName}`];
+                                    return `${displayName}`;
                                 }
                                 
                                 const modelStats = bucketData.modelStats[originalModel];
                                 if (!modelStats) {
-                                    return [`${displayName}: No data available`];
+                                    return `${displayName}: No data available`;
                                 }
                                 
                                 const successRate = context.raw.y;
@@ -1025,29 +1052,26 @@ function initializeChart(chartData) {
                                 const attempts = modelStats.attempts;
                                 const caseCount = bucketData.caseCount;
                                 
-                                // Get confidence interval
-                                let ciInfo = '';
+                                // Format model success rate
+                                let modelInfo = `${displayName}: ${successRate.toFixed(2)}% (${successful}/${caseCount})`;
+                                
+                                // Add model-specific notes if any
+                                const untestedCases = caseCount - attempts;
+                                if (untestedCases > 0) {
+                                    modelInfo += ` (${untestedCases} untested)`;
+                                }
+                                
+                                // Add confidence interval if enabled
                                 const ciElement = document.getElementById('show-confidence-intervals');
                                 if (ciElement && ciElement.checked && attempts > 0) {
                                     const [lower, upper] = wilson_score_interval(successful, caseCount);
-                                    ciInfo = `\n95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
+                                    modelInfo += `\n  95% CI: ${(lower * 100).toFixed(2)}% - ${(upper * 100).toFixed(2)}%`;
                                 }
                                 
-                                // Calculate untested cases
-                                const untestedCases = caseCount - attempts;
-                                let untestedInfo = '';
-                                if (untestedCases > 0) {
-                                    untestedInfo = `\nModel did not return result for ${untestedCases} case${untestedCases > 1 ? 's' : ''} in this bucket`;
-                                }
-                                
-                                return [
-                                    `${displayName}: ${successRate.toFixed(2)}% (${successful}/${caseCount})`,
-                                    `Token Range: ${bucketData.minTokens/1000}k-${bucketData.maxTokens/1000}k (avg: ${(bucketData.avgTokens/1000).toFixed(1)}k)
-Cases: ${bucketData.caseCount}${untestedInfo}${ciInfo}`
-                                ];
+                                return modelInfo;
                             } catch (error) {
-                                console.error('Error in tooltip callback:', error);
-                                return ['Error displaying tooltip'];
+                                console.error('Error in tooltip label callback:', error);
+                                return 'Error displaying model data';
                             }
                         }
                     }
