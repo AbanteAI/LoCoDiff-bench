@@ -406,7 +406,6 @@ def create_html_header() -> str:
 <body>
     <header>
         <h1>LoCoDiff Benchmark Results</h1>
-        <p>Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
     </header>
     <main>
 """
@@ -933,7 +932,7 @@ def generate_chart_data(
         "languages": list(sorted(all_languages)),
         "min_tokens_k": 0,  # Always start at 0k
         "max_tokens_k": max_tokens_k,
-        "default_bucket_count": 5,  # Default number of buckets
+        "default_bucket_count": 4,  # Default number of buckets
     }
 
     return chart_data
@@ -973,6 +972,9 @@ def create_token_chart_section() -> str:
     return """
     <section id="token-chart">
         <h2>Success Rate by Prompt Size</h2>
+        <div class="chart-container">
+            <canvas id="token-success-chart"></canvas>
+        </div>
         <div class="chart-controls">
             <div class="model-selection">
                 <h3>Models</h3>
@@ -985,8 +987,8 @@ def create_token_chart_section() -> str:
             <div class="bucketing-options">
                 <h3>Bucketing Options</h3>
                 <div class="bucket-count-control">
-                    <label for="bucket-count">Number of Buckets: <span id="bucket-count-display">5</span></label>
-                    <input type="range" id="bucket-count" min="1" max="20" value="5" step="1">
+                    <label for="bucket-count">Number of Buckets: <span id="bucket-count-display">4</span></label>
+                    <input type="range" id="bucket-count" min="1" max="20" value="4" step="1">
                 </div>
             </div>
             <div class="display-options">
@@ -998,9 +1000,6 @@ def create_token_chart_section() -> str:
                     </label>
                 </div>
             </div>
-        </div>
-        <div class="chart-container">
-            <canvas id="token-success-chart"></canvas>
         </div>
     </section>
     """
@@ -1048,7 +1047,7 @@ function initializeChart(chartData) {
     // Create global variables for chart state that need to be accessed by callbacks
     let currentSelectedLanguages = [];
     let currentSelectedModels = [];
-    let currentBucketCount = chartData.default_bucket_count || 5;
+    let currentBucketCount = chartData.default_bucket_count || 4;
     let buckets = []; // Will be calculated dynamically
     
     // Get canvas context
@@ -1941,7 +1940,6 @@ def generate_cases_overview_page(
     <header>
         <h1>All Benchmark Cases</h1>
         <p><a href="index.html">← Back to Overview</a></p>
-        <p>Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
     </header>
     <main>
         <section>
