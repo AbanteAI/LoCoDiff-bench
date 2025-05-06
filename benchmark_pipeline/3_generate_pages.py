@@ -1923,16 +1923,21 @@ def generate_cases_overview_page(
         body {{
             max-width: 95%; /* Use more of the screen width */
         }}
+        /* General settings for fixed columns */
         #cases-table td.fixed-col {{
             white-space: normal; /* Allow wrapping of text in fixed columns */
             overflow-wrap: break-word;
             word-wrap: break-word;
-            min-width: 250px;
+        }}
+        /* First column (Case names) */
+        #cases-table th.fixed-col:nth-child(1), #cases-table td.fixed-col:nth-child(1) {{
+            min-width: 300px; /* Ensure enough width for the 40-character case names */
             max-width: 400px;
         }}
+        /* Second column (Prompt Tokens) */
         #cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {{
             left: auto; /* Override the fixed position for the second column */
-            width: 125px; /* Increased from 100px to fit "Prompt Tokens" text */
+            width: 100px; /* Reduced from 125px - just enough for token numbers */
         }}
         /* Multi-column layout for model checkboxes */
         .multi-column-checkboxes {{
@@ -2198,7 +2203,8 @@ def generate_model_page(
     <style>
         /* Custom styles for model-specific pages */
         .case-name {{
-            max-width: 300px;
+            min-width: 300px; /* Ensure enough width for the 40-character names */
+            max-width: 400px;
             white-space: normal;
             overflow-wrap: break-word;
         }}
