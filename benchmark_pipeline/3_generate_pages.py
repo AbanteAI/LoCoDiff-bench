@@ -1923,21 +1923,59 @@ def generate_cases_overview_page(
         body {{
             max-width: 95%; /* Use more of the screen width */
         }}
-        /* General settings for fixed columns */
-        #cases-table td.fixed-col {{
-            white-space: normal; /* Allow wrapping of text in fixed columns */
-            overflow-wrap: break-word;
-            word-wrap: break-word;
+        
+        /* Redo the table layout completely to fix shading issues */
+        #cases-table {{
+            table-layout: fixed;
+            width: 100%;
+            border-collapse: collapse;
         }}
-        /* First column (Case names) */
-        #cases-table th.fixed-col:nth-child(1), #cases-table td.fixed-col:nth-child(1) {{
-            min-width: 300px; /* Ensure enough width for the 40-character case names */
+        
+        /* Override the default cases table styles */
+        #cases-table th, #cases-table td {{
+            padding: 8px;
+            border: 1px solid #e1e4e8;
+        }}
+        
+        /* Case name column - fixed and wider */
+        #cases-table th:first-child, #cases-table td:first-child {{
+            position: sticky;
+            left: 0;
+            min-width: 350px; /* Increased from 300px for more space */
             max-width: 400px;
+            text-align: left;
+            z-index: 2;
         }}
-        /* Second column (Prompt Tokens) */
-        #cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {{
-            left: auto; /* Override the fixed position for the second column */
-            width: 100px; /* Reduced from 125px - just enough for token numbers */
+        
+        /* Prompt tokens column - fixed width and position */
+        #cases-table th:nth-child(2), #cases-table td:nth-child(2) {{
+            position: sticky;
+            left: 350px; /* Match the width of the first column */
+            width: 80px; /* Reduced from 100px */
+            z-index: 2;
+            text-align: center;
+        }}
+        
+        /* Ensure background colors match the row shading */
+        #cases-table tbody tr:nth-child(odd) td {{
+            background-color: #f6f8fa;
+        }}
+        
+        #cases-table tbody tr:nth-child(even) td {{
+            background-color: white;
+        }}
+        
+        /* Header row always has its own background */
+        #cases-table thead th {{
+            background-color: #f6f8fa;
+            font-weight: 600;
+            text-align: center;
+            z-index: 3; /* Ensure header is above all */
+        }}
+        
+        /* Ensure first column header is left-aligned like its cells */
+        #cases-table thead th:first-child {{
+            text-align: left;
         }}
         /* Multi-column layout for model checkboxes */
         .multi-column-checkboxes {{
@@ -1993,8 +2031,8 @@ def generate_cases_overview_page(
             <table id="cases-table">
                 <thead>
                     <tr>
-                        <th class="fixed-col">Case</th>
-                        <th class="fixed-col">Prompt Tokens</th>
+                        <th>Case</th>
+                        <th>Prompt Tokens</th>
 """
 
     # Add column headers for each model
@@ -2018,8 +2056,8 @@ def generate_cases_overview_page(
         truncated_name = truncate_case_name(case["original_filename"])
         html_content += f"""
                     <tr>
-                        <td class="fixed-col case-name">{truncated_name}</td>
-                        <td class="fixed-col">{case["token_count"]}</td>
+                        <td class="case-name">{truncated_name}</td>
+                        <td>{case["token_count"]}</td>
 """
 
         # Add status buttons for each model
@@ -2203,11 +2241,38 @@ def generate_model_page(
     <link rel="stylesheet" href="../styles.css">
     <style>
         /* Custom styles for model-specific pages */
-        .case-name {{
-            min-width: 300px; /* Ensure enough width for the 40-character names */
+        #cases-table {{
+            table-layout: fixed;
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        #cases-table th, #cases-table td {{
+            padding: 8px;
+            border: 1px solid #e1e4e8;
+            text-align: center;
+        }}
+        
+        /* First column (case name) styling */
+        #cases-table th:first-child, #cases-table td:first-child {{
+            min-width: 350px; /* Increased from 300px */
             max-width: 400px;
+            text-align: left;
+        }}
+        
+        /* Second column (prompt tokens) styling */
+        #cases-table th:nth-child(2), #cases-table td:nth-child(2) {{
+            width: 80px; /* Reduced from standard width */
+        }}
+        
+        .case-name {{
             white-space: normal;
             overflow-wrap: break-word;
+        }}
+        
+        /* Zebra striping */
+        #cases-table tbody tr:nth-child(odd) {{
+            background-color: #f6f8fa;
         }}
     </style>
 </head>
@@ -2741,17 +2806,8 @@ tbody tr:hover {
     white-space: nowrap;
 }
 
-#cases-table th.fixed-col, #cases-table td.fixed-col {
-    text-align: left;
-    position: sticky;
-    left: 0;
-    background-color: white;
-    z-index: 10;
-}
-
-#cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {
-    left: 250px; /* Adjust based on width of first column */
-}
+/* The fixed-col classes have been replaced with first-child and nth-child selectors
+   in the page-specific CSS for better control of backgrounds and positioning */
 
 #cases-table th.model-col, #cases-table td.model-col {
     min-width: 120px;
