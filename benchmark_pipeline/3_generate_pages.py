@@ -45,7 +45,7 @@ import yaml
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Set
+from typing import Dict, List, Any, Tuple, Set, Optional
 
 
 # --- Helper Functions ---
@@ -193,7 +193,7 @@ def find_top_performers(values: List[Tuple[int, float]]) -> Dict[int, str]:
     return rank_classes
 
 
-def format_cell_with_rank(content: str, rank_class: str = None) -> str:
+def format_cell_with_rank(content: str, rank_class: Optional[str] = None) -> str:
     """
     Formats a table cell with appropriate ranking class if provided.
 
