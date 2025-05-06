@@ -2255,14 +2255,29 @@ def generate_model_page(
         
         /* First column (case name) styling */
         #cases-table th:first-child, #cases-table td:first-child {{
-            min-width: 350px; /* Increased from 300px */
-            max-width: 400px;
+            min-width: 375px; /* Increased from 350px */
+            max-width: 450px;
             text-align: left;
         }}
         
         /* Second column (prompt tokens) styling */
         #cases-table th:nth-child(2), #cases-table td:nth-child(2) {{
-            width: 80px; /* Reduced from standard width */
+            width: 120px; /* Increased from 80px */
+        }}
+        
+        /* Third column (Status) styling */
+        #cases-table th:nth-child(3), #cases-table td:nth-child(3) {{
+            width: 70px; /* Made smaller */
+        }}
+        
+        /* Fourth column (Cost) styling */
+        #cases-table th:nth-child(4), #cases-table td:nth-child(4) {{
+            width: 80px; /* Made smaller */
+        }}
+        
+        /* Fifth column (Actions) styling */
+        #cases-table th:nth-child(5), #cases-table td:nth-child(5) {{
+            width: 90px; /* Made smaller */
         }}
         
         .case-name {{
