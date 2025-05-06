@@ -13,6 +13,7 @@ Purpose:
   - Success rates by programming language
   - Cost information where available
   - Placeholder for future navigation to individual benchmark case details
+  - Highlighting of top performers in each category with gold/silver/bronze indicators
 
 Arguments:
   --benchmark-run-dir (required): Path to the directory containing benchmark run data
@@ -44,7 +45,7 @@ import yaml
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Set
+from typing import Dict, List, Any, Tuple, Set, Optional
 
 
 # --- Helper Functions ---
@@ -126,6 +127,87 @@ def determine_quartile(token_count: int, quartile_ranges: List[Tuple[int, int]])
     # Should not happen if quartile_ranges were calculated correctly
     print(f"Warning: Could not classify token count {token_count} into any quartile")
     return -1
+
+
+def parse_success_rate(cell_content: str) -> float:
+    """
+    Extracts success rate percentage from a cell content string.
+
+    Args:
+        cell_content: String containing success rate info (e.g. "24.50% (49/200)")
+
+    Returns:
+        Float representing the success rate percentage
+    """
+    try:
+        # Extract percentage value from the beginning of the string
+        percentage_str = cell_content.split("%")[0].strip()
+        return float(percentage_str)
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def find_top_performers(values: List[Tuple[int, float]]) -> Dict[int, str]:
+    """
+    Identifies the indices of the top 3 performers in a list of values.
+
+    Args:
+        values: List of tuples (index, value) to rank
+
+    Returns:
+        Dictionary mapping indices to rank classes ('gold', 'silver', 'bronze')
+    """
+    if not values:
+        return {}
+
+    # Sort values in descending order (higher is better)
+    sorted_values = sorted(values, key=lambda x: x[1], reverse=True)
+
+    # Initialize result dictionary
+    rank_classes = {}
+
+    # Assign medals if there are values to rank
+    medal_classes = ["gold", "silver", "bronze"]
+
+    # Handle ties by giving the same rank to equal values
+    current_rank = 0
+    prev_value = None
+
+    for i, (idx, value) in enumerate(sorted_values):
+        # If we've already assigned all medals, break
+        if current_rank >= len(medal_classes):
+            break
+
+        # If this value is different from the previous one, increment rank
+        if prev_value is not None and value < prev_value:
+            current_rank = i
+
+        # If we've reached the maximum rank, break
+        if current_rank >= len(medal_classes):
+            break
+
+        # Assign medal class to this index
+        rank_classes[idx] = medal_classes[current_rank]
+        prev_value = value
+
+    return rank_classes
+
+
+def format_cell_with_rank(content: str, rank_class: Optional[str] = None) -> str:
+    """
+    Formats a table cell with appropriate ranking class if provided.
+
+    Args:
+        content: The cell content
+        rank_class: Optional rank class ('gold', 'silver', 'bronze')
+
+    Returns:
+        HTML string for the formatted cell
+    """
+    if rank_class:
+        return f'<td class="{rank_class}">{content}</td>'
+    else:
+        return f"<td>{content}</td>"
 
 
 def infer_language_from_filename(filename: str, ext_to_lang_map: Dict[str, str]) -> str:
@@ -394,7 +476,7 @@ def create_overall_stats_table(
         if cost is not None:
             model_stats[model]["total_cost"] += float(cost)
 
-    # Create the HTML table
+    # Create the HTML table header
     html = """
     <section id="overall-stats">
         <h2>Overall Model Performance</h2>
@@ -411,7 +493,11 @@ def create_overall_stats_table(
             <tbody>
     """
 
-    for model in sorted(all_models):
+    # Collect models and their success rates for ranking
+    success_rates = []
+    model_rows = {}
+
+    for i, model in enumerate(sorted(all_models)):
         stats = model_stats.get(
             model, {"total_attempts": 0, "successful": 0, "total_cost": 0.0}
         )
@@ -423,10 +509,44 @@ def create_overall_stats_table(
         # Use display name if available
         display_name = model_display_names.get(model, model)
 
+        # Store row content for this model
+        model_rows[i] = (
+            model,
+            display_name,
+            success_rate,
+            stats,
+            attempts,
+            total_cost,
+            avg_cost,
+        )
+
+        # Track success rate for ranking
+        success_rates.append((i, success_rate))
+
+    # Find top performers
+    top_performers = find_top_performers(success_rates)
+
+    # Generate HTML rows with ranking
+    for i, (
+        model,
+        display_name,
+        success_rate,
+        stats,
+        attempts,
+        total_cost,
+        avg_cost,
+    ) in model_rows.items():
+        # Get rank for this model (if it's a top performer)
+        rank_class = top_performers.get(i)
+
+        # Format success rate cell with appropriate ranking
+        success_rate_cell = f"{success_rate:.2f}% ({stats['successful']}/{attempts})"
+        formatted_success_cell = format_cell_with_rank(success_rate_cell, rank_class)
+
         html += f"""
                 <tr>
                     <td>{display_name}</td>
-                    <td>{success_rate:.2f}% ({stats["successful"]}/{attempts})</td>
+                    {formatted_success_cell}
                     <td>{attempts}/{num_cases} ({attempts / num_cases * 100:.2f}%)</td>
                     <td>${total_cost:.2f}</td>
                     <td>${avg_cost:.3f}</td>
@@ -519,18 +639,44 @@ def create_quartile_stats_table(
             <tbody>
     """
 
-    for model in sorted(all_models):
-        # Use display name if available
+    # Prepare model data rows and collect success rates for each quartile
+    model_rows = {}
+    quartile_success_rates = {i: [] for i in range(4)}  # For each quartile
+
+    for idx, model in enumerate(sorted(all_models)):
         display_name = model_display_names.get(model, model)
+        quartile_stats = model_quartile_stats.get(model, {})
+
+        # Store model data for later use
+        model_rows[idx] = (model, display_name, quartile_stats)
+
+        # Collect success rates for each quartile
+        for q in range(4):
+            stats = quartile_stats.get(q, {"attempts": 0, "successful": 0})
+            attempts = stats["attempts"]
+            success_rate = (stats["successful"] / attempts * 100) if attempts > 0 else 0
+            quartile_success_rates[q].append((idx, success_rate))
+
+    # Find top performers for each quartile
+    top_performers = {}
+    for q in range(4):
+        top_performers[q] = find_top_performers(quartile_success_rates[q])
+
+    # Generate HTML rows with rankings for each quartile
+    for idx, (model, display_name, quartile_stats) in model_rows.items():
         html += f"<tr><td>{display_name}</td>"
 
-        quartile_stats = model_quartile_stats.get(model, {})
-        for i in range(4):
-            stats = quartile_stats.get(i, {"attempts": 0, "successful": 0})
+        for q in range(4):
+            stats = quartile_stats.get(q, {"attempts": 0, "successful": 0})
             attempts = stats["attempts"]
             success_rate = (stats["successful"] / attempts * 100) if attempts > 0 else 0
 
-            html += f"<td>{success_rate:.2f}% ({stats['successful']}/{attempts})</td>"
+            # Get rank for this model in this quartile (if it's a top performer)
+            rank_class = top_performers[q].get(idx)
+
+            # Format cell content
+            cell_content = f"{success_rate:.2f}% ({stats['successful']}/{attempts})"
+            html += format_cell_with_rank(cell_content, rank_class)
 
         html += "</tr>"
 
@@ -619,18 +765,44 @@ def create_language_stats_table(
             <tbody>
     """
 
-    for model in sorted(all_models):
-        # Use display name if available
+    # Prepare model data rows and collect success rates for each language
+    model_rows = {}
+    language_success_rates = {lang: [] for lang in all_languages}  # For each language
+
+    for idx, model in enumerate(sorted(all_models)):
         display_name = model_display_names.get(model, model)
+        language_stats = model_language_stats.get(model, {})
+
+        # Store model data for later use
+        model_rows[idx] = (model, display_name, language_stats)
+
+        # Collect success rates for each language
+        for language in all_languages:
+            stats = language_stats.get(language, {"attempts": 0, "successful": 0})
+            attempts = stats["attempts"]
+            success_rate = (stats["successful"] / attempts * 100) if attempts > 0 else 0
+            language_success_rates[language].append((idx, success_rate))
+
+    # Find top performers for each language
+    top_performers = {}
+    for language in all_languages:
+        top_performers[language] = find_top_performers(language_success_rates[language])
+
+    # Generate HTML rows with rankings for each language
+    for idx, (model, display_name, language_stats) in model_rows.items():
         html += f"<tr><td>{display_name}</td>"
 
-        language_stats = model_language_stats.get(model, {})
         for language in all_languages:
             stats = language_stats.get(language, {"attempts": 0, "successful": 0})
             attempts = stats["attempts"]
             success_rate = (stats["successful"] / attempts * 100) if attempts > 0 else 0
 
-            html += f"<td>{success_rate:.2f}% ({stats['successful']}/{attempts})</td>"
+            # Get rank for this model in this language (if it's a top performer)
+            rank_class = top_performers[language].get(idx)
+
+            # Format cell content
+            cell_content = f"{success_rate:.2f}% ({stats['successful']}/{attempts})"
+            html += format_cell_with_rank(cell_content, rank_class)
 
         html += "</tr>"
 
@@ -2299,7 +2471,26 @@ def create_css_file() -> str:
     warning = get_auto_generation_warning()
     warning_comment = f"/*\n{warning}\n*/\n\n"
 
-    css_content = """/* Basic Reset */
+    css_content = """/* Ranking styles for top performers */
+td.gold {
+    border: 3px solid #ffd700; /* Gold color */
+    background-color: rgba(255, 215, 0, 0.1); /* Light gold background */
+    font-weight: bold;
+}
+
+td.silver {
+    border: 3px solid #c0c0c0; /* Silver color */
+    background-color: rgba(192, 192, 192, 0.1); /* Light silver background */
+    font-weight: bold;
+}
+
+td.bronze {
+    border: 3px solid #cd7f32; /* Bronze color */
+    background-color: rgba(205, 127, 50, 0.1); /* Light bronze background */
+    font-weight: bold;
+}
+
+/* Basic Reset */
 * {
     margin: 0;
     padding: 0;
