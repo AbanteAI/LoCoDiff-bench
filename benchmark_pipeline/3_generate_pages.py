@@ -2010,9 +2010,10 @@ def generate_cases_overview_page(
     for case in cases:
         case_prefix = case["prefix"]
         safe_case = case_prefix.replace("/", "_")
+        truncated_name = truncate_case_name(case["original_filename"])
         html_content += f"""
                     <tr>
-                        <td class="fixed-col case-name">{case["original_filename"]}</td>
+                        <td class="fixed-col case-name">{truncated_name}</td>
                         <td class="fixed-col">{case["token_count"]}</td>
 """
 
@@ -2234,9 +2235,12 @@ def generate_model_page(
         # Create a safe case page filename
         safe_case = case["prefix"].replace("/", "_")
 
+        # Truncate case name if too long
+        truncated_name = truncate_case_name(case["original_filename"])
+
         html_content += f"""
                     <tr class="case-row {status_class}">
-                        <td class="case-name">{case["original_filename"]}</td>
+                        <td class="case-name">{truncated_name}</td>
                         <td>{case["prompt_tokens"]}</td>
                         <td class="{status_class}">{status_text}</td>
                         <td>${case["cost_usd"]:.6f}</td>
@@ -2968,6 +2972,25 @@ footer {
 
 
 # --- Main Function ---
+
+
+def truncate_case_name(name: str, max_length: int = 40) -> str:
+    """
+    Truncates a case name if longer than max_length.
+    For long names, format is "...[final 37 characters of path]"
+
+    Args:
+        name: The case name or path to truncate
+        max_length: Maximum allowed length
+
+    Returns:
+        Truncated name if longer than max_length, otherwise original name
+    """
+    if len(name) <= max_length:
+        return name
+
+    # For long names, keep the last 37 chars and prefix with "..."
+    return f"...{name[-37:]}"
 
 
 def main():
