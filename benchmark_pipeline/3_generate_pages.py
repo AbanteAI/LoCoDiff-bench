@@ -1946,6 +1946,12 @@ def generate_cases_overview_page(
             min-width: 250px;
             margin-bottom: 5px;
         }}
+        /* Ensure case names wrap properly */
+        .case-name {{
+            max-width: 300px;
+            white-space: normal;
+            overflow-wrap: break-word;
+        }}
     </style>
 </head>
 <body>
@@ -2008,7 +2014,7 @@ def generate_cases_overview_page(
         safe_case = case_prefix.replace("/", "_")
         html_content += f"""
                     <tr>
-                        <td class="fixed-col">{case["original_filename"]}</td>
+                        <td class="fixed-col case-name">{case["original_filename"]}</td>
                         <td class="fixed-col">{case["token_count"]}</td>
 """
 
@@ -2209,15 +2215,6 @@ def generate_model_page(
         <section>
             <h2>All Benchmark Cases</h2>
             
-            <div class="case-filter">
-                <label>
-                    <input type="checkbox" id="show-successful" checked> Show Successful
-                </label>
-                <label>
-                    <input type="checkbox" id="show-failed" checked> Show Failed
-                </label>
-            </div>
-            
             <table id="cases-table">
                 <thead>
                     <tr>
@@ -2260,29 +2257,6 @@ def generate_model_page(
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
     </footer>
     
-    <script>
-        // Add filtering functionality
-        document.addEventListener('DOMContentLoaded', function() {
-            const showSuccessfulCheckbox = document.getElementById('show-successful');
-            const showFailedCheckbox = document.getElementById('show-failed');
-            
-            function updateFilters() {
-                const showSuccessful = showSuccessfulCheckbox.checked;
-                const showFailed = showFailedCheckbox.checked;
-                
-                document.querySelectorAll('.case-row').forEach(row => {
-                    if (row.classList.contains('success')) {
-                        row.style.display = showSuccessful ? '' : 'none';
-                    } else {
-                        row.style.display = showFailed ? '' : 'none';
-                    }
-                });
-            }
-            
-            showSuccessfulCheckbox.addEventListener('change', updateFilters);
-            showFailedCheckbox.addEventListener('change', updateFilters);
-        });
-    </script>
 </body>
 </html>
     """
