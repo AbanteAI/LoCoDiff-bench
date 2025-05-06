@@ -2255,9 +2255,7 @@ def generate_model_page(
         
         /* First column (case name) styling */
         #cases-table th:first-child, #cases-table td:first-child {{
-            min-width: 325px; /* Decreased from original 350px */
-            max-width: 375px; /* Decreased from original 400px */
-            text-align: left;
+            width: 240px; /* Fixed width as requested */
         }}
         
         /* Second column (prompt tokens) styling */
@@ -2280,9 +2278,11 @@ def generate_model_page(
             width: 90px; /* Made smaller */
         }}
         
+        /* Ensure text wraps properly */
         .case-name {{
             white-space: normal;
             overflow-wrap: break-word;
+            text-align: center; /* Ensure center alignment */
         }}
         
         /* Zebra striping */
