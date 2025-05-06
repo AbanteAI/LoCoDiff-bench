@@ -1912,7 +1912,7 @@ def generate_cases_overview_page(
     cases.sort(key=lambda x: x["token_count"])
 
     # Start building the HTML content
-    html_content = f"""<!DOCTYPE html>
+    html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -2207,9 +2207,6 @@ def generate_model_page(
     <main>
         <section>
             <h2>All Benchmark Cases</h2>
-            <p>{
-        len(model_cases)
-    } cases sorted by prompt token size (smallest to largest)</p>
             
             <div class="case-filter">
                 <label>
