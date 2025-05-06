@@ -1937,23 +1937,14 @@ def generate_cases_overview_page(
             border: 1px solid #e1e4e8;
         }}
         
-        /* Case name column - fixed and wider */
+        /* Case name column - matching model-specific pages */
         #cases-table th:first-child, #cases-table td:first-child {{
-            position: sticky;
-            left: 0;
-            min-width: 350px; /* Increased from 300px for more space */
-            max-width: 400px;
-            text-align: left;
-            z-index: 2;
+            width: 240px; /* Match model-specific pages */
         }}
         
-        /* Prompt tokens column - fixed width and position */
+        /* Prompt tokens column - matching model-specific pages */
         #cases-table th:nth-child(2), #cases-table td:nth-child(2) {{
-            position: sticky;
-            left: 350px; /* Match the width of the first column */
-            width: 80px; /* Reduced from 100px */
-            z-index: 2;
-            text-align: center;
+            width: 120px; /* Match model-specific pages */
         }}
         
         /* Ensure background colors match the row shading */
@@ -1973,10 +1964,15 @@ def generate_cases_overview_page(
             z-index: 3; /* Ensure header is above all */
         }}
         
-        /* Ensure first column header is left-aligned like its cells */
-        #cases-table thead th:first-child {{
-            text-align: left;
+        /* All headers are center-aligned for consistency */
+        
+        /* Ensure case names are center-aligned and wrap properly */
+        .case-name {{
+            white-space: normal;
+            overflow-wrap: break-word;
+            text-align: center; /* Center alignment to match model pages */
         }}
+        
         /* Multi-column layout for model checkboxes */
         .multi-column-checkboxes {{
             display: flex;
