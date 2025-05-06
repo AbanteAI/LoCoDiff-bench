@@ -1935,6 +1935,17 @@ def generate_cases_overview_page(
             left: auto; /* Override the fixed position for the second column */
             width: 125px; /* Increased from 100px to fit "Prompt Tokens" text */
         }}
+        /* Multi-column layout for model checkboxes */
+        .multi-column-checkboxes {{
+            display: flex;
+            flex-wrap: wrap;
+            max-height: none;
+        }}
+        .multi-column-checkboxes .checkbox-item {{
+            width: 25%; /* Four columns */
+            min-width: 250px;
+            margin-bottom: 5px;
+        }}
     </style>
 </head>
 <body>
@@ -1946,11 +1957,10 @@ def generate_cases_overview_page(
     <main>
         <section>
             <h2>Benchmark Cases by Prompt Size</h2>
-            <p>{len(cases)} cases sorted by prompt token size (smallest to largest)</p>
             
             <div class="model-selection">
                 <h3>Select Models to Display</h3>
-                <div id="model-checkboxes">
+                <div id="model-checkboxes" class="multi-column-checkboxes">
 """
 
     # Add model selection checkboxes - initialized as unchecked
