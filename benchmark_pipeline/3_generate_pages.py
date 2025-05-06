@@ -2197,10 +2197,16 @@ def generate_model_page(
     <link rel="stylesheet" href="../styles.css">
     <style>
         /* Custom styles for model-specific pages */
-        .case-name {{
-            max-width: 300px;
-            white-space: normal;
-            overflow-wrap: break-word;
+        .case-name {{ /* This class is on the first td cell */
+            /* max-width: 300px; */ /* This line should be commented out or removed */
+            white-space: normal; /* Ensure text wraps (should be inherited from global td style) */
+            overflow-wrap: break-word; /* Break long words (should be inherited from global td style) */
+            word-break: break-all; /* Force break anywhere if necessary */
+        }}
+        /* Optional: helps stabilize other column widths */
+        #cases-table th:not(:first-child),
+        #cases-table td:not(:first-child) {{
+            width: auto;
         }}
     </style>
 </head>
