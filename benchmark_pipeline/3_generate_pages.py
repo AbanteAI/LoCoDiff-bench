@@ -2255,8 +2255,8 @@ def generate_model_page(
         
         /* First column (case name) styling */
         #cases-table th:first-child, #cases-table td:first-child {{
-            min-width: 375px; /* Increased from 350px */
-            max-width: 450px;
+            min-width: 325px; /* Decreased from original 350px */
+            max-width: 375px; /* Decreased from original 400px */
             text-align: left;
         }}
         
