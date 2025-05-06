@@ -1911,7 +1911,7 @@ def generate_cases_overview_page(
     cases.sort(key=lambda x: x["token_count"])
 
     # Start building the HTML content
-    html_content = f"""<!DOCTYPE html>
+    html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1932,7 +1932,24 @@ def generate_cases_overview_page(
         }}
         #cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {{
             left: auto; /* Override the fixed position for the second column */
-            width: 100px;
+            width: 125px; /* Increased from 100px to fit "Prompt Tokens" text */
+        }}
+        /* Multi-column layout for model checkboxes */
+        .multi-column-checkboxes {{
+            display: flex;
+            flex-wrap: wrap;
+            max-height: none;
+        }}
+        .multi-column-checkboxes .checkbox-item {{
+            width: 25%; /* Four columns */
+            min-width: 250px;
+            margin-bottom: 5px;
+        }}
+        /* Ensure case names wrap properly */
+        .case-name {{
+            max-width: 300px;
+            white-space: normal;
+            overflow-wrap: break-word;
         }}
     </style>
 </head>
@@ -1944,11 +1961,10 @@ def generate_cases_overview_page(
     <main>
         <section>
             <h2>Benchmark Cases by Prompt Size</h2>
-            <p>{len(cases)} cases sorted by prompt token size (smallest to largest)</p>
             
             <div class="model-selection">
                 <h3>Select Models to Display</h3>
-                <div id="model-checkboxes">
+                <div id="model-checkboxes" class="multi-column-checkboxes">
 """
 
     # Add model selection checkboxes - initialized as unchecked
@@ -1996,7 +2012,7 @@ def generate_cases_overview_page(
         safe_case = case_prefix.replace("/", "_")
         html_content += f"""
                     <tr>
-                        <td class="fixed-col">{case["original_filename"]}</td>
+                        <td class="fixed-col case-name">{case["original_filename"]}</td>
                         <td class="fixed-col">{case["token_count"]}</td>
 """
 
@@ -2049,28 +2065,63 @@ def generate_cases_overview_page(
     <script>
         // Add model column toggling functionality
         document.addEventListener('DOMContentLoaded', function() {
-            // Handle checkbox changes
-            document.querySelectorAll('input[data-model]').forEach(checkbox => {
-                checkbox.addEventListener('change', function() {
-                    const modelId = this.getAttribute('data-model');
-                    const isVisible = this.checked;
-                    
-                    // Toggle visibility of corresponding table cells
-                    document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
-                        cell.style.display = isVisible ? '' : 'none';
-                    });
+            // Function to save selected models to localStorage
+            function saveSelectedModels() {
+                const selectedModels = [];
+                document.querySelectorAll('input[data-model]:checked').forEach(checkbox => {
+                    selectedModels.push(checkbox.getAttribute('data-model'));
                 });
-            });
-            
-            // Initial setup - ensure all columns are properly set (hidden by default)
-            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                localStorage.setItem('locodiff_selected_models', JSON.stringify(selectedModels));
+            }
+                
+            // Function to update visibility based on checkbox state
+            function updateVisibility(checkbox) {
                 const modelId = checkbox.getAttribute('data-model');
                 const isVisible = checkbox.checked;
-                
+                    
+                // Toggle visibility of corresponding table cells
                 document.querySelectorAll(`th.model-col[data-model="${modelId}"], td.model-col[data-model="${modelId}"]`).forEach(cell => {
                     cell.style.display = isVisible ? '' : 'none';
                 });
+            }
+                
+            // Handle checkbox changes
+            document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    updateVisibility(this);
+                    saveSelectedModels();
+                });
             });
+                
+            // Restore selections from localStorage and apply visibility
+            try {
+                const savedModels = JSON.parse(localStorage.getItem('locodiff_selected_models') || '[]');
+                    
+                // First, uncheck all by default (in case there are no saved selections)
+                document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                    checkbox.checked = false;
+                });
+                    
+                // Check boxes for saved models
+                if (savedModels.length > 0) {
+                    savedModels.forEach(modelId => {
+                        const checkbox = document.querySelector(`input[data-model="${modelId}"]`);
+                        if (checkbox) checkbox.checked = true;
+                    });
+                }
+                    
+                // Apply visibility based on current checkbox states
+                document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                    updateVisibility(checkbox);
+                });
+            } catch (error) {
+                console.error('Error restoring model selections:', error);
+                    
+                // Fallback: ensure all columns have proper visibility
+                document.querySelectorAll('input[data-model]').forEach(checkbox => {
+                    updateVisibility(checkbox);
+                });
+            }
         });
     </script>
 </body>
@@ -2144,6 +2195,14 @@ def generate_model_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{display_name} - Benchmark Cases</title>
     <link rel="stylesheet" href="../styles.css">
+    <style>
+        /* Custom styles for model-specific pages */
+        .case-name {{
+            max-width: 300px;
+            white-space: normal;
+            overflow-wrap: break-word;
+        }}
+    </style>
 </head>
 <body>
     <header>
@@ -2153,16 +2212,6 @@ def generate_model_page(
     <main>
         <section>
             <h2>All Benchmark Cases</h2>
-            <p>{len(model_cases)} cases sorted by prompt token size (smallest to largest)</p>
-            
-            <div class="case-filter">
-                <label>
-                    <input type="checkbox" id="show-successful" checked> Show Successful
-                </label>
-                <label>
-                    <input type="checkbox" id="show-failed" checked> Show Failed
-                </label>
-            </div>
             
             <table id="cases-table">
                 <thead>
@@ -2187,7 +2236,7 @@ def generate_model_page(
 
         html_content += f"""
                     <tr class="case-row {status_class}">
-                        <td>{case["original_filename"]}</td>
+                        <td class="case-name">{case["original_filename"]}</td>
                         <td>{case["prompt_tokens"]}</td>
                         <td class="{status_class}">{status_text}</td>
                         <td>${case["cost_usd"]:.6f}</td>
@@ -2206,29 +2255,6 @@ def generate_model_page(
         <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
     </footer>
     
-    <script>
-        // Add filtering functionality
-        document.addEventListener('DOMContentLoaded', function() {
-            const showSuccessfulCheckbox = document.getElementById('show-successful');
-            const showFailedCheckbox = document.getElementById('show-failed');
-            
-            function updateFilters() {
-                const showSuccessful = showSuccessfulCheckbox.checked;
-                const showFailed = showFailedCheckbox.checked;
-                
-                document.querySelectorAll('.case-row').forEach(row => {
-                    if (row.classList.contains('success')) {
-                        row.style.display = showSuccessful ? '' : 'none';
-                    } else {
-                        row.style.display = showFailed ? '' : 'none';
-                    }
-                });
-            }
-            
-            showSuccessfulCheckbox.addEventListener('change', updateFilters);
-            showFailedCheckbox.addEventListener('change', updateFilters);
-        });
-    </script>
 </body>
 </html>
     """
