@@ -2739,8 +2739,26 @@ tbody tr:hover {
     z-index: 10;
 }
 
-#cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {
-    left: 250px; /* Adjust based on width of first column */
+/* ---------- Prevent bleeding sticky columns ---------- */
+/* Fix the width of the 1st sticky column to the same offset used by the 2nd */
+#cases-table th.fixed-col:first-child,
+#cases-table td.fixed-col:first-child {
+    width: 250px;      /* must match the 'left:' value below */
+    max-width: 250px;
+    min-width: 250px;
+}
+
+/* If you ever decide you don't need the 2nd sticky col, comment-out both lines below */
+#cases-table th.fixed-col:nth-child(2),
+#cases-table td.fixed-col:nth-child(2) {
+    left: 250px;       /* stays unchanged but is now guaranteed not to overlap */
+}
+
+/* ---------- Force safe wrapping for ridiculous path names ---------- */
+.case-name,
+#cases-table td:first-child {
+    overflow-wrap: anywhere;  /* modern spec */
+    word-break: break-all;    /* legacy fallback */
 }
 
 #cases-table th.model-col, #cases-table td.model-col {
