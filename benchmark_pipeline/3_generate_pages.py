@@ -2181,6 +2181,14 @@ def generate_model_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{display_name} - Benchmark Cases</title>
     <link rel="stylesheet" href="../styles.css">
+    <style>
+        /* Custom styles for model-specific pages */
+        .case-name {max - width: 300px;
+            white-space: normal;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+    </style>
 </head>
 <body>
     <header>
@@ -2190,7 +2198,9 @@ def generate_model_page(
     <main>
         <section>
             <h2>All Benchmark Cases</h2>
-            <p>{len(model_cases)} cases sorted by prompt token size (smallest to largest)</p>
+            <p>{
+        len(model_cases)
+    } cases sorted by prompt token size (smallest to largest)</p>
             
             <div class="case-filter">
                 <label>
@@ -2224,7 +2234,7 @@ def generate_model_page(
 
         html_content += f"""
                     <tr class="case-row {status_class}">
-                        <td>{case["original_filename"]}</td>
+                        <td class="case-name">{case["original_filename"]}</td>
                         <td>{case["prompt_tokens"]}</td>
                         <td class="{status_class}">{status_text}</td>
                         <td>${case["cost_usd"]:.6f}</td>
