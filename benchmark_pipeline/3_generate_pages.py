@@ -2574,12 +2574,22 @@ table {
     border-collapse: collapse;
     margin-bottom: 20px;
     font-size: 14px;
+    table-layout: fixed;
 }
 
 th, td {
     padding: 8px 12px;
     text-align: left;
     border: 1px solid #e1e4e8;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    white-space: normal;
+}
+
+/* Adjust column widths for cases tables */
+#cases-table th:first-child, 
+#cases-table td:first-child {
+    width: 30%;
 }
 
 th {
