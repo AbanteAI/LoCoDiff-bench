@@ -2193,10 +2193,11 @@ def generate_model_page(
     <link rel="stylesheet" href="../styles.css">
     <style>
         /* Custom styles for model-specific pages */
-        .case-name {max - width: 300px;
+        .case-name {{
+            max-width: 300px;
             white-space: normal;
             overflow-wrap: break-word;
-        }
+        }}
     </style>
 </head>
 <body>
