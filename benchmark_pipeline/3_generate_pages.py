@@ -3038,21 +3038,21 @@ footer {
 
 def truncate_case_name(name: str, max_length: int = 40) -> str:
     """
-    Truncates a case name if longer than max_length.
-    For long names, format is "...[final 37 characters of path]"
+    For long paths, returns just the filename.
+    For shorter names, returns the original name unchanged.
 
     Args:
-        name: The case name or path to truncate
-        max_length: Maximum allowed length
+        name: The case name or path
+        max_length: Maximum length before extracting just the filename
 
     Returns:
-        Truncated name if longer than max_length, otherwise original name
+        Original name if length <= max_length, otherwise just the filename
     """
     if len(name) <= max_length:
         return name
 
-    # For long names, keep the last 37 chars and prefix with "..."
-    return f"...{name[-37:]}"
+    # Extract just the filename (part after the last slash)
+    return name.split("/")[-1].split("\\")[-1]
 
 
 def main():
