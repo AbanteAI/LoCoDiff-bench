@@ -389,6 +389,64 @@ def collect_results_metadata(
 # --- HTML Generation Functions ---
 
 
+def create_table_of_contents() -> str:
+    """
+    Creates a table of contents section for the main page.
+
+    Returns:
+        HTML string for the table of contents section
+    """
+    return """
+    <section id="table-of-contents">
+        <h2>Table of Contents</h2>
+        <nav class="toc">
+            <ul>
+                <li><a href="#locodiff-summary">What is LoCoDiff?</a></li>
+                <li><a href="#token-chart">Interactive Chart</a></li>
+                <li><a href="#benchmark-example">Methodology Example</a></li>
+                <li><a href="#overall-stats">Overall Model Performance</a></li>
+                <li><a href="#quartile-stats">Performance by Prompt Size</a></li>
+                <li><a href="#language-stats">Performance by Language</a></li>
+                <li><a href="#explore-benchmarks">Explore Benchmark Cases</a></li>
+            </ul>
+        </nav>
+    </section>
+    """
+
+
+def create_locodiff_summary() -> str:
+    """
+    Creates a summary section describing LoCoDiff and Mentat's role.
+
+    Returns:
+        HTML string for the summary section
+    """
+    return """
+    <section id="locodiff-summary">
+        <h2>What is LoCoDiff?</h2>
+        <div class="locodiff-description">
+            <p>
+                LoCoDiff is a benchmark for evaluating large language models on their ability to understand
+                long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
+                code by understanding git history, including complex merge conflicts and development patterns.
+            </p>
+            <p>
+                Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
+                LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
+                and asking it to reproduce the final state of a file.
+            </p>
+            <div class="mentat-contribution">
+                <p>
+                    <strong>About this benchmark:</strong> 100% of the code for the LoCoDiff benchmark was written by 
+                    <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
+                    entirely run by the Mentat bot, from data collection to visualization generation.
+                </p>
+            </div>
+        </div>
+    </section>
+    """
+
+
 def create_html_header() -> str:
     """Creates the HTML header with basic metadata and CSS link."""
     warning = get_auto_generation_warning()
@@ -2741,7 +2799,83 @@ def create_css_file() -> str:
     warning = get_auto_generation_warning()
     warning_comment = f"/*\n{warning}\n*/\n\n"
 
-    css_content = """/* Ranking styles for top performers */
+    css_content = """/* Table of Contents styles */
+#table-of-contents {
+    margin: 20px 0 30px 0;
+    padding: 15px 20px;
+    background-color: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+}
+
+#table-of-contents h2 {
+    margin-bottom: 15px;
+    font-size: 20px;
+}
+
+.toc ul {
+    list-style-type: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+}
+
+.toc li {
+    margin-bottom: 10px;
+}
+
+.toc a {
+    display: inline-block;
+    padding: 5px 12px;
+    background-color: #eef2f5;
+    border: 1px solid #d1d5da;
+    border-radius: 4px;
+    color: #0366d6;
+    font-weight: 500;
+    text-decoration: none;
+    transition: background-color 0.2s;
+}
+
+.toc a:hover {
+    background-color: #d1e4f6;
+    text-decoration: none;
+}
+
+/* LoCoDiff Summary styles */
+#locodiff-summary {
+    margin: 30px 0;
+    padding: 20px;
+    background-color: #f8f9fa;
+    border-radius: 6px;
+    border: 1px solid #e1e4e8;
+}
+
+.locodiff-description p {
+    font-size: 16px;
+    line-height: 1.6;
+    margin-bottom: 15px;
+}
+
+.mentat-contribution {
+    background-color: #eef8ff;
+    border: 1px solid #c8e1ff;
+    border-radius: 6px;
+    padding: 15px;
+    margin-top: 20px;
+}
+
+.mentat-contribution p {
+    margin: 0;
+    color: #0366d6;
+}
+
+.mentat-contribution strong {
+    color: #24292e;
+}
+
+/* Ranking styles for top performers */
 td.gold {
     border: 3px solid #ffd700; /* Gold color */
     background-color: rgba(255, 215, 0, 0.1); /* Light gold background */
@@ -3523,8 +3657,10 @@ def main():
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
+    html_content += create_table_of_contents()  # Add table of contents first
+    html_content += create_locodiff_summary()  # Add summary section second
     html_content += create_token_chart_section()
-    html_content += create_example_section()  # Add the new example section
+    html_content += create_example_section()
     html_content += create_overall_stats_table(
         results_metadata, all_models, num_cases, model_display_names
     )
