@@ -440,11 +440,9 @@ def create_locodiff_summary() -> str:
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <h2>What is LoCoDiff?</h2>
         <p style="margin-bottom: 20px;">
-            LoCoDiff is the first natural long-context benchmark for code that tests real comprehension without artificial padding. 
-            It challenges models to reconstruct code files by understanding git history—where every part of the context 
-            connects meaningfully to others through commits, branches, and merge conflicts. Unlike other long-context 
-            benchmarks that insert noise or irrelevant content, LoCoDiff uses the naturally occurring complexity of 
-            real-world development history.
+            LoCoDiff is the first long-context code benchmark that uses git history instead of artificial padding.
+            Models must understand commits, branches, and merge conflicts to reconstruct a file's final state—testing
+            comprehension of naturally interconnected content rather than tolerance for noise.
         </p>
         <p style="margin-bottom: 20px;">
             100% of the code for the LoCoDiff was written by 
