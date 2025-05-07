@@ -476,8 +476,8 @@ def create_html_footer(include_chart_js: bool = False) -> str:
                     }
                 }
                 
-                // Join with line breaks to preserve spacing
-                highlightedContent = highlightedLines.join('\\n');
+                // Concatenate the spans directly without adding newlines
+                highlightedContent = highlightedLines.join('');
                 
                 // Replace code block content
                 codeBlock.innerHTML = highlightedContent;
