@@ -1161,17 +1161,6 @@ def create_example_section() -> str:
         + """</code></pre>
             </div>
         </div>
-        
-        <div class="example-task">
-            <h3>What This Tests</h3>
-            <p>This benchmark evaluates a model's ability to:</p>
-            <ul>
-                <li>Understand Git diff syntax and commit history</li>
-                <li>Track changes across multiple branches</li>
-                <li>Interpret how merge conflicts were resolved</li>
-                <li>Reconstruct the exact final state of the file</li>
-            </ul>
-        </div>
     </section>
     """
     )
