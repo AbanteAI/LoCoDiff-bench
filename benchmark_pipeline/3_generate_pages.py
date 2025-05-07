@@ -424,7 +424,14 @@ def create_html_footer(include_chart_js: bool = False) -> str:
     footer = """
     </main>
     <footer>
-        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+        <div class="footer-content">
+            <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench" class="github-link"><img src="assets/images/github-logo.png" alt="GitHub" class="github-icon">GitHub Repository</a></p>
+            <p class="built-with">
+                <a href="https://mentat.ai" target="_blank" class="mentat-link">
+                    built with mentat.ai <img src="assets/images/mentat-logo-transparent.png" alt="Mentat" class="mentat-icon">
+                </a>
+            </p>
+        </div>
     </footer>
     """
 
