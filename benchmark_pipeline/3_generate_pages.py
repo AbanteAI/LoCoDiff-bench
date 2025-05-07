@@ -398,7 +398,6 @@ def create_table_of_contents() -> str:
     """
     return """
     <section id="table-of-contents">
-        <h2>Table of Contents</h2>
         <nav class="toc">
             <ul>
                 <li><a href="#locodiff-summary">What is LoCoDiff?</a></li>
@@ -1092,7 +1091,7 @@ def create_token_chart_section() -> str:
     """Creates an HTML section for the token-based chart."""
     return """
     <section id="token-chart">
-        <h2>Chart</h2>
+        <h2>Interactive Chart</h2>
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
@@ -2811,11 +2810,6 @@ def create_css_file() -> str:
     background-color: #f6f8fa;
     border: 1px solid #e1e4e8;
     border-radius: 6px;
-}
-
-#table-of-contents h2 {
-    margin-bottom: 15px;
-    font-size: 20px;
 }
 
 .toc ul {
