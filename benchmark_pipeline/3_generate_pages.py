@@ -400,12 +400,12 @@ def create_html_header() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LoCoDiff Benchmark Results</title>
+    <title>LoCoDiff Benchmark</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header>
-        <h1>LoCoDiff Benchmark Results</h1>
+        <h1>LoCoDiff Benchmark</h1>
     </header>
     <main>
 """
@@ -430,6 +430,64 @@ def create_html_footer(include_chart_js: bool = False) -> str:
 
     if include_chart_js:
         footer += create_chart_javascript()
+
+    # Add JavaScript for syntax highlighting diffs
+    footer += """
+    <script>
+        // Highlight diff lines (added/removed) on load
+        document.addEventListener('DOMContentLoaded', function() {
+            // Select all code blocks in the example prompt
+            const codeBlocks = document.querySelectorAll('.example-prompt pre code.language-diff');
+            
+            codeBlocks.forEach(function(codeBlock) {
+                // Get all lines in the code block
+                const content = codeBlock.innerHTML;
+                
+                // Replace the content with highlighted version
+                let highlightedContent = '';
+                
+                // Split by real newlines in the content
+                const lines = content.split('\\n');
+                
+                // Process each line and preserve empty lines
+                let highlightedLines = [];
+                for (let i = 0; i < lines.length; i++) {
+                    let line = lines[i];
+                    
+                    if (line === '') {
+                        // Preserve blank lines by using a non-breaking space
+                        highlightedLines.push('<span class="empty-line">&nbsp;</span>');
+                    }
+                    // Skip highlighting for file path indicators
+                    else if (line.startsWith('+++') || line.startsWith('---')) {
+                        highlightedLines.push('<span>' + line + '</span>');
+                    }
+                    // Highlight added lines - check for both '+' at start and '+' after whitespace (for merge conflicts)
+                    else if (line.startsWith('+') || line.trim().startsWith('+')) {
+                        highlightedLines.push('<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>');
+                    }
+                    // Highlight removed lines - check for both '-' at start and '-' after whitespace
+                    else if (line.startsWith('-') || line.trim().startsWith('-')) {
+                        highlightedLines.push('<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>');
+                    }
+                    // Normal line
+                    else {
+                        highlightedLines.push('<span>' + line + '</span>');
+                    }
+                }
+                
+                // Concatenate the spans directly without adding newlines
+                highlightedContent = highlightedLines.join('');
+                
+                // Replace code block content
+                codeBlock.innerHTML = highlightedContent;
+            });
+            
+            // Initialize highlight.js 
+            hljs.highlightAll();
+        });
+    </script>
+    """
 
     footer += """
 </body>
@@ -971,7 +1029,7 @@ def create_token_chart_section() -> str:
     """Creates an HTML section for the token-based chart."""
     return """
     <section id="token-chart">
-        <h2>Success Rate by Prompt Size</h2>
+        <h2>Chart</h2>
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
@@ -1003,6 +1061,108 @@ def create_token_chart_section() -> str:
         </div>
     </section>
     """
+
+
+def load_example_git_history() -> tuple[str, str]:
+    """
+    Loads the example git history and expected output from files.
+
+    Returns:
+        Tuple of (git_history, expected_output)
+    """
+    example_prompt_path = Path("benchmark_pipeline/locodiff-example/example_prompt.txt")
+    example_expected_path = Path(
+        "benchmark_pipeline/locodiff-example/example_expected.txt"
+    )
+
+    git_history = ""
+    expected_output = ""
+
+    if example_prompt_path.exists():
+        with open(example_prompt_path, "r", encoding="utf-8") as f:
+            git_history = f.read()
+    else:
+        print(f"Warning: Example prompt file not found at {example_prompt_path}")
+        print("Run generate_example_prompt.py to create it")
+        # Provide a placeholder
+        git_history = "# Example git history not found. Run benchmark_pipeline/generate_example_prompt.py first."
+
+    if example_expected_path.exists():
+        with open(example_expected_path, "r", encoding="utf-8") as f:
+            expected_output = f.read()
+    else:
+        expected_output = "# Expected output file not found. Run benchmark_pipeline/generate_example_prompt.py first."
+
+    return git_history, expected_output
+
+
+def create_example_section() -> str:
+    """Creates an HTML section explaining the benchmark with a git merge conflict example."""
+    # Load real git history and expected output
+    git_history, expected_output = load_example_git_history()
+
+    # Simple ASCII diagram of the git branch structure
+    ascii_diagram = """
+   A
+   /  \\
+   B    C
+   \\  /
+   D
+    """
+
+    # Construct the HTML for the example section
+    html = (
+        """
+    <section id="benchmark-example">
+        <h2>LoCoDiff Methodology: A Toy Example</h2>
+        
+        <p class="intro-text">
+            LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
+            including how merge conflicts were resolved. Here's a simple example:
+        </p>
+        
+        <div class="example-timeline">
+            <h3>Shopping List Example</h3>
+            <div class="branch-structure-container">
+                <div class="branch-diagram-box">
+                    <pre class="branch-diagram">"""
+        + ascii_diagram
+        + """</pre>
+                </div>
+                <div class="branch-explanation">
+                    <p class="commit-description">
+                        Commit A: Creates shopping list file with 5 items<br>
+                        Commit B: Adds a new item at the end and changes the first item<br>
+                        Commit C: On a separate branch from B, changes the first item to something different<br>
+                        Commit D: Merges B and C branches, keeping both the new items that replaced the first
+                    </p>
+                    <p class="model-task">
+                        The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
+                        From this information the model is asked to reconstruct the exact final state of the file.
+                    </p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="example-io-container">
+            <div class="example-prompt">
+                <h3>Input: git log output for a file</h3>
+                <pre><code class="language-diff">"""
+        + git_history
+        + """</code></pre>
+            </div>
+            
+            <div class="example-expected">
+                <h3>Target Output: Exact final state of the file</h3>
+                <pre><code class="language-text">"""
+        + expected_output
+        + """</code></pre>
+            </div>
+        </div>
+    </section>
+    """
+    )
+    return html
 
 
 def create_chart_javascript() -> str:
@@ -2803,6 +2963,136 @@ tbody tr:hover {
     text-decoration: none;
 }
 
+/* Benchmark Example Section Styles */
+#benchmark-example {
+    margin: 30px 0 50px 0;
+    padding: 20px;
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    border: 1px solid #e1e4e8;
+}
+
+.intro-text {
+    font-size: 16px;
+    line-height: 1.6;
+    margin-bottom: 20px;
+}
+
+.branch-diagram {
+    font-family: monospace;
+    text-align: center;
+    font-size: 16px;
+    line-height: 1.4;
+    margin: 0;
+    padding: 0;
+    white-space: pre;
+}
+
+.example-timeline {
+    margin: 20px 0;
+}
+
+.example-timeline h3 {
+    text-align: center;
+    margin-bottom: 15px;
+}
+
+.branch-structure-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    align-items: center;
+    margin: 15px 0;
+}
+
+.branch-diagram-box {
+    flex: 0 0 auto;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    padding: 15px;
+    margin: 0 auto;
+}
+
+.branch-explanation {
+    flex: 1;
+    min-width: 300px;
+    padding: 10px;
+    text-align: left;
+}
+
+.branch-explanation p {
+    line-height: 1.6;
+    margin: 0 0 15px 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+}
+
+.branch-explanation p:last-child {
+    margin-bottom: 0;
+}
+
+/* Ensure consistent font styling for both paragraphs */
+.branch-explanation p.commit-description,
+.branch-explanation p.model-task {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #333;
+}
+
+.branch-explanation p.model-task {
+    margin-top: 12px;
+    font-size: 0.95em;
+}
+
+.branch-explanation p.model-task code {
+    background-color: #f1f1f1;
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-family: Consolas, Monaco, 'Andale Mono', monospace;
+    font-size: 0.9em;
+}
+
+/* Container for side-by-side display */
+.example-io-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    margin: 20px 0;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    padding: 20px;
+}
+
+.example-prompt, .example-expected {
+    flex: 1;
+    min-width: 400px;
+}
+
+.example-task {
+    margin: 20px 0;
+    padding: 15px;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+}
+
+.example-io-container h3 {
+    padding-bottom: 5px;
+    border-bottom: 1px solid #e1e4e8;
+    margin-bottom: 15px;
+    color: #24292e;
+}
+
+.example-prompt pre, .example-expected pre {
+    /* No max-height restriction to show full content */
+}
+
+.example-task ul {
+    margin-left: 20px;
+    line-height: 1.6;
+}
+
 /* Cases overview table */
 #cases-table {
     table-layout: fixed;
@@ -3020,6 +3310,83 @@ tr.success:hover, tr.failure:hover {
     color: #cb2431;
 }
 
+/* Git diff syntax highlighting for the example */
+/* Simple and clean CSS for diff highlighting */
+.example-prompt pre code.language-diff {
+    font-family: Consolas, Monaco, 'Andale Mono', monospace;
+    font-size: 14px;
+    line-height: 1.2;
+    padding: 0;
+    white-space: pre;
+}
+
+/* Make all spans display as blocks without extra spacing */
+.example-prompt pre code.language-diff span {
+    display: block;
+    white-space: pre;
+    margin: 0;
+    padding: 0 8px;
+}
+
+/* Highlight.js generated classes */
+.example-prompt pre code.language-diff span.hljs-addition {
+    background-color: #e6ffec;
+    color: #22863a;
+    margin: 0;
+    padding: 0 8px;
+}
+
+.example-prompt pre code.language-diff span.hljs-deletion {
+    background-color: #ffebe9;
+    color: #cb2431;
+    margin: 0;
+    padding: 0 8px;
+}
+
+/* Remove any extra spacing that might be causing gaps */
+.example-prompt pre {
+    margin: 0;
+    padding: 0;
+    white-space: pre;
+}
+
+.example-prompt pre code {
+    margin: 0;
+    padding: 8px;
+    white-space: pre;
+}
+
+/* Make sure spans don't have extra margins/padding */
+.example-prompt pre code.language-diff span:first-child {
+    margin-top: 0;
+}
+
+.example-prompt pre code.language-diff span:last-child {
+    margin-bottom: 0;
+}
+
+/* Style for empty lines to ensure they have height */
+.example-prompt pre code.language-diff span.empty-line {
+    height: 1.2em;
+    line-height: 1.2;
+    display: block;
+}
+
+/* Style for command note showing the git command */
+.command-note {
+    margin: 10px 0;
+    background-color: #1e1e1e;
+    border-radius: 4px;
+    padding: 8px 12px;
+    display: inline-block;
+}
+
+.command-note code {
+    color: #f0f0f0;
+    font-family: Consolas, Monaco, 'Andale Mono', monospace;
+    font-size: 14px;
+}
+
 .diff-info {
     color: #6a737d;
     background-color: #f1f8ff;
@@ -3157,6 +3524,7 @@ def main():
     print("Generating HTML content...")
     html_content = create_html_header()
     html_content += create_token_chart_section()
+    html_content += create_example_section()  # Add the new example section
     html_content += create_overall_stats_table(
         results_metadata, all_models, num_cases, model_display_names
     )
@@ -3202,7 +3570,6 @@ def main():
         model_case_count = 0
         for (case_prefix, case_model), metadata in results_metadata.items():
             if case_model == model:
-                print(f"  - Generating case page: {case_prefix}")
                 generate_case_page(
                     case_prefix,
                     model,
