@@ -439,25 +439,21 @@ def create_locodiff_summary() -> str:
     return """
     <section id="locodiff-summary">
         <h2>What is LoCoDiff?</h2>
-        <div class="locodiff-description">
-            <p>
-                LoCoDiff is a benchmark for evaluating large language models on their ability to understand
-                long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
-                code by understanding git history, including complex merge conflicts and development patterns.
-            </p>
-            <p>
-                Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
-                LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
-                and asking it to reproduce the final state of a file.
-            </p>
-            <div class="mentat-contribution">
-                <p>
-                    <strong>About this benchmark:</strong> 100% of the code for the LoCoDiff benchmark was written by 
-                    <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
-                    entirely run by the Mentat bot, from data collection to visualization generation.
-                </p>
-            </div>
-        </div>
+        <p>
+            LoCoDiff is a benchmark for evaluating large language models on their ability to understand
+            long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
+            code by understanding git history, including complex merge conflicts and development patterns.
+        </p>
+        <p>
+            Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
+            LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
+            and asking it to reproduce the final state of a file.
+        </p>
+        <p>
+            100% of the code for the LoCoDiff benchmark was written by 
+            <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
+            entirely run by the Mentat bot, from data collection to visualization generation.
+        </p>
     </section>
     """
 
@@ -1194,49 +1190,42 @@ def create_example_section() -> str:
     <section id="benchmark-example">
         <h2>LoCoDiff Methodology: A Toy Example</h2>
         
-        <p class="intro-text">
+        <p>
             LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
             including how merge conflicts were resolved. Here's a simple example:
         </p>
         
-        <div class="example-timeline">
-            <h3>Shopping List Example</h3>
-            <div class="branch-structure-container">
-                <div class="branch-diagram-box">
-                    <pre class="branch-diagram">"""
+        <h3>Shopping List Example</h3>
+        
+        <div style="display: flex; flex-wrap: wrap; gap: 20px; margin: 15px 0;">
+            <div>
+                <pre>"""
         + ascii_diagram
         + """</pre>
-                </div>
-                <div class="branch-explanation">
-                    <p class="commit-description">
-                        Commit A: Creates shopping list file with 5 items<br>
-                        Commit B: Adds a new item at the end and changes the first item<br>
-                        Commit C: On a separate branch from B, changes the first item to something different<br>
-                        Commit D: Merges B and C branches, keeping both the new items that replaced the first
-                    </p>
-                    <p class="model-task">
-                        The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
-                        From this information the model is asked to reconstruct the exact final state of the file.
-                    </p>
-                </div>
+            </div>
+            <div>
+                <p>
+                    Commit A: Creates shopping list file with 5 items<br>
+                    Commit B: Adds a new item at the end and changes the first item<br>
+                    Commit C: On a separate branch from B, changes the first item to something different<br>
+                    Commit D: Merges B and C branches, keeping both the new items that replaced the first
+                </p>
+                <p>
+                    The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
+                    From this information the model is asked to reconstruct the exact final state of the file.
+                </p>
             </div>
         </div>
         
-        <div class="example-io-container">
-            <div class="example-prompt">
-                <h3>Input: git log output for a file</h3>
-                <pre><code class="language-diff">"""
+        <h3>Input: git log output for a file</h3>
+        <pre><code class="language-diff">"""
         + git_history
         + """</code></pre>
-            </div>
-            
-            <div class="example-expected">
-                <h3>Target Output: Exact final state of the file</h3>
-                <pre><code class="language-text">"""
+        
+        <h3>Target Output: Exact final state of the file</h3>
+        <pre><code class="language-text">"""
         + expected_output
         + """</code></pre>
-            </div>
-        </div>
     </section>
     """
     )
