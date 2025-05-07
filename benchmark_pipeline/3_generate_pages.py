@@ -1005,6 +1005,108 @@ def create_token_chart_section() -> str:
     """
 
 
+def load_example_git_history() -> tuple[str, str]:
+    """
+    Loads the example git history and expected output from files.
+
+    Returns:
+        Tuple of (git_history, expected_output)
+    """
+    example_prompt_path = Path("locodiff-example/example_prompt.txt")
+    example_expected_path = Path("locodiff-example/example_expected.txt")
+
+    git_history = ""
+    expected_output = ""
+
+    if example_prompt_path.exists():
+        with open(example_prompt_path, "r", encoding="utf-8") as f:
+            git_history = f.read()
+    else:
+        print(f"Warning: Example prompt file not found at {example_prompt_path}")
+        print("Run generate_example_prompt.py to create it")
+        # Provide a placeholder
+        git_history = "# Example git history not found. Run benchmark_pipeline/generate_example_prompt.py first."
+
+    if example_expected_path.exists():
+        with open(example_expected_path, "r", encoding="utf-8") as f:
+            expected_output = f.read()
+    else:
+        expected_output = "# Expected output file not found. Run benchmark_pipeline/generate_example_prompt.py first."
+
+    return git_history, expected_output
+
+
+def create_example_section() -> str:
+    """Creates an HTML section explaining the benchmark with a git merge conflict example."""
+    # Load real git history and expected output
+    git_history, expected_output = load_example_git_history()
+
+    # Simple ASCII diagram of the git branch structure
+    ascii_diagram = """
+    A
+   / \\
+  B   C
+   \\ /
+    D
+    """
+
+    # Construct the HTML for the example section
+    html = (
+        """
+    <section id="benchmark-example">
+        <h2>Understanding LoCoDiff: A Practical Example</h2>
+        
+        <p class="intro-text">
+            LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
+            including how merge conflicts were resolved. Here's a simple example:
+        </p>
+        
+        <div class="example-timeline">
+            <h3>Branch Structure</h3>
+            <pre class="branch-diagram">"""
+        + ascii_diagram
+        + """</pre>
+            <p>
+                <strong>A</strong>: Initial commit<br>
+                <strong>B</strong>: Optimization branch (more efficient implementation)<br>
+                <strong>C</strong>: Feature branch (add average function)<br>
+                <strong>D</strong>: Merge commit (resolves conflicts between B and C)
+            </p>
+        </div>
+        
+        <div class="example-prompt">
+            <h3>What the Model Sees: The Git Log</h3>
+            <p>LoCoDiff provides models with the git log (including diffs) and asks them to reconstruct the final file:</p>
+            <pre><code class="language-diff">"""
+        + git_history
+        + """</code></pre>
+        </div>
+        
+        <div class="example-expected">
+            <h3>The Expected Output</h3>
+            <p>The model must generate the final state of the file:</p>
+            <pre><code class="language-python">"""
+        + expected_output
+        + """</code></pre>
+        </div>
+        
+        <div class="example-task">
+            <h3>The Model's Task</h3>
+            <p>Given only this Git history, the model must reconstruct the exact final state of the file, resolving the same conflicts 
+               a developer would need to understand. This tests the model's ability to:</p>
+            <ul>
+                <li>Understand Git diff syntax and commit history</li>
+                <li>Track changes across multiple branches</li>
+                <li>Interpret how merge conflicts were resolved</li>
+                <li>Reconstruct the exact final state of the code</li>
+            </ul>
+        </div>
+    </section>
+    """
+    )
+    return html
+
+
 def create_chart_javascript() -> str:
     """Creates JavaScript code for initializing and controlling the chart."""
     return """
@@ -2803,6 +2905,54 @@ tbody tr:hover {
     text-decoration: none;
 }
 
+/* Benchmark Example Section Styles */
+#benchmark-example {
+    margin: 30px 0 50px 0;
+    padding: 20px;
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    border: 1px solid #e1e4e8;
+}
+
+.intro-text {
+    font-size: 16px;
+    line-height: 1.6;
+    margin-bottom: 20px;
+}
+
+.branch-diagram {
+    font-family: monospace;
+    text-align: center;
+    padding: 10px;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    display: inline-block;
+    margin: 10px auto;
+}
+
+.example-timeline {
+    text-align: center;
+    margin: 20px 0;
+}
+
+.example-prompt, .example-expected, .example-task {
+    margin: 20px 0;
+    padding: 15px;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+}
+
+.example-prompt pre, .example-expected pre {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.example-task ul {
+    margin-left: 20px;
+    line-height: 1.6;
+}
+
 /* Cases overview table */
 #cases-table {
     table-layout: fixed;
@@ -3157,6 +3307,7 @@ def main():
     print("Generating HTML content...")
     html_content = create_html_header()
     html_content += create_token_chart_section()
+    html_content += create_example_section()  # Add the new example section
     html_content += create_overall_stats_table(
         results_metadata, all_models, num_cases, model_display_names
     )
