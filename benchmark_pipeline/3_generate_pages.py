@@ -1012,8 +1012,10 @@ def load_example_git_history() -> tuple[str, str]:
     Returns:
         Tuple of (git_history, expected_output)
     """
-    example_prompt_path = Path("locodiff-example/example_prompt.txt")
-    example_expected_path = Path("locodiff-example/example_expected.txt")
+    example_prompt_path = Path("benchmark_pipeline/locodiff-example/example_prompt.txt")
+    example_expected_path = Path(
+        "benchmark_pipeline/locodiff-example/example_expected.txt"
+    )
 
     git_history = ""
     expected_output = ""
