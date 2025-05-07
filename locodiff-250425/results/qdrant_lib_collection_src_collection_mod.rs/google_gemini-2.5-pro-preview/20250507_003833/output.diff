@@ -1,0 +1,128 @@
+
+index 71e15f9b..2c3910d1 100644
+--- a/qdrant_lib_collection_src_collection_mod.rs_expectedoutput.txt (expected):tmp/tmpnnlu754n_expected.txt	
++++ b/qdrant_lib_collection_src_collection_mod.rs_extracted.txt (actual):tmp/tmpx0_yqt42_actual.txt	
+@@ -93,7 +93,6 @@ pub struct Collection {
+ }
+ 
+ pub type RequestShardTransfer = Arc<dyn Fn(ShardTransfer) + Send + Sync>;
+-
+ pub type OnTransferFailure = Arc<dyn Fn(ShardTransfer, CollectionId, &str) + Send + Sync>;
+ pub type OnTransferSuccess = Arc<dyn Fn(ShardTransfer, CollectionId) + Send + Sync>;
+ 
+@@ -438,13 +437,18 @@ impl Collection {
+             )));
+         }
+ 
++        // Functions below lock `shard_holder`!
++        // Because of that, we need to grab all necessary data (like `resharding_state`),
++        // before calling `ensure_replica_with_state`.
++        // Otherwise it might lead to double-lock on `shard_holder`.
++        let resharding_state = shard_holder.resharding_state.read().clone();
++
+         // Update replica status
+         replica_set
+             .ensure_replica_with_state(peer_id, new_state)
+             .await?;
+ 
+         if new_state == ReplicaState::Dead {
+-            let resharding_state = shard_holder.resharding_state.read().clone();
+             let related_transfers = shard_holder.get_related_transfers(shard_id, peer_id);
+ 
+             // Functions below lock `shard_holder`!
+@@ -469,7 +473,7 @@ impl Collection {
+                 .as_ref()
+                 .is_some_and(ReplicaState::is_resharding);
+             if is_resharding {
+-                if let Some(state) = resharding_state {
++                if let Some(state) = resharding_state.filter(|state| state.peer_id == peer_id) {
+                     abort_resharding_result = self.abort_resharding(state.key(), false).await;
+                 }
+             }
+@@ -563,6 +567,15 @@ impl Collection {
+         }
+     }
+ 
++    pub async fn apply_state(
++        &self,
++        state: State,
++        this_peer_id: PeerId,
++        abort_transfer: impl FnMut(ShardTransfer),
++    ) -> CollectionResult<()> {
++        state.apply(this_peer_id, self, abort_transfer).await
++    }
++
+     pub async fn remove_shards_at_peer(&self, peer_id: PeerId) -> CollectionResult<()> {
+         // Abort resharding, if shards are removed from peer driving resharding
+         // (which *usually* means the *peer* is being removed from consensus)
+@@ -618,7 +631,7 @@ impl Collection {
+                 None => {
+                     log::debug!(
+                         "Transfer {:?} does not exist, but not reported as cancelled. Reporting now.",
+-                        transfer.key(),
++                        (transfer.key())
+                     );
+                     on_transfer_failure(transfer, self.name(), "transfer task does not exist");
+                 }
+@@ -626,14 +639,14 @@ impl Collection {
+                 Some(TaskResult::Finished) => {
+                     log::debug!(
+                         "Transfer {:?} is finished successfully, but not reported. Reporting now.",
+-                        transfer.key(),
++                        (transfer.key())
+                     );
+                     on_transfer_success(transfer, self.name());
+                 }
+                 Some(TaskResult::Failed) => {
+                     log::debug!(
+                         "Transfer {:?} is failed, but not reported as failed. Reporting now.",
+-                        transfer.key(),
++                        (transfer.key())
+                     );
+                     on_transfer_failure(transfer, self.name(), "transfer failed");
+                 }
+@@ -677,15 +690,18 @@ impl Collection {
+                 continue;
+             }
+ 
+-            // Don't automatically recover replicas if started in recovery mode
+-            if self.shared_storage_config.recovery_mode.is_some() {
+-                continue;
+-            }
+-
+-            // Don't recover replicas if not dead
+-            let is_dead = this_peer_state == Some(Dead);
+-            if !is_dead {
+-                continue;
++            let is_dummy = replica_set.is_dummy().await;
++            if this_peer_state == Some(Dead) && is_dummy {
++                // Dummy shard is dead and needs recovery
++                log::warn!(
++                    "Shard {}:{shard_id} replica on peer {this_peer_id} is a dummy and needs recovery",
++                    self.id
++                );
++            } else {
++                // Don't automatically recover replicas if not dead
++                if this_peer_state != Some(Dead) {
++                    continue;
++                }
+             }
+ 
+             // Try to find dead replicas with no active transfers
+@@ -838,16 +854,6 @@ impl Collection {
+         }
+     }
+ 
+-    pub async fn effective_optimizers_config(&self) -> CollectionResult<OptimizersConfig> {
+-        let config = self.collection_config.read().await;
+-
+-        if let Some(optimizers_overwrite) = self.optimizers_overwrite.clone() {
+-            Ok(optimizers_overwrite.update(&config.optimizer_config)?)
+-        } else {
+-            Ok(config.optimizer_config.clone())
+-        }
+-    }
+-
+     pub async fn lock_updates(&self) -> RwLockWriteGuard<()> {
+         self.updates_lock.write().await
+     }
