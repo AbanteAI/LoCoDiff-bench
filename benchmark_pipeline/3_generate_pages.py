@@ -441,21 +441,38 @@ def create_html_footer(include_chart_js: bool = False) -> str:
             
             codeBlocks.forEach(function(codeBlock) {
                 // Get all lines in the code block
-                const lines = codeBlock.innerHTML.split('\\n');
+                const content = codeBlock.innerHTML;
                 
-                // Process each line
-                const highlightedLines = lines.map(function(line) {
-                    if (line.startsWith('+')) {
-                        return '<span style="background-color: #e6ffec; color: #22863a; display: block;">' + line + '</span>';
-                    } else if (line.startsWith('-')) {
-                        return '<span style="background-color: #ffebe9; color: #cb2431; display: block;">' + line + '</span>';
-                    } else {
-                        return '<span style="display: block;">' + line + '</span>';
+                // Replace the content with highlighted version
+                let highlightedContent = '';
+                
+                // Split by real newlines in the content
+                const lines = content.split('\\n');
+                
+                // Process each line without adding extra spacing
+                for (let i = 0; i < lines.length; i++) {
+                    let line = lines[i];
+                    
+                    // Skip highlighting for file path indicators
+                    if (line.startsWith('+++') || line.startsWith('---')) {
+                        highlightedContent += '<span>' + line + '</span>';
                     }
-                });
+                    // Highlight added lines
+                    else if (line.startsWith('+')) {
+                        highlightedContent += '<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>';
+                    }
+                    // Highlight removed lines 
+                    else if (line.startsWith('-')) {
+                        highlightedContent += '<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>';
+                    }
+                    // Normal line
+                    else {
+                        highlightedContent += '<span>' + line + '</span>';
+                    }
+                }
                 
-                // Replace code block content
-                codeBlock.innerHTML = highlightedLines.join('\\n');
+                // Replace code block content without joining with newlines
+                codeBlock.innerHTML = highlightedContent;
             });
             
             // Initialize highlight.js 
@@ -3271,78 +3288,58 @@ tr.success:hover, tr.failure:hover {
 }
 
 /* Git diff syntax highlighting for the example */
-code.language-diff {
-    counter-reset: line;
-}
-
-/* Style for all lines in a diff */
-.example-prompt pre code.language-diff span {
-    display: block;
-    line-height: 1.5;
-}
-
-/* Style for add/remove lines in diff */
-.example-prompt pre code.language-diff span {
+/* Simple and clean CSS for diff highlighting */
+.example-prompt pre code.language-diff {
+    font-family: Consolas, Monaco, 'Andale Mono', monospace;
+    font-size: 14px;
+    line-height: 1.2;
+    padding: 0;
     white-space: pre;
 }
 
-/* Green background for added lines */
-.example-prompt pre code.language-diff span[class="hljs-addition"],
-.example-prompt pre code.language-diff span:not([class]):not(:empty) {
-    position: relative;
+/* Make all spans display as blocks without extra spacing */
+.example-prompt pre code.language-diff span {
+    display: block;
+    white-space: pre;
+    margin: 0;
     padding: 0 8px;
-    box-sizing: border-box;
 }
 
-/* Green background for lines starting with + */
-.example-prompt pre code.language-diff span:not([class]):not(:empty) {
-    display: block;
-}
-
-.example-prompt pre code.language-diff span[class="hljs-addition"],
-.example-prompt pre code.language-diff span:not([class]):not(:empty):first-letter {
-    color: inherit;
-}
-
-/* Simple direct approach for + and - lines */
-.example-prompt pre code.language-diff span:not([class]):not(:empty) {
-    display: block;
-}
-
-/* Apply green background to lines starting with + */
-.example-prompt pre code.language-diff span:not([class]):not(:empty) {
-    display: block;
-}
-
-.example-prompt pre code.language-diff span:is([class="hljs-addition"]),
-.example-prompt pre code.language-diff span:not([class]):not(:empty) {
-    position: relative;
-}
-
-/* Explicitly style lines with + and - */
+/* Highlight.js generated classes */
 .example-prompt pre code.language-diff span.hljs-addition {
     background-color: #e6ffec;
     color: #22863a;
+    margin: 0;
+    padding: 0 8px;
 }
 
 .example-prompt pre code.language-diff span.hljs-deletion {
     background-color: #ffebe9;
     color: #cb2431;
+    margin: 0;
+    padding: 0 8px;
 }
 
-/* Apply styles after page loads with JavaScript */
-code.language-diff::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
+/* Remove any extra spacing that might be causing gaps */
+.example-prompt pre {
+    margin: 0;
+    padding: 0;
+    white-space: pre;
 }
 
-/* Add JavaScript to highlight diff lines */
-#highlight-diff-script {
-    display: none;
+.example-prompt pre code {
+    margin: 0;
+    padding: 8px;
+    white-space: pre;
+}
+
+/* Make sure spans don't have extra margins/padding */
+.example-prompt pre code.language-diff span:first-child {
+    margin-top: 0;
+}
+
+.example-prompt pre code.language-diff span:last-child {
+    margin-bottom: 0;
 }
 
 /* Style for command note showing the git command */
