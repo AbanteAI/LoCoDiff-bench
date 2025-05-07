@@ -424,7 +424,12 @@ def create_html_footer(include_chart_js: bool = False) -> str:
     footer = """
     </main>
     <footer>
-        <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench">GitHub Repository</a></p>
+        <div class="footer-content">
+            <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench" class="github-link"><img src="assets/images/github-logo.png" alt="GitHub" class="github-icon"></a></p>
+            <p class="built-with">
+                built with <a href="https://mentat.ai" target="_blank" class="mentat-link">mentat.ai</a> <img src="assets/images/mentat-logo-transparent.png" alt="Mentat" class="mentat-icon">
+            </p>
+        </div>
     </footer>
     """
 
@@ -3400,12 +3405,59 @@ tr.success:hover, tr.failure:hover {
 
 /* Footer */
 footer {
-    margin-top: 40px;
-    padding-top: 20px;
-    border-top: 1px solid #eaecef;
+    position: fixed;
+    bottom: 15px;
+    right: 15px;
+    padding: 10px;
     color: #586069;
     font-size: 14px;
-    text-align: center;
+    text-align: right;
+    background-color: rgba(255, 255, 255, 0.95);
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    z-index: 1000;
+}
+
+.footer-content {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+}
+
+footer p {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.github-link, .mentat-link {
+    color: #0366d6;
+    font-weight: 500;
+    transition: opacity 0.2s;
+}
+
+.github-link:hover, .mentat-link:hover {
+    opacity: 0.8;
+    text-decoration: none;
+}
+
+.github-icon, .mentat-icon {
+    width: 16px;
+    height: 16px;
+    max-width: 16px;
+    max-height: 16px;
+    object-fit: contain;
+}
+
+.mentat-icon {
+    border-radius: 3px;
+    margin-left: 2px;
+}
+
+.built-with {
+    font-weight: 400;
 }"""
 
     return warning_comment + css_content
