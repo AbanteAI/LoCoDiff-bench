@@ -1146,16 +1146,14 @@ def create_example_section() -> str:
         
         <div class="example-io-container">
             <div class="example-prompt">
-                <h3>Input: Git History</h3>
-                <p>The model receives just the git log with diffs showing the commit history:</p>
+                <h3>Input: git log output for a file</h3>
                 <pre><code class="language-diff">"""
         + git_history
         + """</code></pre>
             </div>
             
             <div class="example-expected">
-                <h3>Target Output: Final File State</h3>
-                <p>The model must generate the exact final state of the file:</p>
+                <h3>Target Output: Exact final state of the file</h3>
                 <pre><code class="language-text">"""
         + expected_output
         + """</code></pre>
