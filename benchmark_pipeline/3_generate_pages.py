@@ -1097,16 +1097,22 @@ def create_example_section() -> str:
         </p>
         
         <div class="example-timeline">
-            <h3>Branch Structure</h3>
-            <pre class="branch-diagram">"""
+            <h3>Shopping List Example</h3>
+            <div class="branch-structure-container">
+                <div class="branch-diagram-box">
+                    <pre class="branch-diagram">"""
         + ascii_diagram
         + """</pre>
-            <p>
-                <strong>A</strong>: Initial shopping list<br>
-                <strong>B</strong>: Change apples to oranges and add cheese<br>
-                <strong>C</strong>: Change apples to bananas<br>
-                <strong>D</strong>: Merge commit (includes both fruits)
-            </p>
+                </div>
+                <div class="branch-explanation">
+                    <p>
+                        <strong>A</strong>: Initial shopping list<br>
+                        <strong>B</strong>: Change apples to oranges and add cheese<br>
+                        <strong>C</strong>: Change apples to bananas<br>
+                        <strong>D</strong>: Merge commit (includes both fruits)
+                    </p>
+                </div>
+            </div>
         </div>
         
         <div class="example-io-container">
@@ -2961,16 +2967,49 @@ tbody tr:hover {
 .branch-diagram {
     font-family: monospace;
     text-align: center;
-    padding: 10px;
-    background-color: white;
-    border: 1px solid #e1e4e8;
-    display: inline-block;
-    margin: 10px auto;
+    font-size: 16px;
+    line-height: 1.4;
+    margin: 0;
+    padding: 0;
+    white-space: pre;
 }
 
 .example-timeline {
-    text-align: center;
     margin: 20px 0;
+}
+
+.example-timeline h3 {
+    text-align: center;
+    margin-bottom: 15px;
+}
+
+.branch-structure-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    align-items: center;
+    margin: 15px 0;
+}
+
+.branch-diagram-box {
+    flex: 0 0 auto;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    padding: 15px;
+    margin: 0 auto;
+}
+
+.branch-explanation {
+    flex: 1;
+    min-width: 300px;
+    padding: 10px;
+    text-align: left;
+}
+
+.branch-explanation p {
+    line-height: 1.6;
+    margin: 0;
 }
 
 /* Container for side-by-side display */
