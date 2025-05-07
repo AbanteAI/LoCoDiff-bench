@@ -462,12 +462,12 @@ def create_html_footer(include_chart_js: bool = False) -> str:
                     else if (line.startsWith('+++') || line.startsWith('---')) {
                         highlightedLines.push('<span>' + line + '</span>');
                     }
-                    // Highlight added lines
-                    else if (line.startsWith('+')) {
+                    // Highlight added lines - check for both '+' at start and '+' after whitespace (for merge conflicts)
+                    else if (line.startsWith('+') || line.trim().startsWith('+')) {
                         highlightedLines.push('<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>');
                     }
-                    // Highlight removed lines 
-                    else if (line.startsWith('-')) {
+                    // Highlight removed lines - check for both '-' at start and '-' after whitespace
+                    else if (line.startsWith('-') || line.trim().startsWith('-')) {
                         highlightedLines.push('<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>');
                     }
                     // Normal line
