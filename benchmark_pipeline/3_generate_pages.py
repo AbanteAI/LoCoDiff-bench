@@ -400,12 +400,12 @@ def create_html_header() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LoCoDiff Benchmark Results</title>
+    <title>LoCoDiff Benchmark</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header>
-        <h1>LoCoDiff Benchmark Results</h1>
+        <h1>LoCoDiff Benchmark</h1>
     </header>
     <main>
 """
@@ -1029,7 +1029,7 @@ def create_token_chart_section() -> str:
     """Creates an HTML section for the token-based chart."""
     return """
     <section id="token-chart">
-        <h2>Success Rate by Prompt Size</h2>
+        <h2>Chart</h2>
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
@@ -1114,7 +1114,7 @@ def create_example_section() -> str:
     html = (
         """
     <section id="benchmark-example">
-        <h2>Understanding LoCoDiff: A Toy Example</h2>
+        <h2>LoCoDiff Methodology: A Toy Example</h2>
         
         <p class="intro-text">
             LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
