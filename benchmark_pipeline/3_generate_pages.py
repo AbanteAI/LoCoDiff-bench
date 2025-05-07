@@ -1131,10 +1131,15 @@ def create_example_section() -> str:
                 </div>
                 <div class="branch-explanation">
                     <p>
-                        <strong>A</strong>: Initial shopping list<br>
-                        <strong>B</strong>: Change apples to oranges and add cheese<br>
-                        <strong>C</strong>: Change apples to bananas<br>
-                        <strong>D</strong>: Merge commit (includes both fruits)
+                        Commit A: Creates shopping list file with 5 items<br>
+                        Commit B: Adds a new item at the end and changes the first item<br>
+                        Commit C: On a separate branch from B, changes the first item to something different<br>
+                        Commit D: Merges B and C branches, keeping both the new items that replaced the first
+                    </p>
+                    <p class="model-task">
+                        The model is shown the output of <code>git log -p --cc --reverse --topo-order -- shopping_list.txt</code>, 
+                        which displays the entire history, along both branches, and the merge conflict resolution. 
+                        From this information the model is asked to reconstruct the exact final state of the file.
                     </p>
                 </div>
             </div>
@@ -1159,14 +1164,13 @@ def create_example_section() -> str:
         </div>
         
         <div class="example-task">
-            <h3>The Model's Task</h3>
-            <p>Given only this Git history, the model must reconstruct the exact final state of the file, resolving the same conflicts 
-               a developer would need to understand. This tests the model's ability to:</p>
+            <h3>What This Tests</h3>
+            <p>This benchmark evaluates a model's ability to:</p>
             <ul>
                 <li>Understand Git diff syntax and commit history</li>
                 <li>Track changes across multiple branches</li>
                 <li>Interpret how merge conflicts were resolved</li>
-                <li>Reconstruct the exact final state of the code</li>
+                <li>Reconstruct the exact final state of the file</li>
             </ul>
         </div>
     </section>
@@ -3033,7 +3037,25 @@ tbody tr:hover {
 
 .branch-explanation p {
     line-height: 1.6;
-    margin: 0;
+    margin: 0 0 15px 0;
+}
+
+.branch-explanation p:last-child {
+    margin-bottom: 0;
+}
+
+.branch-explanation p.model-task {
+    margin-top: 12px;
+    font-size: 0.95em;
+    color: #555;
+}
+
+.branch-explanation p.model-task code {
+    background-color: #f1f1f1;
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-family: Consolas, Monaco, 'Andale Mono', monospace;
+    font-size: 0.9em;
 }
 
 /* Container for side-by-side display */
