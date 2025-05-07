@@ -501,6 +501,43 @@ def create_html_footer(include_chart_js: bool = False) -> str:
             </p>
         </div>
     </footer>
+    
+    <!-- Fix anchor link scrolling -->
+    <script>
+        // When the page loads, check if there's a hash in the URL and scroll to it properly
+        document.addEventListener('DOMContentLoaded', function() {
+            // If we have a hash in the URL
+            if (window.location.hash) {
+                // Wait a brief moment to ensure page is fully rendered
+                setTimeout(function() {
+                    // Get the element with the ID matching the hash
+                    const element = document.getElementById(window.location.hash.substring(1));
+                    if (element) {
+                        // Scroll to the element
+                        element.scrollIntoView();
+                    }
+                }, 100);
+            }
+            
+            // Add click handlers to all TOC links
+            const tocLinks = document.querySelectorAll('.toc a');
+            tocLinks.forEach(function(link) {
+                link.addEventListener('click', function(e) {
+                    // Get the ID from the href
+                    const targetId = this.getAttribute('href').substring(1);
+                    const targetElement = document.getElementById(targetId);
+                    
+                    if (targetElement) {
+                        e.preventDefault();
+                        // Update URL
+                        history.pushState(null, null, '#' + targetId);
+                        // Scroll to element
+                        targetElement.scrollIntoView();
+                    }
+                });
+            });
+        });
+    </script>
     """
 
     if include_chart_js:
