@@ -1104,9 +1104,9 @@ def create_example_section() -> str:
     # Simple ASCII diagram of the git branch structure
     ascii_diagram = """
     A
-   / \\
-  B   C
-   \\ /
+   /  \\
+  B    C
+   \\  /
     D
     """
 
@@ -1130,7 +1130,7 @@ def create_example_section() -> str:
         + """</pre>
                 </div>
                 <div class="branch-explanation">
-                    <p>
+                    <p class="commit-description">
                         Commit A: Creates shopping list file with 5 items<br>
                         Commit B: Adds a new item at the end and changes the first item<br>
                         Commit C: On a separate branch from B, changes the first item to something different<br>
@@ -3038,16 +3038,24 @@ tbody tr:hover {
 .branch-explanation p {
     line-height: 1.6;
     margin: 0 0 15px 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
 }
 
 .branch-explanation p:last-child {
     margin-bottom: 0;
 }
 
+/* Ensure consistent font styling for both paragraphs */
+.branch-explanation p.commit-description,
+.branch-explanation p.model-task {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #333;
+}
+
 .branch-explanation p.model-task {
     margin-top: 12px;
     font-size: 0.95em;
-    color: #555;
 }
 
 .branch-explanation p.model-task code {
