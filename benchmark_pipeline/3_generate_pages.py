@@ -3381,7 +3381,6 @@ def main():
         model_case_count = 0
         for (case_prefix, case_model), metadata in results_metadata.items():
             if case_model == model:
-                print(f"  - Generating case page: {case_prefix}")
                 generate_case_page(
                     case_prefix,
                     model,
