@@ -995,7 +995,7 @@ def create_token_chart_section() -> str:
                 <h3>Display Options</h3>
                 <div class="checkbox-item">
                     <label>
-                        <input type="checkbox" id="show-confidence-intervals" checked>
+                        <input type="checkbox" id="show-confidence-intervals">
                         Show 95% Confidence Intervals
                     </label>
                 </div>
@@ -1923,17 +1923,56 @@ def generate_cases_overview_page(
         body {{
             max-width: 95%; /* Use more of the screen width */
         }}
-        #cases-table td.fixed-col {{
-            white-space: normal; /* Allow wrapping of text in fixed columns */
+        
+        /* Redo the table layout completely to fix shading issues */
+        #cases-table {{
+            table-layout: fixed;
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        /* Override the default cases table styles */
+        #cases-table th, #cases-table td {{
+            padding: 8px;
+            border: 1px solid #e1e4e8;
+        }}
+        
+        /* Case name column - matching model-specific pages */
+        #cases-table th:first-child, #cases-table td:first-child {{
+            width: 240px; /* Match model-specific pages */
+        }}
+        
+        /* Prompt tokens column - matching model-specific pages */
+        #cases-table th:nth-child(2), #cases-table td:nth-child(2) {{
+            width: 120px; /* Match model-specific pages */
+        }}
+        
+        /* Ensure background colors match the row shading */
+        #cases-table tbody tr:nth-child(odd) td {{
+            background-color: #f6f8fa;
+        }}
+        
+        #cases-table tbody tr:nth-child(even) td {{
+            background-color: white;
+        }}
+        
+        /* Header row always has its own background */
+        #cases-table thead th {{
+            background-color: #f6f8fa;
+            font-weight: 600;
+            text-align: center;
+            z-index: 3; /* Ensure header is above all */
+        }}
+        
+        /* All headers are center-aligned for consistency */
+        
+        /* Ensure case names are center-aligned and wrap properly */
+        .case-name {{
+            white-space: normal;
             overflow-wrap: break-word;
-            word-wrap: break-word;
-            min-width: 250px;
-            max-width: 400px;
+            text-align: center; /* Center alignment to match model pages */
         }}
-        #cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {{
-            left: auto; /* Override the fixed position for the second column */
-            width: 125px; /* Increased from 100px to fit "Prompt Tokens" text */
-        }}
+        
         /* Multi-column layout for model checkboxes */
         .multi-column-checkboxes {{
             display: flex;
@@ -1988,8 +2027,8 @@ def generate_cases_overview_page(
             <table id="cases-table">
                 <thead>
                     <tr>
-                        <th class="fixed-col">Case</th>
-                        <th class="fixed-col">Prompt Tokens</th>
+                        <th>Case</th>
+                        <th>Prompt Tokens</th>
 """
 
     # Add column headers for each model
@@ -2010,10 +2049,11 @@ def generate_cases_overview_page(
     for case in cases:
         case_prefix = case["prefix"]
         safe_case = case_prefix.replace("/", "_")
+        truncated_name = truncate_case_name(case["original_filename"])
         html_content += f"""
                     <tr>
-                        <td class="fixed-col case-name">{case["original_filename"]}</td>
-                        <td class="fixed-col">{case["token_count"]}</td>
+                        <td class="case-name">{truncated_name}</td>
+                        <td>{case["token_count"]}</td>
 """
 
         # Add status buttons for each model
@@ -2197,10 +2237,53 @@ def generate_model_page(
     <link rel="stylesheet" href="../styles.css">
     <style>
         /* Custom styles for model-specific pages */
+        #cases-table {{
+            table-layout: fixed;
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        #cases-table th, #cases-table td {{
+            padding: 8px;
+            border: 1px solid #e1e4e8;
+            text-align: center;
+        }}
+        
+        /* First column (case name) styling */
+        #cases-table th:first-child, #cases-table td:first-child {{
+            width: 240px; /* Fixed width as requested */
+        }}
+        
+        /* Second column (prompt tokens) styling */
+        #cases-table th:nth-child(2), #cases-table td:nth-child(2) {{
+            width: 120px; /* Increased from 80px */
+        }}
+        
+        /* Third column (Status) styling */
+        #cases-table th:nth-child(3), #cases-table td:nth-child(3) {{
+            width: 70px; /* Made smaller */
+        }}
+        
+        /* Fourth column (Cost) styling */
+        #cases-table th:nth-child(4), #cases-table td:nth-child(4) {{
+            width: 80px; /* Made smaller */
+        }}
+        
+        /* Fifth column (Actions) styling */
+        #cases-table th:nth-child(5), #cases-table td:nth-child(5) {{
+            width: 90px; /* Made smaller */
+        }}
+        
+        /* Ensure text wraps properly */
         .case-name {{
-            max-width: 300px;
             white-space: normal;
             overflow-wrap: break-word;
+            text-align: center; /* Ensure center alignment */
+        }}
+        
+        /* Zebra striping */
+        #cases-table tbody tr:nth-child(odd) {{
+            background-color: #f6f8fa;
         }}
     </style>
 </head>
@@ -2234,9 +2317,12 @@ def generate_model_page(
         # Create a safe case page filename
         safe_case = case["prefix"].replace("/", "_")
 
+        # Truncate case name if too long
+        truncated_name = truncate_case_name(case["original_filename"])
+
         html_content += f"""
                     <tr class="case-row {status_class}">
-                        <td class="case-name">{case["original_filename"]}</td>
+                        <td class="case-name">{truncated_name}</td>
                         <td>{case["prompt_tokens"]}</td>
                         <td class="{status_class}">{status_text}</td>
                         <td>${case["cost_usd"]:.6f}</td>
@@ -2731,17 +2817,8 @@ tbody tr:hover {
     white-space: nowrap;
 }
 
-#cases-table th.fixed-col, #cases-table td.fixed-col {
-    text-align: left;
-    position: sticky;
-    left: 0;
-    background-color: white;
-    z-index: 10;
-}
-
-#cases-table th.fixed-col:nth-child(2), #cases-table td.fixed-col:nth-child(2) {
-    left: 250px; /* Adjust based on width of first column */
-}
+/* The fixed-col classes have been replaced with first-child and nth-child selectors
+   in the page-specific CSS for better control of backgrounds and positioning */
 
 #cases-table th.model-col, #cases-table td.model-col {
     min-width: 120px;
@@ -2968,6 +3045,20 @@ footer {
 
 
 # --- Main Function ---
+
+
+def truncate_case_name(name: str) -> str:
+    """
+    Extracts just the filename from a path, discarding directory information.
+
+    Args:
+        name: The case name or path
+
+    Returns:
+        Just the filename part of the path
+    """
+    # Extract just the filename (part after the last slash)
+    return name.split("/")[-1].split("\\")[-1]
 
 
 def main():
