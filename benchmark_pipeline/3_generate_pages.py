@@ -1137,8 +1137,7 @@ def create_example_section() -> str:
                         Commit D: Merges B and C branches, keeping both the new items that replaced the first
                     </p>
                     <p class="model-task">
-                        The model is shown the output of <code>git log -p --cc --reverse --topo-order -- shopping_list.txt</code>, 
-                        which displays the entire history, along both branches, and the merge conflict resolution. 
+                        The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
                         From this information the model is asked to reconstruct the exact final state of the file.
                     </p>
                 </div>

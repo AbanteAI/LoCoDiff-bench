@@ -146,9 +146,11 @@ def save_output(git_log, final_state):
     # Create output directory if it doesn't exist
     os.makedirs("locodiff-example", exist_ok=True)
 
-    # Save git log to a file with the command at the top
+    # Save git log to a file with the command at the top in multi-line format
     with open("locodiff-example/example_prompt.txt", "w") as f:
-        f.write("> git log -p --cc --reverse --topo-order -- shopping_list.txt\n\n\n")
+        f.write(
+            "> git log -p \\\n    --cc \\\n    --reverse \\\n    --topo-order \\\n    -- shopping_list.txt\n\n\n"
+        )
         f.write(git_log)
 
     # Save final state to a file
