@@ -1188,45 +1188,52 @@ def create_example_section() -> str:
     # Construct the HTML for the example section
     html = (
         """
-    <section id="benchmark-example">
+    <section id="benchmark-example" style="background-color: transparent; border: none; padding: 0;">
         <h2>LoCoDiff Methodology: A Toy Example</h2>
         
-        <p>
+        <p class="intro-text">
             LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
             including how merge conflicts were resolved. Here's a simple example:
         </p>
         
-        <h3>Shopping List Example</h3>
-        
-        <div style="display: flex; flex-wrap: wrap; gap: 20px; margin: 15px 0;">
-            <div>
-                <pre>"""
+        <div class="example-timeline">
+            <h3>Shopping List Example</h3>
+            <div class="branch-structure-container">
+                <div class="branch-diagram-box">
+                    <pre class="branch-diagram">"""
         + ascii_diagram
         + """</pre>
-            </div>
-            <div>
-                <p>
-                    Commit A: Creates shopping list file with 5 items<br>
-                    Commit B: Adds a new item at the end and changes the first item<br>
-                    Commit C: On a separate branch from B, changes the first item to something different<br>
-                    Commit D: Merges B and C branches, keeping both the new items that replaced the first
-                </p>
-                <p>
-                    The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
-                    From this information the model is asked to reconstruct the exact final state of the file.
-                </p>
+                </div>
+                <div class="branch-explanation">
+                    <p class="commit-description">
+                        Commit A: Creates shopping list file with 5 items<br>
+                        Commit B: Adds a new item at the end and changes the first item<br>
+                        Commit C: On a separate branch from B, changes the first item to something different<br>
+                        Commit D: Merges B and C branches, keeping both the new items that replaced the first
+                    </p>
+                    <p class="model-task">
+                        The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
+                        From this information the model is asked to reconstruct the exact final state of the file.
+                    </p>
+                </div>
             </div>
         </div>
         
-        <h3>Input: git log output for a file</h3>
-        <pre><code class="language-diff">"""
+        <div class="example-io-container">
+            <div class="example-prompt">
+                <h3>Input: git log output for a file</h3>
+                <pre><code class="language-diff">"""
         + git_history
         + """</code></pre>
-        
-        <h3>Target Output: Exact final state of the file</h3>
-        <pre><code class="language-text">"""
+            </div>
+            
+            <div class="example-expected">
+                <h3>Target Output: Exact final state of the file</h3>
+                <pre><code class="language-text">"""
         + expected_output
         + """</code></pre>
+            </div>
+        </div>
     </section>
     """
     )
