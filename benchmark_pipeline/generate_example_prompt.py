@@ -38,11 +38,11 @@ def setup_repo():
         # Initial commit (A)
         with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
             f.write("""# shopping_list.txt
-1. apples
-2. milk
-3. bread
-4. eggs
-5. coffee
+apples
+milk
+bread
+eggs
+coffee
 """)
 
         run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
@@ -57,12 +57,12 @@ def setup_repo():
         # Make changes for branch 1 (Commit B)
         with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
             f.write("""# shopping_list.txt
-1. oranges
-2. milk
-3. bread
-4. eggs
-5. coffee
-6. cheese
+oranges
+milk
+bread
+eggs
+coffee
+cheese
 """)
 
         run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
@@ -80,11 +80,11 @@ def setup_repo():
         # Make changes for branch 2 (Commit C)
         with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
             f.write("""# shopping_list.txt
-1. bananas
-2. milk
-3. bread
-4. eggs
-5. coffee
+bananas
+milk
+bread
+eggs
+coffee
 """)
 
         run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
@@ -100,13 +100,13 @@ def setup_repo():
             # Resolve the conflict manually
             with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
                 f.write("""# shopping_list.txt
-1. oranges
-2. bananas
-3. milk
-4. bread
-5. eggs
-6. coffee
-7. cheese
+oranges
+bananas
+milk
+bread
+eggs
+coffee
+cheese
 """)
 
             run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
