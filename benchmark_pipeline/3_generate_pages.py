@@ -450,9 +450,10 @@ def create_locodiff_summary() -> str:
             and asking it to reproduce the final state of a file.
         </p>
         <p>
-            100% of the code for the LoCoDiff benchmark was written by 
+            100% of the code for the LoCoDiff was written by 
             <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
-            entirely run by the Mentat bot, from data collection to visualization generation.
+            entirely run by Mentat, from data collection to visualization generation. You can examine the agent runs yourself at 
+            <a href="https://mentat.ai/gh/AbanteAI/LoCoDiff-bench/agents">the agent runs page</a>.
         </p>
     </section>
     """
