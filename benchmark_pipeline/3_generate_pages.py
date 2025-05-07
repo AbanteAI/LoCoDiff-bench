@@ -3061,8 +3061,7 @@ tbody tr:hover {
 }
 
 .example-prompt pre, .example-expected pre {
-    max-height: 400px;
-    overflow-y: auto;
+    /* No max-height restriction to show full content */
 }
 
 .example-task ul {
