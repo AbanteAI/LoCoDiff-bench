@@ -1119,7 +1119,6 @@ def create_example_section() -> str:
             <div class="example-prompt">
                 <h3>Input: Git History</h3>
                 <p>The model receives just the git log with diffs showing the commit history:</p>
-                <div class="command-note"><code>git log -p --cc --reverse --topo-order -- shopping_list.txt</code></div>
                 <pre><code class="language-diff">"""
         + git_history
         + """</code></pre>
