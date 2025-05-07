@@ -449,29 +449,37 @@ def create_html_footer(include_chart_js: bool = False) -> str:
                 // Split by real newlines in the content
                 const lines = content.split('\\n');
                 
-                // Process each line without adding extra spacing
+                // Process each line and preserve empty lines
+                let highlightedLines = [];
                 for (let i = 0; i < lines.length; i++) {
                     let line = lines[i];
                     
+                    if (line === '') {
+                        // Preserve blank lines by using a non-breaking space
+                        highlightedLines.push('<span class="empty-line">&nbsp;</span>');
+                    }
                     // Skip highlighting for file path indicators
-                    if (line.startsWith('+++') || line.startsWith('---')) {
-                        highlightedContent += '<span>' + line + '</span>';
+                    else if (line.startsWith('+++') || line.startsWith('---')) {
+                        highlightedLines.push('<span>' + line + '</span>');
                     }
                     // Highlight added lines
                     else if (line.startsWith('+')) {
-                        highlightedContent += '<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>';
+                        highlightedLines.push('<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>');
                     }
                     // Highlight removed lines 
                     else if (line.startsWith('-')) {
-                        highlightedContent += '<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>';
+                        highlightedLines.push('<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>');
                     }
                     // Normal line
                     else {
-                        highlightedContent += '<span>' + line + '</span>';
+                        highlightedLines.push('<span>' + line + '</span>');
                     }
                 }
                 
-                // Replace code block content without joining with newlines
+                // Join with line breaks to preserve spacing
+                highlightedContent = highlightedLines.join('\\n');
+                
+                // Replace code block content
                 codeBlock.innerHTML = highlightedContent;
             });
             
@@ -3339,6 +3347,13 @@ tr.success:hover, tr.failure:hover {
 
 .example-prompt pre code.language-diff span:last-child {
     margin-bottom: 0;
+}
+
+/* Style for empty lines to ensure they have height */
+.example-prompt pre code.language-diff span.empty-line {
+    height: 1.2em;
+    line-height: 1.2;
+    display: block;
 }
 
 /* Style for command note showing the git command */
