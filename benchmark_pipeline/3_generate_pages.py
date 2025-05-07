@@ -1069,27 +1069,29 @@ def create_example_section() -> str:
         + ascii_diagram
         + """</pre>
             <p>
-                <strong>A</strong>: Initial commit<br>
-                <strong>B</strong>: Optimization branch (more efficient implementation)<br>
-                <strong>C</strong>: Feature branch (add average function)<br>
-                <strong>D</strong>: Merge commit (resolves conflicts between B and C)
+                <strong>A</strong>: Initial shopping list<br>
+                <strong>B</strong>: Change apples to oranges and add cheese<br>
+                <strong>C</strong>: Change apples to bananas<br>
+                <strong>D</strong>: Merge commit (includes both fruits)
             </p>
         </div>
         
-        <div class="example-prompt">
-            <h3>What the Model Sees: The Git Log</h3>
-            <p>LoCoDiff provides models with the git log (including diffs) and asks them to reconstruct the final file:</p>
-            <pre><code class="language-diff">"""
+        <div class="example-io-container">
+            <div class="example-prompt">
+                <h3>Input: Git History</h3>
+                <p>The model receives just the git log with diffs showing the commit history:</p>
+                <pre><code class="language-diff">"""
         + git_history
         + """</code></pre>
-        </div>
-        
-        <div class="example-expected">
-            <h3>The Expected Output</h3>
-            <p>The model must generate the final state of the file:</p>
-            <pre><code class="language-python">"""
+            </div>
+            
+            <div class="example-expected">
+                <h3>Target Output: Final File State</h3>
+                <p>The model must generate the exact final state of the file:</p>
+                <pre><code class="language-text">"""
         + expected_output
         + """</code></pre>
+            </div>
         </div>
         
         <div class="example-task">
@@ -2937,12 +2939,36 @@ tbody tr:hover {
     margin: 20px 0;
 }
 
-.example-prompt, .example-expected, .example-task {
+/* Container for side-by-side display */
+.example-io-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    margin: 20px 0;
+    background-color: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    padding: 20px;
+}
+
+.example-prompt, .example-expected {
+    flex: 1;
+    min-width: 400px;
+}
+
+.example-task {
     margin: 20px 0;
     padding: 15px;
     background-color: white;
     border: 1px solid #e1e4e8;
     border-radius: 6px;
+}
+
+.example-io-container h3 {
+    padding-bottom: 5px;
+    border-bottom: 1px solid #e1e4e8;
+    margin-bottom: 15px;
+    color: #24292e;
 }
 
 .example-prompt pre, .example-expected pre {
