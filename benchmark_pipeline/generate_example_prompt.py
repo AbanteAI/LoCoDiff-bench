@@ -36,103 +36,82 @@ def setup_repo():
         run_command(["git", "config", "user.name", "Example User"], cwd=temp_dir)
 
         # Initial commit (A)
-        with open(os.path.join(temp_dir, "simple_math.py"), "w") as f:
-            f.write("""# simple_math.py
-def calculate_sum(numbers):
-    total = 0
-    for num in numbers:
-        total += num
-    return total
-
-# Example usage
-if __name__ == "__main__":
-    print(calculate_sum([1, 2, 3, 4, 5]))  # Should output: 15
+        with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
+            f.write("""# shopping_list.txt
+1. apples
+2. milk
+3. bread
+4. eggs
+5. coffee
 """)
 
-        run_command(["git", "add", "simple_math.py"], cwd=temp_dir)
+        run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
         run_command(
-            ["git", "commit", "-m", "Initial implementation of sum calculator"],
+            ["git", "commit", "-m", "Initial shopping list"],
             cwd=temp_dir,
         )
 
-        # Create branch 1 (optimization)
-        run_command(["git", "checkout", "-b", "feature/optimize"], cwd=temp_dir)
+        # Create branch 1 (oranges + cheese)
+        run_command(["git", "checkout", "-b", "feature/oranges"], cwd=temp_dir)
 
         # Make changes for branch 1 (Commit B)
-        with open(os.path.join(temp_dir, "simple_math.py"), "w") as f:
-            f.write("""# simple_math.py
-def calculate_sum(numbers):
-    return sum(numbers)  # More efficient implementation
-
-# Example usage
-if __name__ == "__main__":
-    print(calculate_sum([1, 2, 3, 4, 5]))  # Should output: 15
+        with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
+            f.write("""# shopping_list.txt
+1. oranges
+2. milk
+3. bread
+4. eggs
+5. coffee
+6. cheese
 """)
 
-        run_command(["git", "add", "simple_math.py"], cwd=temp_dir)
+        run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
         run_command(
-            ["git", "commit", "-m", "Optimize sum calculation using built-in function"],
+            ["git", "commit", "-m", "Change apples to oranges and add cheese"],
             cwd=temp_dir,
         )
 
         # Go back to main branch to create branch 2
         run_command(["git", "checkout", "master"], cwd=temp_dir)
 
-        # Create branch 2 (new feature)
-        run_command(["git", "checkout", "-b", "feature/average"], cwd=temp_dir)
+        # Create branch 2 (bananas)
+        run_command(["git", "checkout", "-b", "feature/bananas"], cwd=temp_dir)
 
         # Make changes for branch 2 (Commit C)
-        with open(os.path.join(temp_dir, "simple_math.py"), "w") as f:
-            f.write("""# simple_math.py
-def calculate_sum(numbers):
-    total = 0
-    for num in numbers:
-        total += num
-    return total
-
-def calculate_average(numbers):
-    if not numbers:
-        return 0
-    return calculate_sum(numbers) / len(numbers)
-
-# Example usage
-if __name__ == "__main__":
-    print(calculate_sum([1, 2, 3, 4, 5]))  # Should output: 15
-    print(calculate_average([1, 2, 3, 4, 5]))  # Should output: 3.0
+        with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
+            f.write("""# shopping_list.txt
+1. bananas
+2. milk
+3. bread
+4. eggs
+5. coffee
 """)
 
-        run_command(["git", "add", "simple_math.py"], cwd=temp_dir)
-        run_command(
-            ["git", "commit", "-m", "Add average calculation function"], cwd=temp_dir
-        )
+        run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
+        run_command(["git", "commit", "-m", "Change apples to bananas"], cwd=temp_dir)
 
         # Merge branch 2 into branch 1
-        run_command(["git", "checkout", "feature/optimize"], cwd=temp_dir)
+        run_command(["git", "checkout", "feature/oranges"], cwd=temp_dir)
 
         try:
             # This will fail due to merge conflict
-            run_command(["git", "merge", "feature/average"], cwd=temp_dir)
+            run_command(["git", "merge", "feature/bananas"], cwd=temp_dir)
         except subprocess.CalledProcessError:
             # Resolve the conflict manually
-            with open(os.path.join(temp_dir, "simple_math.py"), "w") as f:
-                f.write("""# simple_math.py
-def calculate_sum(numbers):
-    return sum(numbers)  # Kept the optimized version
-
-def calculate_average(numbers):
-    if not numbers:
-        return 0
-    return calculate_sum(numbers) / len(numbers)
-
-# Example usage
-if __name__ == "__main__":
-    print(calculate_sum([1, 2, 3, 4, 5]))  # Should output: 15
-    print(calculate_average([1, 2, 3, 4, 5]))  # Should output: 3.0
+            with open(os.path.join(temp_dir, "shopping_list.txt"), "w") as f:
+                f.write("""# shopping_list.txt
+1. oranges
+2. bananas
+3. milk
+4. bread
+5. eggs
+6. coffee
+7. cheese
 """)
 
-            run_command(["git", "add", "simple_math.py"], cwd=temp_dir)
+            run_command(["git", "add", "shopping_list.txt"], cwd=temp_dir)
             run_command(
-                ["git", "commit", "-m", "Merge feature/average into feature/optimize"],
+                ["git", "commit", "-m", "Merge feature/bananas into feature/oranges"],
                 cwd=temp_dir,
             )
 
@@ -146,13 +125,13 @@ if __name__ == "__main__":
                 "--topo-order",
                 "--reverse",
                 "--",
-                "simple_math.py",
+                "shopping_list.txt",
             ],
             cwd=temp_dir,
         )
 
         # Get final file state for verification
-        with open(os.path.join(temp_dir, "simple_math.py"), "r") as f:
+        with open(os.path.join(temp_dir, "shopping_list.txt"), "r") as f:
             final_state = f.read()
 
         return git_log, final_state
