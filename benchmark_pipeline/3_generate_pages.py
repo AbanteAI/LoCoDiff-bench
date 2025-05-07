@@ -437,7 +437,7 @@ def create_locodiff_summary() -> str:
         HTML string for the summary section
     """
     return """
-    <section id="locodiff-summary">
+    <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <h2>What is LoCoDiff?</h2>
         <p>
             LoCoDiff is a benchmark for evaluating large language models on their ability to understand
