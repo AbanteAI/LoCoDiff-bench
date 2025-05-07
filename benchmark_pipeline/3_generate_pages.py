@@ -499,40 +499,93 @@ def create_html_footer(include_chart_js: bool = False) -> str:
         </div>
     </footer>
     
-    <!-- Fix anchor link scrolling -->
+    <!-- Improved anchor link scrolling fix -->
     <script>
-        // When the page loads, check if there's a hash in the URL and scroll to it properly
-        document.addEventListener('DOMContentLoaded', function() {
-            // If we have a hash in the URL
-            if (window.location.hash) {
-                // Wait a brief moment to ensure page is fully rendered
-                setTimeout(function() {
-                    // Get the element with the ID matching the hash
-                    const element = document.getElementById(window.location.hash.substring(1));
-                    if (element) {
-                        // Scroll to the element
-                        element.scrollIntoView();
-                    }
-                }, 100);
-            }
+        // Enhanced scroll function that handles scrolling more reliably
+        function smoothScrollToElement(element) {
+            if (!element) return;
             
-            // Add click handlers to all TOC links
+            // Get element's position, accounting for any scroll that's already happened
+            const rect = element.getBoundingClientRect();
+            const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+            const targetY = rect.top + scrollTop - 20; // 20px offset for spacing
+            
+            // Scroll to position
+            window.scrollTo({
+                top: targetY,
+                behavior: 'smooth'
+            });
+            
+            // Set another timeout to make sure scrolling persists
+            setTimeout(function() {
+                window.scrollTo({
+                    top: targetY,
+                    behavior: 'auto'
+                });
+            }, 500);
+        }
+        
+        // Handle hash navigation on page load
+        function handleHashOnLoad() {
+            if (window.location.hash) {
+                const targetId = window.location.hash.substring(1);
+                const targetElement = document.getElementById(targetId);
+                
+                if (targetElement) {
+                    // Delay to ensure all content is loaded and laid out
+                    setTimeout(function() {
+                        smoothScrollToElement(targetElement);
+                        
+                        // Add additional scroll check to handle any interference
+                        setTimeout(function() {
+                            smoothScrollToElement(targetElement);
+                        }, 1000);
+                    }, 300);
+                }
+            }
+        }
+        
+        // Set up TOC links
+        function setupTOCLinks() {
             const tocLinks = document.querySelectorAll('.toc a');
             tocLinks.forEach(function(link) {
                 link.addEventListener('click', function(e) {
-                    // Get the ID from the href
+                    e.preventDefault();
+                    
                     const targetId = this.getAttribute('href').substring(1);
                     const targetElement = document.getElementById(targetId);
                     
                     if (targetElement) {
-                        e.preventDefault();
                         // Update URL
                         history.pushState(null, null, '#' + targetId);
-                        // Scroll to element
-                        targetElement.scrollIntoView();
+                        
+                        // Scroll to target
+                        smoothScrollToElement(targetElement);
+                        
+                        // Prevent any other scripts from scrolling elsewhere
+                        e.stopPropagation();
                     }
                 });
             });
+        }
+        
+        // Run when DOM is loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            setupTOCLinks();
+            handleHashOnLoad();
+        });
+        
+        // Also run after window is fully loaded (including all resources)
+        window.addEventListener('load', function() {
+            handleHashOnLoad();
+            
+            // Prevent any unwanted scroll resets
+            window.addEventListener('scroll', function(e) {
+                // If we've just navigated to a hash, don't let other scripts interfere
+                if (window.location.hash && window.scrollWasManuallySet) {
+                    e.stopPropagation();
+                }
+            }, { passive: true });
         });
     </script>
     """
