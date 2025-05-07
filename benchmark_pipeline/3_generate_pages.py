@@ -1103,11 +1103,11 @@ def create_example_section() -> str:
 
     # Simple ASCII diagram of the git branch structure
     ascii_diagram = """
-    A
+   A
    /  \\
-  B    C
+  B     C
    \\  /
-    D
+   D
     """
 
     # Construct the HTML for the example section
