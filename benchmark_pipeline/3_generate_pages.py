@@ -431,6 +431,39 @@ def create_html_footer(include_chart_js: bool = False) -> str:
     if include_chart_js:
         footer += create_chart_javascript()
 
+    # Add JavaScript for syntax highlighting diffs
+    footer += """
+    <script>
+        // Highlight diff lines (added/removed) on load
+        document.addEventListener('DOMContentLoaded', function() {
+            // Select all code blocks in the example prompt
+            const codeBlocks = document.querySelectorAll('.example-prompt pre code.language-diff');
+            
+            codeBlocks.forEach(function(codeBlock) {
+                // Get all lines in the code block
+                const lines = codeBlock.innerHTML.split('\\n');
+                
+                // Process each line
+                const highlightedLines = lines.map(function(line) {
+                    if (line.startsWith('+')) {
+                        return '<span style="background-color: #e6ffec; color: #22863a; display: block;">' + line + '</span>';
+                    } else if (line.startsWith('-')) {
+                        return '<span style="background-color: #ffebe9; color: #cb2431; display: block;">' + line + '</span>';
+                    } else {
+                        return '<span style="display: block;">' + line + '</span>';
+                    }
+                });
+                
+                // Replace code block content
+                codeBlock.innerHTML = highlightedLines.join('\\n');
+            });
+            
+            // Initialize highlight.js 
+            hljs.highlightAll();
+        });
+    </script>
+    """
+
     footer += """
 </body>
 </html>
@@ -1056,7 +1089,7 @@ def create_example_section() -> str:
     html = (
         """
     <section id="benchmark-example">
-        <h2>Understanding LoCoDiff: A Practical Example</h2>
+        <h2>Understanding LoCoDiff: A Toy Example</h2>
         
         <p class="intro-text">
             LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
@@ -1080,6 +1113,7 @@ def create_example_section() -> str:
             <div class="example-prompt">
                 <h3>Input: Git History</h3>
                 <p>The model receives just the git log with diffs showing the commit history:</p>
+                <div class="command-note"><code>git log -p --cc --reverse --topo-order -- shopping_list.txt</code></div>
                 <pre><code class="language-diff">"""
         + git_history
         + """</code></pre>
@@ -3196,6 +3230,96 @@ tr.success:hover, tr.failure:hover {
 .diff-removed {
     background-color: #ffebe9;
     color: #cb2431;
+}
+
+/* Git diff syntax highlighting for the example */
+code.language-diff {
+    counter-reset: line;
+}
+
+/* Style for all lines in a diff */
+.example-prompt pre code.language-diff span {
+    display: block;
+    line-height: 1.5;
+}
+
+/* Style for add/remove lines in diff */
+.example-prompt pre code.language-diff span {
+    white-space: pre;
+}
+
+/* Green background for added lines */
+.example-prompt pre code.language-diff span[class="hljs-addition"],
+.example-prompt pre code.language-diff span:not([class]):not(:empty) {
+    position: relative;
+    padding: 0 8px;
+    box-sizing: border-box;
+}
+
+/* Green background for lines starting with + */
+.example-prompt pre code.language-diff span:not([class]):not(:empty) {
+    display: block;
+}
+
+.example-prompt pre code.language-diff span[class="hljs-addition"],
+.example-prompt pre code.language-diff span:not([class]):not(:empty):first-letter {
+    color: inherit;
+}
+
+/* Simple direct approach for + and - lines */
+.example-prompt pre code.language-diff span:not([class]):not(:empty) {
+    display: block;
+}
+
+/* Apply green background to lines starting with + */
+.example-prompt pre code.language-diff span:not([class]):not(:empty) {
+    display: block;
+}
+
+.example-prompt pre code.language-diff span:is([class="hljs-addition"]),
+.example-prompt pre code.language-diff span:not([class]):not(:empty) {
+    position: relative;
+}
+
+/* Explicitly style lines with + and - */
+.example-prompt pre code.language-diff span.hljs-addition {
+    background-color: #e6ffec;
+    color: #22863a;
+}
+
+.example-prompt pre code.language-diff span.hljs-deletion {
+    background-color: #ffebe9;
+    color: #cb2431;
+}
+
+/* Apply styles after page loads with JavaScript */
+code.language-diff::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+}
+
+/* Add JavaScript to highlight diff lines */
+#highlight-diff-script {
+    display: none;
+}
+
+/* Style for command note showing the git command */
+.command-note {
+    margin: 10px 0;
+    background-color: #1e1e1e;
+    border-radius: 4px;
+    padding: 8px 12px;
+    display: inline-block;
+}
+
+.command-note code {
+    color: #f0f0f0;
+    font-family: Consolas, Monaco, 'Andale Mono', monospace;
+    font-size: 14px;
 }
 
 .diff-info {
