@@ -59,6 +59,22 @@ def delete_and_recreate_dir(dir_path: Path) -> None:
     print(f"Recreated directory: {dir_path}")
 
 
+def copy_static_assets(docs_dir: Path) -> None:
+    """Copies static assets to the docs directory."""
+    # Create assets directory structure
+    assets_dir = docs_dir / "assets" / "images"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    # Define the source directory for static assets
+    static_dir = Path("benchmark_pipeline/static/images")
+
+    # Copy each image file
+    for image_file in static_dir.glob("*"):
+        shutil.copy(image_file, assets_dir / image_file.name)
+
+    print(f"Copied static assets to {assets_dir}")
+
+
 def read_json_file(file_path: Path) -> Dict[str, Any]:
     """Reads a JSON file and returns the parsed content."""
     try:
@@ -3516,6 +3532,9 @@ def main():
 
     # Delete and recreate docs directory
     delete_and_recreate_dir(docs_dir)
+
+    # Copy static assets to the docs directory
+    copy_static_assets(docs_dir)
 
     # Collect metadata
     print("Collecting prompt metadata...")
