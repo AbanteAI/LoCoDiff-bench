@@ -1105,7 +1105,7 @@ def create_example_section() -> str:
     ascii_diagram = """
    A
    /  \\
-  B     C
+   B    C
    \\  /
    D
     """
