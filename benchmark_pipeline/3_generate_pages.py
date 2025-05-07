@@ -497,34 +497,145 @@ def create_html_footer(include_chart_js: bool = False) -> str:
         </div>
     </footer>
     
-    <!-- Simple, native scroll behavior using CSS and minimal JS -->
-    <style>
-        /* Add smooth scrolling behavior to the entire page */
-        html {
-            scroll-behavior: smooth;
+    <!-- Navigation and Scroll Script -->
+    <script>
+        // Global variables
+        let sectionPositions = [];
+        let targetScrollY = 0;
+        let scrollInterval = null;
+        
+        // Builds a map of all section positions
+        function mapSectionPositions() {
+            sectionPositions = [];
+            document.querySelectorAll('section[id]').forEach(section => {
+                const rect = section.getBoundingClientRect();
+                const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+                sectionPositions.push({
+                    id: section.id,
+                    top: rect.top + scrollTop - 30 // 30px offset for better viewing (e.g. under a fixed header)
+                });
+            });
         }
         
-        /* Add top margin to sections to account for headers or navigation */
-        section[id] {
-            scroll-margin-top: 30px;
-        }
-    </style>
-    <script>
-        // Simple initialization to handle direct URL navigation with hash
-        document.addEventListener('DOMContentLoaded', function() {
-            // Handle initial hash in URL
-            if (window.location.hash) {
-                // Wait a moment for the page to fully render
-                setTimeout(() => {
-                    const targetId = window.location.hash.substring(1);
-                    const targetElement = document.getElementById(targetId);
-                    
-                    if (targetElement) {
-                        // Use native scrollIntoView - browser handles all layout changes
-                        targetElement.scrollIntoView({behavior: 'smooth', block: 'start'});
-                    }
-                }, 200);
+        // Scrolls to a specific Y position and provides brief stabilization.
+        function forceScrollToY(yPos) {
+            // Cancel any existing interval
+            if (scrollInterval) {
+                clearInterval(scrollInterval);
+                scrollInterval = null;
             }
+            
+            // Perform the initial scroll
+            window.scrollTo(0, yPos);
+            targetScrollY = yPos; // Store the target
+            
+            let attempts = 0;
+            const maxAttempts = 8; // Max stabilization attempts (e.g., 8 * 50ms = 400ms)
+            const stabilizationIntervalMs = 50; // Interval period in milliseconds
+
+            scrollInterval = setInterval(() => {
+                const currentY = window.pageYOffset || document.documentElement.scrollTop;
+                attempts++;
+
+                // Condition 1: Max attempts reached or scroll is stable at/near target
+                if (attempts > maxAttempts || Math.abs(currentY - targetScrollY) < 3) { // 3px tolerance for stability
+                    clearInterval(scrollInterval);
+                    scrollInterval = null;
+                    return;
+                }
+                
+                // Condition 2: User has scrolled significantly away from the target (likely intentional)
+                if (Math.abs(currentY - targetScrollY) > 50) { // 50px threshold for user override
+                    clearInterval(scrollInterval);
+                    scrollInterval = null;
+                    return;
+                }
+                
+                // Condition 3: If not stable and user hasn't intervened, re-apply scroll to target.
+                // This handles minor drifts or layout settlements immediately after the initial scroll.
+                if (Math.abs(currentY - targetScrollY) > 2) { // Only scroll if further than 2px from target
+                    window.scrollTo(0, targetScrollY);
+                }
+
+            }, stabilizationIntervalMs);
+        }
+        
+        // Handle clicks on TOC links
+        function setupTOCLinks() {
+            const tocLinks = document.querySelectorAll('.toc a');
+            
+            tocLinks.forEach(link => {
+                const targetId = link.getAttribute('href').substring(1);
+                
+                link.addEventListener('click', function(e) {
+                    e.preventDefault();  // Prevent default anchor behavior
+                    e.stopPropagation(); // Stop event from bubbling
+                    
+                    mapSectionPositions(); // Recalculate positions in case of dynamic content
+                    
+                    const targetSection = sectionPositions.find(section => section.id === targetId);
+                    
+                    if (targetSection) {
+                        try {
+                            // Update URL hash without causing a page jump or new history entry
+                            history.replaceState(null, '', "#" + targetId);
+                        } catch (err) {
+                            console.log("Could not update URL hash:", err);
+                        }
+                        forceScrollToY(targetSection.top); // Perform custom scroll
+                    }
+                    return false; // Redundant due to preventDefault, but harmless
+                });
+            });
+        }
+        
+        // Load-time initialization
+        document.addEventListener('DOMContentLoaded', function() {
+            mapSectionPositions(); // Initial mapping
+            setupTOCLinks();       // Setup click handlers for TOC
+            
+            // Handle initial hash in URL on page load
+            if (window.location.hash) {
+                const targetId = window.location.hash.substring(1);
+                // Ensure positions are mapped before finding target, DOMContentLoaded might be early
+                mapSectionPositions(); 
+                const targetSection = sectionPositions.find(section => section.id === targetId);
+                
+                if (targetSection) {
+                    // Delay slightly to allow the page layout to settle
+                    setTimeout(() => {
+                        forceScrollToY(targetSection.top);
+                    }, 300); 
+                }
+            }
+        });
+        
+        // Re-map positions on window resize and after all content (like images) is loaded
+        window.addEventListener('resize', mapSectionPositions);
+        
+        window.addEventListener('load', function() {
+            mapSectionPositions(); // Final mapping after all resources
+            
+            // Re-check hash navigation on full load, especially if DOMContentLoaded's scroll didn't stick or was premature
+            // Check if a scrollInterval is already active to avoid redundant calls if DOMContentLoaded's timed scroll is still pending/active.
+            if (window.location.hash && !scrollInterval) { 
+                const targetId = window.location.hash.substring(1);
+                const targetSection = sectionPositions.find(section => section.id === targetId);
+                
+                if (targetSection) {
+                    // A shorter delay might be sufficient after full load
+                    setTimeout(() => {
+                        forceScrollToY(targetSection.top);
+                    }, 100);
+                }
+            }
+            
+            // Ensure positions are updated if images load late and shift layout
+            document.querySelectorAll('img').forEach(img => {
+                if (!img.complete) {
+                    img.addEventListener('load', mapSectionPositions);
+                }
+            });
         });
     </script>
     """
@@ -557,7 +668,7 @@ def create_html_footer(include_chart_js: bool = False) -> str:
                     
                     if (line === '') {
                         // Preserve blank lines by using a non-breaking space
-                        highlightedLines.push('<span class="empty-line">&nbsp;</span>');
+                        highlightedLines.push('<span class="empty-line"> </span>');
                     }
                     // Skip highlighting for file path indicators
                     else if (line.startsWith('+++') || line.startsWith('---')) {
