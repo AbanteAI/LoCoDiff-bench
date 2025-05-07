@@ -1,0 +1,383 @@
+```typescript
+import { Atom, Reactor, Signal, atom, computed, reactor, transact } from '@tldraw/state'
+import {
+	WeakCache,
+	assert,
+	filterEntries,
+	getOwnProperty,
+	objectMapEntries,
+	objectMapKeys,
+	objectMapValues,
+	throttleToNextFrame,
+	uniqueId,
+} from '@tldraw/utils'
+import isEqual from 'lodash.isequal'
+import { AtomMap } from './AtomMap'
+import { IdOf, RecordId, UnknownRecord } from './BaseRecord'
+import { RecordScope } from './RecordType'
+import { RecordsDiff, squashRecordDiffs } from './RecordsDiff'
+import { StoreQueries } from './StoreQueries'
+import { SerializedSchema, StoreSchema } from './StoreSchema'
+import { StoreSideEffects } from './StoreSideEffects'
+import { devFreeze } from './devFreeze'
+
+/** @public */
+export type RecordFromId<K extends RecordId<UnknownRecord>> =
+	K extends RecordId<infer R> ? R : never
+
+/**
+ * A diff describing the changes to a collection.
+ *
+ * @public
+ */
+export interface CollectionDiff<T> {
+	added?: Set<T>
+	removed?: Set<T>
+}
+
+/** @public */
+export type ChangeSource = 'user' | 'remote'
+
+/** @public */
+export interface StoreListenerFilters {
+	source: ChangeSource | 'all'
+	scope: RecordScope | 'all'
+}
+
+/**
+ * An entry containing changes that originated either by user actions or remote changes.
+ *
+ * @public
+ */
+export interface HistoryEntry<R extends UnknownRecord = UnknownRecord> {
+	changes: RecordsDiff<R>
+	source: ChangeSource
+}
+
+/**
+ * A function that will be called when the history changes.
+ *
+ * @public
+ */
+export type StoreListener<R extends UnknownRecord> = (entry: HistoryEntry<R>) => void
+
+/**
+ * A record store is a collection of records of different types.
+ *
+ * @public
+ */
+export interface ComputedCache<Data, R extends UnknownRecord> {
+	get(id: IdOf<R>): Data | undefined
+}
+
+/** @public */
+export interface CreateComputedCacheOpts<Data, R extends UnknownRecord> {
+	areRecordsEqual?(a: R, b: R): boolean
+	areResultsEqual?(a: Data, b: Data): boolean
+}
+
+/**
+ * A serialized snapshot of the record store's values.
+ *
+ * @public
+ */
+export type SerializedStore<R extends UnknownRecord> = Record<IdOf<R>, R>
+
+/** @public */
+export interface StoreSnapshot<R extends UnknownRecord> {
+	store: SerializedStore<R>
+	schema: SerializedSchema
+}
+
+/** @public */
+export interface StoreValidator<R extends UnknownRecord> {
+	validate(record: unknown): R
+	validateUsingKnownGoodVersion?(knownGoodVersion: R, record: unknown): R
+}
+
+/** @public */
+export type StoreValidators<R extends UnknownRecord> = {
+	[K in R['typeName']]: StoreValidator<Extract<R, { typeName: K }>>
+}
+
+/** @public */
+export interface StoreError {
+	error: Error
+	phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests'
+	recordBefore?: unknown
+	recordAfter: unknown
+	isExistingValidationIssue: boolean
+}
+
+/** @internal */
+export type StoreRecord<S extends Store<any>> = S extends Store<infer R> ? R : never
+
+/**
+ * A store of records.
+ *
+ * @public
+ */
+export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
+	/**
+	 * The random id of the store.
+	 */
+	public readonly id: string
+	/**
+	 * An AtomMap containing the stores records.
+	 *
+	 * @internal
+	 * @readonly
+	 */
+	private readonly records: AtomMap<IdOf<R>, R>
+
+	/**
+	 * An atom containing the store's history.
+	 *
+	 * @public
+	 * @readonly
+	 */
+	readonly history: Atom<number, RecordsDiff<R>> = atom('history', 0, {
+		historyLength: 1000,
+	})
+
+	/**
+	 * A StoreQueries instance for this store.
+	 *
+	 * @public
+	 * @readonly
+	 */
+	readonly query: StoreQueries<R>
+
+	/**
+	 * A set containing listeners that have been added to this store.
+	 *
+	 * @internal
+	 */
+	private listeners = new Set<{ onHistory: StoreListener<R>; filters: StoreListenerFilters }>()
+
+	/**
+	 * An array of history entries that have not yet been flushed.
+	 *
+	 * @internal
+	 */
+	private historyAccumulator = new HistoryAccumulator<R>()
+
+	/**
+	 * A reactor that responds to changes to the history by squashing the accumulated history and
+	 * notifying listeners of the changes.
+	 *
+	 * @internal
+	 */
+	private historyReactor: Reactor
+
+	/**
+	 * Function to dispose of any in-flight timeouts.
+	 *
+	 * @internal
+	 */
+	private cancelHistoryReactor(): void {
+		/* noop */
+	}
+
+	readonly schema: StoreSchema<R, Props>
+
+	readonly props: Props
+
+	public readonly scopedTypes: { readonly [K in RecordScope]: ReadonlySet<R['typeName']> }
+
+	public readonly sideEffects = new StoreSideEffects<R>(this)
+
+	constructor(config: {
+		id?: string
+		/** The store's initial data. */
+		initialData?: SerializedStore<R>
+		/**
+		 * A map of validators for each record type. A record's validator will be called when the record
+		 * is created or updated. It should throw an error if the record is invalid.
+		 */
+		schema: StoreSchema<R, Props>
+		props: Props
+	}) {
+		const { initialData, schema, id } = config
+
+		this.id = id ?? uniqueId()
+		this.schema = schema
+		this.props = config.props
+
+		if (initialData) {
+			this.records = new AtomMap(
+				'store',
+				objectMapEntries(initialData).map(([id, record]) => [
+					id,
+					devFreeze(this.schema.validateRecord(this, record, 'initialize', null)),
+				])
+			)
+		} else {
+			this.records = new AtomMap('store')
+		}
+
+		this.query = new StoreQueries<R>(this.records, this.history)
+
+		this.historyReactor = reactor(
+			'Store.historyReactor',
+			() => {
+				// deref to make sure we're subscribed regardless of whether we need to propagate
+				this.history.get()
+				// If we have accumulated history, flush it and update listeners
+				this._flushHistory()
+			},
+			{ scheduleEffect: (cb) => (this.cancelHistoryReactor = throttleToNextFrame(cb)) }
+		)
+		this.scopedTypes = {
+			document: new Set(
+				objectMapValues(this.schema.types)
+					.filter((t) => t.scope === 'document')
+					.map((t) => t.typeName)
+			),
+			session: new Set(
+				objectMapValues(this.schema.types)
+					.filter((t) => t.scope === 'session')
+					.map((t) => t.typeName)
+			),
+			presence: new Set(
+				objectMapValues(this.schema.types)
+					.filter((t) => t.scope === 'presence')
+					.map((t) => t.typeName)
+			),
+		}
+	}
+
+	public _flushHistory() {
+		// If we have accumulated history, flush it and update listeners
+		if (this.historyAccumulator.hasChanges()) {
+			const entries = this.historyAccumulator.flush()
+			for (const { changes, source } of entries) {
+				let instanceChanges = null as null | RecordsDiff<R>
+				let documentChanges = null as null | RecordsDiff<R>
+				let presenceChanges = null as null | RecordsDiff<R>
+				for (const { onHistory, filters } of this.listeners) {
+					if (filters.source !== 'all' && filters.source !== source) {
+						continue
+					}
+					if (filters.scope !== 'all') {
+						if (filters.scope === 'document') {
+							documentChanges ??= this.filterChangesByScope(changes, 'document')
+							if (!documentChanges) continue
+							onHistory({ changes: documentChanges, source })
+						} else if (filters.scope === 'session') {
+							instanceChanges ??= this.filterChangesByScope(changes, 'session')
+							if (!instanceChanges) continue
+							onHistory({ changes: instanceChanges, source })
+						} else {
+							presenceChanges ??= this.filterChangesByScope(changes, 'presence')
+							if (!presenceChanges) continue
+							onHistory({ changes: presenceChanges, source })
+						}
+					} else {
+						onHistory({ changes, source })
+					}
+				}
+			}
+		}
+	}
+
+	dispose() {
+		this.cancelHistoryReactor()
+	}
+
+	/**
+	 * Filters out non-document changes from a diff. Returns null if there are no changes left.
+	 * @param change - the records diff
+	 * @param scope - the records scope
+	 * @returns
+	 */
+	filterChangesByScope(change: RecordsDiff<R>, scope: RecordScope) {
+		const result = {
+			added: filterEntries(change.added, (_, r) => this.scopedTypes[scope].has(r.typeName)),
+			updated: filterEntries(change.updated, (_, r) => this.scopedTypes[scope].has(r[1].typeName)),
+			removed: filterEntries(change.removed, (_, r) => this.scopedTypes[scope].has(r.typeName)),
+		}
+		if (
+			Object.keys(result.added).length === 0 &&
+			Object.keys(result.updated).length === 0 &&
+			Object.keys(result.removed).length === 0
+		) {
+			return null
+		}
+		return result
+	}
+
+	/**
+	 * Update the history with a diff of changes.
+	 *
+	 * @param changes - The changes to add to the history.
+	 */
+	private updateHistory(changes: RecordsDiff<R>): void {
+		this.historyAccumulator.add({
+			changes,
+			source: this.isMergingRemoteChanges ? 'remote' : 'user',
+		})
+		if (this.listeners.size === 0) {
+			this.historyAccumulator.clear()
+		}
+		this.history.set(this.history.get() + 1, changes)
+	}
+
+	validate(phase: 'initialize' | 'createRecord' | 'updateRecord' | 'tests') {
+		this.allRecords().forEach((record) => this.schema.validateRecord(this, record, phase, null))
+	}
+
+	/**
+	 * Add some records to the store. It's an error if they already exist.
+	 *
+	 * @param records - The records to add.
+	 * @param phaseOverride - The phase override.
+	 * @public
+	 */
+	put(records: R[], phaseOverride?: 'initialize'): void {
+		this.atomic(() => {
+			const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {}
+			const additions: Record<IdOf<UnknownRecord>, R> = {}
+
+			// Iterate through all records, creating, updating or removing as needed
+			let record: R
+
+			// There's a chance that, despite having records, all of the values are
+			// identical to what they were before; and so we'd end up with an "empty"
+			// history entry. Let's keep track of whether we've actually made any
+			// changes (e.g. additions, deletions, or updates that produce a new value).
+			let didChange = false
+
+			const source = this.isMergingRemoteChanges ? 'remote' : 'user'
+
+			for (let i = 0, n = records.length; i < n; i++) {
+				record = records[i]
+
+				const initialValue = this.records.__unsafe__getWithoutCapture(record.id)
+				// If we already have an atom for this record, update its value.
+				if (initialValue) {
+					// If we have a beforeUpdate callback, run it against the initial and next records
+					record = this.sideEffects.handleBeforeChange(initialValue, record, source)
+
+					// Validate the record
+					const validated = this.schema.validateRecord(
+						this,
+						record,
+						phaseOverride ?? 'updateRecord',
+						initialValue
+					)
+
+					if (validated === initialValue) continue
+
+					record = devFreeze(record)
+					this.records.set(record.id, record)
+
+					didChange = true
+					updates[record.id] = [initialValue, record]
+					this.addDiffForAfterEvent(initialValue, record)
+				} else {
+					record = this.sideEffects.handleBeforeCreate(record, source)
+
+					didChange = true
+
+					// If
