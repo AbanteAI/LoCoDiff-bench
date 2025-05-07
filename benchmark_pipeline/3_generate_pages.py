@@ -497,151 +497,34 @@ def create_html_footer(include_chart_js: bool = False) -> str:
         </div>
     </footer>
     
-    <!-- Complete overhaul of navigation - no anchor links -->
+    <!-- Simple, native scroll behavior using CSS and minimal JS -->
+    <style>
+        /* Add smooth scrolling behavior to the entire page */
+        html {
+            scroll-behavior: smooth;
+        }
+        
+        /* Add top margin to sections to account for headers or navigation */
+        section[id] {
+            scroll-margin-top: 30px;
+        }
+    </style>
     <script>
-        // Global variable to store sections and their positions
-        let sectionPositions = [];
-        let isScrolling = false;
-        let targetScrollY = 0;
-        let scrollInterval = null;
-        let lastScrollTime = 0;
-        
-        // This function builds a map of all section positions
-        function mapSectionPositions() {
-            sectionPositions = [];
-            document.querySelectorAll('section[id]').forEach(section => {
-                const rect = section.getBoundingClientRect();
-                const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-                sectionPositions.push({
-                    id: section.id,
-                    top: rect.top + scrollTop - 30 // Offset for better viewing
-                });
-            });
-        }
-        
-        // Force scroll to a specific Y position and keep it there
-        function forceScrollToY(yPos) {
-            // Cancel any existing interval
-            if (scrollInterval) {
-                clearInterval(scrollInterval);
-            }
-            
-            // Set up initial scroll
-            window.scrollTo(0, yPos);
-            targetScrollY = yPos;
-            isScrolling = true;
-            lastScrollTime = Date.now();
-            
-            // Set up interval to maintain position
-            scrollInterval = setInterval(() => {
-                const currentY = window.pageYOffset || document.documentElement.scrollTop;
-                const now = Date.now();
-                
-                // If we've been scrolling for more than 2 seconds, stop forcing
-                if (now - lastScrollTime > 2000) {
-                    clearInterval(scrollInterval);
-                    scrollInterval = null;
-                    isScrolling = false;
-                    return;
-                }
-                
-                // If user has scrolled away from target, they probably want to look at something else
-                if (Math.abs(currentY - targetScrollY) > 200) {
-                    clearInterval(scrollInterval);
-                    scrollInterval = null;
-                    isScrolling = false;
-                    return;
-                }
-                
-                // If we're not at the target position, force scroll
-                if (Math.abs(currentY - targetScrollY) > 2) {
-                    window.scrollTo(0, targetScrollY);
-                }
-            }, 50); // Check every 50ms
-        }
-        
-        // Handle clicks on TOC links - completely custom behavior
-        function setupTOCLinks() {
-            const tocLinks = document.querySelectorAll('.toc a');
-            
-            tocLinks.forEach(link => {
-                // Replace href with JavaScript-only action
-                const targetId = link.getAttribute('href').substring(1);
-                
-                // Set up click handler
-                link.addEventListener('click', function(e) {
-                    // Always prevent default browser behavior
-                    e.preventDefault();
-                    e.stopPropagation();
-                    
-                    // Remap positions in case anything changed
-                    mapSectionPositions();
-                    
-                    // Find target section
-                    const targetSection = sectionPositions.find(section => section.id === targetId);
-                    
-                    if (targetSection) {
-                        // Record current section in URL but with minimal side effects
-                        try {
-                            history.replaceState({}, "", "#" + targetId);
-                        } catch (err) {
-                            // Handle potential security errors in some browsers
-                            console.log("Could not update URL:", err);
-                        }
-                        
-                        // Force scroll to position and maintain it
-                        forceScrollToY(targetSection.top);
-                    }
-                    
-                    return false;
-                });
-            });
-        }
-        
-        // Load-time initialization
+        // Simple initialization to handle direct URL navigation with hash
         document.addEventListener('DOMContentLoaded', function() {
-            // Initial section mapping
-            mapSectionPositions();
-            
-            // Set up navigation
-            setupTOCLinks();
-            
             // Handle initial hash in URL
             if (window.location.hash) {
-                const targetId = window.location.hash.substring(1);
-                const targetSection = sectionPositions.find(section => section.id === targetId);
-                
-                if (targetSection) {
-                    // Wait to ensure page is fully rendered
-                    setTimeout(() => {
-                        forceScrollToY(targetSection.top);
-                    }, 300);
-                }
+                // Wait a moment for the page to fully render
+                setTimeout(() => {
+                    const targetId = window.location.hash.substring(1);
+                    const targetElement = document.getElementById(targetId);
+                    
+                    if (targetElement) {
+                        // Use native scrollIntoView - browser handles all layout changes
+                        targetElement.scrollIntoView({behavior: 'smooth', block: 'start'});
+                    }
+                }, 200);
             }
-        });
-        
-        // Re-map on resize and when images load
-        window.addEventListener('resize', mapSectionPositions);
-        window.addEventListener('load', function() {
-            // Final mapping after all resources loaded
-            mapSectionPositions();
-            
-            // Re-check hash navigation
-            if (window.location.hash) {
-                const targetId = window.location.hash.substring(1);
-                const targetSection = sectionPositions.find(section => section.id === targetId);
-                
-                if (targetSection) {
-                    forceScrollToY(targetSection.top);
-                }
-            }
-            
-            // Find and hook image load events
-            document.querySelectorAll('img').forEach(img => {
-                if (!img.complete) {
-                    img.addEventListener('load', mapSectionPositions);
-                }
-            });
         });
     </script>
     """
