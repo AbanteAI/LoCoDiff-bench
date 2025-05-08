@@ -1297,7 +1297,7 @@ def create_example_section() -> str:
             </p>
         </div>
         
-        <div class="blog-info">
+        <div class="blog-info" style="margin-top: 30px;">
             <h3 style="text-align: left;">Blog</h3>
             <p>
                 Further details and thinking about the benchmark are available at our blog post: 
