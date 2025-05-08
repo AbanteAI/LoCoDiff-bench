@@ -34,11 +34,3 @@ python benchmark_pipeline/2_run_benchmark.py --concurrency CONCURRENCY --num-run
 You'll need an OpenRouter API key set as `OPENROUTER_API_KEY` in your environment.
 
 Rerunning the command will retry any benchmark cases that hit API errors or haven't been run yet.
-
-## Step 3: Generate Visualization Pages (Internal Use)
-
-```bash
-python benchmark_pipeline/3_generate_pages.py --benchmark-run-dir BENCHMARK_DIR
-```
-
-This script creates/updates files in the `docs/` directory with visualizations and statistics for all the models that have been benchmarked. This step is mainly for internal use or when contributing results back to the main repository.
