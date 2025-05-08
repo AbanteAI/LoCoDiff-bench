@@ -440,15 +440,15 @@ def create_locodiff_summary() -> str:
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <h2>What is LoCoDiff?</h2>
         <p style="margin-bottom: 20px;">
-            LoCoDiff is a benchmark for evaluating large language models on their ability to understand
-            long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
-            code by understanding git history, including complex merge conflicts and development patterns.
+            LoCoDiff is a long-context code benchmark that has many advantages over other long context benchmarks:
         </p>
-        <p style="margin-bottom: 20px;">
-            Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
-            LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
-            and asking it to reproduce the final state of a file.
-        </p>
+        <ul style="margin-bottom: 20px; margin-left: 20px;">
+            <li>Tests comprehension of naturally interconnected content (not artificially generated or padded content)</li>
+            <li>Benchmark cases can be generated from any repo</li>
+            <li>Prompt generation and output evaluation are simple and easy to understand</li>
+            <li>Also strains models' abilities to output long outputs</li>
+            <li>Surprisingly difficult for reasoning models to reason about</li>
+        </ul>
         <p style="margin-bottom: 20px;">
             100% of the code for the LoCoDiff was written by 
             <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
