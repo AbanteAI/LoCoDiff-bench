@@ -437,27 +437,24 @@ def create_locodiff_summary() -> str:
         HTML string for the summary section
     """
     return """
-    <section id="locodiff-summary">
+    <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <h2>What is LoCoDiff?</h2>
-        <div class="locodiff-description">
-            <p>
-                LoCoDiff is a benchmark for evaluating large language models on their ability to understand
-                long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
-                code by understanding git history, including complex merge conflicts and development patterns.
-            </p>
-            <p>
-                Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
-                LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
-                and asking it to reproduce the final state of a file.
-            </p>
-            <div class="mentat-contribution">
-                <p>
-                    <strong>About this benchmark:</strong> 100% of the code for the LoCoDiff benchmark was written by 
-                    <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
-                    entirely run by the Mentat bot, from data collection to visualization generation.
-                </p>
-            </div>
-        </div>
+        <p style="margin-bottom: 20px;">
+            LoCoDiff is a benchmark for evaluating large language models on their ability to understand
+            long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
+            code by understanding git history, including complex merge conflicts and development patterns.
+        </p>
+        <p style="margin-bottom: 20px;">
+            Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
+            LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
+            and asking it to reproduce the final state of a file.
+        </p>
+        <p style="margin-bottom: 20px;">
+            100% of the code for the LoCoDiff was written by 
+            <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
+            entirely run by Mentat, from data collection to visualization generation. You can examine the agent runs yourself at 
+            <a href="https://mentat.ai/gh/AbanteAI/LoCoDiff-bench/agents">the agent runs page</a>.
+        </p>
     </section>
     """
 
@@ -1191,7 +1188,7 @@ def create_example_section() -> str:
     # Construct the HTML for the example section
     html = (
         """
-    <section id="benchmark-example">
+    <section id="benchmark-example" style="background-color: transparent; border: none; padding: 0;">
         <h2>LoCoDiff Methodology: A Toy Example</h2>
         
         <p class="intro-text">
