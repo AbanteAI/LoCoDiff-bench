@@ -1226,6 +1226,11 @@ D
     <section id="benchmark-example" style="background-color: transparent; border: none; padding: 0;">
         <h2>Methodology</h2>
         
+        <p style="margin-bottom: 15px;">
+            The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
+            From this information the model is asked to reconstruct the exact final state of the file.
+        </p>
+        
         <div class="example-timeline">
             <h3 style="text-align: left;">Toy Shopping List Example</h3>
             <div class="branch-structure-container">
@@ -1240,10 +1245,6 @@ D
                         Commit B: Changes "apples" to "oranges", and adds new item at the end<br>
                         Commit C: On a separate branch from B, changes "apples" to "bananas"<br>
                         Commit D: Merges B and C branches, resolving conflict by keeping both "oranges" and "bananas"
-                    </p>
-                    <p class="model-task">
-                        The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
-                        From this information the model is asked to reconstruct the exact final state of the file.
                     </p>
                 </div>
             </div>
