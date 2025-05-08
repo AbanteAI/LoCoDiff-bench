@@ -1164,7 +1164,7 @@ def create_token_chart_section() -> str:
                 <h3 style="font-size: 1em; margin: 5px 0;">Bucketing Options</h3>
                 <div class="bucket-count-control" style="margin: 5px 0;">
                     <label for="bucket-count" style="font-size: 0.9em;">Number of Buckets: <span id="bucket-count-display">4</span></label>
-                    <input type="range" id="bucket-count" min="1" max="20" value="4" step="1" style="width: 100%;">
+                    <input type="range" id="bucket-count" min="1" max="10" value="4" step="1" style="width: 100%;">
                 </div>
             </div>
             <div class="display-options">
