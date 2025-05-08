@@ -228,17 +228,21 @@ def find_top_performers(values: List[Tuple[int, float]]) -> Dict[int, str]:
 
 def format_cell_with_rank(content: str, rank_class: Optional[str] = None) -> str:
     """
-    Formats a table cell with appropriate ranking class if provided.
+    Formats a table cell with medal emoji if ranked.
 
     Args:
         content: The cell content
         rank_class: Optional rank class ('gold', 'silver', 'bronze')
 
     Returns:
-        HTML string for the formatted cell
+        HTML string for the formatted cell with medal emoji for top performers
     """
     if rank_class:
-        return f'<td class="{rank_class}">{content}</td>'
+        medal_emoji = {"gold": "🥇 ", "silver": "🥈 ", "bronze": "🥉 "}.get(
+            rank_class, ""
+        )
+
+        return f"<td>{medal_emoji}{content}</td>"
     else:
         return f"<td>{content}</td>"
 
@@ -3082,24 +3086,7 @@ def create_css_file() -> str:
     color: #24292e;
 }
 
-/* Ranking styles for top performers */
-td.gold {
-    border: 3px solid #ffd700; /* Gold color */
-    background-color: rgba(255, 215, 0, 0.1); /* Light gold background */
-    font-weight: bold;
-}
-
-td.silver {
-    border: 3px solid #c0c0c0; /* Silver color */
-    background-color: rgba(192, 192, 192, 0.1); /* Light silver background */
-    font-weight: bold;
-}
-
-td.bronze {
-    border: 3px solid #cd7f32; /* Bronze color */
-    background-color: rgba(205, 127, 50, 0.1); /* Light bronze background */
-    font-weight: bold;
-}
+/* Ranking styles for top performers - Removed borders in favor of medal emojis */
 
 /* Basic Reset */
 * {
