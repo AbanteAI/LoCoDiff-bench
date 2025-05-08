@@ -439,10 +439,10 @@ def create_locodiff_summary() -> str:
     return """
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <h2>What is LoCoDiff?</h2>
-        <p style="margin-bottom: 20px;">
+        <p style="margin-bottom: 10px;">
             LoCoDiff is a novel long-context benchmark with several unique strengths:
         </p>
-        <ul style="margin-bottom: 20px; margin-left: 20px;">
+        <ul style="margin-top: 0; margin-bottom: 20px; margin-left: 20px;">
             <li>Tests comprehension of naturally interconnected content (not artificially generated or padded content)</li>
             <li>Focused on code, can be constructed for any repo and language</li>
             <li>Prompt generation and output evaluation are simple and easy to understand</li>
@@ -1104,7 +1104,7 @@ def create_token_chart_section() -> str:
     """Creates an HTML section for the token-based chart."""
     return """
     <section id="token-chart">
-        <h2>Interactive Chart</h2>
+        <h2>Interactive Results</h2>
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
@@ -1189,12 +1189,7 @@ def create_example_section() -> str:
     html = (
         """
     <section id="benchmark-example" style="background-color: transparent; border: none; padding: 0;">
-        <h2>LoCoDiff Methodology: A Toy Example</h2>
-        
-        <p class="intro-text">
-            LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
-            including how merge conflicts were resolved. Here's a simple example:
-        </p>
+        <h2>Methodology</h2>
         
         <div class="example-timeline">
             <h3>Shopping List Example</h3>
@@ -1340,9 +1335,45 @@ function initializeChart(chartData) {
         console.warn('Bucket count slider elements not found. Check that the HTML includes the proper elements.');
     }
     
+    // Create watermark plugin
+    const watermarkPlugin = {
+        id: 'watermark',
+        beforeDraw: (chart) => {
+            const ctx = chart.ctx;
+            const { chartArea: { top, left, right, bottom }, width, height } = chart;
+            
+            // Create an image object
+            const image = new Image();
+            image.src = 'assets/images/mentat-logo-transparent.png';
+            
+            // Only draw the image once it's loaded
+            if (image.complete) {
+                const logoWidth = width * 0.3;  // Use 30% of chart width
+                const logoHeight = logoWidth * (image.height / image.width);
+                
+                // Position the image in the center of the chart
+                const x = (left + right) / 2 - logoWidth / 2;
+                const y = (top + bottom) / 2 - logoHeight / 2;
+                
+                // Set transparency
+                ctx.globalAlpha = 0.1;
+                
+                // Draw image
+                ctx.drawImage(image, x, y, logoWidth, logoHeight);
+                
+                // Reset transparency
+                ctx.globalAlpha = 1.0;
+            } else {
+                // Set up image.onload if the image isn't loaded yet
+                image.onload = () => chart.draw();
+            }
+        }
+    };
+    
     // Create chart
     const chart = new Chart(ctx, {
         type: 'line',
+        plugins: [watermarkPlugin],  // Register the watermark plugin
         data: {
             datasets: []
         },
@@ -1377,6 +1408,9 @@ function initializeChart(chartData) {
                 }
             },
             plugins: {
+                watermark: {
+                    // Empty object enables the plugin
+                },
                 title: {
                     display: true,
                     text: 'LoCoDiff: Natural Long Context Code Bench',
