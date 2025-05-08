@@ -464,6 +464,7 @@ def create_locodiff_summary() -> str:
         </p>
         <ul style="margin-top: 0; margin-bottom: 20px; margin-left: 20px;">
             <li>Utilizes <strong>naturally interconnected content</strong>, not artificially generated or padded context</li>
+            <li><strong>No junk context</strong>: every part of the context is required for the task</li>
             <li><strong>Tests a real skill critical for coding agents</strong>: keeping track of the state of edited files</li>
             <li>Prompt generation and output evaluation are <strong>simple and easy to understand</strong></li>
             <li>Also strains models' abilities to handle long outputs</li>
