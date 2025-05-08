@@ -2550,11 +2550,27 @@ def generate_cases_overview_page(
                     checkbox.checked = false;
                 });
                     
-                // Check boxes for saved models
+                // Check boxes for saved models if any exist
                 if (savedModels.length > 0) {
                     savedModels.forEach(modelId => {
                         const checkbox = document.querySelector(`input[data-model="${modelId}"]`);
                         if (checkbox) checkbox.checked = true;
+                    });
+                } else {
+                    // For first-time visitors, check these three models by default
+                    const defaultModels = [
+                        "anthropic_claude-3.7-sonnetthinking",
+                        "google_gemini-2.5-pro-0506",
+                        "x-ai_grok-3-beta"
+                    ];
+                    
+                    defaultModels.forEach(modelId => {
+                        const checkbox = document.querySelector(`input[data-model="${modelId}"]`);
+                        if (checkbox) {
+                            checkbox.checked = true;
+                            // Also update visibility to show these columns
+                            updateVisibility(checkbox);
+                        }
                     });
                 }
                     
