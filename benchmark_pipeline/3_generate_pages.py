@@ -1233,6 +1233,16 @@ D
             The exact command we use to generate the history for each file is: <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">git log -p --cc --reverse --topo-order -- path/to/file</code>. <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">-p</code> and <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">--cc</code> display the diffs for commits and show merge commit diffs with respect to each parent. <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">--reverse</code> and <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">--topo-order</code> make sure the commits are shown from oldest to newest, with parent commits always appearing before children. This is the cleanest, clearest way to present the history to the model.
         </p>
         
+        <p style="margin-bottom: 15px;">
+            The benchmark consists of 200 files, 40 each from 5 repos: 
+            <a href="https://github.com/Aider-AI/aider" target="_blank">Aider <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (python), 
+            <a href="https://github.com/ghostty-org/ghostty" target="_blank">Ghostty <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (Zig), 
+            <a href="https://github.com/tldraw/tldraw" target="_blank">tldraw <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (typescript), 
+            <a href="https://github.com/qdrant/qdrant" target="_blank">Qdrant <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (rust), and 
+            <a href="https://github.com/facebook/react" target="_blank">React <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (javascript). 
+            For each repo, we filtered to files modified in the last 6 months that were no longer than 12k tokens long (in their final state - what the model needs to output). We then sampled, biasing the sampling to target an even distribution of prompt lengths, with a limit of 100k.
+        </p>
+
         <div class="example-timeline">
             <h3 style="text-align: left;">Toy Shopping List Example</h3>
             <div class="branch-structure-container">
@@ -1266,37 +1276,6 @@ D
         + expected_output
         + """</code></pre>
             </div>
-        </div>
-        
-        <div class="repo-selection-info">
-            <h3 style="text-align: left;">Repo and File Selection</h3>
-            <p>
-                LoCoDiff benchmark prompts are generated from actual Git repositories, capturing the organic
-                evolution of code over time. For this benchmark, we used a variety of open-source repositories
-                to ensure diversity in coding styles, complexity, and development patterns.
-            </p>
-            <p>
-                The benchmark supports multiple programming languages with the following file extensions:
-            </p>
-            <ul style="margin-left: 20px; margin-bottom: 15px;">
-                <li><strong>Python</strong>: .py</li>
-                <li><strong>JavaScript</strong>: .js, .jsx</li>
-                <li><strong>TypeScript</strong>: .ts, .tsx</li>
-                <li><strong>Zig</strong>: .zig</li>
-                <li><strong>Rust</strong>: .rs</li>
-            </ul>
-            <p>
-                When generating benchmark prompts, files are filtered based on:
-            </p>
-            <ul style="margin-left: 20px; margin-bottom: 15px;">
-                <li>Modification date (defaults to files modified within the last 6 months)</li>
-                <li>Prompt token count (to ensure a distribution across different context lengths)</li>
-                <li>Expected output token count (typically capped at 12,000 tokens)</li>
-            </ul>
-            <p>
-                This selective process ensures that the benchmark cases are representative of real-world
-                coding scenarios while providing a controlled testing environment across a range of context lengths.
-            </p>
         </div>
         
     </section>
