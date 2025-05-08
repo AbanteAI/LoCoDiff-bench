@@ -492,7 +492,7 @@ def create_html_header() -> str:
 <body>
     <header>
         <h1>LoCoDiff Benchmark</h1>
-        <p style="margin-top: 0; font-size: 0.9em; color: #666;">May 8th, <a href="https://mentat.ai" target="_blank">Mentat AI Team</a></p>
+        <p style="margin-top: 0; font-size: 0.9em; color: #666;"><a href="https://mentat.ai" target="_blank">Mentat AI Team</a> - May 8th 2025</p>
     </header>
     <main>
 """
@@ -1236,11 +1236,11 @@ D
         
         <p style="margin-bottom: 15px;">
             The benchmark consists of 200 files, 40 each from 5 repos: 
-            <a href="https://github.com/Aider-AI/aider" target="_blank">Aider <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (python), 
-            <a href="https://github.com/ghostty-org/ghostty" target="_blank">Ghostty <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (Zig), 
-            <a href="https://github.com/tldraw/tldraw" target="_blank">tldraw <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (typescript), 
-            <a href="https://github.com/qdrant/qdrant" target="_blank">Qdrant <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (rust), and 
-            <a href="https://github.com/facebook/react" target="_blank">React <img src="assets/images/github-logo.png" alt="GitHub" class="github-icon" style="height: 14px; vertical-align: middle; margin-left: 2px;"></a> (javascript). 
+            <a href="https://github.com/Aider-AI/aider" target="_blank">Aider</a> (Python), 
+            <a href="https://github.com/ghostty-org/ghostty" target="_blank">Ghostty</a> (Zig), 
+            <a href="https://github.com/tldraw/tldraw" target="_blank">tldraw</a> (TypeScript), 
+            <a href="https://github.com/qdrant/qdrant" target="_blank">Qdrant</a> (Rust), and 
+            <a href="https://github.com/facebook/react" target="_blank">React</a> (JavaScript). 
             For each repo, we filtered to files modified in the last 6 months that were no longer than 12k tokens long (in their final state - what the model needs to output). We then sampled, biasing the sampling to target an even distribution of prompt lengths, with a limit of 100k.
         </p>
 
@@ -1357,7 +1357,7 @@ function initializeChart(chartData) {
         "anthropic/claude-3.7-sonnetthinking",
         "deepseek/deepseek-chat-v3-0324",
         "deepseek/deepseek-r1",
-        "google/gemini-2.5-pro-preview",
+        "google/gemini-2.5-pro-0506",
         "openai/gpt-4.1",
         "openai/o3",
         "x-ai/grok-3-beta"
@@ -1437,10 +1437,10 @@ function initializeChart(chartData) {
                 const logoWidth = width * 0.15;  // Reduced from 30% to 15% of chart width
                 const logoHeight = logoWidth * (image.height / image.width);
                 
-                // Position the image in the top right of the chart with a small margin
+                // Position the image in the top right of the chart with a margin
                 const margin = 20;
                 const x = right - logoWidth - margin;
-                const y = top + margin;
+                const y = top + margin + 40;  // Added 40px to move it down
                 
                 // Set transparency
                 ctx.globalAlpha = 0.15;
