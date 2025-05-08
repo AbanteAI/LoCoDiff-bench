@@ -1721,18 +1721,31 @@ function initializeChart(chartData) {
     
     // Function to update the chart subtitle based on selected languages
     function updateChartSubtitle() {
-        let subtitleText = '';
+        // Get language description
+        let languageText = '';
         
         if (currentSelectedLanguages.length === 0) {
-            subtitleText = 'No languages selected';
+            languageText = 'no languages selected';
         } else if (currentSelectedLanguages.length === chartData.languages.length) {
-            subtitleText = 'All Languages';
+            languageText = 'all languages';
         } else if (currentSelectedLanguages.length <= 3) {
             // Show all selected languages if there are 3 or fewer
-            subtitleText = currentSelectedLanguages.join(', ');
+            languageText = currentSelectedLanguages.join(', ');
         } else {
             // Show count if more than 3 languages selected
-            subtitleText = `${currentSelectedLanguages.length} Languages Selected`;
+            languageText = `${currentSelectedLanguages.length} languages selected`;
+        }
+        
+        // Count filtered cases
+        const filteredCases = getFilteredCases();
+        const caseCount = filteredCases.length;
+        
+        // Create the full subtitle with case count, bucket count, and language info
+        let subtitleText = '';
+        if (caseCount === 0) {
+            subtitleText = `No cases to display (${languageText})`;
+        } else {
+            subtitleText = `${caseCount} cases, divided into ${currentBucketCount} buckets (${languageText})`;
         }
         
         // Update the chart subtitle
