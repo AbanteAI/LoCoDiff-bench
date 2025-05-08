@@ -1227,8 +1227,10 @@ D
         <h2>Methodology</h2>
         
         <p style="margin-bottom: 15px;">
-            The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
-            From this information the model is asked to reconstruct the exact final state of the file.
+            For each benchmark prompt, we show the model the commit history of a particular file, and ask the model to infer the exact current state of that file. This requires the file to track the state of the file as it changes, from the initial commit, diffs along various branches, and merge conflict resolutions.
+        </p>
+        <p style="margin-bottom: 15px;">
+            The exact command we use to generate the history for each file is: `git log -p --cc --reverse --topo-order -- path/to/file`. `-p` and `--cc` display the diffs for commits and show merge commit diffs with respect to each parent. `--reverse` and `--topo-order` make sure the commits are shown from oldest to newest, with parent commits always appearing before children. This is the cleanest, clearest way to present the history to the model.
         </p>
         
         <div class="example-timeline">
