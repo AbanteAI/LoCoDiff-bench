@@ -755,7 +755,7 @@ def create_quartile_stats_table(
     # Create the HTML table
     html = """
     <section id="quartile-stats">
-        <h2>Success Rates by Prompt Size Quartiles</h2>
+        <h2>Results Table</h2>
         <table>
             <thead>
                 <tr>
@@ -764,6 +764,9 @@ def create_quartile_stats_table(
 
     for label in quartile_labels:
         html += f"<th>{label}</th>"
+
+    # Add Total Cost column header
+    html += "<th>Total Cost</th>"
 
     html += """
                 </tr>
@@ -774,13 +777,24 @@ def create_quartile_stats_table(
     # Prepare model data rows and collect success rates for each quartile
     model_rows = {}
     quartile_success_rates = {i: [] for i in range(4)}  # For each quartile
+    model_total_costs = {}  # To track total cost for each model
+
+    # Calculate total cost for each model
+    for (case_prefix, model), result_metadata in results_metadata.items():
+        if model not in model_total_costs:
+            model_total_costs[model] = 0.0
+
+        cost = result_metadata.get("cost_usd", 0.0)
+        if cost is not None:
+            model_total_costs[model] += float(cost)
 
     for idx, model in enumerate(sorted(all_models)):
         display_name = model_display_names.get(model, model)
         quartile_stats = model_quartile_stats.get(model, {})
+        total_cost = model_total_costs.get(model, 0.0)
 
         # Store model data for later use
-        model_rows[idx] = (model, display_name, quartile_stats)
+        model_rows[idx] = (model, display_name, quartile_stats, total_cost)
 
         # Collect success rates for each quartile
         for q in range(4):
@@ -795,7 +809,7 @@ def create_quartile_stats_table(
         top_performers[q] = find_top_performers(quartile_success_rates[q])
 
     # Generate HTML rows with rankings for each quartile
-    for idx, (model, display_name, quartile_stats) in model_rows.items():
+    for idx, (model, display_name, quartile_stats, total_cost) in model_rows.items():
         html += f"<tr><td>{display_name}</td>"
 
         for q in range(4):
@@ -809,6 +823,9 @@ def create_quartile_stats_table(
             # Format cell content
             cell_content = f"{success_rate:.2f}% ({stats['successful']}/{attempts})"
             html += format_cell_with_rank(cell_content, rank_class)
+
+        # Add total cost column
+        html += f"<td>${total_cost:.2f}</td>"
 
         html += "</tr>"
 
@@ -1379,18 +1396,26 @@ function initializeChart(chartData) {
             
             // Only draw the image once it's loaded
             if (image.complete) {
-                const logoWidth = width * 0.3;  // Use 30% of chart width
+                const logoWidth = width * 0.15;  // Reduced from 30% to 15% of chart width
                 const logoHeight = logoWidth * (image.height / image.width);
                 
-                // Position the image in the center of the chart
-                const x = (left + right) / 2 - logoWidth / 2;
-                const y = (top + bottom) / 2 - logoHeight / 2;
+                // Position the image in the top right of the chart with a small margin
+                const margin = 20;
+                const x = right - logoWidth - margin;
+                const y = top + margin;
                 
                 // Set transparency
-                ctx.globalAlpha = 0.1;
+                ctx.globalAlpha = 0.15;
                 
                 // Draw image
                 ctx.drawImage(image, x, y, logoWidth, logoHeight);
+                
+                // Add "mentat.ai" text below the logo
+                ctx.globalAlpha = 0.8;  // More visible text
+                ctx.font = 'bold 16px Arial';
+                ctx.fillStyle = '#666';
+                ctx.textAlign = 'center';
+                ctx.fillText('mentat.ai', x + logoWidth/2, y + logoHeight + 18);
                 
                 // Reset transparency
                 ctx.globalAlpha = 1.0;
@@ -3787,9 +3812,6 @@ def main():
     html_content += create_locodiff_summary()  # Add summary section first
     html_content += create_token_chart_section()
     html_content += create_example_section()
-    html_content += create_overall_stats_table(
-        results_metadata, all_models, num_cases, model_display_names
-    )
     html_content += create_quartile_stats_table(
         results_metadata, prompt_metadata, all_models, model_display_names
     )
