@@ -1430,7 +1430,7 @@ function initializeChart(chartData) {
                 ctx.font = 'bold 16px Arial';
                 ctx.fillStyle = '#666';
                 ctx.textAlign = 'center';
-                ctx.fillText('mentat.ai', x + logoWidth/2, y + 5);
+                ctx.fillText('mentat.ai', x + logoWidth/2, y + 12);
                 
                 // Draw image
                 ctx.globalAlpha = 0.15;  // Reset to logo transparency
