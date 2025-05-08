@@ -1,6 +1,6 @@
 # LoCoDiff: Natural Long Context Code Bench
 
-LoCoDiff is a novel long-context benchmark for evaluating language models' ability to understand git history and reconstruct code. Developed by the [Mentat AI](https://mentat.ai) team, this benchmark offers several unique strengths:
+LoCoDiff is a novel **lo**ng-**co**ntext benchmark for evaluating language models' ability to understand git history and reconstruct code. Developed by the [Mentat AI](https://mentat.ai) team, this benchmark offers several unique strengths:
 
 - Utilizes **naturally interconnected content**, not artificially generated or padded context
 - **No junk context**: every part of the context is required for the task
