@@ -1172,7 +1172,7 @@ def create_token_chart_section() -> str:
                 <div class="checkbox-item" style="margin: 3px 0;">
                     <label style="font-size: 0.9em;">
                         <input type="checkbox" id="show-confidence-intervals">
-                        Show 95% Confidence Intervals
+                        95% Wilson Score Intervals
                     </label>
                 </div>
             </div>
