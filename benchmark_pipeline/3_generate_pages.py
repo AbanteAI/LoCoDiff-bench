@@ -228,17 +228,21 @@ def find_top_performers(values: List[Tuple[int, float]]) -> Dict[int, str]:
 
 def format_cell_with_rank(content: str, rank_class: Optional[str] = None) -> str:
     """
-    Formats a table cell with appropriate ranking class if provided.
+    Formats a table cell with medal emoji and border styling if ranked.
 
     Args:
         content: The cell content
         rank_class: Optional rank class ('gold', 'silver', 'bronze')
 
     Returns:
-        HTML string for the formatted cell
+        HTML string for the formatted cell with medal emoji and border styling for top performers
     """
     if rank_class:
-        return f'<td class="{rank_class}">{content}</td>'
+        medal_emoji = {"gold": "🥇 ", "silver": "🥈 ", "bronze": "🥉 "}.get(
+            rank_class, ""
+        )
+
+        return f'<td class="{rank_class}">{medal_emoji}{content}</td>'
     else:
         return f"<td>{content}</td>"
 
@@ -459,11 +463,11 @@ def create_locodiff_summary() -> str:
             LoCoDiff is a novel long-context benchmark with several unique strengths:
         </p>
         <ul style="margin-top: 0; margin-bottom: 20px; margin-left: 20px;">
-            <li>Tests comprehension of naturally interconnected content (not artificially generated or padded content)</li>
+            <li>Tests comprehension of <strong>naturally interconnected content</strong> (not artificially generated or padded content)</li>
             <li>Focused on code, can be constructed for any repo and language</li>
-            <li>Prompt generation and output evaluation are simple and easy to understand</li>
+            <li>Prompt generation and output evaluation are <strong>simple and easy to understand</strong></li>
             <li>Also strains models' abilities to output long outputs</li>
-            <li>Surprisingly difficult for reasoning models to reason about</li>
+            <li>Surprisingly <strong>difficult for reasoning models</strong> to reason about</li>
         </ul>
         <p style="margin-bottom: 20px;">
             100% of the code for the LoCoDiff was written by 
@@ -492,6 +496,7 @@ def create_html_header() -> str:
 <body>
     <header>
         <h1>LoCoDiff Benchmark</h1>
+        <p style="margin-top: 0; font-size: 0.9em; color: #666;"><a href="https://mentat.ai" target="_blank">Mentat AI Team</a> - May 8th 2025</p>
     </header>
     <main>
 """
@@ -630,6 +635,7 @@ def create_overall_stats_table(
     html = """
     <section id="overall-stats">
         <h2>Overall Model Performance</h2>
+        <p style="margin-top: 0; margin-bottom: 10px; font-size: 0.9em; color: #666; text-align: center;"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" style="height: 24px; vertical-align: middle; margin-right: 5px;">Mentat.ai LoCoDiff Bench</p>
         <table>
             <thead>
                 <tr>
@@ -774,6 +780,7 @@ def create_quartile_stats_table(
     html = """
     <section id="quartile-stats">
         <h2>Accuracy by Context Length Quartiles</h2>
+        <p style="margin-top: 0; margin-bottom: 10px; font-size: 0.9em; color: #666; text-align: center;"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" style="height: 24px; vertical-align: middle; margin-right: 5px;">Mentat.ai LoCoDiff Bench</p>
         <table>
             <thead>
                 <tr>
@@ -917,6 +924,7 @@ def create_language_stats_table(
     html = """
     <section id="language-stats">
         <h2>Accuracy by Programming Language</h2>
+        <p style="margin-top: 0; margin-bottom: 10px; font-size: 0.9em; color: #666; text-align: center;"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" style="height: 24px; vertical-align: middle; margin-right: 5px;">Mentat.ai LoCoDiff Bench</p>
         <table>
             <thead>
                 <tr>
@@ -1226,8 +1234,29 @@ D
     <section id="benchmark-example" style="background-color: transparent; border: none; padding: 0;">
         <h2>Methodology</h2>
         
+        <p style="margin-bottom: 15px;">
+            For each benchmark prompt, we show the model the commit history of a particular file, and ask the model to infer the exact current state of that file. This requires the file to track the state of the file as it changes, from the initial commit, diffs along various branches, and merge conflict resolutions.
+        </p>
+        <p style="margin-bottom: 15px;">
+            The exact command we use to generate the history for each file is: <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">git log -p --cc --reverse --topo-order -- path/to/file</code>. <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">-p</code> and <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">--cc</code> display the diffs for commits and show merge commit diffs with respect to each parent. <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">--reverse</code> and <code style="background-color: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-family: monospace;">--topo-order</code> make sure the commits are shown from oldest to newest, with parent commits always appearing before children. This is the cleanest, clearest way to present the history to the model.
+        </p>
+        
+        <p style="margin-bottom: 15px;">
+            The benchmark consists of 200 files, 40 each from 5 repos: 
+            <a href="https://github.com/Aider-AI/aider" target="_blank">Aider</a> (Python), 
+            <a href="https://github.com/ghostty-org/ghostty" target="_blank">Ghostty</a> (Zig), 
+            <a href="https://github.com/tldraw/tldraw" target="_blank">tldraw</a> (TypeScript), 
+            <a href="https://github.com/qdrant/qdrant" target="_blank">Qdrant</a> (Rust), and 
+            <a href="https://github.com/facebook/react" target="_blank">React</a> (JavaScript). 
+            For each repo, we filtered to files modified in the last 6 months that were no longer than 12k tokens long (in their final state - what the model needs to output). We then sampled, biasing the sampling to target an even distribution of prompt lengths, with a limit of 100k.
+        </p>
+
+        <p style="margin-bottom: 15px;">
+            All case prompts, expected outputs, and model answers can be explored <a href="cases.html">here</a>. To quickly understand what the model sees, here is a minimal example:
+        </p>
+
         <div class="example-timeline">
-            <h3 style="text-align: left;">Toy Shopping List Example</h3>
+            <h3 style="text-align: left;">Toy Example with Shopping List</h3>
             <div class="branch-structure-container">
                 <div class="branch-diagram-box">
                     <pre class="branch-diagram">"""
@@ -1240,10 +1269,6 @@ D
                         Commit B: Changes "apples" to "oranges", and adds new item at the end<br>
                         Commit C: On a separate branch from B, changes "apples" to "bananas"<br>
                         Commit D: Merges B and C branches, resolving conflict by keeping both "oranges" and "bananas"
-                    </p>
-                    <p class="model-task">
-                        The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
-                        From this information the model is asked to reconstruct the exact final state of the file.
                     </p>
                 </div>
             </div>
@@ -1265,37 +1290,6 @@ D
             </div>
         </div>
         
-        <div class="repo-selection-info">
-            <h3 style="text-align: left;">Repo and File Selection</h3>
-            <p>
-                LoCoDiff benchmark prompts are generated from actual Git repositories, capturing the organic
-                evolution of code over time. For this benchmark, we used a variety of open-source repositories
-                to ensure diversity in coding styles, complexity, and development patterns.
-            </p>
-            <p>
-                The benchmark supports multiple programming languages with the following file extensions:
-            </p>
-            <ul style="margin-left: 20px; margin-bottom: 15px;">
-                <li><strong>Python</strong>: .py</li>
-                <li><strong>JavaScript</strong>: .js, .jsx</li>
-                <li><strong>TypeScript</strong>: .ts, .tsx</li>
-                <li><strong>Zig</strong>: .zig</li>
-                <li><strong>Rust</strong>: .rs</li>
-            </ul>
-            <p>
-                When generating benchmark prompts, files are filtered based on:
-            </p>
-            <ul style="margin-left: 20px; margin-bottom: 15px;">
-                <li>Modification date (defaults to files modified within the last 6 months)</li>
-                <li>Prompt token count (to ensure a distribution across different context lengths)</li>
-                <li>Expected output token count (typically capped at 12,000 tokens)</li>
-            </ul>
-            <p>
-                This selective process ensures that the benchmark cases are representative of real-world
-                coding scenarios while providing a controlled testing environment across a range of context lengths.
-            </p>
-        </div>
-        
     </section>
     """
     )
@@ -1307,15 +1301,15 @@ def create_key_takeaways_section() -> str:
     return """
     <section id="key-takeaways">
         <h2>Key Takeaways</h2>
-        <p>
-            Our benchmark revealed several important findings about long-context capabilities in modern LLMs:
+        <p style="margin-bottom: 15px;">
+            <strong>Performance drops rapidly as context increases:</strong> While some models score near 100% for prompts <5k tokens, all drop significantly by 10k. All models drop to under 50% accuracy when prompts are just 25k tokens long. When we originally conceived of this benchmark, we were excited to put the million token long context limits of some models to the test, but it seems they are not yet ready for that.
         </p>
-        <ul style="margin-left: 20px; margin-bottom: 15px;">
-            <li>Claude 3.7 Sonnet with thinking mode outperforms other models, especially on longer contexts</li>
-            <li>Reasoning models generally struggle with this task, despite their capabilities in other domains</li>
-            <li>Performance decreases as context length increases, but the slope varies significantly between models</li>
-            <li>Success rates differ by programming language, with most models performing better on Python</li>
-        </ul>
+        <p style="margin-bottom: 15px;">
+            <strong>Claude 3.7 Sonnet Thinking is the clear SOTA:</strong> It's the best for all context lengths and languages.
+        </p>
+        <p style="margin-bottom: 15px;">
+            <strong>Reasoning models, except for Sonnet do WORSE than their non-reasoning counterparts:</strong> DeepSeek's Chat v3 beats R1, Gemini 2.5 Flash Non-thinking beats Gemini 2.5 Flash Thinking, and GPT-4.1 beats o3 and o4-mini. The only except to this trend is Sonnet 3.7 Thinking, which beats Sonnet 3.7 Non-thinking. It's unclear how reasoning models should best use their tokens to solve this task, but somehow Sonnet 3.7 uses them well.
+        </p>
         <p>
             For further details and in-depth analysis of these findings, see our 
             <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">blog post on LoCoDiff</a>.
@@ -1374,7 +1368,7 @@ function initializeChart(chartData) {
         "anthropic/claude-3.7-sonnetthinking",
         "deepseek/deepseek-chat-v3-0324",
         "deepseek/deepseek-r1",
-        "google/gemini-2.5-pro-preview",
+        "google/gemini-2.5-pro-0506",
         "openai/gpt-4.1",
         "openai/o3",
         "x-ai/grok-3-beta"
@@ -1454,10 +1448,10 @@ function initializeChart(chartData) {
                 const logoWidth = width * 0.15;  // Reduced from 30% to 15% of chart width
                 const logoHeight = logoWidth * (image.height / image.width);
                 
-                // Position the image in the top right of the chart with a small margin
+                // Position the image in the top right of the chart with a margin
                 const margin = 20;
                 const x = right - logoWidth - margin;
-                const y = top + margin;
+                const y = top + margin + 40;  // Added 40px to move it down
                 
                 // Set transparency
                 ctx.globalAlpha = 0.15;
@@ -1536,7 +1530,19 @@ function initializeChart(chartData) {
                     },
                     padding: {
                         top: 10,
-                        bottom: 30
+                        bottom: 5
+                    }
+                },
+                subtitle: {
+                    display: true,
+                    text: 'All Languages',
+                    color: '#666',
+                    font: {
+                        size: 14,
+                        style: 'italic'
+                    },
+                    padding: {
+                        bottom: 20
                     }
                 },
                 legend: {
@@ -1719,6 +1725,26 @@ function initializeChart(chartData) {
         }
     }
     
+    // Function to update the chart subtitle based on selected languages
+    function updateChartSubtitle() {
+        let subtitleText = '';
+        
+        if (currentSelectedLanguages.length === 0) {
+            subtitleText = 'No languages selected';
+        } else if (currentSelectedLanguages.length === chartData.languages.length) {
+            subtitleText = 'All Languages';
+        } else if (currentSelectedLanguages.length <= 3) {
+            // Show all selected languages if there are 3 or fewer
+            subtitleText = currentSelectedLanguages.join(', ');
+        } else {
+            // Show count if more than 3 languages selected
+            subtitleText = `${currentSelectedLanguages.length} Languages Selected`;
+        }
+        
+        // Update the chart subtitle
+        chart.options.plugins.subtitle.text = subtitleText;
+    }
+    
     // Function to update chart based on selected models, languages, and bucket count
     function updateChart() {
         // Get selected models and languages
@@ -1727,6 +1753,9 @@ function initializeChart(chartData) {
         
         currentSelectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
             .map(checkbox => checkbox.getAttribute('data-language'));
+        
+        // Update the chart subtitle based on selected languages
+        updateChartSubtitle();
         
         // Recalculate buckets based on selected languages and bucket count
         calculateBuckets();
@@ -1987,7 +2016,8 @@ def generate_prompt_page(
 <body>
     <header>
         <h1>Prompt: {original_filename}</h1>
-        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">Back to Case</a> | <a href="../../../cases.html">All Cases</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
         <section>
@@ -2052,7 +2082,8 @@ def generate_expected_output_page(
 <body>
     <header>
         <h1>Expected Output: {original_filename}</h1>
-        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">Back to Case</a> | <a href="../../../cases.html">All Cases</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
         <section>
@@ -2223,7 +2254,8 @@ def generate_actual_output_page(
 <body>
     <header>
         <h1>Actual Output: {original_filename}</h1>
-        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">Back to Case</a> | <a href="../../../cases.html">All Cases</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
         {content_section}
@@ -2528,11 +2560,27 @@ def generate_cases_overview_page(
                     checkbox.checked = false;
                 });
                     
-                // Check boxes for saved models
+                // Check boxes for saved models if any exist
                 if (savedModels.length > 0) {
                     savedModels.forEach(modelId => {
                         const checkbox = document.querySelector(`input[data-model="${modelId}"]`);
                         if (checkbox) checkbox.checked = true;
+                    });
+                } else {
+                    // For first-time visitors, check these three models by default
+                    const defaultModels = [
+                        "anthropic_claude-3.7-sonnetthinking",
+                        "google_gemini-2.5-pro-0506",
+                        "x-ai_grok-3-beta"
+                    ];
+                    
+                    defaultModels.forEach(modelId => {
+                        const checkbox = document.querySelector(`input[data-model="${modelId}"]`);
+                        if (checkbox) {
+                            checkbox.checked = true;
+                            // Also update visibility to show these columns
+                            updateVisibility(checkbox);
+                        }
                     });
                 }
                     
@@ -2916,7 +2964,8 @@ def generate_case_page(
 <body>
     <header>
         <h1>Case: {original_filename}</h1>
-        <p><a href="../../models/{safe_model}.html">← Back to {display_name} Cases</a> | <a href="../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../models/{safe_model}.html">All {display_name} Cases</a> | <a href="../../cases.html">All Cases</a> | <a href="../../index.html">Home</a></p>
     </header>
     <main>
         <section class="case-details">
@@ -2925,7 +2974,6 @@ def generate_case_page(
                 <p><strong>Model:</strong> {display_name}</p>
                 <p><strong>Status:</strong> <span class="{status_class}">{status_text}</span></p>
                 <p><strong>Prompt Tokens:</strong> {case_metadata.get("prompt_tokens", "N/A")}</p>
-                <p><strong>Output Tokens:</strong> {result_metadata.get("output_tokens", "N/A")}</p>
                 <p><strong>Native Prompt Tokens:</strong> {result_metadata.get("native_prompt_tokens", "N/A")}</p>
                 <p><strong>Native Completion Tokens:</strong> {result_metadata.get("native_completion_tokens", "N/A")}</p>
                 <p><strong>Native Tokens Reasoning:</strong> {result_metadata.get("native_tokens_reasoning", "N/A")}</p>
@@ -3038,7 +3086,7 @@ def create_css_file() -> str:
     color: #24292e;
 }
 
-/* Ranking styles for top performers */
+/* Ranking styles for top performers - Using both borders and medal emojis */
 td.gold {
     border: 3px solid #ffd700; /* Gold color */
     background-color: rgba(255, 215, 0, 0.1); /* Light gold background */
@@ -3872,10 +3920,10 @@ def main():
     html_content = create_html_header()
     html_content += create_locodiff_summary()  # Add summary section first
     html_content += create_token_chart_section()
-    html_content += create_example_section()
     html_content += (
         create_key_takeaways_section()
-    )  # Add key takeaways after methodology
+    )  # Add key takeaways before methodology
+    html_content += create_example_section()
     html_content += create_quartile_stats_table(
         results_metadata, prompt_metadata, all_models, model_display_names
     )
