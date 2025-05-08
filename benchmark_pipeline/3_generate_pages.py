@@ -1503,7 +1503,7 @@ function initializeChart(chartData) {
                     },
                     title: {
                         display: true,
-                        text: 'Prompt Token Length (k)'
+                        text: 'Prompt Token Length'
                     },
                     grid: {
                         // Make grid lines match our ticks
@@ -1513,10 +1513,15 @@ function initializeChart(chartData) {
                 y: {
                     title: {
                         display: true,
-                        text: 'Success Rate (%)'
+                        text: 'Success Rate'
                     },
                     min: 0,
-                    max: 100
+                    max: 100,
+                    ticks: {
+                        callback: function(value) {
+                            return value + '%';
+                        }
+                    }
                 }
             },
             plugins: {
