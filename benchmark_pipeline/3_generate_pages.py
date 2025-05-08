@@ -1236,7 +1236,7 @@ D
                 </div>
                 <div class="branch-explanation">
                     <p class="commit-description">
-                        Commit A: Creates shopping list file with 5 items (apples, bananas, milk, bread, eggs)<br>
+                        Commit A: Creates initial shopping list file<br>
                         Commit B: Adds oranges at the end and changes apples to red apples<br>
                         Commit C: On a separate branch from B, changes apples to green apples<br>
                         Commit D: Merges B and C branches, keeping both red apples and green apples in the list
