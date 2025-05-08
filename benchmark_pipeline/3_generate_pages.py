@@ -1192,7 +1192,7 @@ def create_example_section() -> str:
         <h2>Methodology</h2>
         
         <div class="example-timeline">
-            <h3>Shopping List Example</h3>
+            <h3 style="text-align: left;">Toy Shopping List Example</h3>
             <div class="branch-structure-container">
                 <div class="branch-diagram-box">
                     <pre class="branch-diagram">"""
@@ -1228,6 +1228,37 @@ def create_example_section() -> str:
         + expected_output
         + """</code></pre>
             </div>
+        </div>
+        
+        <div class="repo-selection-info">
+            <h3 style="text-align: left;">Repo and File Selection</h3>
+            <p>
+                LoCoDiff benchmark prompts are generated from actual Git repositories, capturing the organic
+                evolution of code over time. For this benchmark, we used a variety of open-source repositories
+                to ensure diversity in coding styles, complexity, and development patterns.
+            </p>
+            <p>
+                The benchmark supports multiple programming languages with the following file extensions:
+            </p>
+            <ul style="margin-left: 20px; margin-bottom: 15px;">
+                <li><strong>Python</strong>: .py</li>
+                <li><strong>JavaScript</strong>: .js, .jsx</li>
+                <li><strong>TypeScript</strong>: .ts, .tsx</li>
+                <li><strong>Zig</strong>: .zig</li>
+                <li><strong>Rust</strong>: .rs</li>
+            </ul>
+            <p>
+                When generating benchmark prompts, files are filtered based on:
+            </p>
+            <ul style="margin-left: 20px; margin-bottom: 15px;">
+                <li>Modification date (defaults to files modified within the last 6 months)</li>
+                <li>Prompt token count (to ensure a distribution across different context lengths)</li>
+                <li>Expected output token count (typically capped at 12,000 tokens)</li>
+            </ul>
+            <p>
+                This selective process ensures that the benchmark cases are representative of real-world
+                coding scenarios while providing a controlled testing environment across a range of context lengths.
+            </p>
         </div>
     </section>
     """
