@@ -1121,30 +1121,29 @@ def create_token_chart_section() -> str:
     """Creates an HTML section for the token-based chart."""
     return """
     <section id="token-chart">
-        <h2>Interactive Results</h2>
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
-        <div class="chart-controls">
-            <div class="model-selection">
-                <h3>Models</h3>
-                <div id="model-checkboxes"></div>
+        <div class="chart-controls" style="font-size: 0.85em; margin-top: 10px; padding: 5px;">
+            <div class="model-selection" style="margin-right: 15px;">
+                <h3 style="font-size: 1em; margin: 5px 0;">Models</h3>
+                <div id="model-checkboxes" style="max-height: 120px; overflow-y: auto;"></div>
             </div>
-            <div class="language-selection">
-                <h3>Languages</h3>
+            <div class="language-selection" style="margin-right: 15px;">
+                <h3 style="font-size: 1em; margin: 5px 0;">Languages</h3>
                 <div id="language-checkboxes"></div>
             </div>
-            <div class="bucketing-options">
-                <h3>Bucketing Options</h3>
-                <div class="bucket-count-control">
-                    <label for="bucket-count">Number of Buckets: <span id="bucket-count-display">4</span></label>
-                    <input type="range" id="bucket-count" min="1" max="20" value="4" step="1">
+            <div class="bucketing-options" style="margin-right: 15px;">
+                <h3 style="font-size: 1em; margin: 5px 0;">Bucketing Options</h3>
+                <div class="bucket-count-control" style="margin: 5px 0;">
+                    <label for="bucket-count" style="font-size: 0.9em;">Number of Buckets: <span id="bucket-count-display">4</span></label>
+                    <input type="range" id="bucket-count" min="1" max="20" value="4" step="1" style="width: 100%;">
                 </div>
             </div>
             <div class="display-options">
-                <h3>Display Options</h3>
-                <div class="checkbox-item">
-                    <label>
+                <h3 style="font-size: 1em; margin: 5px 0;">Display Options</h3>
+                <div class="checkbox-item" style="margin: 3px 0;">
+                    <label style="font-size: 0.9em;">
                         <input type="checkbox" id="show-confidence-intervals">
                         Show 95% Confidence Intervals
                     </label>
@@ -1412,7 +1411,7 @@ function initializeChart(chartData) {
                 ctx.font = 'bold 16px Arial';
                 ctx.fillStyle = '#666';
                 ctx.textAlign = 'center';
-                ctx.fillText('mentat.ai', x + logoWidth/2, y - 8);
+                ctx.fillText('mentat.ai', x + logoWidth/2, y - 3);
                 
                 // Draw image
                 ctx.globalAlpha = 0.15;  // Reset to logo transparency
