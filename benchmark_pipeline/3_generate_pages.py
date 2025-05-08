@@ -1368,7 +1368,7 @@ function initializeChart(chartData) {
         "anthropic/claude-3.7-sonnetthinking",
         "deepseek/deepseek-chat-v3-0324",
         "deepseek/deepseek-r1",
-        "google/gemini-2.5-pro-0506",
+        "google/gemini-2.5-pro-preview",
         "openai/gpt-4.1",
         "openai/o3",
         "x-ai/grok-3-beta"
@@ -2570,7 +2570,7 @@ def generate_cases_overview_page(
                     // For first-time visitors, check these three models by default
                     const defaultModels = [
                         "anthropic_claude-3.7-sonnetthinking",
-                        "google_gemini-2.5-pro-0506",
+                        "google_gemini-2.5-pro-preview",
                         "x-ai_grok-3-beta"
                     ];
                     
