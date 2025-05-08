@@ -542,7 +542,9 @@ def create_html_footer(include_chart_js: bool = False) -> str:
                         highlightedLines.push('<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>');
                     }
                     // Highlight removed lines - check for both '-' at start and '-' after whitespace
-                    else if (line.startsWith('-') || line.trim().startsWith('-')) {
+                    // But exclude command-line options that start with '--'
+                    else if ((line.startsWith('-') && !line.startsWith('--')) || 
+                             (line.trim().startsWith('-') && !line.trim().startsWith('--'))) {
                         highlightedLines.push('<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>');
                     }
                     // Normal line
@@ -1231,16 +1233,16 @@ def create_example_section() -> str:
         </div>
         
         <div class="example-io-container">
-            <div class="example-prompt">
+            <div class="example-prompt" style="border: 1px solid #ddd; border-radius: 6px; padding: 15px; background-color: #f8f8f8;">
                 <h3>Input: git log output for a file</h3>
-                <pre><code class="language-diff">"""
+                <pre style="background-color: #f1f1f1; border: 1px solid #e1e4e8; border-radius: 3px;"><code class="language-diff">"""
         + git_history
         + """</code></pre>
             </div>
             
-            <div class="example-expected">
+            <div class="example-expected" style="border: 1px solid #ddd; border-radius: 6px; padding: 15px; background-color: #f8f8f8;">
                 <h3>Target Output: Exact final state of the file</h3>
-                <pre><code class="language-text">"""
+                <pre style="background-color: #f1f1f1; border: 1px solid #e1e4e8; border-radius: 3px;"><code class="language-text">"""
         + expected_output
         + """</code></pre>
             </div>
@@ -1411,7 +1413,7 @@ function initializeChart(chartData) {
                 ctx.font = 'bold 16px Arial';
                 ctx.fillStyle = '#666';
                 ctx.textAlign = 'center';
-                ctx.fillText('mentat.ai', x + logoWidth/2, y - 3);
+                ctx.fillText('mentat.ai', x + logoWidth/2, y + 5);
                 
                 // Draw image
                 ctx.globalAlpha = 0.15;  // Reset to logo transparency
