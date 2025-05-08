@@ -1237,9 +1237,9 @@ D
                 <div class="branch-explanation">
                     <p class="commit-description">
                         Commit A: Creates initial shopping list file<br>
-                        Commit B: Adds oranges at the end and changes apples to red apples<br>
-                        Commit C: On a separate branch from B, changes apples to green apples<br>
-                        Commit D: Merges B and C branches, keeping both red apples and green apples in the list
+                        Commit B: Changes "apples" to "oranges", and adds new item at the end<br>
+                        Commit C: On a separate branch from B, changes "apples" to "bananas"<br>
+                        Commit D: Merges B and C branches, resolving conflict by keeping both "oranges" and "bananas"
                     </p>
                     <p class="model-task">
                         The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
