@@ -1317,7 +1317,7 @@ def create_key_takeaways_section() -> str:
             <strong>Claude 3.7 Sonnet w/ Thinking is the clear SOTA:</strong> It's the best for all context lengths and languages.
         </p>
         <p style="margin-bottom: 15px;">
-            <strong>Reasoning models, except for Sonnet do WORSE than their non-reasoning counterparts:</strong> DeepSeek's Chat v3 beats R1, Gemini 2.5 Flash without thinking beats Gemini 2.5 Flash with thinking, and GPT-4.1 beats o3 and o4-mini. The only except to this trend is Sonnet 3.7 w/ Thinking, which beats Sonnet 3.7 without thinking. It's unclear how reasoning models should best use their tokens to solve this task, but somehow Sonnet 3.7 uses them well.
+            <strong>Reasoning models, except for Sonnet do WORSE than their non-reasoning counterparts:</strong> DeepSeek's Chat v3 beats R1, Gemini 2.5 Flash w/o Thinking beats Gemini 2.5 Flash w/ Thinking, and GPT-4.1 beats o3 and o4-mini. The only except to this trend is Sonnet 3.7 w/ Thinking, which beats Sonnet 3.7 w/o Thinking. It's unclear how reasoning models should best use their tokens to solve this task, but somehow Sonnet 3.7 uses them well.
         </p>
         <p>
             For further details and in-depth analysis of these findings, see our 
