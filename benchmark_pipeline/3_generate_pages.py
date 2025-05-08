@@ -1213,12 +1213,12 @@ def create_example_section() -> str:
 
     # Simple ASCII diagram of the git branch structure
     ascii_diagram = """
-   A
-   /  \\
-   B    C
-   \\  /
-   D
-    """
+A
+/  \\
+B    C
+\\  /
+D
+"""
 
     # Construct the HTML for the example section
     html = (
@@ -1373,6 +1373,7 @@ function initializeChart(chartData) {
     const defaultSelectedModels = [
         "anthropic/claude-3.7-sonnetthinking",
         "deepseek/deepseek-chat-v3-0324",
+        "deepseek/deepseek-r1",
         "google/gemini-2.5-pro-preview",
         "openai/gpt-4.1",
         "openai/o3",
