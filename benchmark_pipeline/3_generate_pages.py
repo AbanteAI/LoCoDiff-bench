@@ -468,7 +468,7 @@ def create_locodiff_summary() -> str:
             <li>Prompt generation and output evaluation are <strong>simple and easy to understand</strong></li>
             <li>Also strains models' abilities to handle long outputs</li>
             <li>Surprisingly <strong>difficult for reasoning models</strong> to reason about</li>
-            <li>Easy to procedurally generate: any file in any git repo can be made into a benchmark case</li>
+            <li><strong>Easy to procedurally generate</strong>: any file in any git repo can be made into a benchmark case</li>
         </ul>
         <p style="margin-bottom: 20px;">
             100% of the code for the LoCoDiff was written by 
