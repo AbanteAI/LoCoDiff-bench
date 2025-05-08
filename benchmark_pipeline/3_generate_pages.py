@@ -1407,15 +1407,16 @@ function initializeChart(chartData) {
                 // Set transparency
                 ctx.globalAlpha = 0.15;
                 
-                // Draw image
-                ctx.drawImage(image, x, y, logoWidth, logoHeight);
-                
-                // Add "mentat.ai" text below the logo
+                // Add "mentat.ai" text above the logo
                 ctx.globalAlpha = 0.8;  // More visible text
                 ctx.font = 'bold 16px Arial';
                 ctx.fillStyle = '#666';
                 ctx.textAlign = 'center';
-                ctx.fillText('mentat.ai', x + logoWidth/2, y + logoHeight + 18);
+                ctx.fillText('mentat.ai', x + logoWidth/2, y - 8);
+                
+                // Draw image
+                ctx.globalAlpha = 0.15;  // Reset to logo transparency
+                ctx.drawImage(image, x, y, logoWidth, logoHeight);
                 
                 // Reset transparency
                 ctx.globalAlpha = 1.0;
