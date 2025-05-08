@@ -774,7 +774,7 @@ def create_quartile_stats_table(
     # Create the HTML table
     html = """
     <section id="quartile-stats">
-        <h2>Results Table</h2>
+        <h2>Accuracy by Context Length Quartiles</h2>
         <table>
             <thead>
                 <tr>
@@ -917,7 +917,7 @@ def create_language_stats_table(
     # Create the HTML table
     html = """
     <section id="language-stats">
-        <h2>Success Rates by Programming Language</h2>
+        <h2>Accuracy by Programming Language</h2>
         <table>
             <thead>
                 <tr>
@@ -1872,6 +1872,11 @@ def create_cases_section(
     <section id="explore-benchmarks">
         <h2>Explore Benchmark Prompts and Model Outputs</h2>
         <div class="explore-options">
+            <div class="case-view">
+                <h3>View by Case</h3>
+                <p>View all benchmark cases with their results across models:</p>
+                <a href="cases.html" class="view-all-cases-button">View All Cases</a>
+            </div>
             <div class="model-view">
                 <h3>View by Model</h3>
                 <p>Select a model to view all its benchmark cases:</p>
@@ -1894,11 +1899,6 @@ def create_cases_section(
 
     html += """
                 </ul>
-            </div>
-            <div class="case-view">
-                <h3>View by Case</h3>
-                <p>View all benchmark cases with their results across models:</p>
-                <a href="cases.html" class="view-all-cases-button">View All Cases</a>
             </div>
         </div>
     </section>
