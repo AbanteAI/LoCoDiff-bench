@@ -10,6 +10,8 @@ LoCoDiff is a novel **lo**ng-**co**ntext benchmark for evaluating language model
 - Surprisingly **difficult for reasoning models** to reason about
 - **Easy to procedurally generate**: any file in any git repo can be made into a benchmark case
 
-# [🔍 Interactive Benchmark Results Site](https://abanteai.github.io/LoCoDiff-bench/)
+To see results, methodology, and analysis:
+
+### 👉 [Explore the **interactive benchmark dashboard**](https://abanteai.github.io/LoCoDiff-bench/)
 
 For instructions on running the benchmark yourself, see the [benchmark pipeline README](benchmark_pipeline/README.md).
