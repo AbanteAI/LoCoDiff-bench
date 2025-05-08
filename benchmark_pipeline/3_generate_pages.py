@@ -2009,7 +2009,8 @@ def generate_prompt_page(
 <body>
     <header>
         <h1>Prompt: {original_filename}</h1>
-        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">Back to Case</a> | <a href="../../../cases.html">All Cases</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
         <section>
@@ -2074,7 +2075,8 @@ def generate_expected_output_page(
 <body>
     <header>
         <h1>Expected Output: {original_filename}</h1>
-        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">Back to Case</a> | <a href="../../../cases.html">All Cases</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
         <section>
@@ -2245,7 +2247,8 @@ def generate_actual_output_page(
 <body>
     <header>
         <h1>Actual Output: {original_filename}</h1>
-        <p><a href="../../../cases/{safe_model}/{safe_case}.html">← Back to Case</a> | <a href="../../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../../cases/{safe_model}/{safe_case}.html">Back to Case</a> | <a href="../../../cases.html">All Cases</a> | <a href="../../../index.html">Home</a></p>
     </header>
     <main>
         {content_section}
@@ -2954,7 +2957,8 @@ def generate_case_page(
 <body>
     <header>
         <h1>Case: {original_filename}</h1>
-        <p><a href="../../models/{safe_model}.html">← Back to {display_name} Cases</a> | <a href="../../index.html">Home</a></p>
+        <h2>Model: {display_name}</h2>
+        <p><a href="../../models/{safe_model}.html">All {display_name} Cases</a> | <a href="../../cases.html">All Cases</a> | <a href="../../index.html">Home</a></p>
     </header>
     <main>
         <section class="case-details">
