@@ -631,6 +631,7 @@ def create_overall_stats_table(
     html = """
     <section id="overall-stats">
         <h2>Overall Model Performance</h2>
+        <p style="margin-top: 0; margin-bottom: 10px; font-size: 0.85em; color: #666; text-align: center;"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" style="height: 14px; vertical-align: middle; margin-right: 4px;">Mentat.ai LoCoDiff Bench</p>
         <table>
             <thead>
                 <tr>
@@ -775,6 +776,7 @@ def create_quartile_stats_table(
     html = """
     <section id="quartile-stats">
         <h2>Accuracy by Context Length Quartiles</h2>
+        <p style="margin-top: 0; margin-bottom: 10px; font-size: 0.85em; color: #666; text-align: center;"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" style="height: 14px; vertical-align: middle; margin-right: 4px;">Mentat.ai LoCoDiff Bench</p>
         <table>
             <thead>
                 <tr>
@@ -918,6 +920,7 @@ def create_language_stats_table(
     html = """
     <section id="language-stats">
         <h2>Accuracy by Programming Language</h2>
+        <p style="margin-top: 0; margin-bottom: 10px; font-size: 0.85em; color: #666; text-align: center;"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" style="height: 14px; vertical-align: middle; margin-right: 4px;">Mentat.ai LoCoDiff Bench</p>
         <table>
             <thead>
                 <tr>
@@ -2967,7 +2970,6 @@ def generate_case_page(
                 <p><strong>Model:</strong> {display_name}</p>
                 <p><strong>Status:</strong> <span class="{status_class}">{status_text}</span></p>
                 <p><strong>Prompt Tokens:</strong> {case_metadata.get("prompt_tokens", "N/A")}</p>
-                <p><strong>Output Tokens:</strong> {result_metadata.get("output_tokens", "N/A")}</p>
                 <p><strong>Native Prompt Tokens:</strong> {result_metadata.get("native_prompt_tokens", "N/A")}</p>
                 <p><strong>Native Completion Tokens:</strong> {result_metadata.get("native_completion_tokens", "N/A")}</p>
                 <p><strong>Native Tokens Reasoning:</strong> {result_metadata.get("native_tokens_reasoning", "N/A")}</p>
