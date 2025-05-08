@@ -455,7 +455,6 @@ def create_locodiff_summary() -> str:
     """
     return """
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
-        <h2>What is LoCoDiff?</h2>
         <p style="margin-bottom: 10px;">
             LoCoDiff is a novel long-context benchmark with several unique strengths:
         </p>
