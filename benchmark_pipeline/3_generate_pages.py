@@ -467,7 +467,7 @@ def create_locodiff_summary() -> str:
             <li><strong>No junk context</strong>: every part of the context is required for the task</li>
             <li><strong>Tests a real skill critical for coding agents</strong>: keeping track of the state of edited files</li>
             <li>Prompt generation and output evaluation are <strong>simple and easy to understand</strong></li>
-            <li>Also strains models' abilities to handle long outputs</li>
+            <li>Challenges models' capacity to generate <strong>long-form outputs</strong></li>
             <li>Surprisingly <strong>difficult for reasoning models</strong> to reason about</li>
             <li><strong>Easy to procedurally generate</strong>: any file in any git repo can be made into a benchmark case</li>
         </ul>
