@@ -1244,6 +1244,10 @@ D
             For each repo, we filtered to files modified in the last 6 months that were no longer than 12k tokens long (in their final state - what the model needs to output). We then sampled, biasing the sampling to target an even distribution of prompt lengths, with a limit of 100k.
         </p>
 
+        <p style="margin-bottom: 15px;">
+            All case prompts, expected outputs, and model answers can be explored <a href="cases.html">here</a>. To quickly understand what the model sees, here is a minimal example:
+        </p>
+
         <div class="example-timeline">
             <h3 style="text-align: left;">Toy Example with Shopping List</h3>
             <div class="branch-structure-container">
