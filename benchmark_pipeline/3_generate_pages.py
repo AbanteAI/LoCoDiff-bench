@@ -103,20 +103,34 @@ def determine_prompt_quartiles(
     sorted_tokens = sorted(prompt_tokens_list)
     total_count = len(sorted_tokens)
 
-    # Calculate quartile boundaries
-    q1_idx = total_count // 4
-    q2_idx = total_count // 2
-    q3_idx = (3 * total_count) // 4
+    # Calculate quartile indices to ensure exact even split
+    # For 200 items, this would give us indices [0, 50, 100, 150, 200]
+    quartile_indices = []
+    for i in range(5):
+        idx = (i * total_count) // 4
+        # Cap at the last index to avoid out of bounds
+        idx = min(idx, total_count - 1) if i < 4 else total_count
+        quartile_indices.append(idx)
 
     # Handle edge cases for small lists
     if total_count < 4:
         return [(sorted_tokens[0], sorted_tokens[-1])] * 4
 
-    # Create quartile ranges
-    q1_range = (sorted_tokens[0], sorted_tokens[q1_idx])
-    q2_range = (sorted_tokens[q1_idx], sorted_tokens[q2_idx])
-    q3_range = (sorted_tokens[q2_idx], sorted_tokens[q3_idx])
-    q4_range = (sorted_tokens[q3_idx], sorted_tokens[-1])
+    # Create quartile ranges using the indices to get token values
+    # Important: The last index is total_count which is out of bounds, so -1 for the upper bound of Q4
+    q1_range = (
+        sorted_tokens[quartile_indices[0]],
+        sorted_tokens[quartile_indices[1] - 1],
+    )
+    q2_range = (
+        sorted_tokens[quartile_indices[1]],
+        sorted_tokens[quartile_indices[2] - 1],
+    )
+    q3_range = (
+        sorted_tokens[quartile_indices[2]],
+        sorted_tokens[quartile_indices[3] - 1],
+    )
+    q4_range = (sorted_tokens[quartile_indices[3]], sorted_tokens[-1])
 
     return [q1_range, q2_range, q3_range, q4_range]
 
@@ -132,12 +146,15 @@ def determine_quartile(token_count: int, quartile_ranges: List[Tuple[int, int]])
     Returns:
         Quartile index (0-3) or -1 if not found
     """
+    # Find the quartile by checking each range inclusively
     for i, (q_min, q_max) in enumerate(quartile_ranges):
-        # First quartile includes both boundaries
-        if i == 0 and q_min <= token_count <= q_max:
+        if q_min <= token_count <= q_max:
             return i
-        # Middle quartiles have exclusive lower bound, inclusive upper bound
-        elif i > 0 and q_min < token_count <= q_max:
+
+    # Try a second pass with looser bounds to handle edge cases
+    # This ensures we don't miss any cases that might fall on boundaries due to float rounding
+    for i, (q_min, q_max) in enumerate(quartile_ranges):
+        if abs(token_count - q_min) < 0.001 or abs(token_count - q_max) < 0.001:
             return i
 
     # Should not happen if quartile_ranges were calculated correctly
@@ -438,17 +455,16 @@ def create_locodiff_summary() -> str:
     """
     return """
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
-        <h2>What is LoCoDiff?</h2>
-        <p style="margin-bottom: 20px;">
-            LoCoDiff is a benchmark for evaluating large language models on their ability to understand
-            long-context coding tasks in a realistic setting. It tests models' capability to reconstruct
-            code by understanding git history, including complex merge conflicts and development patterns.
+        <p style="margin-bottom: 10px;">
+            LoCoDiff is a novel long-context benchmark with several unique strengths:
         </p>
-        <p style="margin-bottom: 20px;">
-            Unlike traditional coding benchmarks that focus on algorithm design or code generation from scratch,
-            LoCoDiff tests a model's understanding of real-world code evolution by showing a model git history
-            and asking it to reproduce the final state of a file.
-        </p>
+        <ul style="margin-top: 0; margin-bottom: 20px; margin-left: 20px;">
+            <li>Tests comprehension of naturally interconnected content (not artificially generated or padded content)</li>
+            <li>Focused on code, can be constructed for any repo and language</li>
+            <li>Prompt generation and output evaluation are simple and easy to understand</li>
+            <li>Also strains models' abilities to output long outputs</li>
+            <li>Surprisingly difficult for reasoning models to reason about</li>
+        </ul>
         <p style="margin-bottom: 20px;">
             100% of the code for the LoCoDiff was written by 
             <a href="https://mentat.ai">Mentat</a>, a coding agent developed by AbanteAI. The benchmark was also
@@ -497,7 +513,7 @@ def create_html_footer(include_chart_js: bool = False) -> str:
         <div class="footer-content">
             <p>LoCoDiff-bench - <a href="https://github.com/AbanteAI/LoCoDiff-bench" class="github-link"><img src="assets/images/github-logo.png" alt="GitHub" class="github-icon"></a></p>
             <p class="built-with">
-                built with <a href="https://mentat.ai" target="_blank" class="mentat-link">mentat.ai</a> <img src="assets/images/mentat-logo-transparent.png" alt="Mentat" class="mentat-icon">
+                built with <a href="https://mentat.ai" target="_blank" class="mentat-link">mentat.ai</a> <a href="https://mentat.ai" target="_blank" class="mentat-link"><img src="assets/images/mentat-logo-transparent.png" alt="Mentat" class="mentat-icon"></a>
             </p>
         </div>
     </footer>
@@ -542,7 +558,9 @@ def create_html_footer(include_chart_js: bool = False) -> str:
                         highlightedLines.push('<span style="background-color: #e6ffec; color: #22863a;">' + line + '</span>');
                     }
                     // Highlight removed lines - check for both '-' at start and '-' after whitespace
-                    else if (line.startsWith('-') || line.trim().startsWith('-')) {
+                    // But exclude command-line options that start with '--'
+                    else if ((line.startsWith('-') && !line.startsWith('--')) || 
+                             (line.trim().startsWith('-') && !line.trim().startsWith('--'))) {
                         highlightedLines.push('<span style="background-color: #ffebe9; color: #cb2431;">' + line + '</span>');
                     }
                     // Normal line
@@ -755,7 +773,7 @@ def create_quartile_stats_table(
     # Create the HTML table
     html = """
     <section id="quartile-stats">
-        <h2>Success Rates by Prompt Size Quartiles</h2>
+        <h2>Accuracy by Context Length Quartiles</h2>
         <table>
             <thead>
                 <tr>
@@ -764,6 +782,9 @@ def create_quartile_stats_table(
 
     for label in quartile_labels:
         html += f"<th>{label}</th>"
+
+    # Add Total Cost column header
+    html += "<th>Total Cost</th>"
 
     html += """
                 </tr>
@@ -774,13 +795,24 @@ def create_quartile_stats_table(
     # Prepare model data rows and collect success rates for each quartile
     model_rows = {}
     quartile_success_rates = {i: [] for i in range(4)}  # For each quartile
+    model_total_costs = {}  # To track total cost for each model
+
+    # Calculate total cost for each model
+    for (case_prefix, model), result_metadata in results_metadata.items():
+        if model not in model_total_costs:
+            model_total_costs[model] = 0.0
+
+        cost = result_metadata.get("cost_usd", 0.0)
+        if cost is not None:
+            model_total_costs[model] += float(cost)
 
     for idx, model in enumerate(sorted(all_models)):
         display_name = model_display_names.get(model, model)
         quartile_stats = model_quartile_stats.get(model, {})
+        total_cost = model_total_costs.get(model, 0.0)
 
         # Store model data for later use
-        model_rows[idx] = (model, display_name, quartile_stats)
+        model_rows[idx] = (model, display_name, quartile_stats, total_cost)
 
         # Collect success rates for each quartile
         for q in range(4):
@@ -795,7 +827,7 @@ def create_quartile_stats_table(
         top_performers[q] = find_top_performers(quartile_success_rates[q])
 
     # Generate HTML rows with rankings for each quartile
-    for idx, (model, display_name, quartile_stats) in model_rows.items():
+    for idx, (model, display_name, quartile_stats, total_cost) in model_rows.items():
         html += f"<tr><td>{display_name}</td>"
 
         for q in range(4):
@@ -809,6 +841,9 @@ def create_quartile_stats_table(
             # Format cell content
             cell_content = f"{success_rate:.2f}% ({stats['successful']}/{attempts})"
             html += format_cell_with_rank(cell_content, rank_class)
+
+        # Add total cost column
+        html += f"<td>${total_cost:.2f}</td>"
 
         html += "</tr>"
 
@@ -881,7 +916,7 @@ def create_language_stats_table(
     # Create the HTML table
     html = """
     <section id="language-stats">
-        <h2>Success Rates by Programming Language</h2>
+        <h2>Accuracy by Programming Language</h2>
         <table>
             <thead>
                 <tr>
@@ -1104,30 +1139,30 @@ def create_token_chart_section() -> str:
     """Creates an HTML section for the token-based chart."""
     return """
     <section id="token-chart">
-        <h2>Interactive Chart</h2>
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
-        <div class="chart-controls">
-            <div class="model-selection">
-                <h3>Models</h3>
+        <h3 style="margin-top: 15px; margin-bottom: 5px; font-size: 1.1em;">Chart Options</h3>
+        <div class="chart-controls" style="font-size: 0.85em; margin-top: 10px; padding: 5px;">
+            <div class="model-selection" style="margin-right: 15px;">
+                <h3 style="font-size: 1em; margin: 5px 0;">Models</h3>
                 <div id="model-checkboxes"></div>
             </div>
-            <div class="language-selection">
-                <h3>Languages</h3>
+            <div class="language-selection" style="margin-right: 15px;">
+                <h3 style="font-size: 1em; margin: 5px 0;">Languages</h3>
                 <div id="language-checkboxes"></div>
             </div>
-            <div class="bucketing-options">
-                <h3>Bucketing Options</h3>
-                <div class="bucket-count-control">
-                    <label for="bucket-count">Number of Buckets: <span id="bucket-count-display">4</span></label>
-                    <input type="range" id="bucket-count" min="1" max="20" value="4" step="1">
+            <div class="bucketing-options" style="margin-right: 15px;">
+                <h3 style="font-size: 1em; margin: 5px 0;">Bucketing Options</h3>
+                <div class="bucket-count-control" style="margin: 5px 0;">
+                    <label for="bucket-count" style="font-size: 0.9em;">Number of Buckets: <span id="bucket-count-display">4</span></label>
+                    <input type="range" id="bucket-count" min="1" max="20" value="4" step="1" style="width: 100%;">
                 </div>
             </div>
             <div class="display-options">
-                <h3>Display Options</h3>
-                <div class="checkbox-item">
-                    <label>
+                <h3 style="font-size: 1em; margin: 5px 0;">Display Options</h3>
+                <div class="checkbox-item" style="margin: 3px 0;">
+                    <label style="font-size: 0.9em;">
                         <input type="checkbox" id="show-confidence-intervals">
                         Show 95% Confidence Intervals
                     </label>
@@ -1178,26 +1213,21 @@ def create_example_section() -> str:
 
     # Simple ASCII diagram of the git branch structure
     ascii_diagram = """
-   A
-   /  \\
-   B    C
-   \\  /
-   D
-    """
+A
+/  \\
+B    C
+\\  /
+D
+"""
 
     # Construct the HTML for the example section
     html = (
         """
     <section id="benchmark-example" style="background-color: transparent; border: none; padding: 0;">
-        <h2>LoCoDiff Methodology: A Toy Example</h2>
-        
-        <p class="intro-text">
-            LoCoDiff tests a model's ability to reconstruct code by understanding its Git history, 
-            including how merge conflicts were resolved. Here's a simple example:
-        </p>
+        <h2>Methodology</h2>
         
         <div class="example-timeline">
-            <h3>Shopping List Example</h3>
+            <h3 style="text-align: left;">Toy Shopping List Example</h3>
             <div class="branch-structure-container">
                 <div class="branch-diagram-box">
                     <pre class="branch-diagram">"""
@@ -1206,10 +1236,10 @@ def create_example_section() -> str:
                 </div>
                 <div class="branch-explanation">
                     <p class="commit-description">
-                        Commit A: Creates shopping list file with 5 items<br>
-                        Commit B: Adds a new item at the end and changes the first item<br>
-                        Commit C: On a separate branch from B, changes the first item to something different<br>
-                        Commit D: Merges B and C branches, keeping both the new items that replaced the first
+                        Commit A: Creates initial shopping list file<br>
+                        Commit B: Changes "apples" to "oranges", and adds new item at the end<br>
+                        Commit C: On a separate branch from B, changes "apples" to "bananas"<br>
+                        Commit D: Merges B and C branches, resolving conflict by keeping both "oranges" and "bananas"
                     </p>
                     <p class="model-task">
                         The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
@@ -1220,24 +1250,78 @@ def create_example_section() -> str:
         </div>
         
         <div class="example-io-container">
-            <div class="example-prompt">
+            <div class="example-prompt" style="border: 1px solid #ddd; border-radius: 6px; padding: 15px; background-color: #f8f8f8;">
                 <h3>Input: git log output for a file</h3>
-                <pre><code class="language-diff">"""
+                <pre style="background-color: #f1f1f1; border: 1px solid #e1e4e8; border-radius: 3px;"><code class="language-diff">"""
         + git_history
         + """</code></pre>
             </div>
             
-            <div class="example-expected">
+            <div class="example-expected" style="border: 1px solid #ddd; border-radius: 6px; padding: 15px; background-color: #f8f8f8;">
                 <h3>Target Output: Exact final state of the file</h3>
-                <pre><code class="language-text">"""
+                <pre style="background-color: #f1f1f1; border: 1px solid #e1e4e8; border-radius: 3px;"><code class="language-text">"""
         + expected_output
         + """</code></pre>
             </div>
         </div>
+        
+        <div class="repo-selection-info">
+            <h3 style="text-align: left;">Repo and File Selection</h3>
+            <p>
+                LoCoDiff benchmark prompts are generated from actual Git repositories, capturing the organic
+                evolution of code over time. For this benchmark, we used a variety of open-source repositories
+                to ensure diversity in coding styles, complexity, and development patterns.
+            </p>
+            <p>
+                The benchmark supports multiple programming languages with the following file extensions:
+            </p>
+            <ul style="margin-left: 20px; margin-bottom: 15px;">
+                <li><strong>Python</strong>: .py</li>
+                <li><strong>JavaScript</strong>: .js, .jsx</li>
+                <li><strong>TypeScript</strong>: .ts, .tsx</li>
+                <li><strong>Zig</strong>: .zig</li>
+                <li><strong>Rust</strong>: .rs</li>
+            </ul>
+            <p>
+                When generating benchmark prompts, files are filtered based on:
+            </p>
+            <ul style="margin-left: 20px; margin-bottom: 15px;">
+                <li>Modification date (defaults to files modified within the last 6 months)</li>
+                <li>Prompt token count (to ensure a distribution across different context lengths)</li>
+                <li>Expected output token count (typically capped at 12,000 tokens)</li>
+            </ul>
+            <p>
+                This selective process ensures that the benchmark cases are representative of real-world
+                coding scenarios while providing a controlled testing environment across a range of context lengths.
+            </p>
+        </div>
+        
     </section>
     """
     )
     return html
+
+
+def create_key_takeaways_section() -> str:
+    """Creates a section highlighting key findings from the benchmark."""
+    return """
+    <section id="key-takeaways">
+        <h2>Key Takeaways</h2>
+        <p>
+            Our benchmark revealed several important findings about long-context capabilities in modern LLMs:
+        </p>
+        <ul style="margin-left: 20px; margin-bottom: 15px;">
+            <li>Claude 3.7 Sonnet with thinking mode outperforms other models, especially on longer contexts</li>
+            <li>Reasoning models generally struggle with this task, despite their capabilities in other domains</li>
+            <li>Performance decreases as context length increases, but the slope varies significantly between models</li>
+            <li>Success rates differ by programming language, with most models performing better on Python</li>
+        </ul>
+        <p>
+            For further details and in-depth analysis of these findings, see our 
+            <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">blog post on LoCoDiff</a>.
+        </p>
+    </section>
+    """
 
 
 def create_chart_javascript() -> str:
@@ -1285,6 +1369,17 @@ function initializeChart(chartData) {
     let currentBucketCount = chartData.default_bucket_count || 4;
     let buckets = []; // Will be calculated dynamically
     
+    // Define models to check by default
+    const defaultSelectedModels = [
+        "anthropic/claude-3.7-sonnetthinking",
+        "deepseek/deepseek-chat-v3-0324",
+        "deepseek/deepseek-r1",
+        "google/gemini-2.5-pro-preview",
+        "openai/gpt-4.1",
+        "openai/o3",
+        "x-ai/grok-3-beta"
+    ];
+    
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
@@ -1296,11 +1391,14 @@ function initializeChart(chartData) {
             ? chartData.model_display_names[model] 
             : model;
         
+        // Check if this model should be checked by default
+        const isChecked = defaultSelectedModels.includes(model);
+        
         const checkbox = document.createElement('div');
         checkbox.className = 'checkbox-item';
         checkbox.innerHTML = `
             <label>
-                <input type="checkbox" data-model="${model}" checked>
+                <input type="checkbox" data-model="${model}" ${isChecked ? 'checked' : ''}>
                 ${displayName}
             </label>
         `;
@@ -1340,9 +1438,54 @@ function initializeChart(chartData) {
         console.warn('Bucket count slider elements not found. Check that the HTML includes the proper elements.');
     }
     
+    // Create watermark plugin
+    const watermarkPlugin = {
+        id: 'watermark',
+        beforeDraw: (chart) => {
+            const ctx = chart.ctx;
+            const { chartArea: { top, left, right, bottom }, width, height } = chart;
+            
+            // Create an image object
+            const image = new Image();
+            image.src = 'assets/images/mentat-logo-transparent.png';
+            
+            // Only draw the image once it's loaded
+            if (image.complete) {
+                const logoWidth = width * 0.15;  // Reduced from 30% to 15% of chart width
+                const logoHeight = logoWidth * (image.height / image.width);
+                
+                // Position the image in the top right of the chart with a small margin
+                const margin = 20;
+                const x = right - logoWidth - margin;
+                const y = top + margin;
+                
+                // Set transparency
+                ctx.globalAlpha = 0.15;
+                
+                // Add "mentat.ai" text above the logo
+                ctx.globalAlpha = 0.8;  // More visible text
+                ctx.font = 'bold 16px Arial';
+                ctx.fillStyle = '#666';
+                ctx.textAlign = 'center';
+                ctx.fillText('mentat.ai', x + logoWidth/2, y + 12);
+                
+                // Draw image
+                ctx.globalAlpha = 0.15;  // Reset to logo transparency
+                ctx.drawImage(image, x, y, logoWidth, logoHeight);
+                
+                // Reset transparency
+                ctx.globalAlpha = 1.0;
+            } else {
+                // Set up image.onload if the image isn't loaded yet
+                image.onload = () => chart.draw();
+            }
+        }
+    };
+    
     // Create chart
     const chart = new Chart(ctx, {
         type: 'line',
+        plugins: [watermarkPlugin],  // Register the watermark plugin
         data: {
             datasets: []
         },
@@ -1360,7 +1503,7 @@ function initializeChart(chartData) {
                     },
                     title: {
                         display: true,
-                        text: 'Prompt Token Length (k)'
+                        text: 'Prompt Token Length'
                     },
                     grid: {
                         // Make grid lines match our ticks
@@ -1370,13 +1513,21 @@ function initializeChart(chartData) {
                 y: {
                     title: {
                         display: true,
-                        text: 'Success Rate (%)'
+                        text: 'Success Rate'
                     },
                     min: 0,
-                    max: 100
+                    max: 100,
+                    ticks: {
+                        callback: function(value) {
+                            return value + '%';
+                        }
+                    }
                 }
             },
             plugins: {
+                watermark: {
+                    // Empty object enables the plugin
+                },
                 title: {
                     display: true,
                     text: 'LoCoDiff: Natural Long Context Code Bench',
@@ -1762,6 +1913,11 @@ def create_cases_section(
     <section id="explore-benchmarks">
         <h2>Explore Benchmark Prompts and Model Outputs</h2>
         <div class="explore-options">
+            <div class="case-view">
+                <h3>View by Case</h3>
+                <p>View all benchmark cases with their results across models:</p>
+                <a href="cases.html" class="view-all-cases-button">View All Cases</a>
+            </div>
             <div class="model-view">
                 <h3>View by Model</h3>
                 <p>Select a model to view all its benchmark cases:</p>
@@ -1784,11 +1940,6 @@ def create_cases_section(
 
     html += """
                 </ul>
-            </div>
-            <div class="case-view">
-                <h3>View by Case</h3>
-                <p>View all benchmark cases with their results across models:</p>
-                <a href="cases.html" class="view-all-cases-button">View All Cases</a>
             </div>
         </div>
     </section>
@@ -3719,13 +3870,12 @@ def main():
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
-    html_content += create_table_of_contents()  # Add table of contents first
-    html_content += create_locodiff_summary()  # Add summary section second
+    html_content += create_locodiff_summary()  # Add summary section first
     html_content += create_token_chart_section()
     html_content += create_example_section()
-    html_content += create_overall_stats_table(
-        results_metadata, all_models, num_cases, model_display_names
-    )
+    html_content += (
+        create_key_takeaways_section()
+    )  # Add key takeaways after methodology
     html_content += create_quartile_stats_table(
         results_metadata, prompt_metadata, all_models, model_display_names
     )
