@@ -459,11 +459,11 @@ def create_locodiff_summary() -> str:
             LoCoDiff is a novel long-context benchmark with several unique strengths:
         </p>
         <ul style="margin-top: 0; margin-bottom: 20px; margin-left: 20px;">
-            <li>Tests comprehension of naturally interconnected content (not artificially generated or padded content)</li>
+            <li>Tests comprehension of <strong>naturally interconnected content</strong> (not artificially generated or padded content)</li>
             <li>Focused on code, can be constructed for any repo and language</li>
-            <li>Prompt generation and output evaluation are simple and easy to understand</li>
+            <li>Prompt generation and output evaluation are <strong>simple and easy to understand</strong></li>
             <li>Also strains models' abilities to output long outputs</li>
-            <li>Surprisingly difficult for reasoning models to reason about</li>
+            <li>Surprisingly <strong>difficult for reasoning models</strong> to reason about</li>
         </ul>
         <p style="margin-bottom: 20px;">
             100% of the code for the LoCoDiff was written by 
