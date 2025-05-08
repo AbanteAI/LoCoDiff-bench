@@ -1245,7 +1245,7 @@ D
         </p>
 
         <div class="example-timeline">
-            <h3 style="text-align: left;">Toy Shopping List Example</h3>
+            <h3 style="text-align: left;">Toy Example with Shopping List</h3>
             <div class="branch-structure-container">
                 <div class="branch-diagram-box">
                     <pre class="branch-diagram">"""
