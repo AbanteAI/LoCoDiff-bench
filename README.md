@@ -9,7 +9,3 @@ LoCoDiff (Local Code Diff) is a novel long-context benchmark for evaluating lang
 - Surprisingly **difficult for reasoning models** to reason about
 
 # [🔍 Interactive Benchmark Results Site](https://abanteai.github.io/LoCoDiff-bench/)
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
