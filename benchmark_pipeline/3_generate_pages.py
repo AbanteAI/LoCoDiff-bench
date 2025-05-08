@@ -1519,7 +1519,19 @@ function initializeChart(chartData) {
                     },
                     padding: {
                         top: 10,
-                        bottom: 30
+                        bottom: 5
+                    }
+                },
+                subtitle: {
+                    display: true,
+                    text: 'All Languages',
+                    color: '#666',
+                    font: {
+                        size: 14,
+                        style: 'italic'
+                    },
+                    padding: {
+                        bottom: 20
                     }
                 },
                 legend: {
@@ -1702,6 +1714,26 @@ function initializeChart(chartData) {
         }
     }
     
+    // Function to update the chart subtitle based on selected languages
+    function updateChartSubtitle() {
+        let subtitleText = '';
+        
+        if (currentSelectedLanguages.length === 0) {
+            subtitleText = 'No languages selected';
+        } else if (currentSelectedLanguages.length === chartData.languages.length) {
+            subtitleText = 'All Languages';
+        } else if (currentSelectedLanguages.length <= 3) {
+            // Show all selected languages if there are 3 or fewer
+            subtitleText = currentSelectedLanguages.join(', ');
+        } else {
+            // Show count if more than 3 languages selected
+            subtitleText = `${currentSelectedLanguages.length} Languages Selected`;
+        }
+        
+        // Update the chart subtitle
+        chart.options.plugins.subtitle.text = subtitleText;
+    }
+    
     // Function to update chart based on selected models, languages, and bucket count
     function updateChart() {
         // Get selected models and languages
@@ -1710,6 +1742,9 @@ function initializeChart(chartData) {
         
         currentSelectedLanguages = Array.from(document.querySelectorAll('input[data-language]:checked'))
             .map(checkbox => checkbox.getAttribute('data-language'));
+        
+        // Update the chart subtitle based on selected languages
+        updateChartSubtitle();
         
         // Recalculate buckets based on selected languages and bucket count
         calculateBuckets();
