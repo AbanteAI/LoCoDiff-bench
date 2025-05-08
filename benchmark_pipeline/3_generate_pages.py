@@ -1252,7 +1252,7 @@ D
         </p>
 
         <p style="margin-bottom: 15px;">
-            All case prompts, expected outputs, and model answers can be explored <a href="cases.html">here</a>. To quickly understand what the model sees, here is a minimal example:
+            All case prompts, expected outputs, and model answers can be explored <a href="cases.html">here</a>. A <a href="/content/anthropic_claude-3.7-sonnetthinking/qdrant_src_actix_api_snapshot_api.rs/prompt.html">typical prompt</a> consisting of 50k tokens can be extremely complex, containing 50-150 commits and ending up with several hundred lines to reproduce. To quickly understand what the model sees, here is a minimal example:
         </p>
 
         <div class="example-timeline">
