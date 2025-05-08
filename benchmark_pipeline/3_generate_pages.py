@@ -1236,10 +1236,10 @@ D
                 </div>
                 <div class="branch-explanation">
                     <p class="commit-description">
-                        Commit A: Creates shopping list file with 5 items<br>
-                        Commit B: Adds a new item at the end and changes the first item<br>
-                        Commit C: On a separate branch from B, changes the first item to something different<br>
-                        Commit D: Merges B and C branches, keeping both the new items that replaced the first
+                        Commit A: Creates shopping list file with 5 items (apples, bananas, milk, bread, eggs)<br>
+                        Commit B: Adds oranges at the end and changes apples to red apples<br>
+                        Commit C: On a separate branch from B, changes apples to green apples<br>
+                        Commit D: Merges B and C branches, keeping both red apples and green apples in the list
                     </p>
                     <p class="model-task">
                         The model is shown the output of a command that displays the entire git history, along both branches, and the merge conflict resolution. 
