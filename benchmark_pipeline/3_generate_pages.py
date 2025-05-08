@@ -495,7 +495,7 @@ def create_html_header() -> str:
 </head>
 <body>
     <header>
-        <h1>LoCoDiff Benchmark</h1>
+        <h1>LoCoDiff: Natural <span style="font-weight:bold">Lo</span>ng <span style="font-weight:bold">Co</span>ntext Code Bench</h1>
         <p style="margin-top: 0; font-size: 0.9em; color: #666;"><a href="https://mentat.ai" target="_blank">Mentat AI Team</a> - May 8th 2025</p>
     </header>
     <main>
