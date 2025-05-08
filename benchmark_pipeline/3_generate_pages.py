@@ -1355,6 +1355,16 @@ function initializeChart(chartData) {
     let currentBucketCount = chartData.default_bucket_count || 4;
     let buckets = []; // Will be calculated dynamically
     
+    // Define models to check by default
+    const defaultSelectedModels = [
+        "anthropic/claude-3.7-sonnetthinking",
+        "deepseek/deepseek-chat-v3-0324",
+        "google/gemini-2.5-pro-preview",
+        "openai/gpt-4.1",
+        "openai/o3",
+        "x-ai/grok-3-beta"
+    ];
+    
     // Get canvas context
     const ctx = document.getElementById('token-success-chart').getContext('2d');
     
@@ -1366,11 +1376,14 @@ function initializeChart(chartData) {
             ? chartData.model_display_names[model] 
             : model;
         
+        // Check if this model should be checked by default
+        const isChecked = defaultSelectedModels.includes(model);
+        
         const checkbox = document.createElement('div');
         checkbox.className = 'checkbox-item';
         checkbox.innerHTML = `
             <label>
-                <input type="checkbox" data-model="${model}" checked>
+                <input type="checkbox" data-model="${model}" ${isChecked ? 'checked' : ''}>
                 ${displayName}
             </label>
         `;
