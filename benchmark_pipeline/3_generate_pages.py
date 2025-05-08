@@ -440,11 +440,11 @@ def create_locodiff_summary() -> str:
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <h2>What is LoCoDiff?</h2>
         <p style="margin-bottom: 20px;">
-            LoCoDiff is a long-context code benchmark that has many advantages over other long context benchmarks:
+            LoCoDiff is a novel long-context benchmark with several unique strengths:
         </p>
         <ul style="margin-bottom: 20px; margin-left: 20px;">
             <li>Tests comprehension of naturally interconnected content (not artificially generated or padded content)</li>
-            <li>Benchmark cases can be generated from any repo</li>
+            <li>Focused on code, can be constructed for any repo and language</li>
             <li>Prompt generation and output evaluation are simple and easy to understand</li>
             <li>Also strains models' abilities to output long outputs</li>
             <li>Surprisingly difficult for reasoning models to reason about</li>
