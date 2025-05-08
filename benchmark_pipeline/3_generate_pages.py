@@ -1310,10 +1310,6 @@ def create_key_takeaways_section() -> str:
         <p style="margin-bottom: 15px;">
             <strong>Reasoning models, except for Sonnet do WORSE than their non-reasoning counterparts:</strong> DeepSeek's Chat v3 beats R1, Gemini 2.5 Flash Non-thinking beats Gemini 2.5 Flash Thinking, and GPT-4.1 beats o3 and o4-mini. The only exception to this trend is Sonnet 3.7 Thinking, which beats Sonnet 3.7 Non-thinking. It's unclear how reasoning models should best use their tokens to solve this task, but somehow Sonnet 3.7 uses them well.
         </p>
-        <p>
-            For further details and in-depth analysis of these findings, see our 
-            <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">blog post on LoCoDiff</a>.
-        </p>
     </section>
     """
 
