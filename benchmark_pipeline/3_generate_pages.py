@@ -1143,10 +1143,11 @@ def create_token_chart_section() -> str:
         <div class="chart-container">
             <canvas id="token-success-chart"></canvas>
         </div>
+        <h3 style="margin-top: 15px; margin-bottom: 5px; font-size: 1.1em;">Chart Options</h3>
         <div class="chart-controls" style="font-size: 0.85em; margin-top: 10px; padding: 5px;">
             <div class="model-selection" style="margin-right: 15px;">
                 <h3 style="font-size: 1em; margin: 5px 0;">Models</h3>
-                <div id="model-checkboxes" style="max-height: 120px; overflow-y: auto;"></div>
+                <div id="model-checkboxes"></div>
             </div>
             <div class="language-selection" style="margin-right: 15px;">
                 <h3 style="font-size: 1em; margin: 5px 0;">Languages</h3>
