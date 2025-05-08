@@ -3084,19 +3084,25 @@ def create_css_file() -> str:
 
 /* Ranking styles for top performers */
 td.gold {
-    border: 3px solid #ffd700; /* Gold color */
+    border-width: 0;
+    border-top: 3px solid #ffd700; /* Gold color - top border */
+    border-left: 3px solid #ffd700; /* Gold color - left border */
     background-color: rgba(255, 215, 0, 0.1); /* Light gold background */
     font-weight: bold;
 }
 
 td.silver {
-    border: 3px solid #c0c0c0; /* Silver color */
+    border-width: 0;
+    border-top: 3px solid #c0c0c0; /* Silver color - top border */
+    border-left: 3px solid #c0c0c0; /* Silver color - left border */
     background-color: rgba(192, 192, 192, 0.1); /* Light silver background */
     font-weight: bold;
 }
 
 td.bronze {
-    border: 3px solid #cd7f32; /* Bronze color */
+    border-width: 0;
+    border-top: 3px solid #cd7f32; /* Bronze color - top border */
+    border-left: 3px solid #cd7f32; /* Bronze color - left border */
     background-color: rgba(205, 127, 50, 0.1); /* Light bronze background */
     font-weight: bold;
 }
