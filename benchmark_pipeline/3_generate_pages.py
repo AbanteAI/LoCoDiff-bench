@@ -3875,10 +3875,10 @@ def main():
     html_content = create_html_header()
     html_content += create_locodiff_summary()  # Add summary section first
     html_content += create_token_chart_section()
-    html_content += create_example_section()
     html_content += (
         create_key_takeaways_section()
-    )  # Add key takeaways after methodology
+    )  # Add key takeaways before methodology
+    html_content += create_example_section()
     html_content += create_quartile_stats_table(
         results_metadata, prompt_metadata, all_models, model_display_names
     )
