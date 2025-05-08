@@ -466,7 +466,7 @@ def create_locodiff_summary() -> str:
             <li>Tests comprehension of <strong>naturally interconnected content</strong> (not artificially generated or padded content)</li>
             <li>Focused on code, can be constructed for any repo and language</li>
             <li>Prompt generation and output evaluation are <strong>simple and easy to understand</strong></li>
-            <li>Also strains models' abilities to output long outputs</li>
+            <li>Also strains models' abilities to handle long outputs</li>
             <li>Surprisingly <strong>difficult for reasoning models</strong> to reason about</li>
         </ul>
         <p style="margin-bottom: 20px;">
