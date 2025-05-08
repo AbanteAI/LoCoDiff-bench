@@ -1296,6 +1296,14 @@ def create_example_section() -> str:
                 coding scenarios while providing a controlled testing environment across a range of context lengths.
             </p>
         </div>
+        
+        <div class="blog-info">
+            <h3 style="text-align: left;">Blog</h3>
+            <p>
+                Further details and thinking about the benchmark are available at our blog post: 
+                <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">LoCoDiff: A Long Context Diff Benchmark</a>.
+            </p>
+        </div>
     </section>
     """
     )
