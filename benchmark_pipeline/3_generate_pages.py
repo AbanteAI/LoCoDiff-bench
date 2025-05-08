@@ -1305,7 +1305,7 @@ def create_key_takeaways_section() -> str:
             <strong>Performance drops rapidly as context increases:</strong> While some models score near 100% for prompts <5k tokens, all drop significantly by 10k. All models drop to under 50% accuracy when prompts are just 25k tokens long. When we originally conceived of this benchmark, we were excited to put the million token long context limits of some models to the test, but it seems they are not yet ready for that.
         </p>
         <p style="margin-bottom: 15px;">
-            <strong>Claude 3.7 Sonnet Thinking is the clear SOTA:</strong> It's the best for all context lengths and languages.
+            <strong>Claude 3.7 Sonnet Thinking is the clear SOTA:</strong> It's the best for all context lengths and languages. We believe its ability to track the evolving state of files over long contexts is one of the reasons it makes such a strong model for coding agents.
         </p>
         <p style="margin-bottom: 15px;">
             <strong>Reasoning models, except for Sonnet do WORSE than their non-reasoning counterparts:</strong> DeepSeek's Chat v3 beats R1, Gemini 2.5 Flash Non-thinking beats Gemini 2.5 Flash Thinking, and GPT-4.1 beats o3 and o4-mini. The only except to this trend is Sonnet 3.7 Thinking, which beats Sonnet 3.7 Non-thinking. It's unclear how reasoning models should best use their tokens to solve this task, but somehow Sonnet 3.7 uses them well.
