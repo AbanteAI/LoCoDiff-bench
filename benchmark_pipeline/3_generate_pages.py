@@ -3719,8 +3719,7 @@ def main():
     # Generate HTML content
     print("Generating HTML content...")
     html_content = create_html_header()
-    html_content += create_table_of_contents()  # Add table of contents first
-    html_content += create_locodiff_summary()  # Add summary section second
+    html_content += create_locodiff_summary()  # Add summary section first
     html_content += create_token_chart_section()
     html_content += create_example_section()
     html_content += create_overall_stats_table(
