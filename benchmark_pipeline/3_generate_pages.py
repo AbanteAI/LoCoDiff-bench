@@ -1296,17 +1296,32 @@ def create_example_section() -> str:
             </p>
         </div>
         
-        <div class="blog-info" style="margin-top: 30px;">
-            <h3 style="text-align: left;">Blog</h3>
-            <p>
-                Further details and thinking about the benchmark are available at our blog post: 
-                <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">LoCoDiff: A Long Context Diff Benchmark</a>.
-            </p>
-        </div>
     </section>
     """
     )
     return html
+
+
+def create_key_takeaways_section() -> str:
+    """Creates a section highlighting key findings from the benchmark."""
+    return """
+    <section id="key-takeaways">
+        <h2>Key Takeaways</h2>
+        <p>
+            Our benchmark revealed several important findings about long-context capabilities in modern LLMs:
+        </p>
+        <ul style="margin-left: 20px; margin-bottom: 15px;">
+            <li>Claude 3.7 Sonnet with thinking mode outperforms other models, especially on longer contexts</li>
+            <li>Reasoning models generally struggle with this task, despite their capabilities in other domains</li>
+            <li>Performance decreases as context length increases, but the slope varies significantly between models</li>
+            <li>Success rates differ by programming language, with most models performing better on Python</li>
+        </ul>
+        <p>
+            For further details and in-depth analysis of these findings, see our 
+            <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">blog post on LoCoDiff</a>.
+        </p>
+    </section>
+    """
 
 
 def create_chart_javascript() -> str:
@@ -3852,6 +3867,9 @@ def main():
     html_content += create_locodiff_summary()  # Add summary section first
     html_content += create_token_chart_section()
     html_content += create_example_section()
+    html_content += (
+        create_key_takeaways_section()
+    )  # Add key takeaways after methodology
     html_content += create_quartile_stats_table(
         results_metadata, prompt_metadata, all_models, model_display_names
     )
