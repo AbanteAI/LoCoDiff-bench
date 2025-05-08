@@ -1308,15 +1308,15 @@ def create_key_takeaways_section() -> str:
     return """
     <section id="key-takeaways">
         <h2>Key Takeaways</h2>
-        <p>
-            Our benchmark revealed several important findings about long-context capabilities in modern LLMs:
+        <p style="margin-bottom: 15px;">
+            <strong>Performance drops rapidly as context increases:</strong> While some models score near 100% for prompts <5k tokens, all drop significantly by 10k. All models drop to under 50% accuracy when prompts are just 25k tokens long. When we originally conceived of this benchmark, we were excited to put the million token long context limits of some models to the test, but it seems they are not yet ready for that.
         </p>
-        <ul style="margin-left: 20px; margin-bottom: 15px;">
-            <li>Claude 3.7 Sonnet with thinking mode outperforms other models, especially on longer contexts</li>
-            <li>Reasoning models generally struggle with this task, despite their capabilities in other domains</li>
-            <li>Performance decreases as context length increases, but the slope varies significantly between models</li>
-            <li>Success rates differ by programming language, with most models performing better on Python</li>
-        </ul>
+        <p style="margin-bottom: 15px;">
+            <strong>Claude 3.7 Sonnet w/ Thinking is the clear SOTA:</strong> It's the best for all context lengths and languages.
+        </p>
+        <p style="margin-bottom: 15px;">
+            <strong>Reasoning models, except for Sonnet do WORSE than their non-reasoning counterparts:</strong> DeepSeek's Chat v3 beats R1, Gemini 2.5 Flash without thinking beats Gemini 2.5 Flash with thinking, and GPT-4.1 beats o3 and o4-mini. The only except to this trend is Sonnet 3.7 w/ Thinking, which beats Sonnet 3.7 without thinking. It's unclear how reasoning models should best use their tokens to solve this task, but somehow Sonnet 3.7 uses them well.
+        </p>
         <p>
             For further details and in-depth analysis of these findings, see our 
             <a href="https://mentat.ai/blog/locodiff-long-context-diff-benchmark">blog post on LoCoDiff</a>.
