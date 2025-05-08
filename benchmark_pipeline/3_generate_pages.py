@@ -460,7 +460,7 @@ def create_locodiff_summary() -> str:
     return """
     <section id="locodiff-summary" style="background-color: transparent; border: none; padding: 0;">
         <p style="margin-bottom: 10px;">
-            LoCoDiff is a novel long-context benchmark with several unique strengths:
+            LoCoDiff is a novel <strong>lo</strong>ng-<strong>co</strong>ntext benchmark with several unique strengths:
         </p>
         <ul style="margin-top: 0; margin-bottom: 20px; margin-left: 20px;">
             <li>Utilizes <strong>naturally interconnected content</strong>, not artificially generated or padded context</li>
