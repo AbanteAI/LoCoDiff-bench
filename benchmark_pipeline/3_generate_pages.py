@@ -103,20 +103,34 @@ def determine_prompt_quartiles(
     sorted_tokens = sorted(prompt_tokens_list)
     total_count = len(sorted_tokens)
 
-    # Calculate quartile boundaries
-    q1_idx = total_count // 4
-    q2_idx = total_count // 2
-    q3_idx = (3 * total_count) // 4
+    # Calculate quartile indices to ensure exact even split
+    # For 200 items, this would give us indices [0, 50, 100, 150, 200]
+    quartile_indices = []
+    for i in range(5):
+        idx = (i * total_count) // 4
+        # Cap at the last index to avoid out of bounds
+        idx = min(idx, total_count - 1) if i < 4 else total_count
+        quartile_indices.append(idx)
 
     # Handle edge cases for small lists
     if total_count < 4:
         return [(sorted_tokens[0], sorted_tokens[-1])] * 4
 
-    # Create quartile ranges
-    q1_range = (sorted_tokens[0], sorted_tokens[q1_idx])
-    q2_range = (sorted_tokens[q1_idx], sorted_tokens[q2_idx])
-    q3_range = (sorted_tokens[q2_idx], sorted_tokens[q3_idx])
-    q4_range = (sorted_tokens[q3_idx], sorted_tokens[-1])
+    # Create quartile ranges using the indices to get token values
+    # Important: The last index is total_count which is out of bounds, so -1 for the upper bound of Q4
+    q1_range = (
+        sorted_tokens[quartile_indices[0]],
+        sorted_tokens[quartile_indices[1] - 1],
+    )
+    q2_range = (
+        sorted_tokens[quartile_indices[1]],
+        sorted_tokens[quartile_indices[2] - 1],
+    )
+    q3_range = (
+        sorted_tokens[quartile_indices[2]],
+        sorted_tokens[quartile_indices[3] - 1],
+    )
+    q4_range = (sorted_tokens[quartile_indices[3]], sorted_tokens[-1])
 
     return [q1_range, q2_range, q3_range, q4_range]
 
@@ -132,12 +146,15 @@ def determine_quartile(token_count: int, quartile_ranges: List[Tuple[int, int]])
     Returns:
         Quartile index (0-3) or -1 if not found
     """
+    # Find the quartile by checking each range inclusively
     for i, (q_min, q_max) in enumerate(quartile_ranges):
-        # First quartile includes both boundaries
-        if i == 0 and q_min <= token_count <= q_max:
+        if q_min <= token_count <= q_max:
             return i
-        # Middle quartiles have exclusive lower bound, inclusive upper bound
-        elif i > 0 and q_min < token_count <= q_max:
+
+    # Try a second pass with looser bounds to handle edge cases
+    # This ensures we don't miss any cases that might fall on boundaries due to float rounding
+    for i, (q_min, q_max) in enumerate(quartile_ranges):
+        if abs(token_count - q_min) < 0.001 or abs(token_count - q_max) < 0.001:
             return i
 
     # Should not happen if quartile_ranges were calculated correctly
