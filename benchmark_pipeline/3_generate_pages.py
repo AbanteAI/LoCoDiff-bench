@@ -1366,6 +1366,7 @@ function initializeChart(chartData) {
     // Define models to check by default
     const defaultSelectedModels = [
         "anthropic/claude-3.7-sonnetthinking",
+        "anthropic/claude-sonnet-4",
         "deepseek/deepseek-chat-v3-0324",
         "deepseek/deepseek-r1",
         "google/gemini-2.5-pro-preview",
@@ -2583,6 +2584,7 @@ def generate_cases_overview_page(
                     // For first-time visitors, check these three models by default
                     const defaultModels = [
                         "anthropic_claude-3.7-sonnetthinking",
+                        "anthropic_claude-sonnet-4",
                         "google_gemini-2.5-pro-preview",
                         "x-ai_grok-3-beta"
                     ];
