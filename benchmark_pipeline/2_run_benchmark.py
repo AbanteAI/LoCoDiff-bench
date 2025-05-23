@@ -144,6 +144,15 @@ async def get_model_response_openrouter(
     client = _get_async_openai_client()
     error_message = None
 
+    extra_body = None
+    if model_name == "anthropic/claude-sonnet-4:thinking":
+        model_name = "anthropic/claude-sonnet-4"
+        extra_body = {
+            "reasoning": {
+                "max_tokens": 50000,
+            }
+        }
+
     try:
         completion = await client.chat.completions.create(
             model=model_name,
@@ -153,6 +162,7 @@ async def get_model_response_openrouter(
                     "content": prompt_content,
                 },
             ],
+            extra_body=extra_body,
             # Optional: Add other parameters like temperature, max_tokens if needed
             # temperature=0.7,
             # max_tokens=2000,
