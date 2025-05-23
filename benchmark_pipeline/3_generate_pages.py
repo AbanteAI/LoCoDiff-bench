@@ -2769,12 +2769,15 @@ def generate_model_page(
         # Truncate case name if too long
         truncated_name = truncate_case_name(case["original_filename"])
 
+        cost_display = (
+            f"${case['cost_usd']:.6f}" if case["cost_usd"] is not None else "N/A"
+        )
         html_content += f"""
                     <tr class="case-row {status_class}">
                         <td class="case-name">{truncated_name}</td>
                         <td>{case["prompt_tokens"]}</td>
                         <td class="{status_class}">{status_text}</td>
-                        <td>${case["cost_usd"]:.6f}</td>
+                        <td>{cost_display}</td>
                         <td>
                             <a href="../cases/{safe_model}/{safe_case}.html" class="view-button">View Details</a>
                         </td>
