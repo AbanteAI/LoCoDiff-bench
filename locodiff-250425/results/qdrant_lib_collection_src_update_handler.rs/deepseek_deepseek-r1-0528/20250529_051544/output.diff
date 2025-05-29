@@ -1,0 +1,306 @@
+
+index cb922e861..610daba99 100644
+--- a/qdrant_lib_collection_src_update_handler.rs_expectedoutput.txt (expected):tmp/tmp3_jcxxja_expected.txt	
++++ b/qdrant_lib_collection_src_update_handler.rs_extracted.txt (actual):tmp/tmpxxvhegg__actual.txt	
+@@ -1,8 +1,8 @@
+ use std::cmp::min;
+ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
+-use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::Arc;
+ 
+ use common::budget::ResourceBudget;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+@@ -16,7 +16,7 @@ use segment::index::hnsw_index::num_rayon_threads;
+ use segment::types::SeqNumberType;
+ use tokio::runtime::Handle;
+ use tokio::sync::mpsc::{self, Receiver, Sender};
+-use tokio::sync::{Mutex as TokioMutex, oneshot};
++use tokio::sync::{oneshot, Mutex as TokioMutex};
+ use tokio::task::{self, JoinHandle};
+ use tokio::time::error::Elapsed;
+ use tokio::time::{Duration, timeout};
+@@ -28,11 +28,11 @@ use crate::collection_manager::optimizers::segment_optimizer::{
+     OptimizerThresholds, SegmentOptimizer,
+ };
+ use crate::collection_manager::optimizers::{Tracker, TrackerLog, TrackerStatus};
+-use crate::common::stoppable_task::{StoppableTaskHandle, spawn_stoppable};
++use crate::common::stoppable_task::{spawn_stoppable, StoppableTaskHandle};
+ use crate::config::CollectionParams;
+-use crate::operations::CollectionUpdateOperations;
+ use crate::operations::shared_storage_config::SharedStorageConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
++use crate::operations::CollectionUpdateOperations;
+ use crate::save_on_disk::SaveOnDisk;
+ use crate::shards::local_shard::LocalShardClocks;
+ use crate::wal::WalError;
+@@ -118,7 +118,6 @@ pub struct UpdateHandler {
+     pub(super) wal_keep_from: Arc<AtomicU64>,
+     optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
+     /// Maximum number of concurrent optimization jobs in this update handler.
+-    /// This parameter depends on the optimizer config and should be updated accordingly.
+     pub max_optimization_threads: Option<usize>,
+     /// Highest and cutoff clocks for the shard WAL.
+     clocks: LocalShardClocks,
+@@ -263,6 +262,68 @@ impl UpdateHandler {
+         Ok(0)
+     }
+ 
++    /// Checks conditions for all optimizers and returns a tuple of two booleans:
++    /// - The first indicates if any optimizers have been triggered since startup.
++    /// - The second indicates if there are any pending/suboptimal optimizers.
++    pub(crate) fn check_optimizer_conditions(&self) -> (bool, bool) {
++        // Check if Qdrant triggered any optimizations since starting at all
++        let has_triggered_any_optimizers = self.has_triggered_optimizers.load(Ordering::Relaxed);
++
++        let excluded_ids = HashSet::<_>::default();
++        let has_suboptimal_optimizers = self.optimizers.iter().any(|optimizer| {
++            let nonoptimal_segment_ids =
++                optimizer.check_condition(self.segments.clone(), &excluded_ids);
++            !nonoptimal_segment_ids.is_empty()
++        });
++
++        (has_triggered_any_optimizers, has_suboptimal_optimizers)
++    }
++
++    /// Ensure we have at least one appendable segment with enough capacity
++    ///
++    /// If there is no appendable segment, or all are at or over capacity, a new empty one is
++    /// created.
++    ///
++    /// Capacity is determined based on `optimizers.max_segment_size_kb`.
++    pub(super) fn ensure_appendable_segment_with_capacity(
++        segments: &LockedSegmentHolder,
++        segments_path: &Path,
++        collection_params: &CollectionParams,
++        thresholds_config: &OptimizerThresholds,
++        payload_index_schema: &PayloadIndexSchema,
++    ) -> OperationResult<()> {
++        let no_segment_with_capacity = {
++            let segments_read = segments.read();
++            segments_read
++                .appendable_segments_ids()
++                .into_iter()
++                .filter_map(|segment_id| segments_read.get(segment_id))
++                .all(|segment| {
++                    let max_vector_size_bytes = segment
++                        .get()
++                        .read()
++                        .max_available_vectors_size_in_bytes()
++                        .unwrap_or_default();
++                    let max_segment_size_bytes = thresholds_config
++                        .max_segment_size_kb
++                        .saturating_mul(segment::common::BYTES_IN_KB);
++
++                    max_vector_size_bytes >= max_segment_size_bytes
++                })
++        };
++
++        if no_segment_with_capacity {
++            debug!("Creating new appendable segment, all existing segments are over capacity");
++            segments.write().create_appendable_segment(
++                segments_path,
++                collection_params,
++                payload_index_schema,
++            )?;
++        }
++
++        Ok(())
++    }
++
+     /// Checks conditions for all optimizers until there is no suggested segment
+     /// Starts a task for each optimization
+     /// Returns handles for started tasks
+@@ -285,7 +346,7 @@ impl UpdateHandler {
+             loop {
+                 // Return early if we reached the optimization job limit
+                 if limit.map(|extra| handles.len() >= extra).unwrap_or(false) {
+-                    log::trace!("Reached optimization job limit, postponing other optimizations");
++                    trace!("Reached optimization job limit, postponing other optimizations");
+                     break 'outer;
+                 }
+ 
+@@ -305,7 +366,7 @@ impl UpdateHandler {
+                     // If there is no Resource budget, break outer loop and return early
+                     // If we have no handles (no optimizations) trigger callback so that we wake up
+                     // our optimization worker to try again later, otherwise it could get stuck
+-                    log::trace!(
++                    trace!(
+                         "No available IO permit for {} optimizer, postponing",
+                         optimizer.name(),
+                     );
+@@ -314,7 +375,7 @@ impl UpdateHandler {
+                     }
+                     break 'outer;
+                 };
+-                log::trace!(
++                trace!(
+                     "Acquired {} IO permit for {} optimizer",
+                     permit.num_io,
+                     optimizer.name(),
+@@ -372,13 +433,15 @@ impl UpdateHandler {
+                                         false
+                                     }
+                                     _ => {
++                                        // Save only the first error
++                                        // If is more likely to be the real cause of all further problems
+                                         segments.write().report_optimizer_error(error.clone());
+ 
+                                         // Error of the optimization can not be handled by API user
+                                         // It is only possible to fix after full restart,
+                                         // so the best available action here is to stop whole
+                                         // optimization thread and log the error
+-                                        log::error!("Optimization error: {error}");
++                                        error!("Optimization error: {error}");
+ 
+                                         tracker_handle
+                                             .update(TrackerStatus::Error(error.to_string()));
+@@ -413,71 +476,6 @@ impl UpdateHandler {
+         handles
+     }
+ 
+-    /// Ensure there is at least one appendable segment with enough capacity
+-    ///
+-    /// If there is no appendable segment, or all are at or over capacity, a new empty one is
+-    /// created.
+-    ///
+-    /// Capacity is determined based on `optimizers.max_segment_size_kb`.
+-    pub(super) fn ensure_appendable_segment_with_capacity(
+-        segments: &LockedSegmentHolder,
+-        segments_path: &Path,
+-        collection_params: &CollectionParams,
+-        thresholds_config: &OptimizerThresholds,
+-        payload_index_schema: &PayloadIndexSchema,
+-    ) -> OperationResult<()> {
+-        let no_segment_with_capacity = {
+-            let segments_read = segments.read();
+-            segments_read
+-                .appendable_segments_ids()
+-                .into_iter()
+-                .filter_map(|segment_id| segments_read.get(segment_id))
+-                .all(|segment| {
+-                    let max_vector_size_bytes = segment
+-                        .get()
+-                        .read()
+-                        .max_available_vectors_size_in_bytes()
+-                        .unwrap_or_default();
+-                    let max_segment_size_bytes = thresholds_config
+-                        .max_segment_size_kb
+-                        .saturating_mul(segment::common::BYTES_IN_KB);
+-
+-                    max_vector_size_bytes >= max_segment_size_bytes
+-                })
+-        };
+-
+-        if no_segment_with_capacity {
+-            log::debug!("Creating new appendable segment, all existing segments are over capacity");
+-            segments.write().create_appendable_segment(
+-                segments_path,
+-                collection_params,
+-                payload_index_schema,
+-            )?;
+-        }
+-
+-        Ok(())
+-    }
+-
+-    /// Checks the optimizer conditions.
+-    ///
+-    /// This function returns a tuple of two booleans:
+-    /// - The first indicates if any optimizers have been triggered since startup.
+-    /// - The second indicates if there are any pending/suboptimal optimizers.
+-    pub(crate) fn check_optimizer_conditions(&self) -> (bool, bool) {
+-        // Check if Qdrant triggered any optimizations since starting at all
+-        let has_triggered_any_optimizers = self.has_triggered_optimizers.load(Ordering::Relaxed);
+-
+-        let excluded_ids = HashSet::<_>::default();
+-        let has_suboptimal_optimizers = self.optimizers.iter().any(|optimizer| {
+-            let nonoptimal_segment_ids =
+-                optimizer.check_condition(self.segments.clone(), &excluded_ids);
+-            !nonoptimal_segment_ids.is_empty()
+-        });
+-
+-        (has_triggered_any_optimizers, has_suboptimal_optimizers)
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+     pub(crate) async fn process_optimization(
+         optimizers: Arc<Vec<Arc<Optimizer>>>,
+         segments: LockedSegmentHolder,
+@@ -588,7 +586,7 @@ impl UpdateHandler {
+                     // tasks that'll trigger this for us. If we don't run optimizers here we might
+                     // get stuck into yellow state until a new update operation is received.
+                     // See: <https://github.com/qdrant/qdrant/pull/5111>
+-                    log::warn!(
++                    warn!(
+                         "Cleaned a optimization handle after timeout, explicitly triggering optimizers",
+                     );
+                     true
+@@ -612,7 +610,7 @@ impl UpdateHandler {
+                     &payload_index_schema.read(),
+                 );
+                 if let Err(err) = result {
+-                    log::error!(
++                    error!(
+                         "Failed to ensure there are appendable segments with capacity: {err}"
+                     );
+                     panic!("Failed to ensure there are appendable segments with capacity: {err}");
+@@ -624,10 +622,7 @@ impl UpdateHandler {
+                 continue;
+             }
+ 
+-            if Self::try_recover(segments.clone(), wal.clone())
+-                .await
+-                .is_err()
+-            {
++            if Self::try_recover(segments.clone(), wal.clone()).is_err() {
+                 continue;
+             }
+ 
+@@ -658,7 +653,7 @@ impl UpdateHandler {
+             // Skip if we reached limit, an ongoing optimization that finishes will trigger this loop again
+             let limit = max_handles.saturating_sub(optimization_handles.lock().await.len());
+             if limit == 0 {
+-                log::trace!("Skipping optimization check, we reached optimization thread limit");
++                trace!("Skipping optimization check, we reached optimization thread limit");
+                 continue;
+             }
+ 
+@@ -811,13 +806,13 @@ impl UpdateHandler {
+ 
+             let ack = confirmed_version.min(keep_from.saturating_sub(1));
+ 
+-            if let Err(err) = clocks.store_if_changed(&shard_path).await {
+-                log::warn!("Failed to store clock maps to disk: {err}");
++            if let Err(err) = clocks.store(&shard_path).await {
++                warn!("Failed to store clock maps to disk: {err}");
+                 segments.write().report_optimizer_error(err);
+             }
+ 
+             if let Err(err) = wal.lock().await.ack(ack) {
+-                log::warn!("Failed to acknowledge WAL version: {err}");
++                warn!("Failed to acknowledge WAL version: {err}");
+                 segments.write().report_optimizer_error(err);
+             }
+         }
+@@ -845,15 +840,15 @@ fn trigger_optimizers_on_resource_budget(
+     sender: Sender<OptimizerSignal>,
+ ) -> JoinHandle<()> {
+     task::spawn(async move {
+-        log::trace!("Skipping optimization checks, waiting for CPU budget to be available");
++        trace!("Skipping optimization checks, waiting for CPU budget to be available");
+         optimizer_resource_budget
+             .notify_on_budget_available(desired_cpus, desired_io)
+             .await;
+-        log::trace!("Continue optimization checks, new CPU budget available");
++        trace!("Continue optimization checks, new CPU budget available");
+ 
+         // Trigger optimizers with Nop operation
+         sender.send(OptimizerSignal::Nop).await.unwrap_or_else(|_| {
+-            log::info!("Can't notify optimizers, assume process is dead. Restart is required")
++            info!("Can't notify optimizers, assume process is dead. Restart is required")
+         });
+     })
+ }
+\ No newline at end of file
