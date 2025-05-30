@@ -1,0 +1,197 @@
+
+index a458d5593..00b495159 100644
+--- a/qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_expectedoutput.txt (expected):tmp/tmpcyqqgwjv_expected.txt	
++++ b/qdrant_lib_collection_src_collection_manager_optimizers_segment_optimizer.rs_extracted.txt (actual):tmp/tmpr204af11_actual.txt	
+@@ -1,16 +1,16 @@
+ use std::collections::{HashMap, HashSet};
+ use std::ops::Deref;
+ use std::path::Path;
+-use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
+ 
+ use common::budget::{ResourceBudget, ResourcePermit};
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::disk::dir_size;
+ use io::storage_version::StorageVersion;
+ use itertools::Itertools;
+-use parking_lot::{Mutex, RwLockUpgradableReadGuard};
+-use segment::common::operation_error::{OperationResult, check_process_stopped};
++use parking_lot::RwLockUpgradableReadGuard;
++use segment::common::operation_error::{check_process_stopped, OperationResult};
+ use segment::common::operation_time_statistics::{
+     OperationDurationsAggregator, ScopeDurationMeasurer,
+ };
+@@ -21,12 +21,13 @@ use segment::segment_constructor::build_segment;
+ use segment::segment_constructor::segment_builder::SegmentBuilder;
+ use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentConfig, VectorStorageType};
+ 
+-use crate::collection_manager::holders::proxy_segment::{self, ProxyIndexChange, ProxySegment};
++use crate::collection_manager::holders::proxy_segment::{
++    self, LockedRmSet, ProxyIndexChange, LockedIndexChanges, ProxySegment,
++};
+ use crate::collection_manager::holders::segment_holder::{
+     LockedSegment, LockedSegmentHolder, SegmentId,
+ };
+ use crate::config::CollectionParams;
+-use crate::operations::config_diff::DiffConfig;
+ use crate::operations::types::{CollectionError, CollectionResult};
+ 
+ const BYTES_IN_KB: usize = 1024;
+@@ -97,21 +98,6 @@ pub trait SegmentOptimizer {
+         &self,
+         optimizing_segments: &[LockedSegment],
+     ) -> CollectionResult<SegmentBuilder> {
+-        // Example:
+-        //
+-        // S1: {
+-        //     text_vectors: 10000,
+-        //     image_vectors: 100
+-        // }
+-        // S2: {
+-        //     text_vectors: 200,
+-        //     image_vectors: 10000
+-        // }
+-
+-        // Example: bytes_count_by_vector_name = {
+-        //     text_vectors: 10200 * dim * VECTOR_ELEMENT_SIZE
+-        //     image_vectors: 10100 * dim * VECTOR_ELEMENT_SIZE
+-        // }
+         let mut bytes_count_by_vector_name = HashMap::new();
+ 
+         // Counting up how much space do the segments being optimized actually take on the fs.
+@@ -135,18 +121,17 @@ pub trait SegmentOptimizer {
+                 *size += vector_size;
+             }
+ 
+-            space_occupied =
+-                space_occupied.and_then(|acc| match dir_size(locked_segment.data_path()) {
+-                    Ok(size) => Some(size + acc),
+-                    Err(err) => {
+-                        log::debug!(
+-                            "Could not estimate size of segment `{}`: {}",
+-                            locked_segment.data_path().display(),
+-                            err
+-                        );
+-                        None
+-                    }
+-                });
++            space_occupied = space_occupied.and_then(|acc| match dir_size(locked_segment.data_path()) {
++                Ok(size) => Some(size + acc),
++                Err(err) => {
++                    log::debug!(
++                        "Could not estimate size of segment `{}`: {}",
++                        locked_segment.data_path().display(),
++                        err
++                    );
++                    None
++                }
++            });
+         }
+ 
+         let space_needed = space_occupied.map(|x| 2 * x);
+@@ -191,7 +176,6 @@ pub trait SegmentOptimizer {
+             }
+         }
+ 
+-        // Example: maximal_vector_store_size_bytes = 10200 * dim * VECTOR_ELEMENT_SIZE
+         let maximal_vector_store_size_bytes = bytes_count_by_vector_name
+             .values()
+             .max()
+@@ -210,7 +194,6 @@ pub trait SegmentOptimizer {
+         let mut vector_data = collection_params.to_base_vector_data()?;
+         let mut sparse_vector_data = collection_params.to_sparse_vector_data()?;
+ 
+-        // If indexing, change to HNSW index and quantization
+         if threshold_is_indexed {
+             let collection_hnsw = self.hnsw_config();
+             let collection_quantization = self.quantization_config();
+@@ -237,7 +220,6 @@ pub trait SegmentOptimizer {
+             });
+         }
+ 
+-        // If storing on disk, set storage type in current segment (not in collection config)
+         if threshold_is_on_disk {
+             vector_data.iter_mut().for_each(|(vector_name, config)| {
+                 // Check whether on_disk is explicitly configured, if not, set it to true
+@@ -359,7 +341,7 @@ pub trait SegmentOptimizer {
+     ///
+     /// # Result
+     ///
+-    /// Rolls back optimization state.
++    /// Rolls back back optimization state.
+     /// All processed changes will still be there, but the collection should be returned into state
+     /// before optimization.
+     fn handle_cancellation(
+@@ -388,7 +370,10 @@ pub trait SegmentOptimizer {
+     /// * `optimizing_segments` - Segments to optimize
+     /// * `proxy_deleted_points` - Holds a set of points, deleted while optimization was running
+     /// * `proxy_changed_indexes` - Holds a set of indexes changes, created or deleted while optimization was running
++    /// * `permit` - IO resources for copying data
++    /// * `resource_budget` - budgeting manager to request CPU resources for indexing phase
+     /// * `stopped` - flag to check if optimization was cancelled by external thread
++    /// * `hw_counter` - hardware counter to measure disk IO during index building
+     ///
+     /// # Result
+     ///
+@@ -397,8 +382,8 @@ pub trait SegmentOptimizer {
+     fn build_new_segment(
+         &self,
+         optimizing_segments: &[LockedSegment],
+-        proxy_deleted_points: proxy_segment::LockedRmSet,
+-        proxy_changed_indexes: proxy_segment::LockedIndexChanges,
++        proxy_deleted_points: LockedRmSet,
++        proxy_changed_indexes: LockedIndexChanges,
+         permit: ResourcePermit, // IO resources for copying data
+         resource_budget: ResourceBudget,
+         stopped: &AtomicBool,
+@@ -502,8 +487,7 @@ pub trait SegmentOptimizer {
+                 description: "optimization cancelled while waiting for budget".to_string(),
+             })?;
+ 
+-        let mut optimized_segment: Segment =
+-            segment_builder.build(indexing_permit, stopped, hw_counter)?;
++        let mut optimized_segment: Segment = segment_builder.build(indexing_permit, stopped, hw_counter)?;
+ 
+         // Delete points
+         let deleted_points_snapshot = proxy_deleted_points
+@@ -560,7 +544,8 @@ pub trait SegmentOptimizer {
+     /// New optimized segment should be added into `segments`.
+     /// If there were any record changes during the optimization - an additional plain segment will be created.
+     ///
+-    /// Returns id of the created optimized segment. If no optimization was done - returns None
++    /// Returns number of points in the new optimized segment
++    ///
+     fn optimize(
+         &self,
+         segments: LockedSegmentHolder,
+@@ -605,8 +590,8 @@ pub trait SegmentOptimizer {
+         let hw_counter = HardwareCounterCell::disposable(); // Internal operation, no measurement needed!
+ 
+         let tmp_segment = self.temp_segment(false)?;
+-        let proxy_deleted_points = proxy_segment::LockedRmSet::default();
+-        let proxy_index_changes = proxy_segment::LockedIndexChanges::default();
++        let proxy_deleted_points = LockedRmSet::default();
++        let proxy_index_changes = LockedIndexChanges::default();
+ 
+         let mut proxies = Vec::new();
+         for sg in optimizing_segments.iter() {
+@@ -648,7 +633,7 @@ pub trait SegmentOptimizer {
+         };
+ 
+         if let Err(e) = check_process_stopped(stopped) {
+-            self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
++            self.handle_cancellation(&segments, &proxy_ids, tmp_segment.clone())?;
+             return Err(CollectionError::from(e));
+         }
+ 
+@@ -677,8 +662,7 @@ pub trait SegmentOptimizer {
+         // - save already removed points while avoiding long read locks
+         // - exclude already removed points from post-optimization removing
+         let already_remove_points = {
+-            let mut all_removed_points: HashSet<_> =
+-                proxy_deleted_points.read().keys().copied().collect();
++            let mut all_removed_points: HashSet<_> = proxy_deleted_points.read().keys().copied().collect();
+             for existing_point in optimized_segment.iter_points() {
+                 all_removed_points.remove(&existing_point);
+             }
