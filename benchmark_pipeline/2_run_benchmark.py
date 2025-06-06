@@ -153,6 +153,7 @@ async def get_model_response_openrouter(
             }
         }
     elif model_name == "google/gemini-2.5-pro-preview-06-05":
+        # OpenRouter uses the generic "gemini-2.5-pro-preview" endpoint for the latest preview version
         model_name = "google/gemini-2.5-pro-preview"
 
     try:
