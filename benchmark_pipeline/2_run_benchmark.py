@@ -152,6 +152,8 @@ async def get_model_response_openrouter(
                 "max_tokens": 50000,
             }
         }
+    elif model_name == "google/gemini-2.5-pro-preview-06-05":
+        model_name = "google/gemini-2.5-pro-preview"
 
     try:
         completion = await client.chat.completions.create(
