@@ -1,0 +1,170 @@
+
+index c6d1df953..1cc70aa66 100644
+--- a/qdrant_src_main.rs_expectedoutput.txt (expected):tmp/tmpwj02bxbk_expected.txt	
++++ b/qdrant_src_main.rs_extracted.txt (actual):tmp/tmpex8_bzxv_actual.txt	
+@@ -11,27 +11,28 @@ mod startup;
+ mod tonic;
+ mod tracing;
+ 
++use std::fmt::Write;
+ use std::io::Error;
+ use std::sync::Arc;
+ use std::thread;
+ use std::thread::JoinHandle;
+ use std::time::Duration;
+ 
+-use ::common::budget::{ResourceBudget, get_io_budget};
++use ::common::budget::{get_io_budget, ResourceBudget};
+ use ::common::cpu::get_cpu_budget;
+ use ::common::flags::{feature_flags, init_feature_flags};
+ use ::tonic::transport::Uri;
+ use api::grpc::transport_channel_pool::TransportChannelPool;
+ use clap::Parser;
+-use collection::shards::channel_service::ChannelService;
++use collection::shard::ChannelService;
+ use consensus::Consensus;
+ use slog::Drain;
+ use startup::setup_panic_hook;
+ use storage::content_manager::consensus::operation_sender::OperationSender;
+ use storage::content_manager::consensus::persistent::Persistent;
+ use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
+-use storage::content_manager::toc::TableOfContent;
+ use storage::content_manager::toc::dispatcher::TocDispatcher;
++use storage::content_manager::toc::TableOfContent;
+ use storage::dispatcher::Dispatcher;
+ use storage::rbac::Access;
+ #[cfg(all(
+@@ -177,31 +178,10 @@ fn main() -> anyhow::Result<()> {
+ 
+     welcome(&settings);
+ 
+-    #[cfg(feature = "gpu")]
+-    if let Some(settings_gpu) = &settings.gpu {
+-        use segment::index::hnsw_index::gpu::*;
+-
+-        // initialize GPU devices manager.
+-        if settings_gpu.indexing {
+-            set_gpu_force_half_precision(settings_gpu.force_half_precision);
+-            set_gpu_groups_count(settings_gpu.groups_count);
+-
+-            let mut gpu_device_manager = GPU_DEVICES_MANAGER.write();
+-            *gpu_device_manager = match gpu_devices_manager::GpuDevicesMaganer::new(
+-                &settings_gpu.device_filter,
+-                settings_gpu.devices.as_deref(),
+-                settings_gpu.allow_integrated,
+-                settings_gpu.allow_emulated,
+-                true, // Currently we always wait for the free gpu device.
+-                settings_gpu.parallel_indexes.unwrap_or(1),
+-            ) {
+-                Ok(gpu_device_manager) => Some(gpu_device_manager),
+-                Err(err) => {
+-                    log::error!("Can't initialize GPU devices manager: {err}");
+-                    None
+-                }
+-            }
+-        }
++    // Report feature flags that are enabled for easier debugging
++    let flags = feature_flags();
++    if !flags.is_default() {
++        log::debug!("Feature flags: {flags:?}");
+     }
+ 
+     if let Some(recovery_warning) = &settings.storage.recovery_mode {
+@@ -214,12 +194,6 @@ fn main() -> anyhow::Result<()> {
+     // Validate as soon as possible, but we must initialize logging first
+     settings.validate_and_warn();
+ 
+-    // Report feature flags that are enabled for easier debugging
+-    let flags = feature_flags();
+-    if !flags.is_default() {
+-        log::debug!("Feature flags: {flags:?}");
+-    }
+-
+     let bootstrap = if args.bootstrap == args.uri {
+         if args.bootstrap.is_some() {
+             log::warn!(
+@@ -286,7 +260,7 @@ fn main() -> anyhow::Result<()> {
+     // Create a signal sender and receiver. It is used to communicate with the consensus thread.
+     let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
+ 
+-    let propose_operation_sender = if settings.cluster.enabled {
++    let propose_operation_sender = if is_distributed_deployment {
+         // High-level channel which could be used to send User-space consensus operations
+         Some(OperationSender::new(propose_sender))
+     } else {
+@@ -372,10 +346,6 @@ fn main() -> anyhow::Result<()> {
+             TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
+         let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
+ 
+-        // `raft` crate uses `slog` crate so it is needed to use `slog_stdlog::StdLog` to forward
+-        // logs from it to `log` crate
+-        let slog_logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), slog::o!());
+-
+         // Runs raft consensus in a separate thread.
+         // Create a pipe `message_sender` to communicate with the consensus
+         let health_checker = Arc::new(common::health::HealthChecker::spawn(
+@@ -387,7 +357,7 @@ fn main() -> anyhow::Result<()> {
+         ));
+ 
+         let handle = Consensus::run(
+-            &slog_logger,
++            &slog::Logger::root(slog_stdlog::StdLog.fuse(), slog::o!()),
+             consensus_state.clone(),
+             bootstrap,
+             args.uri.map(|uri| uri.to_string()),
+@@ -403,23 +373,6 @@ fn main() -> anyhow::Result<()> {
+ 
+         handles.push(handle);
+ 
+-        let toc_arc_clone = toc_arc.clone();
+-        let consensus_state_clone = consensus_state.clone();
+-        let _cancel_transfer_handle = runtime_handle.spawn(async move {
+-            consensus_state_clone.is_leader_established.await_ready();
+-            match toc_arc_clone
+-                .cancel_related_transfers("Source or target peer restarted")
+-                .await
+-            {
+-                Ok(_) => {
+-                    log::debug!("All transfers if any cancelled");
+-                }
+-                Err(err) => {
+-                    log::error!("Can't cancel related transfers: {err}");
+-                }
+-            }
+-        });
+-
+         // TODO(resharding): Remove resharding driver?
+         //
+         // runtime_handle.block_on(async {
+@@ -447,6 +400,22 @@ fn main() -> anyhow::Result<()> {
+             ));
+         }
+ 
++        let toc_arc_clone = toc_arc.clone();
++        let consensus_state_clone = consensus_state.clone();
++        let _cancel_transfer_handle = runtime_handle.spawn(async move {
++            consensus_state_clone.is_leader_established.await_ready();
++            match toc_arc_clone
++                .cancel_related_transfers("Source or target peer restarted")
++                .await
++            {
++                Ok(_) => {
++                    log::debug!("All transfers if any cancelled");
++                }
++                Err(err) => {
++                    log::error!("Can't cancel related transfers: {err}");
++                }
++            }
++        });
+         (telemetry_collector, dispatcher_arc, Some(health_checker))
+     } else {
+         log::info!("Distributed mode disabled");
+@@ -561,8 +530,6 @@ fn main() -> anyhow::Result<()> {
+ 
+     #[cfg(feature = "service_debug")]
+     {
+-        use std::fmt::Write;
+-
+         use parking_lot::deadlock;
+ 
+         const DEADLOCK_CHECK_PERIOD: Duration = Duration::from_secs(10);
