@@ -1365,14 +1365,12 @@ function initializeChart(chartData) {
     
     // Define models to check by default
     const defaultSelectedModels = [
-        "anthropic/claude-3.7-sonnetthinking",
         "anthropic/claude-sonnet-4",
-        "deepseek/deepseek-chat-v3-0324",
-        "deepseek/deepseek-r1",
         "google/gemini-2.5-pro-preview-06-05",
         "openai/gpt-4.1",
         "openai/o3",
-        "x-ai/grok-3-beta"
+        "x-ai/grok-3-beta",
+        "x-ai/grok-4-07-09"
     ];
     
     // Get canvas context
