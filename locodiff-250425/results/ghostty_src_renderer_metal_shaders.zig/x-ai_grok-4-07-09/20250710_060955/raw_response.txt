@@ -1,0 +1,594 @@
+```zig
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const macos = @import("macos");
+const objc = @import("objc");
+const math = @import("../../math.zig");
+const mtl = @import("api.zig");
+const log = std.log.scoped(.metal);
+
+pub const Shaders = struct {
+    library: objc.Object,
+    cell_text_pipeline: objc.Object,
+    cell_bg_pipeline: objc.Object,
+    image_pipeline: objc.Object,
+    post_pipelines: []const objc.Object,
+
+    pub fn init(
+        alloc: Allocator,
+        device: objc.Object,
+        post_shaders: []const [:0]const u8,
+        pixel_format: mtl.MTLPixelFormat,
+    ) !Shaders {
+        const library = try initLibrary(device);
+        errdefer library.msgSend(void, objc.sel("release"), .{});
+
+        const cell_text_pipeline = try initCellTextPipeline(device, library, pixel_format);
+        errdefer cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+
+        const cell_bg_pipeline = try initCellBgPipeline(device, library, pixel_format);
+        errdefer cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+
+        const image_pipeline = try initImagePipeline(device, library, pixel_format);
+        errdefer image_pipeline.msgSend(void, objc.sel("release"), .{});
+
+        const post_pipelines: []const objc.Object = initPostPipelines(
+            alloc,
+            device,
+            library,
+            post_shaders,
+            pixel_format,
+        ) catch |err| err: {
+            log.warn("error initializing postprocess shaders err={}", .{err});
+            break :err &.{};
+        };
+        errdefer if (post_pipelines.len > 0) {
+            for (post_pipelines) |pipeline| pipeline.msgSend(void, objc.sel("release"), .{});
+            alloc.free(post_pipelines);
+        };
+
+        return .{
+            .library = library,
+            .cell_text_pipeline = cell_text_pipeline,
+            .cell_bg_pipeline = cell_bg_pipeline,
+            .image_pipeline = image_pipeline,
+            .post_pipelines = post_pipelines,
+        };
+    }
+
+    pub fn deinit(self: *Shaders, alloc: Allocator) void {
+        self.cell_text_pipeline.msgSend(void, objc.sel("release"), .{});
+        self.cell_bg_pipeline.msgSend(void, objc.sel("release"), .{});
+        self.image_pipeline.msgSend(void, objc.sel("release"), .{});
+        self.library.msgSend(void, objc.sel("release"), .{});
+
+        if (self.post_pipelines.len > 0) {
+            for (self.post_pipelines) |pipeline| {
+                pipeline.msgSend(void, objc.sel("release"), .{});
+            }
+            alloc.free(self.post_pipelines);
+        }
+    }
+};
+
+pub const CellText = extern struct {
+    glyph_pos: [2]u32 align(8) = .{ 0, 0 },
+    glyph_size: [2]u32 align(8) = .{ 0, 0 },
+    bearings: [2]i16 align(4) = .{ 0, 0 },
+    grid_pos: [2]u16 align(4),
+    color: [4]u8 align(4),
+    mode: Mode align(1),
+    constraint_width: u8 align(1) = 0,
+
+    pub const Mode = enum(u8) {
+        fg = 1,
+        fg_constrained = 2,
+        fg_color = 3,
+        cursor = 4,
+        fg_powerline = 5,
+    };
+
+    test {
+        try std.testing.expectEqual(32, @sizeOf(CellText));
+    }
+};
+
+pub const Image = extern struct {
+    grid_pos: [2]f32,
+    cell_offset: [2]f32,
+    source_rect: [4]f32,
+    dest_size: [2]f32,
+};
+
+pub const Uniforms = extern struct {
+    projection_matrix: math.Mat align(16),
+    cell_size: [2]f32 align(8),
+    grid_size: [2]u16 align(4),
+    grid_padding: [4]f32 align(16),
+    padding_extend: PaddingExtend align(1),
+    min_contrast: f32 align(4),
+    cursor_pos: [2]u16 align(4),
+    cursor_color: [4]u8 align(4),
+    bg_color: [4]u8 align(4),
+    cursor_wide: bool align(1),
+    use_display_p3: bool align(1),
+    use_linear_blending: bool align(1),
+    use_linear_correction: bool align(1) = false,
+
+    const PaddingExtend = packed struct(u8) {
+        left: bool = false,
+        right: bool = false,
+        up: bool = false,
+        down: bool = false,
+        _padding: u4 = 0,
+    };
+};
+
+pub const PostUniforms = extern struct {
+    resolution: [3]f32 align(16),
+    time: f32 align(4),
+    time_delta: f32 align(4),
+    frame_rate: f32 align(4),
+    frame: i32 align(4),
+    channel_time: [4][4]f32 align(16),
+    channel_resolution: [4][4]f32 align(16),
+    mouse: [4]f32 align(16),
+    date: [4]f32 align(16),
+    sample_rate: f32 align(4),
+};
+
+fn initLibrary(device: objc.Object) !objc.Object {
+    const start = try std.time.Instant.now();
+
+    const data = try macos.dispatch.Data.create(
+        @embedFile("ghostty_metallib"),
+        macos.dispatch.queue.getMain(),
+        macos.dispatch.Data.DESTRUCTOR_DEFAULT,
+    );
+    defer data.release();
+
+    var err: ?*anyopaque = null;
+    const library = device.msgSend(
+        objc.Object,
+        objc.sel("newLibraryWithData:error:"),
+        .{ data, &err },
+    );
+    try checkError(err);
+
+    const end = try std.time.Instant.now();
+    log.debug("shader library loaded time={}us", .{end.since(start) / std.time.ns_per_us});
+
+    return library;
+}
+
+fn initPostPipelines(
+    alloc: Allocator,
+    device: objc.Object,
+    library: objc.Object,
+    shaders: []const [:0]const u8,
+    pixel_format: mtl.MTLPixelFormat,
+) ![]const objc.Object {
+    if (shaders.len == 0) return &.{};
+
+    var i: usize = 0;
+
+    var pipelines = try alloc.alloc(objc.Object, shaders.len);
+    errdefer {
+        for (pipelines[0..i]) |pipeline| {
+            pipeline.msgSend(void, objc.sel("release"), .{});
+        }
+        alloc.free(pipelines);
+    };
+
+    for (shaders) |source| {
+        pipelines[i] = try initPostPipeline(device, library, source, pixel_format);
+        i += 1;
+    }
+
+    return pipelines;
+}
+
+fn initPostPipeline(
+    device: objc.Object,
+    library: objc.Object,
+    data: [:0]const u8,
+    pixel_format: mtl.MTLPixelFormat,
+) !objc.Object {
+    const post_library = library: {
+        const source = try macos.foundation.String.createWithBytes(
+            data,
+            .utf8,
+            false,
+        );
+        defer source.release();
+
+        var err: ?*anyopaque = null;
+        const post_library = device.msgSend(
+            objc.Object,
+            objc.sel("newLibraryWithSource:options:error:"),
+            .{ source, @as(?*anyopaque, null), &err },
+        );
+        try checkError(err);
+        errdefer post_library.msgSend(void, objc.sel("release"), .{});
+
+        break :library post_library;
+    };
+    defer post_library.msgSend(void, objc.sel("release"), .{});
+
+    const func_vert = func_vert: {
+        const str = try macos.foundation.String.createWithBytes(
+            "full_screen_vertex",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_vert objc.Object.fromId(ptr.?);
+    };
+    defer func_vert.msgSend(void, objc.sel("release"), .{});
+    const func_frag = func_frag: {
+        const str = try macos.foundation.String.createWithBytes(
+            "main0",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = post_library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_frag objc.Object.fromId(ptr.?);
+    };
+    defer func_frag.msgSend(void, objc.sel("release"), .{});
+
+    const desc = init: {
+        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+        break :init id_init;
+    };
+    defer desc.msgSend(void, objc.sel("release"), .{});
+    desc.setProperty("vertexFunction", func_vert);
+    desc.setProperty("fragmentFunction", func_frag);
+
+    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
+    {
+        const attachment = attachments.msgSend(
+            objc.Object,
+            objc.sel("objectAtIndexedSubscript:"),
+            .{@as(c_ulong, 0)},
+        );
+
+        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+    }
+
+    var err: ?*anyopaque = null;
+    const pipeline_state = device.msgSend(
+        objc.Object,
+        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
+        .{ desc, &err },
+    );
+    try checkError(err);
+
+    return pipeline_state;
+}
+
+fn initCellTextPipeline(
+    device: objc.Object,
+    library: objc.Object,
+    pixel_format: mtl.MTLPixelFormat,
+) !objc.Object {
+    const func_vert = func_vert: {
+        const str = try macos.foundation.String.createWithBytes(
+            "cell_text_vertex",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_vert objc.Object.fromId(ptr.?);
+    };
+    defer func_vert.msgSend(void, objc.sel("release"), .{});
+    const func_frag = func_frag: {
+        const str = try macos.foundation.String.createWithBytes(
+            "cell_text_fragment",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_frag objc.Object.fromId(ptr.?);
+    };
+    defer func_frag.msgSend(void, objc.sel("release"), .{});
+
+    const vertex_desc = vertex_desc: {
+        const desc = init: {
+            const Class = objc.getClass("MTLVertexDescriptor").?;
+            const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+            const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+            break :init id_init;
+        };
+
+        const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
+        autoAttribute(CellText, attrs);
+
+        const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+        {
+            const layout = layouts.msgSend(
+                objc.Object,
+                objc.sel("objectAtIndexedSubscript:"),
+                .{@as(c_ulong, 0)},
+            );
+
+            layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
+            layout.setProperty("stride", @as(c_ulong, @sizeOf(CellText)));
+        }
+
+        break :vertex_desc desc;
+    };
+    defer vertex_desc.msgSend(void, objc.sel("release"), .{});
+
+    const desc = init: {
+        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+        break :init id_init;
+    };
+    defer desc.msgSend(void, objc.sel("release"), .{});
+
+    desc.setProperty("vertexFunction", func_vert);
+    desc.setProperty("fragmentFunction", func_frag);
+    desc.setProperty("vertexDescriptor", vertex_desc);
+
+    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
+    {
+        const attachment = attachments.msgSend(
+            objc.Object,
+            objc.sel("objectAtIndexedSubscript:"),
+            .{@as(c_ulong, 0)},
+        );
+
+        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+
+        attachment.setProperty("blendingEnabled", true);
+        attachment.setProperty("rgbBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
+        attachment.setProperty("alphaBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
+        attachment.setProperty("sourceRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
+        attachment.setProperty("sourceAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
+        attachment.setProperty("destinationRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
+        attachment.setProperty("destinationAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
+    }
+
+    var err: ?*anyopaque = null;
+    const pipeline_state = device.msgSend(
+        objc.Object,
+        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
+        .{ desc, &err },
+    );
+    try checkError(err);
+    errdefer pipeline_state.msgSend(void, objc.sel("release"), .{});
+
+    return pipeline_state;
+}
+
+pub const CellBg = [4]u8;
+
+fn initCellBgPipeline(
+    device: objc.Object,
+    library: objc.Object,
+    pixel_format: mtl.MTLPixelFormat,
+) !objc.Object {
+    const func_vert = func_vert: {
+        const str = try macos.foundation.String.createWithBytes(
+            "full_screen_vertex",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_vert objc.Object.fromId(ptr.?);
+    };
+    defer func_vert.msgSend(void, objc.sel("release"), .{});
+    const func_frag = func_frag: {
+        const str = try macos.foundation.String.createWithBytes(
+            "cell_bg_fragment",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_frag objc.Object.fromId(ptr.?);
+    };
+    defer func_frag.msgSend(void, objc.sel("release"), .{});
+
+    const desc = init: {
+        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+        break :init id_init;
+    };
+    defer desc.msgSend(void, objc.sel("release"), .{});
+
+    desc.setProperty("vertexFunction", func_vert);
+    desc.setProperty("fragmentFunction", func_frag);
+
+    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
+    {
+        const attachment = attachments.msgSend(
+            objc.Object,
+            objc.sel("objectAtIndexedSubscript:"),
+            .{@as(c_ulong, 0)},
+        );
+
+        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+
+        attachment.setProperty("blendingEnabled", true);
+        attachment.setProperty("rgbBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
+        attachment.setProperty("alphaBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
+        attachment.setProperty("sourceRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
+        attachment.setProperty("sourceAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
+        attachment.setProperty("destinationRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
+        attachment.setProperty("destinationAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
+    }
+
+    var err: ?*anyopaque = null;
+    const pipeline_state = device.msgSend(
+        objc.Object,
+        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
+        .{ desc, &err },
+    );
+    try checkError(err);
+    errdefer pipeline_state.msgSend(void, objc.sel("release"), .{});
+
+    return pipeline_state;
+}
+
+fn initImagePipeline(
+    device: objc.Object,
+    library: objc.Object,
+    pixel_format: mtl.MTLPixelFormat,
+) !objc.Object {
+    const func_vert = func_vert: {
+        const str = try macos.foundation.String.createWithBytes(
+            "image_vertex",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_vert objc.Object.fromId(ptr.?);
+    };
+    defer func_vert.msgSend(void, objc.sel("release"), .{});
+    const func_frag = func_frag: {
+        const str = try macos.foundation.String.createWithBytes(
+            "image_fragment",
+            .utf8,
+            false,
+        );
+        defer str.release();
+
+        const ptr = library.msgSend(?*anyopaque, objc.sel("newFunctionWithName:"), .{str});
+        break :func_frag objc.Object.fromId(ptr.?);
+    };
+    defer func_frag.msgSend(void, objc.sel("release"), .{});
+
+    const vertex_desc = vertex_desc: {
+        const desc = init: {
+            const Class = objc.getClass("MTLVertexDescriptor").?;
+            const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+            const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+            break :init id_init;
+        };
+
+        const attrs = objc.Object.fromId(desc.getProperty(?*anyopaque, "attributes"));
+        autoAttribute(Image, attrs);
+
+        const layouts = objc.Object.fromId(desc.getProperty(?*anyopaque, "layouts"));
+        {
+            const layout = layouts.msgSend(
+                objc.Object,
+                objc.sel("objectAtIndexedSubscript:"),
+                .{@as(c_ulong, 0)},
+            );
+
+            layout.setProperty("stepFunction", @intFromEnum(mtl.MTLVertexStepFunction.per_instance));
+            layout.setProperty("stride", @as(c_ulong, @sizeOf(Image)));
+        }
+
+        break :vertex_desc desc;
+    };
+    defer vertex_desc.msgSend(void, objc.sel("release"), .{});
+
+    const desc = init: {
+        const Class = objc.getClass("MTLRenderPipelineDescriptor").?;
+        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
+        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
+        break :init id_init;
+    };
+    defer desc.msgSend(void, objc.sel("release"), .{});
+
+    desc.setProperty("vertexFunction", func_vert);
+    desc.setProperty("fragmentFunction", func_frag);
+    desc.setProperty("vertexDescriptor", vertex_desc);
+
+    const attachments = objc.Object.fromId(desc.getProperty(?*anyopaque, "colorAttachments"));
+    {
+        const attachment = attachments.msgSend(
+            objc.Object,
+            objc.sel("objectAtIndexedSubscript:"),
+            .{@as(c_ulong, 0)},
+        );
+
+        attachment.setProperty("pixelFormat", @intFromEnum(pixel_format));
+
+        attachment.setProperty("blendingEnabled", true);
+        attachment.setProperty("rgbBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
+        attachment.setProperty("alphaBlendOperation", @intFromEnum(mtl.MTLBlendOperation.add));
+        attachment.setProperty("sourceRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
+        attachment.setProperty("sourceAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one));
+        attachment.setProperty("destinationRGBBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
+        attachment.setProperty("destinationAlphaBlendFactor", @intFromEnum(mtl.MTLBlendFactor.one_minus_source_alpha));
+    }
+
+    var err: ?*anyopaque = null;
+    const pipeline_state = device.msgSend(
+        objc.Object,
+        objc.sel("newRenderPipelineStateWithDescriptor:error:"),
+        .{ desc, &err },
+    );
+    try checkError(err);
+    errdefer pipeline_state.msgSend(void, objc.sel("release"), .{});
+
+    return pipeline_state;
+}
+
+fn autoAttribute(T: type, attrs: objc.Object) void {
+    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+        const offset = @offsetOf(T, field.name);
+
+        const FT = switch (@typeInfo(field.type)) {
+            .@"enum" => |e| e.tag_type,
+            else => field.type,
+        };
+
+        const format = switch (FT) {
+            [4]u8 => mtl.MTLVertexFormat.uchar4,
+            [2]u16 => mtl.MTLVertexFormat.ushort2,
+            [2]i16 => mtl.MTLVertexFormat.short2,
+            [2]f32 => mtl.MTLVertexFormat.float2,
+            [4]f32 => mtl.MTLVertexFormat.float4,
+            [2]i32 => mtl.MTLVertexFormat.int2,
+            u32 => mtl.MTLVertexFormat.uint,
+            [2]u32 => mtl.MTLVertexFormat.uint2,
+            [4]u32 => mtl.MTLVertexFormat.uint4,
+            u8 => mtl.MTLVertexFormat.uchar,
+            else => comptime unreachable,
+        };
+
+        const attr = attrs.msgSend(
+            objc.Object,
+            objc.sel("objectAtIndexedSubscript:"),
+            .{@as(c_ulong, i)},
+        );
+
+        attr.setProperty("format", @intFromEnum(format));
+        attr.setProperty("offset", @as(c_ulong, offset));
+        attr.setProperty("bufferIndex", @as(c_ulong, 0));
+    }
+}
+
+fn checkError(err_: ?*anyopaque) !void {
+    const nserr = objc.Object.fromId(err_ orelse return);
+    const str = @as(
+        *macos.foundation.String,
+        @ptrCast(nserr.getProperty(?*anyopaque, "localizedDescription").?),
+    );
+
+    log.err("metal error={s}", .{str.cstringPtr(.ascii).?});
+    return error.MetalFailed;
+}
+```

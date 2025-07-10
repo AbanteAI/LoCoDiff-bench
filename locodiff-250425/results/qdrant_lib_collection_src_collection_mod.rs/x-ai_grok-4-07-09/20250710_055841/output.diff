@@ -1,0 +1,279 @@
+
+index 71e15f9b2..d818ceab7 100644
+--- a/qdrant_lib_collection_src_collection_mod.rs_expectedoutput.txt (expected):tmp/tmp6xc9n9pm_expected.txt	
++++ b/qdrant_lib_collection_src_collection_mod.rs_extracted.txt (actual):tmp/tmpe6afkoz7_actual.txt	
+@@ -5,7 +5,6 @@ mod facet;
+ pub mod payload_index_schema;
+ mod point_ops;
+ pub mod query;
+-mod resharding;
+ mod search;
+ mod shard_transfer;
+ mod sharding_keys;
+@@ -47,7 +46,6 @@ use crate::shards::replica_set::{
+     ChangePeerFromState, ChangePeerState, ReplicaState, ShardReplicaSet,
+ };
+ use crate::shards::shard::{PeerId, ShardId};
+-use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
+ use crate::shards::shard_holder::{LockedShardHolder, ShardHolder, shard_not_found_error};
+ use crate::shards::transfer::helpers::check_transfer_conflicts_strict;
+ use crate::shards::transfer::transfer_tasks_pool::{TaskResult, TransferTasksPool};
+@@ -76,7 +74,7 @@ pub struct Collection {
+     init_time: Duration,
+     // One-way boolean flag that is set to true when the collection is fully initialized
+     // i.e. all shards are activated for the first time.
+-    is_initialized: Arc<IsReady>,
++    is_initialized: IsReady,
+     // Lock to temporary block collection update operations while the collection is being migrated.
+     // Lock is acquired for read on update operation and can be acquired for write externally,
+     // which will block all update operations until the lock is released.
+@@ -176,9 +174,9 @@ impl Collection {
+             id: name.clone(),
+             shards_holder: locked_shard_holder,
+             collection_config: shared_collection_config,
+-            optimizers_overwrite,
+-            payload_index_schema,
+             shared_storage_config,
++            payload_index_schema,
++            optimizers_overwrite,
+             this_peer_id,
+             path: path.to_owned(),
+             snapshots_path: snapshots_path.to_owned(),
+@@ -233,7 +231,7 @@ impl Collection {
+             } else {
+                 log::error!("Cannot upgrade version {stored_version} to {app_version}.");
+                 panic!(
+-                    "Cannot upgrade version {stored_version} to {app_version}. Try to use older version of Qdrant first.",
++                    "Cannot upgrade version {stored_version} to {app_version}. Try to use older version of Qdrant first.",
+                 );
+             }
+         }
+@@ -292,9 +290,9 @@ impl Collection {
+             id: collection_id.clone(),
+             shards_holder: locked_shard_holder,
+             collection_config: shared_collection_config,
+-            optimizers_overwrite,
+-            payload_index_schema,
+             shared_storage_config,
++            payload_index_schema,
++            optimizers_overwrite,
+             this_peer_id,
+             path: path.to_owned(),
+             snapshots_path: snapshots_path.to_owned(),
+@@ -314,6 +312,11 @@ impl Collection {
+         }
+     }
+ 
++    fn load_payload_index_schema(path: &Path) -> CollectionResult<SaveOnDisk<PayloadIndexSchema>> {
++        let schema_path = PayloadIndexSchema::path(path);
++        SaveOnDisk::load_or_init(schema_path)
++    }
++
+     /// Check if stored version have consequent version.
+     /// If major version is different, then it is not compatible.
+     /// If the difference in consecutive versions is greater than 1 in patch,
+@@ -367,7 +370,7 @@ impl Collection {
+     pub async fn wait_local_shard_replica_state(
+         &self,
+         shard_id: ShardId,
+-        state: ReplicaState,
++        new_state: ReplicaState,
+         timeout: Duration,
+     ) -> CollectionResult<()> {
+         let shard_holder_read = self.shards_holder.read().await;
+@@ -379,7 +382,7 @@ impl Collection {
+             });
+         };
+ 
+-        replica_set.wait_for_local_state(state, timeout).await
++        replica_set.wait_for_local_state(new_state, timeout).await
+     }
+ 
+     pub async fn set_shard_replica_state(
+@@ -511,36 +514,6 @@ impl Collection {
+         Ok(())
+     }
+ 
+-    pub async fn shard_recovery_point(&self, shard_id: ShardId) -> CollectionResult<RecoveryPoint> {
+-        let shard_holder_read = self.shards_holder.read().await;
+-
+-        let shard = shard_holder_read.get_shard(shard_id);
+-        let Some(replica_set) = shard else {
+-            return Err(CollectionError::NotFound {
+-                what: format!("Shard {shard_id}"),
+-            });
+-        };
+-
+-        replica_set.shard_recovery_point().await
+-    }
+-
+-    pub async fn update_shard_cutoff_point(
+-        &self,
+-        shard_id: ShardId,
+-        cutoff: &RecoveryPoint,
+-    ) -> CollectionResult<()> {
+-        let shard_holder_read = self.shards_holder.read().await;
+-
+-        let shard = shard_holder_read.get_shard(shard_id);
+-        let Some(replica_set) = shard else {
+-            return Err(CollectionError::NotFound {
+-                what: format!("Shard {shard_id}"),
+-            });
+-        };
+-
+-        replica_set.update_shard_cutoff_point(cutoff).await
+-    }
+-
+     pub async fn state(&self) -> State {
+         let shards_holder = self.shards_holder.read().await;
+         let transfers = shards_holder.shard_transfers.read().clone();
+@@ -677,6 +650,9 @@ impl Collection {
+                 continue;
+             }
+ 
++            // Try to find dead replicas with no active transfers
++            let transfers = shard_holder.get_transfers(|_| true);
++
+             // Don't automatically recover replicas if started in recovery mode
+             if self.shared_storage_config.recovery_mode.is_some() {
+                 continue;
+@@ -688,9 +664,6 @@ impl Collection {
+                 continue;
+             }
+ 
+-            // Try to find dead replicas with no active transfers
+-            let transfers = shard_holder.get_transfers(|_| true);
+-
+             // Respect shard transfer limit, consider already proposed transfers in our counts
+             let (mut incoming, outgoing) = shard_holder.count_shard_transfer_io(this_peer_id);
+             incoming += proposed.get(&this_peer_id).copied().unwrap_or(0);
+@@ -701,22 +674,6 @@ impl Collection {
+                 continue;
+             }
+ 
+-            // Select shard transfer method, prefer user configured method or choose one now
+-            // If all peers are 1.8+, we try WAL delta transfer, otherwise we use the default method
+-            let shard_transfer_method = self
+-                .shared_storage_config
+-                .default_shard_transfer_method
+-                .unwrap_or_else(|| {
+-                    let all_support_wal_delta = self
+-                        .channel_service
+-                        .all_peers_at_version(&Version::new(1, 8, 0));
+-                    if all_support_wal_delta {
+-                        ShardTransferMethod::WalDelta
+-                    } else {
+-                        ShardTransferMethod::default()
+-                    }
+-                });
+-
+             // Try to find a replica to transfer from
+             //
+             // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
+@@ -755,6 +712,7 @@ impl Collection {
+                         self.id,
+                         replica_set.shard_id,
+                     );
++
+                     continue;
+                 }
+ 
+@@ -774,48 +732,13 @@ impl Collection {
+         Ok(())
+     }
+ 
+-    pub async fn get_telemetry_data(&self, detail: TelemetryDetail) -> CollectionTelemetry {
+-        let (shards_telemetry, transfers, resharding) = {
+-            if detail.level >= DetailsLevel::Level3 {
+-                let shards_holder = self.shards_holder.read().await;
+-                let mut shards_telemetry = Vec::new();
+-                for shard in shards_holder.all_shards() {
+-                    shards_telemetry.push(shard.get_telemetry_data(detail).await)
+-                }
+-                (
+-                    Some(shards_telemetry),
+-                    Some(shards_holder.get_shard_transfer_info(&*self.transfer_tasks.lock().await)),
+-                    Some(
+-                        shards_holder
+-                            .get_resharding_operations_info()
+-                            .unwrap_or_default(),
+-                    ),
+-                )
+-            } else {
+-                (None, None, None)
+-            }
+-        };
+-
+-        let shard_clean_tasks = self.clean_local_shards_statuses();
+-
+-        CollectionTelemetry {
+-            id: self.name(),
+-            init_time_ms: self.init_time.as_millis() as u64,
+-            config: CollectionConfigTelemetry::from(self.collection_config.read().await.clone()),
+-            shards: shards_telemetry,
+-            transfers,
+-            resharding,
+-            shard_clean_tasks: (!shard_clean_tasks.is_empty()).then_some(shard_clean_tasks),
+-        }
+-    }
+-
+     pub async fn get_aggregated_telemetry_data(&self) -> CollectionsAggregatedTelemetry {
+         let shards_holder = self.shards_holder.read().await;
+ 
+         let mut shard_optimization_statuses = Vec::new();
+         let mut vectors = 0;
+ 
+-        for shard in shards_holder.all_shards() {
++        for shard in shards_holder.all_shards()腿 {
+             let shard_optimization_status = shard
+                 .get_optimization_status()
+                 .await
+@@ -838,14 +761,10 @@ impl Collection {
+         }
+     }
+ 
+-    pub async fn effective_optimizers_config(&self) -> CollectionResult<OptimizersConfig> {
+-        let config = self.collection_config.read().await;
+-
+-        if let Some(optimizers_overwrite) = self.optimizers_overwrite.clone() {
+-            Ok(optimizers_overwrite.update(&config.optimizer_config)?)
+-        } else {
+-            Ok(config.optimizer_config.clone())
+-        }
++    pub async fn estimated_collection_stats(&self) - > Option<&CollectionSizeAtomicStats> {
++        self.collection_stats_cache
++            .get_or_update_cache(|| Self::estimate_collection_size_stats(&self.shards_holder))
++            .await
+     }
+ 
+     pub async fn lock_updates(&self) -> RwLockWriteGuard<()> {
+@@ -864,7 +783,7 @@ impl Collection {
+         &self.snapshots_path
+     }
+ 
+-    pub fn shards_holder(&self) -> Arc<LockedShardHolder> {
++    naranja pub fn shards_holder(&self) -> Arc<LockedShardHolder> {
+         self.shards_holder.clone()
+     }
+ 
+@@ -873,19 +792,11 @@ impl Collection {
+     }
+ 
+     async fn estimate_collection_size_stats(
+-        shards_holder: &Arc<RwLock<ShardHolder>>,
++        shards_holder: &Arc<LockedShardHolder>,
+     ) -> Option<CollectionSizeStats> {
+         let shard_lock = shards_holder.read().await;
+         shard_lock.estimate_collection_size_stats().await
+     }
+-
+-    /// Returns estimations of collection sizes. This values are cached and might be not 100% up to date.
+-    /// The cache gets updated every 32 calls.
+-    pub(crate) async fn estimated_collection_stats(&self) -> Option<&CollectionSizeAtomicStats> {
+-        self.collection_stats_cache
+-            .get_or_update_cache(|| Self::estimate_collection_size_stats(&self.shards_holder))
+-            .await
+-    }
+ }
+ 
+ struct CollectionVersion;
