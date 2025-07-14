@@ -1,0 +1,172 @@
+
+index 70dd22b46..0ca6d85ae 100644
+--- a/qdrant_lib_segment_src_segment_constructor_segment_builder.rs_expectedoutput.txt (expected):tmp/tmp4cy5grwg_expected.txt	
++++ b/qdrant_lib_segment_src_segment_constructor_segment_builder.rs_extracted.txt (actual):tmp/tmp27hvs2gt_actual.txt	
+@@ -11,7 +11,6 @@ use atomic_refcell::AtomicRefCell;
+ use bitvec::macros::internal::funty::Integral;
+ use common::budget::ResourcePermit;
+ use common::counter::hardware_counter::HardwareCounterCell;
+-use common::flags::feature_flags;
+ use common::small_uint::U24;
+ use common::types::PointOffsetType;
+ use io::storage_version::StorageVersion;
+@@ -235,7 +234,7 @@ impl SegmentBuilder {
+                 }
+                 FieldIndex::UuidIndex(index) => {
+                     if let Some(ids) = index.get_values(internal_id) {
+-                        uuid_hash(&mut ordering, ids);
++                        uuid_hash(&mut ordering, ids.copied());
+                     }
+                     break;
+                 }
+@@ -339,8 +338,7 @@ impl SegmentBuilder {
+                 .collect::<Result<Vec<_>, OperationError>>()?;
+ 
+             let mut iter = points_to_insert.iter().map(|point_data| {
+-                let other_vector_storage =
+-                    &other_vector_storages[point_data.segment_index.get() as usize];
++                let other_vector_storage = &other_vector_storages[point_data.segment_index.get() as usize];
+                 let vec = other_vector_storage.get_vector(point_data.internal_id);
+                 let vector_deleted = other_vector_storage.is_deleted_vector(point_data.internal_id);
+                 (vec, vector_deleted)
+@@ -427,7 +425,7 @@ impl SegmentBuilder {
+                     self.payload_storage.set(
+                         new_internal_id,
+                         &other_payload,
+-                        &HardwareCounterCell::disposable(),
++                        &hw_counter,
+                     )?;
+                 }
+             }
+@@ -439,6 +437,9 @@ impl SegmentBuilder {
+             }
+         }
+ 
++        self.id_tracker.mapping_flusher()()?;
++        self.id_tracker.versions_flusher()()?;
++
+         Ok(true)
+     }
+ 
+@@ -485,6 +486,23 @@ impl SegmentBuilder {
+             id_tracker.versions_flusher()()?;
+             let id_tracker_arc = Arc::new(AtomicRefCell::new(id_tracker));
+ 
++            let payload_index_path = get_payload_index_path(temp_dir.path());
++
++            let mut payload_index = StructPayloadIndex::open(
++                payload_storage_arc.clone(),
++                id_tracker_arc.clone(),
++                Arc::new(AtomicRefCell::new(HashMap::new())),
++                &payload_index_path,
++                appendable_flag,
++            )?;
++            for (field, payload_schema) in indexed_fields {
++                payload_index.set_indexed(&field, payload_schema, hw_counter)?;
++                check_process_stopped(stopped)?;
++            }
++
++            payload_index.flusher()()?;
++            let payload_index_arc = Arc::new(AtomicRefCell::new(payload_index));
++
+             let mut quantized_vectors = Self::update_quantization(
+                 &segment_config,
+                 &vector_data,
+@@ -523,38 +541,11 @@ impl SegmentBuilder {
+ 
+                 let vector_storage_arc = Arc::new(AtomicRefCell::new(vector_info.vector_storage));
+ 
+-                vector_storages_arc.insert(vector_name.to_owned(), vector_storage_arc);
+-            }
+-
+-            let payload_index_path = get_payload_index_path(temp_dir.path());
++                old_indices.insert(vector_name, vector_info.old_indices);
+ 
+-            let mut payload_index = StructPayloadIndex::open(
+-                payload_storage_arc.clone(),
+-                id_tracker_arc.clone(),
+-                vector_storages_arc.clone(),
+-                &payload_index_path,
+-                appendable_flag,
+-            )?;
+-            for (field, payload_schema) in indexed_fields {
+-                payload_index.set_indexed(&field, payload_schema, hw_counter)?;
+-                check_process_stopped(stopped)?;
++                vector_storages_arc.insert(vector_name.to_owned(), vector_storage_arc);
+             }
+ 
+-            payload_index.flusher()()?;
+-            let payload_index_arc = Arc::new(AtomicRefCell::new(payload_index));
+-
+-            // Try to lock GPU device.
+-            #[cfg(feature = "gpu")]
+-            let gpu_devices_manager = crate::index::hnsw_index::gpu::GPU_DEVICES_MANAGER.read();
+-            #[cfg(feature = "gpu")]
+-            let gpu_device = gpu_devices_manager
+-                .as_ref()
+-                .map(|devices_manager| devices_manager.lock_device(stopped))
+-                .transpose()?
+-                .flatten();
+-            #[cfg(not(feature = "gpu"))]
+-            let gpu_device = None;
+-
+             // Arc permit to share it with each vector store
+             let permit = Arc::new(permit);
+ 
+@@ -575,7 +566,7 @@ impl SegmentBuilder {
+                     VectorIndexBuildArgs {
+                         permit: permit.clone(),
+                         old_indices: &old_indices.remove(vector_name).unwrap(),
+-                        gpu_device: gpu_device.as_ref(),
++                        gpu_device: None,
+                         stopped,
+                         feature_flags: feature_flags(),
+                     },
+@@ -635,7 +626,7 @@ impl SegmentBuilder {
+             debug_assert_eq!(
+                 Arc::strong_count(&permit),
+                 1,
+-                "Must release CPU permit Arc everywhere",
++                "Must release resource permit Arc everywhere",
+             );
+             drop(permit);
+ 
+@@ -714,6 +705,19 @@ impl SegmentBuilder {
+     }
+ }
+ 
++fn create_temp_dir(parent_path: &Path) -> Result<TempDir, OperationError> {
++    // Ensure parent path exists
++    std::fs::create_dir_all(parent_path)
++        .and_then(|_| TempDir::with_prefix_in("segment_builder_", parent_path))
++        .map_err(|err| {
++            OperationError::service_error(format!(
++                "Could not create temp directory in `{}`: {}",
++                parent_path.display(),
++                err
++            ))
++        })
++}
++
+ fn uuid_hash<I>(hash: &mut u64, ids: I)
+ where
+     I: Iterator<Item = u128>,
+@@ -735,17 +739,4 @@ where
+             *hash = hash.wrapping_add(id as u64);
+         }
+     }
+-}
+-
+-fn create_temp_dir(parent_path: &Path) -> Result<TempDir, OperationError> {
+-    // Ensure parent path exists
+-    std::fs::create_dir_all(parent_path)
+-        .and_then(|_| TempDir::with_prefix_in("segment_builder_", parent_path))
+-        .map_err(|err| {
+-            OperationError::service_error(format!(
+-                "Could not create temp directory in `{}`: {}",
+-                parent_path.display(),
+-                err
+-            ))
+-        })
+ }
+\ No newline at end of file

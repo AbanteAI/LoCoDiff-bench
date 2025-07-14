@@ -1,0 +1,197 @@
+
+index 71e15f9b2..2e0731780 100644
+--- a/qdrant_lib_collection_src_collection_mod.rs_expectedoutput.txt (expected):tmp/tmp4ioktmtd_expected.txt	
++++ b/qdrant_lib_collection_src_collection_mod.rs_extracted.txt (actual):tmp/tmpovd1fj1e_actual.txt	
+@@ -29,10 +29,10 @@ use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+ 
+ use crate::collection::payload_index_schema::PayloadIndexSchema;
+ use crate::collection_state::{ShardInfo, State};
++use crate::common::is_ready::IsReady;
+ use crate::common::collection_size_stats::{
+     CollectionSizeAtomicStats, CollectionSizeStats, CollectionSizeStatsCache,
+ };
+-use crate::common::is_ready::IsReady;
+ use crate::config::CollectionConfigInternal;
+ use crate::operations::config_diff::{DiffConfig, OptimizersConfigDiff};
+ use crate::operations::shared_storage_config::SharedStorageConfig;
+@@ -164,20 +164,20 @@ impl Collection {
+ 
+         let locked_shard_holder = Arc::new(LockedShardHolder::new(shard_holder));
+ 
+-        let collection_stats_cache = CollectionSizeStatsCache::new_with_values(
+-            Self::estimate_collection_size_stats(&locked_shard_holder).await,
+-        );
+-
+         // Once the config is persisted - the collection is considered to be successfully created.
+         CollectionVersion::save(path)?;
+         collection_config.save(path)?;
+ 
++        let collection_stats_cache = CollectionSizeStatsCache::new_with_values(
++            Self::estimate_collection_size_stats(&locked_shard_holder).await,
++        );
++
+         Ok(Self {
+             id: name.clone(),
+             shards_holder: locked_shard_holder,
+             collection_config: shared_collection_config,
+-            optimizers_overwrite,
+             payload_index_schema,
++            optimizers_overwrite,
+             shared_storage_config,
+             this_peer_id,
+             path: path.to_owned(),
+@@ -206,7 +206,7 @@ impl Collection {
+         snapshots_path: &Path,
+         shared_storage_config: Arc<SharedStorageConfig>,
+         channel_service: ChannelService,
+-        on_replica_failure: replica_set::ChangePeerFromState,
++        on_replica_failure: ChangePeerFromState,
+         request_shard_transfer: RequestShardTransfer,
+         abort_shard_transfer: replica_set::AbortShardTransfer,
+         search_runtime: Option<Handle>,
+@@ -257,13 +257,13 @@ impl Collection {
+                 .expect("Can not apply optimizer overwrite");
+         }
+ 
+-        let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
+-
+         let payload_index_schema = Arc::new(
+             Self::load_payload_index_schema(path)
+                 .expect("Can't load or initialize payload index schema"),
+         );
+ 
++        let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
++
+         shard_holder
+             .load_shards(
+                 path,
+@@ -292,8 +292,8 @@ impl Collection {
+             id: collection_id.clone(),
+             shards_holder: locked_shard_holder,
+             collection_config: shared_collection_config,
+-            optimizers_overwrite,
+             payload_index_schema,
++            optimizers_overwrite,
+             shared_storage_config,
+             this_peer_id,
+             path: path.to_owned(),
+@@ -337,6 +337,14 @@ impl Collection {
+         true
+     }
+ 
++    fn load_payload_index_schema(
++        collection_path: &Path,
++    ) -> CollectionResult<SaveOnDisk<PayloadIndexSchema>> {
++        let payload_index_schema_path = collection_path.join("payload_index_schema.json");
++        let payload_index_schema = SaveOnDisk::load_or_init(payload_index_schema_path)?;
++        Ok(payload_index_schema)
++    }
++
+     pub fn name(&self) -> String {
+         self.id.clone()
+     }
+@@ -587,6 +595,16 @@ impl Collection {
+             .await
+     }
+ 
++    /// Check auto shard transfer limits,
++    /// returns true if current counts are above the configured limit
++    fn check_auto_shard_transfer_limit(&self, incoming: usize, outgoing: usize) -> bool {
++        let limit = self
++            .shared_storage_config
++            .max_auto_shard_transfer_io
++            .unwrap_or(usize::MAX);
++        incoming > limit || outgoing > limit
++    }
++
+     pub async fn sync_local_state(
+         &self,
+         on_transfer_failure: OnTransferFailure,
+@@ -598,7 +616,7 @@ impl Collection {
+         // Check for disabled replicas
+         let shard_holder = self.shards_holder.read().await;
+ 
+-        let get_shard_transfers = |shard_id, from| {
++        let get_shard_transfers = |shard_id: ShardId, from: PeerId| {
+             shard_holder
+                 .get_transfers(|transfer| transfer.shard_id == shard_id && transfer.from == from)
+         };
+@@ -640,10 +658,6 @@ impl Collection {
+             }
+         }
+ 
+-        // Count how many transfers we are now proposing
+-        // We must track this here so we can reference it when checking for tranfser limits,
+-        // because transfers we propose now will not be in the consensus state within the lifetime
+-        // of this function
+         let mut proposed = HashMap::<PeerId, usize>::new();
+ 
+         // Check for proper replica states
+@@ -677,6 +691,10 @@ impl Collection {
+                 continue;
+             }
+ 
++            if this_peer_state != Some(Dead) {
++                continue;
++            }
++
+             // Don't automatically recover replicas if started in recovery mode
+             if self.shared_storage_config.recovery_mode.is_some() {
+                 continue;
+@@ -848,10 +866,56 @@ impl Collection {
+         }
+     }
+ 
++    pub async fn start_resharding(
++        &self,
++        peer_id: PeerId,
++        shard_id: ShardId,
++        shard_key: Option<ShardKey>,
++    ) -> CollectionResult<()> {
++        self.shards_holder
++            .write()
++            .await
++            .start_resharding(peer_id, shard_id, shard_key)
++            .await
++    }
++
++    pub async fn abort_resharding(
++        &self,
++        state: crate::shards::resharding::ReshardKey,
++        abort_transfers: bool,
++    ) -> CollectionResult<()> {
++        self.shards_holder
++            .write()
++            .await
++            .abort_resharding(state)
++            .await
++    }
++
++    pub async fn resharding_state(&self) -> Option<crate::shards::resharding::ReshardingState> {
++        self.shards_holder
++            .read()
++            .await
++            .resharding_state
++            .read()
++            .clone()
++    }
++
+     pub async fn lock_updates(&self) -> RwLockWriteGuard<()> {
+         self.updates_lock.write().await
+     }
+ 
++    pub async fn abort_shard_transfer(
++        &self,
++        transfer_key: crate::shards::transfer::TransferKey,
++        transfer_diagnostics: Option<String>,
++    ) -> CollectionResult<()> {
++        self.shards_holder
++            .write()
++            .await
++            .abort_shard_transfer(transfer_key, transfer_diagnostics)
++            .await
++    }
++
+     pub fn wait_collection_initiated(&self, timeout: Duration) -> bool {
+         self.is_initialized.await_ready_for_timeout(timeout)
+     }

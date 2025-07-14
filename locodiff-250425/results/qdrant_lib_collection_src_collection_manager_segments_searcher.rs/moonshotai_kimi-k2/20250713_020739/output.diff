@@ -1,0 +1,242 @@
+
+index 8096e53f4..f78267141 100644
+--- a/qdrant_lib_collection_src_collection_manager_segments_searcher.rs_expectedoutput.txt (expected):tmp/tmp5r9ld9vt_expected.txt	
++++ b/qdrant_lib_collection_src_collection_manager_segments_searcher.rs_extracted.txt (actual):tmp/tmp3e4smp_c_actual.txt	
+@@ -1,15 +1,16 @@
+-use std::collections::BTreeSet;
+ use std::collections::hash_map::Entry;
+-use std::sync::Arc;
++use std::collections::{AHashMap, BTreeSet};
+ use std::sync::atomic::AtomicBool;
++use std::sync::Arc;
+ 
+-use ahash::AHashMap;
++use ahash::AHashSet;
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use common::types::ScoreType;
+ use futures::stream::FuturesUnordered;
+ use futures::{FutureExt, TryStreamExt};
+ use itertools::Itertools;
+ use ordered_float::Float;
++use parking_lot::RwLock;
+ use segment::common::operation_error::OperationError;
+ use segment::data_types::named_vectors::NamedVectors;
+ use segment::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
+@@ -29,9 +30,7 @@ use crate::collection_manager::search_result_aggregator::BatchResultAggregator;
+ use crate::common::stopping_guard::StoppingGuard;
+ use crate::config::CollectionConfigInternal;
+ use crate::operations::query_enum::QueryEnum;
+-use crate::operations::types::{
+-    CollectionResult, CoreSearchRequestBatch, Modifier, RecordInternal,
+-};
++use crate::operations::types::{CollectionResult, CoreSearchRequestBatch, Modifier, RecordInternal};
+ use crate::optimizers_builder::DEFAULT_INDEXING_THRESHOLD_KB;
+ 
+ type BatchOffset = usize;
+@@ -206,23 +205,11 @@ impl SegmentsSearcher {
+         )
+         .with_is_stopped(is_stopped_guard.get_is_stopped());
+ 
+-        for search_request in &batch_request.searches {
+-            search_request
+-                .query
+-                .iterate_sparse(|vector_name, sparse_vector| {
+-                    if idf_vectors.contains(&vector_name) {
+-                        query_context.init_idf(vector_name, &sparse_vector.indices);
+-                    }
+-                })
+-        }
+-
+         // Do blocking calls in a blocking task: `segment.get().read()` calls might block async runtime
+         let task = {
+             let segments = segments.clone();
+-
+             tokio::task::spawn_blocking(move || {
+                 let segments = segments.read();
+-
+                 if segments.is_empty() {
+                     return None;
+                 }
+@@ -251,11 +238,14 @@ impl SegmentsSearcher {
+ 
+         // Using block to ensure `segments` variable is dropped in the end of it
+         let (locked_segments, searches): (Vec<_>, Vec<_>) = {
+-            // Unfortunately, we have to do `segments.read()` twice, once in blocking task
+-            // and once here, due to `Send` bounds :/
+             let segments_lock = segments.read();
+             let segments = segments_lock.non_appendable_then_appendable_segments();
+ 
++            // If no segments
++            if segments.clone().count() == 0 {
++                return Ok(vec![vec![]; batch_request.searches.len()]);
++            }
++
+             // Probabilistic sampling for the `limit` parameter avoids over-fetching points from segments.
+             // e.g. 10 segments with limit 1000 would fetch 10000 points in total and discard 9000 points.
+             // With probabilistic sampling we determine a smaller sampling limit for each segment.
+@@ -270,13 +260,11 @@ impl SegmentsSearcher {
+             segments
+                 .map(|segment| {
+                     let query_context_arc_segment = query_context_arc.clone();
+-
+                     let search = runtime_handle.spawn_blocking({
+                         let (segment, batch_request) = (segment.clone(), batch_request.clone());
+                         move || {
+                             let segment_query_context =
+                                 query_context_arc_segment.get_segment_query_context();
+-
+                             search_in_segment(
+                                 segment,
+                                 batch_request,
+@@ -294,7 +282,6 @@ impl SegmentsSearcher {
+         // the resulting Vec is in the same order as the segment searches were provided.
+         let (all_search_results_per_segment, further_results) =
+             Self::execute_searches(searches).await?;
+-        debug_assert!(all_search_results_per_segment.len() == locked_segments.len());
+ 
+         let (mut result_aggregator, searches_to_rerun) = Self::process_search_result_step1(
+             all_search_results_per_segment,
+@@ -328,7 +315,6 @@ impl SegmentsSearcher {
+                     res.push(runtime_handle.spawn_blocking(move || {
+                         let segment_query_context =
+                             query_context_arc_segment.get_segment_query_context();
+-
+                         search_in_segment(
+                             segment,
+                             partial_batch_request,
+@@ -374,6 +360,8 @@ impl SegmentsSearcher {
+     /// The points ids can contain duplicates, the records will be fetched only once
+     ///
+     /// If an id is not found in the segments, it won't be included in the output.
++    ///
++    /// If an id is not found in the segments, it won't be included in the output.
+     pub async fn retrieve(
+         segments: LockedSegmentHolder,
+         points: &[PointIdType],
+@@ -550,10 +538,11 @@ impl SegmentsSearcher {
+         let mut aggregator = BatchResultAggregator::new(std::iter::once(limit));
+         aggregator.update_point_versions(segments_results.iter().flatten());
+         aggregator.update_batch_results(0, segments_results.into_iter().flatten());
+-        let top =
+-            aggregator.into_topk().into_iter().next().ok_or_else(|| {
+-                OperationError::service_error("expected first result of aggregator")
+-            })?;
++        let top = aggregator
++            .into_topk()
++            .into_iter()
++            .next()
++            .ok_or_else(|| OperationError::service_error("expected first result of aggregator"))?;
+ 
+         Ok(top)
+     }
+@@ -592,6 +581,12 @@ struct BatchSearchParams<'a> {
+     pub params: Option<&'a SearchParams>,
+ }
+ 
++/// Determines the effective ef limit value for the given parameters.
++fn effective_limit(limit: usize, ef_limit: usize, poisson_sampling: usize) -> usize {
++    // Prefer the highest of poisson_sampling/ef_limit, but never be higher than limit
++    poisson_sampling.max(ef_limit).min(limit)
++}
++
+ /// Returns suggested search sampling size for a given number of points and required limit.
+ fn sampling_limit(
+     limit: usize,
+@@ -617,12 +612,6 @@ fn sampling_limit(
+     effective
+ }
+ 
+-/// Determines the effective ef limit value for the given parameters.
+-fn effective_limit(limit: usize, ef_limit: usize, poisson_sampling: usize) -> usize {
+-    // Prefer the highest of poisson_sampling/ef_limit, but never be higher than limit
+-    poisson_sampling.max(ef_limit).min(limit)
+-}
+-
+ /// Process sequentially contiguous batches
+ ///
+ /// # Arguments
+@@ -765,14 +754,14 @@ fn get_hnsw_ef_construct(config: &SegmentConfig, vector_name: &VectorName) -> Op
+         .get(vector_name)
+         .and_then(|config| match &config.index {
+             Indexes::Plain {} => None,
+-            Indexes::Hnsw(hnsw) => Some(hnsw),
++            Indexes::Hnsw(hnsw) => Some(hnsw.ef_construct),
+         })
+-        .map(|hnsw| hnsw.ef_construct)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use ahash::AHashSet;
++    use std::collections::AHashSet;
++
+     use api::rest::SearchRequestInternal;
+     use common::counter::hardware_counter::HardwareCounterCell;
+     use parking_lot::RwLock;
+@@ -852,13 +841,12 @@ mod tests {
+             searches: vec![req],
+         };
+ 
+-        let hw_acc = HwMeasurementAcc::new();
+         let result = SegmentsSearcher::search(
+             Arc::new(segment_holder),
+             Arc::new(batch_request),
+             &Handle::current(),
+             true,
+-            QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_acc),
++            QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, HwMeasurementAcc::new()),
+         )
+         .await
+         .unwrap()
+@@ -894,7 +882,7 @@ mod tests {
+             let req1 = SearchRequestInternal {
+                 vector: random_vector(&mut rnd, 4).into(),
+                 limit: 150, // more than LOWER_SEARCH_LIMIT_SAMPLING
+-                offset: None,
++                offset: 0,
+                 with_payload: None,
+                 with_vector: None,
+                 filter: None,
+@@ -904,7 +892,7 @@ mod tests {
+             let req2 = SearchRequestInternal {
+                 vector: random_vector(&mut rnd, 4).into(),
+                 limit: 50, // less than LOWER_SEARCH_LIMIT_SAMPLING
+-                offset: None,
++                offset: 0,
+                 filter: None,
+                 params: None,
+                 with_payload: None,
+@@ -916,8 +904,6 @@ mod tests {
+                 searches: vec![req1.into(), req2.into()],
+             };
+ 
+-            let batch_request = Arc::new(batch_request);
+-
+             let hw_measurement_acc = HwMeasurementAcc::new();
+             let query_context =
+                 QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_measurement_acc.clone());
+@@ -932,14 +918,12 @@ mod tests {
+             .await
+             .unwrap();
+ 
+-            assert_ne!(hw_measurement_acc.get_cpu(), 0);
++            assert!(!result_no_sampling.is_empty());
+ 
+             let hw_measurement_acc = HwMeasurementAcc::new();
+             let query_context =
+                 QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_measurement_acc.clone());
+ 
+-            assert!(!result_no_sampling.is_empty());
+-
+             let result_sampling = SegmentsSearcher::search(
+                 segment_holder.clone(),
+                 batch_request,
+@@ -951,8 +935,6 @@ mod tests {
+             .unwrap();
+             assert!(!result_sampling.is_empty());
+ 
+-            assert_ne!(hw_measurement_acc.get_cpu(), 0);
+-
+             // assert equivalence in depth
+             assert_eq!(result_no_sampling[0].len(), result_sampling[0].len());
+             assert_eq!(result_no_sampling[1].len(), result_sampling[1].len());
