@@ -15,3 +15,7 @@ To see results, methodology, and analysis:
 # 👉 [Explore the **Interactive Benchmark Dashboard**!](https://abanteai.github.io/LoCoDiff-bench/)
 
 For instructions on running the benchmark yourself, see the [benchmark pipeline README](benchmark_pipeline/README.md).
+
+## Getting Started
+
+This benchmark is designed to test models on their ability to understand complex git diffs and reconstruct code from historical context. The benchmark suite includes hundreds of real-world code examples extracted from popular open-source repositories.
