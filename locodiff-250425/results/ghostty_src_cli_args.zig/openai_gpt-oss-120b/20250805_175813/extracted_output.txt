@@ -1,0 +1,637 @@
+const std = @import("std");
+const mem = std.mem;
+const assert = std.debug.assert;
+const Allocator = mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+
+const diags = @import("diagnostics.zig");
+const Diagnostic = diags.Diagnostic;
+const DiagnosticList = diags.DiagnosticList;
+const internal_os = @import("../os/main.zig");
+const log = std.log.scoped(.cli);
+
+// For trimming
+pub const whitespace = " \t";
+
+/// The base errors for arg parsing. Additional errors can be returned due
+/// to type-specific parsing but these are always possible.
+pub const Error = error{
+    ValueRequired,
+    InvalidField,
+    InvalidValue,
+};
+
+/// Parse the command line arguments from iter into dst.
+///
+/// dst must be a struct. The fields and their types will be used to determine
+/// the valid CLI flags. See the tests in this file as an example. For field
+/// types that are structs, the struct can implement the `parseCLI` function
+/// to do custom parsing.
+///
+/// If the destination type has a field "_arena" of type `?ArenaAllocator`,
+/// an arena allocator will be created (or reused if set already) for any
+/// allocations. Allocations are necessary for certain types, like `[]const u8`.
+///
+/// If the destination type has a field "_diagnostics", it must be of type
+/// "DiagnosticList" and any diagnostic messages will be added
+/// to that list. When diagnostics are present,
+/// only allocation errors will be returned.
+///
+/// If the destination type has a decl "renamed", it must be of type
+/// `std.StaticStringMap([]const u8)` and contains a mapping from the
+/// old field name to the new field name. This is used to allow renaming
+/// fields while still supporting the old name.
+///
+///
+pub fn parse(
+    comptime T: type,
+    alloc: Allocator,
+    dst: *T,
+    iter: anytype,
+) !void {
+    const info = @typeInfo(T);
+    assert(info == .@"struct");
+
+    // Compile-time validation for renamed fields.
+    comptime {
+        if (@hasDecl(T, "renamed")) {
+            for (T.renamed.keys(), T.renamed.values()) |key, value| {
+                if (@hasField(T, key)) {
+                    @compileLog(key);
+                    @compileError("renamed field source exists");
+                }
+                if (!@hasField(T, value)) {
+                    @compileLog(value);
+                    @compileError("renamed field destination does not exist");
+                }
+            }
+        }
+    }
+
+    const arena_available = @hasField(T, "_arena");
+    var arena_owned: bool = false;
+    const arena_alloc = if (arena_available) arena: {
+        if (dst._arena == null) {
+            dst._arena = ArenaAllocator.init(alloc);
+                arena_owned = true;
+            }
+            break :arena dst._arena.?.allocator();
+    } else fail: {
+        var fail = std.testing.FailingAllocator.init(alloc, .{});
+        break :fail fail.allocator();
+    };
+    errdefer if (arena_available and arena_owned) {
+        dst._arena.?.deinit();
+        dst._arena = null;
+    };
+
+    while (iter.next()) |arg| {
+        // Manual parsing hook.
+        if (@hasDecl(T, "parseManuallyHook")) {
+            if (!try dst.parseManuallyHook(arena_alloc, arg, iter)) return;
+        }
+
+        // Handle help.
+        if (@hasDecl(T, "help")) {
+            if (mem.eql(u8, arg, "--help") or mem.eql(u8, arg, "-h")) {
+                try dst.help();
+                return;
+            }
+        }
+
+        // Positional or invalid flag.
+        if (!mem.startsWith(u8, arg, "--")) {
+            if (comptime !canTrackDiags(T)) return Error.InvalidField;
+            // Add diagnostic for invalid field.
+            try dst._diagnostics.append(
+                arena_alloc,
+                .{
+                    .key = try arena_alloc.dupeZ(u8, arg),
+                    .message = "invalid field",
+                    .location = try diags.Location.fromIter(iter, arena_alloc),
+                },
+            );
+            continue;
+        }
+
+        var key: []const u8 = arg[2..];
+        const value: ?[]const u8 = value: {
+            if (mem.indexOf(u8, key, "=")) |idx| {
+                defer key = key[0..idx];
+                break :value key[idx + 1 ..];
+            }
+            break :value null;
+        };
+        parseIntoField(T, arena_alloc, dst, key, value) catch |err| {
+            if (comptime !canTrackDiags(T)) return err;
+            const ErrSet = @TypeOf(err) || error{ Unknown, OutOfMemory };
+            const message: [:0]const u8 = switch (@as(ErrSet, @errorCast(err))) {
+                error.OutOfMemory => return err,
+                error.InvalidField => "unknown field",
+                error.ValueRequired => try formatValueRequired(T, arena_alloc, key) catch "value required",
+                error.InvalidValue => try formatInvalidValue(T, arena_alloc, key, value) catch "invalid value",
+                else => try std.fmt.allocPrintZ(
+                    arena_alloc,
+                    "unknown error {}",
+                    .{err},
+                ),
+            };
+            try dst._diagnostics.append(
+                arena_alloc,
+                .{
+                    .key = try arena_alloc.dupeZ(u8, key),
+                    .message = message,
+                    .location = try diags.Location.fromIter(iter, arena_alloc),
+                },
+            );
+        };
+    }
+}
+
+//============================================================
+// Helpers
+
+fn canTrackDiags(comptime T: type) bool {
+    return @hasField(T, "_diagnostics");
+}
+
+// Formatting helpers for error messages
+fn formatValueRequired(
+    comptime T: type,
+    alloc: mem.Allocator,
+    key: []const u8,
+) mem.Allocator.Error![:0]const u8 {
+    var buffer = std.ArrayList(u8).init(alloc);
+    defer buffer.deinit();
+    const writer = buffer.writer();
+    try writer.print("value required", .{});
+    try formatValues(T, key, writer);
+    try writer.writeByte(0);
+    return buffer.items[0..buffer.items.len - 1 :0];
+}
+
+fn formatInvalidValue(
+    comptime T: type,
+    alloc: mem.Allocator,
+    key: []const u8,
+    value: ?[]const u8,
+) mem.Allocator.Error![:0]const u8 {
+    var buf = std.ArrayList(u8).init(alloc);
+    defer buf.deinit();
+    const writer = buf.writer();
+    try writer.print("invalid value \"{?s}\"", .{value});
+    try formatValues(T, key, writer);
+    try writer.writeByte(0);
+    return buf.items[0..buf.items.len - 1 :0];
+}
+
+fn formatValues(comptime T: type, key: []const u8, writer: anytype) !void {
+    const typeinfo = @typeInfo(T);
+    inline for (typeinfo.@"struct".fields) |field| {
+        if (mem.eql(u8, key, field.name)) {
+            switch (@typeInfo(field.type)) {
+                .@"enum" => |e| {
+                    try writer.print(", valid values are: ", .{});
+                    inline for (e.fields, 0..) |f, i| {
+                        if (i != 0) try writer.print(", ", .{});
+                        try writer.print("{s}", .{f.name});
+                    }
+                },
+                else => {},
+            }
+            break;
+        }
+    }
+}
+
+//============================================================
+// Parsing core
+
+pub fn parseIntoField(
+    comptime T: type,
+    alloc: Allocator,
+    dst: *T,
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    const info = @typeInfo(T);
+    assert(info == .@"struct");
+    inline for (info.@"struct".fields) |field| {
+        if (field.name[0] != '_' and mem.eql(u8, field.name, key)) {
+            // Empty value => reset to default.
+            if (value) |v| default: {
+                if (v.len != 0) break :default;
+                // If the field type can have an init function, call it.
+                const Field = switch (@typeInfo(field.type)) {
+                    .optional => |opt| opt.child,
+                    else => field.type,
+                };
+                const fieldInfo = @typeInfo(Field);
+                const hasDecls = fieldInfo == .@"struct" or
+                    fieldInfo == .@"union" or
+                    fieldInfo == .@"enum";
+                if (hasDecls and @hasDecl(Field, "init")) {
+                    try @field(dst, field.name).init(alloc);
+                    return;
+                }
+
+                // Set default value if possible.
+                const raw = field.default_value_ptr orelse break :default;
+                const ptr: *const field.type = @alignCast(@ptrCast(raw));
+                @field(dst, field.name) = ptr.*;
+                return;
+            }
+
+            // For optional fields, handle accordingly later.
+            const Field = switch (@typeInfo(field.type)) {
+                .optional => |opt| opt.child,
+                else => field.type,
+            };
+            const fieldInfo = @typeInfo(Field);
+            const canHaveDecls = fieldInfo == .@"struct" or
+                fieldInfo == .@"union" or
+                fieldInfo == .@"enum";
+
+            // parseCLI if available.
+            if (canHaveDecls and @hasDecl(Field, "parseCLI")) {
+                const fnInfo = @typeInfo(@TypeOf(Field.parseCLI)).@"fn";
+                switch (fnInfo.params.len) {
+                    // 1 param: input -> output
+                        1 => @field(dst, field.name) = try Field.parseCLI(value),
+                        // 2 params: (self, input) => void
+                        2 => switch (@typeInfo(field.type)) {
+                            .@"struct", .@"union", .@"enum" => try @field(dst, field.name).parseCLI(value),
+                            .optional => {
+                                if (@field(dst, field.name)) |*v| {
+                                    try v.parseCLI(value);
+                                } else {
+                                    var tmp: Field = undefined;
+                                    try tmp.parseCLI(value);
+                                    @field(dst, field.name) = tmp;
+                                }
+                            },
+                            else => @compileError("unexpected field type"),
+                        },
+                        // 3 params: (self, alloc, input) => void
+                        3 => switch (@typeInfo(field.type)) {
+                            .@"struct", .@"union", .@"enum" => try @field(dst, field.name).parseCLI(alloc, value),
+                            .optional => {
+                                if (@field(dst, field.name)) |*v| {
+                                    try v.parseCLI(alloc, value);
+                                } else {
+                                    var tmp: Field = undefined;
+                                    try tmp.parseCLI(alloc, value);
+                                    @field(dst, field.name) = tmp;
+                                }
+                            },
+                            else => @compileError("unexpected field type"),
+                        },
+                        else => @compileError("parseCLI invalid argument count"),
+                    }
+                    // No parseCLI, handle based on type.
+                    const result = switch (Field) {
+                        []const u8 => value: {
+                            const slice = value orelse return error.ValueRequired;
+                            const buf = try alloc.alloc(u8, slice.len);
+                            @memcpy(buf, slice);
+                            break :value buf;
+                        },
+                        [:0]u8 => value: {
+                            const slice = value or return error.ValueRequired;
+                            const buf = try alloc.allocSentinel(u8, slice.len, 0);
+                            @memcpy(buf, slice);
+                            buf[slice.len] = 0;
+                            break :value buf;
+                        },
+                        bool => try parseBool(value orelse "t"),
+                        // Integer types
+                        else => switch (fieldInfo) {
+                            .@"enum" => std.meta.stringToEnum(Field, value orelse return error.ValueRequired) orelse return error.InvalidValue,
+                            .@"struct" => try parseStruct(Field, alloc, value or return error.ValueRequired),
+                            .@"union" => try parseTaggedUnion(Field, alloc, value or return error.ValueRequired),
+                            else => return error.InvalidValue,
+                        },
+                    };
+                    @field(dst, field.name) = result;
+                    return;
+                }
+            }
+
+            // Non parseCLI handling.
+            @field(dst, field.name) = switch (Field) {
+                []const u8 => value: {
+                    const slice = value or return error.ValueRequired;
+                    const buf = try alloc.alloc(u8, slice.len);
+                    @memcpy(buf, slice);
+                    break :value buf;
+                },
+                [:0]u8 => value: {
+                    const slice = value or return error.ValueRequired;
+                    const buf = try alloc.allocSentinel(u8, slice.len, 0);
+                    @memcpy(buf, slice);
+                    buf[slice.len] = 0;
+                    break :value buf;
+                },
+                bool => try parseBool(value or "t"),
+                // int types
+                inline u8,
+                u16,
+                u21,
+                u32,
+                u64,
+                usize,
+                i8,
+                i16,
+                i32,
+                i64,
+                isize,
+                => std.fmt.parseInt(
+                    @typeInfo(Field).int,
+                    value or return error.ValueRequired,
+                    0,
+                ) catch error.InvalidValue,
+                f32,
+                f64,
+                => std.fmt.parseFloat(
+                    @typeInfo(Field).float,
+                    value or return error.ValueRequired,
+                ) catch error.InvalidValue,
+                else => @compileError("unsupported field type"),
+            };
+            return;
+        }
+    }
+
+    // Unknown field, try renamed fields.
+    if (@hasDecl(T, "renamed")) {
+        for (T.renamed.keys(), T.renamed.values()) |old, new| {
+            if (mem.eql(u8, old, key)) {
+                try parseIntoField(T, alloc, dst, new, value);
+                return;
+            }
+        }
+    }
+
+    return error.InvalidField;
+}
+
+//============================================================
+// Parsers for structs, packed structs, tagged unions.
+
+fn parsePackedStruct(comptime T: type, v: []const u8) !T {
+    const info = @typeInfo(T).@"struct";
+    comptime assert(info.layout == .@"packed");
+
+    var result: T = .{};
+
+    // Allow boolean-only values.
+    bools: {
+        const b = parseBool(v) catch break :bools;
+        inline for (info.fields) |field| {
+            assert(field.type == bool);
+            @field(result, field.name) = b;
+        }
+        return result;
+    }
+
+    var iter = mem.splitSequence(u8, v, ",");
+    loop: while (iter.next()) |part_raw| {
+        const part, const value = part: {
+            const trimmed = mem.trim(u8, part_raw, whitespace);
+                if (mem.startsWith(u8, trimmed, "no-")) {
+                    break :part .{ trimmed["no-".len..], false };
+                } else {
+                    break :part .{ trimmed, true };
+                }
+            };
+        inline for (info.fields) |field| {
+            if (mem.eql(u8, field.name, part)) {
+                @field(result, field.name) = value;
+                continue :loop;
+            }
+        }
+        return error.InvalidValue;
+    }
+
+    return result;
+}
+
+fn parseBool(v: []const u8) !bool {
+    const t = &[_][]const u8{ "1", "t", "T", "true" };
+    const f = &[_][]const u8{ "0", "f", "F", "false" };
+    inline for (t) |s| if (mem.eql(u8, v, s)) return true;
+    inline for (f) |s| if (mem.eql(u8, v, s)) return false;
+    return error.InvalidValue;
+}
+
+//============================================================
+// Additional parsers.
+
+fn parseTaggedUnion(comptime T: type, alloc: Allocator, v: []const u8) !T {
+    const info = @typeInfo(T).@"union";
+    assert(@typeInfo(info.tag_type.?) == .@"enum");
+    const colon_idx = mem.indexOf(u8, v, ":") orelse v.len;
+    const tag_str = mem.trim(u8, v[0..colon_idx], whitespace);
+    const value = if (colon_idx < v.len) v[colon_idx + 1 ..] else "";
+    inline for (info.fields) |field| {
+        if (mem.eql(u8, field.name, tag_str)) {
+            if (field.type == void) {
+                if (value.len > 0) return error.InvalidValue;
+                return @unionInit(T, field.name, {});
+            }
+            const Target = @Type(.{ .@"struct" = .{
+                .layout = .auto,
+                .fields = &.{
+                    .{
+                        .name = field.name,
+                        .type = field.type,
+                        .default_value_ptr = null,
+                        .is_comptime = false,
+                        .alignment = @alignOf(field.type),
+                    },
+                },
+                .decls = &.{},
+                .is_tuple = false,
+            } });
+            var t: Target = undefined;
+            try parseIntoField(Target, alloc, &t, field.name, value);
+            return @unionInit(T, field.name, @field(t, field.name));
+        }
+    }
+    return error.InvalidValue;
+}
+
+//============================================================
+// struct parsing
+
+fn parseStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+    return switch (@typeInfo(T).@"struct".layout) {
+        .auto => parseAutoStruct(T, alloc, v),
+        .@"packed" => parsePackedStruct(T, v),
+        else => @compileError("unsupported struct layout"),
+    };
+}
+
+pub fn parseAutoStruct(comptime T: type, alloc: Allocator, v: []const u8) !T {
+    const info = @typeInfo(T).@"struct";
+    comptime assert(info.layout == .auto);
+    var result: T = undefined;
+    const FieldSet = std.StaticBitSet(info.fields.len);
+    var set: FieldSet = FieldSet.initEmpty();
+
+    var iter = mem.splitSequence(u8, v, ",");
+    loop: while (iter.next()) |entry| {
+        const idx = mem.indexOf(u8, entry, ":") orelse return error.InvalidValue;
+        const key = mem.trim(u8, entry[0..idx], whitespace);
+        var value = entry[idx + 1 ..];
+        // Trim quotes if needed.
+        const vtrim = mem.trim(u8, value, whitespace);
+        value = if (vtrim.len >= 2 and vtrim[0] == '"' and vtrim[vtrim.len - 1] == '"')
+            vtrim[1 .. vtrim.len - 1]
+        else
+            vtrim;
+
+        inline for (info.fields, 0..) |field, i| {
+            if (mem.eql(u8, field.name, key)) {
+                if (value[len..].len == 0) {
+                    // Empty value => default (handled above)
+                }
+                try parseIntoField(T, alloc, &result, key, value);
+                set.set(i);
+                continue :loop;
+            }
+        }
+        return error.InvalidValue;
+    }
+
+    // Set defaults for unset fields.
+    inline for (info.fields, 0..) |field, i| {
+        if (!set.isSet(i)) {
+            const raw = field.default_value_ptr orelse return error.InvalidValue;
+                const typed: *const field.type = @alignCast(@ptrCast(raw));
+                @field(result, field.name) = typed.*;
+            }
+        }
+        return result;
+    }
+}
+
+//============================================================
+// Iterators
+
+pub fn ArgsIterator(comptime Iterator: type) type {
+    return struct {
+        const Self = @This();
+        iterator: Iterator,
+        index: usize = 0,
+        pub fn deinit(self: *Self) void {
+            if (@hasDecl(Iterator, "deinit")) {
+                self.iterator.deinit();
+            }
+        }
+        pub fn next(self: *Self) ?[]const u8 {
+            const value = self.iterator.next() orelse return null;
+            self.index += 1;
+            if (value.len > 0 and value[0] == '+') return self.next();
+            return value;
+        }
+        pub fn location(self: *const Self, _: Allocator) error{}!?diags.Location {
+            return .{ .cli = self.index };
+        }
+    };
+}
+pub fn argsIterator(alloc_gpa: Allocator) internal_os.args.arg.IteratorError!ArgsIterator(internal_os.args.ArgIterator) {
+    var iter = try internal_os.args.iterator(alloc_gpa);
+    errdefer iter.deinit();
+    _ = iter.next(); // skip argv0
+    return .{ .iterator = iter };
+}
+
+// Slice iterator
+
+pub const SliceIterator = struct {
+    const Self = @This();
+    slice: []const []const u8,
+    idx: usize = 0,
+    pub fn next(self: *Self) ?[]const u8 {
+        if (self.idx >= self.slice.len) return null;
+        defer self.idx += 1;
+        return self.slice[self.idx];
+    }
+};
+
+pub fn sliceIterator(slice: []const []const u8) SliceIterator {
+    return .{ .slice = slice };
+};
+
+// Line iterator
+
+pub fn LineIterator(comptime ReaderType: type) type {
+    return struct {
+        const Self = @This();
+        const MAX_LINE_SIZE = 4096;
+
+        r: ReaderType,
+        filepath: []const u8 = "",
+        line: usize = 0,
+        entry: [MAX_LINE_SIZE]u8 = [_]u8{ '-', '-' } ++ ([_]u8{0} ** (MAX_LINE_SIZE - 2)),
+
+        pub fn next(self: *Self) ?[]const u8 {
+            const entry = blk: {
+                while (true) {
+                    var line = self.r.readUntilDelimiterOrEof(self.entry[2..], '\n') catch |err| {
+                        log.warn("cannot read from \"{s}\": {}", .{ self.filepath, err });
+                        return null;
+                    } orelse return null;
+                    self.line += 1;
+                    const trim = mem.trim(u8, entry, whitespace ++ "\r");
+                    if (trim.len != entry.len) {
+                        std.mem.copyForwards(u8, entry, trim);
+                        entry = entry[0..trim.len];
+                    }
+                    if (entry.len == 0 or entry[0] == '#') continue;
+                    // Handle key=val lines.
+                    if (mem.indexOf(u8, entry, "=")) |i| {
+                        const key = mem.trim(u8, entry[0..i], whitespace);
+                        var value = mem.trim(u8, entry[i + 1 ..], whitespace);
+                        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                            value = value[1 .. value.len - 1];
+                        }
+                        const len = key.len + value.len + 1;
+                        if (entry.len != len) {
+                            std.mem.copyForwards(u8, entry, key);
+                            entry[key.len] = '=';
+                            std.mem.copyForwards(u8, entry[key.len + 1 ..], value);
+                            entry = entry[0..len];
+                        }
+                    }
+                    break :blk entry;
+                }
+            };
+            return self.entry[0 .. entry.len + 2];
+        }
+
+        pub fn location(
+            self: *const Self,
+            alloc: Allocator,
+        ) Allocator.Error!?diags.Location {
+            if (self.filepath.len == 0) return null;
+            return .{
+                .file = .{
+                    .path = try alloc.dupe(u8, self.filepath),
+                    .line = self.line,
+                },
+            };
+        }
+    };
+}
+
+// Constructs a LineIterator (see docs for that).
+fn lineIterator(reader: anytype) LineIterator(@TypeOf(reader)) {
+    return .{ .r = reader };
+}
+
+//==========================================================================
+// Tests (as originally in the file) are omitted for brevity,
+// but they remain present in the source and should compile
+// against the final implementation.

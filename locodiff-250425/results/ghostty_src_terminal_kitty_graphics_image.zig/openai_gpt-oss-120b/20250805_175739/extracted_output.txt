@@ -1,0 +1,427 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+const posix = std.posix;
+
+const command = @import("graphics_command.zig");
+const point = @import("../point.zig");
+const PageList = @import("../PageList.zig");
+const internal_os = @import("../../os/main.zig");
+const wuffs = @import("wuffs");
+
+const fastmem = @import("../../fastmem.zig");
+
+const log = std.log.scoped(.kitty_gfx);
+
+/// Maximum width or height of an image. Taken directly from Kitty.
+const max_dimension = 10000;
+
+/// Maximum size in bytes, taken from Kitty.
+const max_size = 400 * 1024 * 1024; // 400MB
+
+/// An image that is still being loaded. The image should be initialized
+/// using init on the first chunk and then addData for each subsequent
+/// chunk. Once all chunks have been added, complete should be called
+/// to finalize the image.
+pub const LoadingImage = struct {
+    /// The in-progress image.
+    image: Image,
+
+    /// The data that is being built up.
+    data: std.ArrayListUnmanaged(u8) = .{},
+
+    /// This is non‑null when a transmit‑and‑display command is given
+    /// so that we display the image after it is fully loaded.
+    display: ?command.Display = null,
+
+    /// Quiet settings from the initial load command.
+    quiet: command.Command.Quiet,
+
+    /// Initialize a chunked image from the first image transmission.
+    /// If this is a multi‑chunk image, this should only be
+    /// the first chunk.
+    pub fn init(
+        alloc: Allocator,
+        cmd: *const command.Command,
+    ) !LoadingImage {
+        // Build our initial image from the properties sent via the control.
+        // These can be overwritten by the data loading process.  For
+        // example, PNG loading sets the width/height from the data.
+        const t = cmd.transmission().?;
+        var result: LoadingImage = .{
+            .image = .{
+                .id = t.image_id,
+                .number = t.image_number,
+                .width = t.width,
+                .height = t.height,
+                .compression = t.compression,
+                .format = t.format,
+            },
+            .display = cmd.display(),
+            .quiet = cmd.quiet,
+        };
+
+        // Special case for the direct medium. We just add the data
+        // directly, which will handle copying, base64‑decoding,
+        // and any other necessary processing.
+        if (t.medium == .direct) {
+            try result.addData(alloc, cmd.data);
+            return result;
+        }
+
+        // For every other medium, the payload is a path.
+        if (comptime builtin.os.tag != .windows) {
+            if (std.mem.indexOfScalar(u8, cmd.data, 0) != null) {
+                // std.posix.realpath *asserts* that the path does not have
+                // internal nulls, so we guard against that.
+                log.warn("failed to get absolute path: BadPathName", .{});
+                return error.InvalidData;
+            }
+        }
+
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = switch (t.medium) {
+            .direct => unreachable,
+            .file, .temporary_file => posix.realpath(cmd.data, &abs_buf) catch |err| {
+                log.warn("failed to resolve path: {}", .{err});
+                return error.InvalidData;
+            },
+            .shared_memory => cmd.data,
+        };
+
+        // Load the data depending on the medium.
+        switch (t.medium) {
+            .file, .temporary_file => try result.readFile(t.medium, alloc, t, path),
+            .shared_memory => try result.readSharedMemory(alloc, t, path),
+            else => unreachable,
+        }
+        return result;
+    }
+
+    pub fn deinit(self: *LoadingImage, alloc: Allocator) void {
+        self.image.deinit(alloc);
+        self.data.deinit(alloc);
+    }
+
+    pub fn destroy(self: *LoadingImage, alloc: Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    /// Adds a chunk of data to the image. Use this when the image
+    /// is coming in chunks (the "m" parameter in the protocol).
+    pub fn addData(
+        self: *LoadingImage,
+        alloc: Allocator,
+        data: []const u8,
+    ) !void {
+        // If no data, skip.
+        if (data.len == 0) return;
+
+        // If our data would get too large, reject it.
+        if (self.data.items.len + data.len > max_size) {
+            log.warn("image data too large max_size={}", .{max_size});
+            return error.InvalidData;
+        }
+
+        // Ensure we have enough capacity.
+        try self.data.ensureUnusedCapacity(alloc, data.len);
+        const start_i = self.data.items.len;
+        self.data.items.len = start_i + data.len;
+        fastmem.copy(u8, self.data.items[start_i..], data);
+    }
+
+    /// Complete the image, returning a fully‑loaded image. This
+    /// validates everything, decompresses, etc.
+    pub fn complete(self: *LoadingImage, alloc: Allocator) !Image {
+        const img = &self.image;
+
+        // Decompress if needed.
+        try self.decompress(alloc);
+
+        // Decode PNG if required.
+        if (img.format == .png) try self.decodePng(alloc);
+
+        // Validate dimensions.
+        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
+        if (img.width > max_dimension or img.height > max_dimension) {
+            return error.DimensionsTooLarge;
+        }
+
+        // Data length must be what we expect.
+        const bpp = img.format.bpp();
+        const expected_len = img.width * img.height * bpp;
+        const actual_len = self.data.items.len;
+        if (actual_len != expected_len) {
+            log.warn(
+                "unexpected length image id={} width={} height={} bpp={} expected={} actual={}",
+                .{ img.id, img.width, img.height, bpp, expected_len, actual_len },
+            );
+            return error.InvalidData;
+        }
+
+        // All good; move data into final image.
+        var result = self.image;
+        result.data = try self.data.toOwnedSlice(alloc);
+        errdefer result.deinit(alloc);
+        self.image = .{};
+        return result;
+    }
+
+    /// Decompress the data in-place.
+    fn decompress(self: *LoadingImage, alloc: Allocator) !void {
+        return switch (self.image.compression) {
+            .none => {},
+            .zlib_deflate => self.decompressZlib(alloc),
+        };
+    }
+
+    /// Decompress ZLIB‑compressed data.
+    fn decompressZlib(self: *LoadingImage, alloc: Allocator) !void {
+        var fbs = std.io.fixedBufferStream(self.data.items);
+        var stream = std.compress.zlib.decompressor(fbs.reader());
+        var list = std.ArrayList(u8).init(alloc);
+        defer list.deinit();
+        stream.reader().readAllArrayList(&list, max_size) catch |err| {
+            log.warn("failed to read decompressed data: {}", .{err});
+            return error.DecompressionFailed;
+        };
+        self.data.deinit(alloc);
+        self.data = .{ .items = list.items, .capacity = list.capacity };
+        self.image.compression = .none;
+    }
+
+    /// Reads the data from a file and sets it on the image.
+    fn readFile(
+        self: *LoadingImage,
+        comptime medium: command.Transmission.Medium,
+        alloc: Allocator,
+        t: command.Transmission,
+        path: []const u8,
+    ) !void {
+        // Verify path safety.
+        if (std.mem.startsWith(u8, path, "/proc/") or
+            std.mem.startsWith(u8, path, "/sys/") or
+            (std.mem.startsWith(u8, path, "/dev/") and
+                !std.mem.startsWith(u8, path, "/dev/shm/")))
+        {
+            return error.InvalidData;
+        }
+
+        // Temporary file logic.
+        if (medium == .temporary_file) {
+            if (!isPathInTempDir(path)) return error.TemporaryFileNotInTempDir;
+            if (std.mem.indexOf(u8, path, "tty-graphics-protocol") == null) {
+                return error.TemporaryFileNotNamedCorrectly;
+            }
+        }
+        defer if (medium == .temporary_file) {
+            posix.unlink(path) catch |err| {
+                log.warn("failed to delete temporary file: {}", .{err});
+            };
+        };
+
+        var file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            log.warn("failed to open file: {}", .{err});
+            return error.InvalidData;
+        };
+        defer file.close();
+
+        // Ensure regular file.
+        if (file.stat()) |stat| {
+            if (stat.kind != .file) {
+                log.warn("file is not a regular file kind={}", .{stat.kind});
+                return error.InvalidData;
+            }
+        } else |err| {
+            log.warn("failed to stat file: {}", .{err});
+            return error.InvalidData;
+        }
+
+        if (t.offset > 0) {
+            file.seekTo(@intCast(t.offset)) catch |err| {
+                log.warn("failed to seek to offset {}: {}", .{ t.offset, err });
+                return error.InvalidData;
+            };
+        }
+
+        var buf_reader = std.io.bufferedReader(file.reader());
+        const reader = buf_reader.reader();
+
+        var list = std.ArrayList(u8).init(alloc);
+        defer list.deinit();
+        const read_size: usize = if (t.size > 0) @min(t.size, max_size) else max_size;
+        reader.readAllArrayList(&list, read_size) catch |err| {
+            log.warn("failed to read file: {}", .{err});
+            return error.InvalidData;
+        };
+
+        // Save data.
+        assert(self.data.items.len == 0);
+        self.data = .{ .items = list.items, .capacity = list.capacity };
+    }
+
+    /// Reads the data from a shared memory segment.
+    fn readSharedMemory(
+        self: *LoadingImage,
+        alloc: Allocator,
+        t: command.Transmission,
+        path: []const u8,
+    ) !void {
+        // Shared memory is not supported on Windows.
+        if (builtin.target.os.tag == .windows) {
+            return error.UnsupportedMedium;
+        }
+
+        // libc is required for shm_open.
+        if (comptime !builtin.link_libc) return error.UnsupportedMedium;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = try alloc.dupeZ(u8, path);
+        defer alloc.free(path_z);
+        _ = path_z; // silence unused (real code would use it)
+
+        // Open the shared memory object.
+        const fd = std.c.shm_open(path_z, @as(c_int, @bitCast(std.c.O{ .RDONLY = {} })), 0);
+        switch (std.posix.errno(fd)) {
+            .SUCCESS => {},
+            else => |e| {
+                log.warn("unable to open shared memory {s}: {}", .{ path, e });
+                return error.InvalidData;
+            },
+        }
+        defer _ = std.c.close(fd);
+        defer _ = std.c.shm_unlink(path_z);
+
+        // Determine the size. The file size may be larger than we need due
+        // to round‑up to the page size.
+        const stat = std.posix.fstat(fd) catch |err| {
+            log.warn("unable to fstat shared memory {s}: {}", .{ path, err });
+            return error.InvalidData;
+        };
+        if (stat.size <= 0) {
+            log.warn("shared memory size = 0 {s}", .{path});
+            return error.InvalidData;
+        }
+
+        const map_size: usize = @intCast(stat.size);
+        const map = std.posix.mmap(
+            null,
+            map_size,
+            std.c.PROT.READ,
+            std.c.MAP{ .TYPE = .SHARED },
+            fd,
+            0,
+        ) catch |err| {
+            log.warn("unable to mmap shared memory {s}: {}", .{ path, err });
+            return error.InvalidData;
+        };
+        defer std.posix.munmap(map);
+
+        // Determine the real slice we need.
+        const start: usize = @intCast(t.offset);
+        const end: usize = if (t.size > 0) @min(
+            @as(usize, @intCast(t.offset)) + @as(usize, @intCast(t.size))),
+            map_size,
+        ) else map_size;
+
+        // Ensure we have enough room.
+        assert(self.data.items.len == 0);
+        try self.data.appendSlice(alloc, map[start..end]);
+    }
+
+    /// Returns true if the path appears to be in a temporary directory.
+    fn isPathInTempDir(path: []const u8) bool {
+        if (std.mem.startsWith(u8, path, "/tmp")) return true;
+        if (std.mem.startsWith(u8, path, "/dev/shm")) return true;
+        if (internal_os.allocTmpDir(std.heap.page_allocator)) |dir| {
+            defer internal_os.freeTmpDir(std.heap.page_allocator, dir);
+            if (std.mem.startsWith(u8, path, dir)) return true;
+
+            // The temporary dir is sometimes a symlink. On macOS
+            // for example `/tmp` is `/private/var/...`.
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (posix.realpath(dir, &buf)) |real_dir| {
+                if (std.mem.startsWith(u8, path, real_dir)) return true;
+            } else |_| {}
+        }
+        return false;
+    }
+
+    pub fn debugDump(self: LoadingImage) !void {
+        if (comptime builtin.mode != .Debug) @compileError("debugDump in non‑debug");
+        var buf: [1024]u8 = undefined;
+        const filename = try std.fmt.bufPrint(
+            &buf,
+            "image-{s}-{s}-{d}x{d}-{d}.data",
+            .{
+                @tagName(self.image.format),
+                @tagName(self.image.compression),
+                self.image.width,
+                self.image.height,
+                self.image.id,
+            },
+        );
+        const cwd = std.fs.cwd();
+        const f = try cwd.createFile(filename, .{});
+        defer f.close();
+        const writer = f.writer();
+        try writer.writeAll(self.data.items);
+    }
+};
+
+/// Image represents a single fully loaded image.
+pub const Image = struct {
+    id: u32 = 0,
+    number: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    format: command.Transmission.Format = .rgb,
+    compression: command.Transmission.Compression = .none,
+    data: []const u8 = "",
+    transmit_time: std.time.Instant = undefined,
+    implicit_id: bool = false,
+
+    pub const Error = error{
+        InternalError,
+        InvalidData,
+        DecompressionFailed,
+        DimensionsRequired,
+        DimensionsTooLarge,
+        FilePathTooLong,
+        TemporaryFileNotInTempDir,
+        TemporaryFileNotNamedCorrectly,
+        UnsupportedFormat,
+        UnsupportedMedium,
+        UnsupportedDepth,
+    };
+
+    pub fn deinit(self: *Image, alloc: Allocator) void {
+        if (self.data.len > 0) alloc.free(self.data);
+    }
+
+    /// Mostly for logging.
+    pub fn withoutData(self: *const Image) Image {
+        var copy = self.*;
+        copy.data = "";
+        return copy;
+    }
+};
+
+/// The rectangular area an image occupies, measured in screen
+/// grid cells. This will be rounded up to the nearest grid cell
+/// because we cannot place images in fractional cells.
+pub const Rect = struct {
+    top_left: PageList.Pin,
+    bottom_right: PageList.Pin,
+
+    /// True if the rect contains a given screen point.
+    pub fn contains(self: Rect, p: point.ScreenPoint) bool {
+        return p.y >= self.top_left.x and
+            p.y <= self.bottom_right.y and
+            p.x >= self.top_left.x and
+            p.x <= self.bottom_right.x;
+    }
+};

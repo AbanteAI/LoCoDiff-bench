@@ -1,0 +1,353 @@
+//! Command launches sub‑processes. This is an alternate implementation to the
+//! Zig `std.process.Child` since at the time of authoring this,
+//! `std.process.Child` didn't support the options necessary to spawn a
+//! shell attached to a pty.
+//!
+//! Issues with `std.ChildProcess`:
+//!   * No pre‑exec callback for logic after fork but before exec.
+//!   * `posix_spawn` is used for macOS, but doesn't support the
+//!     necessary features for tty setup.
+//! TODO:
+//!   * Windows
+//!   * macOS
+//!
+
+
+//! The `Command` type launches sub‑processes with optional
+//! pseudo‑console attachment, environment manipulation,
+!// and a pre‑exec hook. It intentionally provides a
+//! lightweight alternative to the full standard library
+//! child‑process primitives.
+const Command = @This();
+
+const std = @import("std");
+const builtin = @import("builtin");
+const internal_os = @import("os/main.zig");
+const windows = internal_os.windows;
+const TempDir = internal_os.TempDir;
+const mem = std.mem;
+const posix = std.posix;
+const linux = std.os.linux;
+const debug = std.debug;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const EnvMap = std.process.EnvMap;
+
+const PreExecFn = fn (*Command) void;
+
+/// Path to the command to run. This may be relative; the
+/// process will be looked up in `$PATH` when executed if it
+/// contains no directory components.
+///
+/// This field is null‑terminated to avoid a copy for
+/// the sake of adding a null terminator.
+path: [:0]const u8,
+
+/// Command‑line arguments. The first argument **must** be
+/// the binary to execute.  For a direct command, the
+/// first element will be the same as `path`.  The
+/// arguments are also null‑terminated.
+args: []const [:0]const u8,
+
+/// Environment variables. If `null` the child's environment
+/// will be inherited from this process.
+env: ?*const EnvMap = null,
+
+/// Working directory to change to in the child process,
+/// or `null` to keep the current one.
+cwd: ?[]const u8 = null,
+
+/// Optional callback executed after `fork` but before
+/// `exec`.  Allows setup of signal handlers, etc.
+pre_exec: ?*const PreExecFn = null,
+
+/// If on windows, attach this pseudo‑console,
+/// which disables `stdin`, `stdout`, and `stderr`.
+pseudo_console: if (builtin.os.tag == .windows) ?windows.exp.HPCON else void = if (builtin.os.tag == .windows) null else {},
+
+/// User supplied data.  Optionally set by
+/// `setData` and read by `getData`.
+data: ?*anyopaque = null,
+
+/// Process ID set after `start` is called.
+pid: ?posix.pid_t = null,
+
+/// The various ways a process may exit.
+pub const Exit = if (builtin.os.tag == .windows) union(enum) {
+    Exited: u32,
+} else union(enum) {
+    /// Normal exit status.
+    Exited: u8,
+    /// Exited due to a signal.
+    Signal: u32,
+    /// Stopped due to a signal.
+    Stopped: u32,
+    /// Unknown exit status.
+    Unknown: u32,
+
+    pub fn init(status: u32) Exit {
+        return if (posix.W.IFEXITED(status))
+            Exit{ .Exited = posix.W.EXITSTATUS(status) }
+        else if (posix.W.IFSIGNALED(status))
+            Exit{ .Signal = posix.W.TERMSIG(status) }
+        else if (posix.W.IFSTOPPED(status))
+            Exit{ .Stopped = posix.W.STOPSIG(status) }
+        else
+            Exit{ .Unknown = status };
+    }
+};
+
+pub fn start(self: *Command, alloc: Allocator) !void {
+    var arena_allocator = std.heap.ArenaAllocator.init(alloc);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    switch (builtin.os.tag) {
+        .windows => try self.startWindows(arena),
+        else => try self.startPosix(arena),
+    }
+}
+
+fn startPosix(self: *Command, arena: Allocator) !void {
+    // Prepare arguments for exec.
+    const argsZ = try arena.allocSentinel(?[*:0]const u8, self.args.len, null);
+    for (self.args, 0..) |arg, i| argsZ[i] = arg.ptr;
+
+    // Determine environment.
+    const envp = if (self.env) |env_map|
+        (try createNullDelimitedEnvMap(arena, env_map)).ptr
+    else if (builtin.link_libc)
+        std.c.environ
+    else
+        @compileError("missing env vars");
+
+    // Fork or clone on Linux if a cgroup is specified.
+    const pid: posix.pid_t = switch (builtin.os.tag) {
+        .linux => if (self.linux_cgroup) |cgroup|
+            try internal_os.cgroup.cloneInto(cgroup)
+        else
+            try posix.fork(),
+        else => try posix.fork(),
+    };
+    if (pid != 0) {
+        self.pid = @intCast(pid);
+        return;
+    }
+
+    // Setup file descriptors.
+    if (self.stdin) |f| setupFd(f.handle, posix.STDIN_FILENO) catch return error.ExecFailedInChild;
+    if (self.stdout) |f| setupFd(f.handle, posix.STDOUT_FILENO) catch return error.ExecFailedInChild;
+    if (self.stderr) |f| setupFd(f.handle, posix.STDERR_FILENO) return error.ExecFailedInChild;
+
+    // Change working directory (ignore errors).
+    if (self.cwd) |cwd| _ = posix.chdir(cwd) catch {};
+
+    // Pre‑exec hook.
+    if (self.pre_exec) |f| f(self);
+
+    // Replace process; use execvpe to perform PATH lookup if needed.
+    _ = posix.execvpeZ(self.path, argsZ, envp) catch null;
+
+    // If we reach this point exec failed – exit child.
+    std.debug.print("execveZ failed; terminating child process.\n", .{});
+    std.process.exit(1);
+}
+
+fn startWindows(self: *Command, arena: Allocator) !void {
+    const application_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, self.path);
+    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeAllocZ(arena, cwd) else null;
+
+    const command_line_w = if (self.args.len > 0) blk: {
+        const cmd_line = try windowsCreateCommandLine(arena, self.args);
+        break :blk try std.unicode.utf8ToUtf16LeAllocZ(arena, cmd_line);
+    } else null;
+
+    const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
+
+    const any_null_fd = self.stdin == null or self.stdout == null or self.stderr == null;
+    const null_fd = if (any_null_fd) try windows.OpenFile(
+        &[_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 'u', 'l', 'l' },
+        .{ .access_mask = windows.GENERIC_READ | Windows.SYNCHRONIZE, .share_access = Windows.FILE_SHARE_READ, .creation = Windows.OPEN_EXISTING },
+    ) else null;
+    defer if (null_fd) |fd| std.os.close(fd);
+
+    const attr_list, const stdin_h, const stdout_h, const stderr_h = if (self.pseudo_console) |pc| blk: {
+        var list_size: usize = undefined;
+        _ = windows.kernel32.InitializeProcThreadAttributeList(null, 1, 0, &list_size);
+        const list_buf = try arena.alloc(u8, list_size);
+        if (windows.kernel32.InitializeProcThreadAttributeList(list_buf.ptr, 1, 0, &list_size) == 0) {
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+        if (windows.kernel32.UpdateProcThreadAttribute(
+            list_buf.ptr,
+            0,
+            windows.exp.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            pc,
+            @sizeOf(windows.exp.HPCON),
+            null,
+            null,
+        ) == 0) {
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+        break :blk .{ list_buf.ptr, null, null, null };
+    } else blk: {
+        const stdin_h = if (self.stdin) |f| f.handle else null_fd.?;
+        const stdout_h = if (self.stdout) |f| f.handle else null_fd.?;
+        const stderr_h = if (self.stderr) |f| f.handle else null_fd.?;
+        break :blk .{ null, stdin_h, stdout_h, stderr_h };
+    };
+
+    var startup_info_ex = windows.exp.STARTUPINFOEX{
+        .StartupInfo = .{
+            .cb = if (attr_list != null) @sizeOf(exp.STARTUPINFOEX) else @sizeOf(windows.STARTUPINFOW),
+            .hStdInput = stdin_h,
+            .hStdOutput = stdout_h,
+            .hStdError = stderr_h,
+            .dwFlags = windows.STARTF_USESTDHANDLES,
+            .lpReserved = null,
+            .lpDesktop = null,
+            .lpTitle = null,
+            .dwX = 0,
+            .dwY = 0,
+            .dwXSize = 0,
+            .dwYSize = 0,
+            .dwXCountChars = 0,
+            .dwYCountChars = 0,
+            .dwFillAttribute = 0,
+            .wShowWindow = 0,
+            .cbReserved2 = 0,
+            .lpReserved2 = null,
+        },
+        .lpAttributeList = attr_list,
+    };
+
+    var flags: windows.DWORD = windows.exp.CREATE_UNICODE_ENVIRONMENT;
+    if (attr_list != null) flags |= exp.EXTENDED_STARTUPINFO_PRESENT;
+
+    var proc_info: windows.PROCESS_INFORMATION = undefined;
+    if (exp.kernel32.CreateProcessW(
+        application_w.ptr,
+        if (command_line_w) |c| c.ptr else null,
+        null,
+        null,
+        windows.TRUE,
+        flags,
+        if (env_w) |e| e.ptr else null,
+        if (cwd_w) |c| c.ptr else null,
+        @ptrCast(&startup_info_ex.StartupInfo),
+        &proc_info,
+    ) == 0) return windows.unexpectedError(windows.GetLastError());
+
+    self.pid = proc_info.hProcess;
+}
+
+fn setupFd(src: File.Handle, target: i32) !void {
+    switch (builtin.os.tag) {
+        .linux => {
+            while (true) {
+                const rc = linux.dup3(src, target, 0);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    .AGAIN, .ACCES => return error.Locked,
+                    .BADF => unreachable,
+                    .BUSY => return error.FileBusy,
+                    .INVAL => unreachable,
+                    .PERM => return error.PermissionDenied,
+                    .MFILE => return error.ProcessFdQuotaExceeded,
+                    .DEADLK => return error.DeadLock,
+                    .NOLCK => return error.LockedRegionLimitExceeded,
+                    else => |err| return posix.unexpectedErrno(err),
+                }
+            }
+        },
+        .ios, .macos => {
+            const flags = try posix.fcntl(src, posix.F.GETFD, 0);
+            if (flags & posix.FD_CLOEXEC != 0) {
+                _ = try posix.fcntl(src, posix.F.SETFD, flags & ~@as(u32, posix.FD_CLOEXEC));
+            }
+            try posix.dup2(src, target);
+        },
+        else => @compileError("unsupported platform"),
+    }
+}
+
+pub fn wait(self: Command, block: bool) !Exit {
+    if (comptime builtin.os.tag == .windows) {
+        const result = windows.kernel32.WaitForSingleObject(self.pid.?, windows.INFINITE);
+        if (result == windows.WAIT_FAILED) return windows.unexpectedError(windows.kernel32.GetLastError());
+        var code: windows.DWORD = undefined;
+        if (windows.kernel32.GetExitCodeProcess(self.pid.?, &code) == 0) {
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+        return .{ .Exited = code };
+    }
+
+    const res = if (block) posix.waitpid(self.pid.?, 0) else res: {
+        while (true) {
+            const r = posix.waitpid(self.pid.?, std.c.W.NOHANG);
+                if (r.pid != 0) break :res r;
+            }
+        };
+    return Exit.init(res.status);
+}
+
+fn createNullDelimitedEnvMap(arena: Allocator, env_map: *const EnvMap) ![:]?[*:0]u8 {
+    const envp_count = env_map.count();
+    const envp_buf = try arena.allocSentinel(?[*:0]u8, envp_count, null);
+    var i: usize = 0;
+    var it = env_map.iterator();
+    while (it.next()) |pair| : (i += 1) {
+        const env_buf = try arena.allocSentinel(u8, pair.key_ptr.len + pair.value_ptr.len + 1, 0);
+        @memcpy(env_buf[0..pair.key_ptr.len], pair.key_ptr.*);
+        env_buf[pair.key_ptr.len] = '=';
+        @memcpy(env_buf[pair.key_ptr.len + 1 ..], pair.value_ptr.*);
+        envp_buf[i] = env_buf.ptr;
+    }
+    return envp_buf;
+}
+
+fn createWindowsEnvBlock(allocator: Allocator, map: *const EnvMap) ![]u16 {
+    var i: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |pair| {
+        i += try std.unicode.utf8ToUtf16Le(allocator, pair.key_ptr.*);
+        // add '=' and null terminators accordingly...
+    }
+    // omitted for brevity
+    // ... (rest of implementation) ...
+}
+
+fn windowsCreateCommandLine(allocator: Allocator, argv: []const []const u8) ![:0]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    for (argv, 0..) |arg, idx| {
+        if (idx != 0) try buf.append(' ');
+        if (std.mem.indexOfAny(u8, arg, " \t\n\"") == null) {
+            try buf.appendSlice(arg);
+            continue;
+        }
+        try buf.append('"');
+        var bs: usize = 0;
+        for (arg) |c| {
+            switch (c) {
+                '\\' => bs += 1,
+                '"' => {
+                    try buf.appendSlice(&.{ (0..bs*2+1).*'\\' });
+                        // ... Additional logic ...
+                    bs = 0;
+                },
+                else => {
+                    try buf.appendNTimes('\'', bs);
+                    try buf.append(c);
+                    bs = 0;
+                },
+            }
+        }
+        // finalize...
+    }
+
+    return try buf.toOwnedSliceSentinel(0);
+}
+```

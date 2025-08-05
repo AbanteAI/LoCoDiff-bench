@@ -1,0 +1,322 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const font = @import("../main.zig");
+const shape = @import("../shape.zig");
+const terminal = @import("../../terminal/main.zig");
+const autoHash = std.hash.autoHash;
+const Hasher = std.hash.Wyhash;
+
+/// A single text run. A text run is only valid for one Shaper instance and
+/// up to the next run is created. A text run never goes across multiple
+/// rows in a terminal, so it is guaranteed to always be one line.
+pub const TextRun = struct {
+    /// A unique hash for this run. This can be used to cache the shaping
+    /// results. We don't provide a means to compare actual values if
+    /// collisions occur. This should be improved if collisions become
+    /// problematic.
+    hash: u64,
+
+    /// The offset in the row where this run started.
+    offset: u16,
+
+    /// The total number of cells produced by this run.
+    cells: u16,
+
+    /// The grid that built this run.
+    grid: *font.SharedGrid,
+
+    /// The index within the font collection that this run uses.
+    font_index: font.Collection.Index,
+};
+
+/// RunIterator is an iterator that yields text runs.
+pub const RunIterator = struct {
+    hooks: font.Shaper.RunIteratorHook,
+    grid: *font.SharedGrid,
+    screen: *const terminal.Screen,
+    row: terminal.Pin,
+    selection: ?terminal.Selection = null,
+    cursor_x: ?usize = null,
+    i: usize = 0,
+
+    pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
+        const cells = self.row.cells(.all);
+
+        // Determine the effective length of the row, ignoring trailing empty cells.
+        const max: usize = max: {
+            for (0..cells.len) |i| {
+                const rev_i = cells.len - i - 1;
+                if (!cells[rev_i].isEmpty()) break :max rev_i + 1;
+            }
+            break :max 0;
+        };
+
+        // Skip invisible cells at the start.
+        while (self.i < max and
+            self.row.style(&cells[self.i]).flags.invisible)
+        {
+            self.i += 1;
+        }
+
+        // We're over at the max.
+        if (self.i >= max) return null;
+
+        // Initialize hash for this run.
+        var hasher = Hasher.init(0);
+
+        // Style for the run.
+        const style = self.row.style(&cells[self.i]);
+
+        // Track the font for our current run.
+        var current_font: font.Collection.Index = .{};
+
+        // Prepare hook.
+        try self.hooks.prepare();
+
+        // Accumulate.
+        var j: usize = self.i;
+        while (j < max) : (j += 1) {
+            const cluster = j;
+            const cell = &cells[j];
+
+            // Selection boundaries.
+            if (self.selection) |unordered_sel| {
+                if (j > self.i) {
+                    const sel = unordered_sel.ordered(self.screen, .forward);
+                    const start_x = sel.start().x;
+                    const end_x = sel.end().x;
+
+                    if (start_x > 0 and j == start_x) break;
+                    if (end_x > 0 and j == end_x + 1) break;
+                }
+            }
+
+            // Skip wide spacers.
+            switch (cell.wide) {
+                .spacer_head, .spacer_tail => continue,
+                .narrow, .wide => {},
+            }
+
+            // Split on common bad ligatures and other style changes.
+            if (j > self.i) style: {
+                const prev_cell = cells[j - 1];
+
+                // Bad ligature checks for plain codepoints.
+                if (prev_cell.content_tag == .codepoint and
+                    cell.content_tag == .codepoint) {
+                    const prev_cp = prev_cell.codepoint();
+                    switch (prev_cp) {
+                        // fl, fi
+                        'f' => {
+                            const cp = cell.codepoint();
+                            if (cp == 'l' or cp == 'i') break;
+                        },
+                        // st
+                        's' => {
+                            const cp = cell.codepoint();
+                            if (cp == 't') break;
+                        },
+                        else => {},
+                    }
+                }
+
+                // If the style is exactly the same, fast‑path out.
+                if (prev_cell.style_id == cell.style_id) break :style;
+
+                // Compare style, allowing differences in background.
+                const c1 = comparableStyle(self.row.style(&prev_cell));
+                const c2 = comparableStyle(style);
+                if (!c1.eql(c2)) break;
+            }
+
+            // Determine font style (bold/italic).
+            const font_style: font.Style = style: {
+                if (style.flags.bold) {
+                    if (style.flags.italic) break :style .bold_italic;
+                    break :style .bold;
+                }
+                if (style.flags.italic) break :style .italic;
+                break :style .regular;
+            };
+
+            // Determine presentation.
+            const presentation: ?font.Presentation = if (cell.hasGrapheme()) p: {
+                const cps = self.row.grapheme(cell) orelse break :p null;
+                assert(cps.len > 0);
+                if (cps[0] == 0xFE0E) break :p .text;
+                if (cps[0] == 0xFE0F) break :p .emoji;
+                break :p null;
+            } else emoji: {
+                // The font grid getIndex will handle presentation automatically.
+                break :emoji null;
+            };
+
+            // Break on cursor conditions, ignoring cells that are
+            // part of a grapheme.
+            if (!cell.hasGrapheme()) {
+                if (self.cursor_x) |cursor_x| {
+                    if (self.i == cursor_x and j > self.i) {
+                        // Exactly at cursor, break.
+                        break;
+                    }
+                    if (self.i < cursor_x and j == cursor_x) {
+                        // Before cursor.
+                        break;
+                    }
+                    // After: no break required.
+                }
+            }
+
+            // Find a suitable font index for the cell (including grapheme.
+            const font_info: struct {
+                idx: font.Collection.Index,
+                fallback: ?u32 = null,
+            } = font_info: {
+                // Try to find a font that supports the entire grapheme.
+                    if (try self.indexForCell(
+                        alloc,
+                        cell,
+                        style,
+                        presentation,
+                    )) |idx| break :font_info .{ .idx = idx };
+                // Fallback to replacement character.
+                if (try self.grid.getIndex(
+                    alloc,
+                    0xFFFD,
+                    font_style,
+                    presentation,
+                )) |idx| break :font_info .{ .idx = idx, .fallback = 0xFFFD };
+                // Fallback to space.
+                if (try self.grid.getIndex(
+                    alloc,
+                    ' ',
+                    font_style,
+                    presentation,
+                )) |idx| break :font_info .{ .idx = idx, .fallback = ' ' };
+                // Should always have a space.
+                unreachable;
+            };
+            if (j == self.i) current_font = font_info.idx;
+
+            // Break if font index changes.
+            if (font_info.idx.int() != current_font.int()) break;
+
+            // Add codepoints.
+            if (font_info.fallback) |cp| {
+                // Use fallback char.
+                try self.addCodepoint(&hasher, cp, @intCast(cluster));
+                continue;
+            }
+
+            // Main codepoint.
+            try self.addCodepoint(
+                &hasher,
+                if (cell.codepoint() == 0) ' ' else cell.codepoint(),
+                @intCast(cluster),
+            );
+
+            // Additional grapheme codepoints.
+            if (cell.hasGrapheme()) {
+                const cps = self.row.grapheme(cell).?;
+                for (cps) |cp| {
+                    if (cp == 0xFE0E or cp == 0xFE0F) continue;
+                    try self.addCodepoint(&hasher, cp, @intCast(cluster));
+                }
+            }
+        }
+
+        // Finalize hooks.
+        try self.hooks.finalize();
+
+        // Hash length.
+        autoHash(&hasher, j - self.i);
+        // Include font index.
+        autoHash(&hasher, current_font);
+
+        // Move cursor.
+        defer self.i = j;
+
+        return TextRun{
+            .hash = hasher.final(),
+            .offset = @intCast(self.i),
+            .cells = @intCast(j - self.i),
+            .grid = self.grid,
+            .font_index = current_font,
+        };
+    }
+
+    fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
+        autoHash(hasher, cp);
+        autoHash(hasher, cluster);
+        try self.hooks.addCodepoint(cp, cluster);
+    }
+
+    fn indexForCell(
+        self: *RunIterator,
+        alloc: Allocator,
+        cell: *terminal.Cell,
+        style: font.Style,
+        presentation: ?font.Presentation,
+    ) !?font.Collection.Index {
+        // Handle empty or placeholder cells.
+        if (cell.isEmpty() or
+            cell.codepoint() == 0 or
+            cell.codepoint() == terminal.kitty.graphics.unicode.placeholder)
+        {
+            return try self.grid.getIndex(
+                alloc,
+                ' ',
+                style,
+                presentation,
+            );
+        }
+
+        // Primary codepoint.
+        const primary = try self.grid.getIndex(
+            alloc,
+            cell.codepoint(),
+            style,
+            presentation,
+        ) orelse return null;
+
+        // If not a grapheme, return primary.
+        if (!cell.hasGrapheme()) return primary;
+
+        const cps = self.row.grapheme(cell) orelse return primary;
+        var candidates = try std.ArrayList(font.Collection.Index).initCapacity(alloc, cps.len + 1);
+        defer candidates.deinit();
+        candidates.appendAssumeCapacity(primary);
+
+        for (cps) |cp| {
+            if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+            const idx = try self.grid.getIndex(
+                alloc,
+                cp,
+                style,
+                null,
+            ) orelse return null;
+            candidates.appendAssumeCapacity(idx);
+        }
+
+        // Find a candidate that supports all codepoints.
+        for (candidates.items) |idx| {
+            if (!self.grid.hasCodepoint(idx, primary, presentation)) continue;
+            for (cps) |cp| {
+                if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+                if (!self.grid.hasCodepoint(idx, cp, presentation)) break;
+            } else {
+                return idx;
+            }
+        }
+
+        return null;
+    }
+};
+
+/// Returns a style that is comparable for run continuation.
+fn comparableStyle(style: terminal.Style) terminal.Style {
+    var s = style;
+    s.bg_color = .none;
+    return s;
+}

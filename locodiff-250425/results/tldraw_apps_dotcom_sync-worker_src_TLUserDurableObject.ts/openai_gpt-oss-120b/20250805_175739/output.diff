@@ -1,0 +1,416 @@
+
+index e49f6e877..5c73a6807 100644
+--- a/tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_expectedoutput.txt (expected):tmp/tmpdzuza5gu_expected.txt	
++++ b/tldraw_apps_dotcom_sync-worker_src_TLUserDurableObject.ts_extracted.txt (actual):tmp/tmpnvnl12j0_actual.txt	
+@@ -1,7 +1,7 @@
+ import {
+-	DB,
+ 	isColumnMutable,
+ 	MAX_NUMBER_OF_FILES,
++	ROOM_PREFIX,
+ 	TlaFile,
+ 	TlaFilePartial,
+ 	TlaFileState,
+@@ -46,17 +46,14 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	private log
+-
+ 	cache: UserDataSyncer | null = null
+ 
+ 	constructor(ctx: DurableObjectState, env: Environment) {
+ 		super(ctx, env)
+ 
+ 		this.sentry = createSentry(ctx, env)
+-
+ 		this.db = createPostgresConnectionPool(env, 'TLUserDurableObject')
+ 		this.measure = env.MEASURE
+-
+ 		// debug logging in preview envs by default
+ 		this.log = new Logger(env, 'TLUserDurableObject', this.sentry)
+ 	}
+@@ -72,7 +69,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			const rateLimited = await isRateLimited(this.env, this.userId!)
+ 			if (rateLimited) {
+ 				this.log.debug('rate limited')
+-				this.logEvent({ type: 'rate_limited', id: this.userId })
+ 				throw new Error('Rate limited')
+ 			}
+ 			if (!this.cache) {
+@@ -87,16 +83,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					this.logEvent.bind(this),
+ 					this.log
+ 				)
++			} else {
++				await this.cache.waitUntilConnected()
+ 			}
+ 		})
+ 		.get(`/app/:userId/connect`, (req) => this.onRequest(req))
+ 
+-	// Handle a request to the Durable Object.
+ 	override async fetch(req: IRequest) {
+ 		const sentry = createSentry(this.ctx, this.env, req)
+ 		try {
+-			// Using storage pins the location of the DO
+-			this.ctx.storage.get('pin-the-do')
+ 			return await this.router.fetch(req)
+ 		} catch (err) {
+ 			if (sentry) {
+@@ -114,23 +109,24 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 	private assertCache(): asserts this is { cache: UserDataSyncer } {
+ 		assert(this.cache, 'no cache')
++		this.cache.maybeStartInterval()
+ 	}
+ 
+-	interval: NodeJS.Timeout | null = null
++	private readonly sockets = new Set<WebSocket>()
++	private interval: NodeJS.Timeout | null = null
++	private nextMutationTimestamp = Date.now() + 2 * 60 * 1000 + 5 * 60 * 1000 * Math.random()
++	private readonly messageQueue = new ExecutionQueue()
+ 
+ 	private maybeStartInterval() {
+ 		if (!this.interval) {
+ 			this.interval = setInterval(() => {
+-				// do cache persist + cleanup
+ 				this.cache?.onInterval()
+-
+-				// clean up closed sockets if there are any
++				// clean up closed sockets
+ 				for (const socket of this.sockets) {
+ 					if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+ 						this.sockets.delete(socket)
+ 					}
+ 				}
+-
+ 				if (this.sockets.size === 0 && typeof this.interval === 'number') {
+ 					clearInterval(this.interval)
+ 					this.interval = null
+@@ -139,40 +135,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	private readonly sockets = new Set<WebSocket>()
+-
+-	maybeReportColdStartTime(type: ZServerSentMessage['type']) {
+-		if (type !== 'initial_data' || !this.coldStartStartTime) return
+-		const time = Date.now() - this.coldStartStartTime
+-		this.coldStartStartTime = null
+-		this.logEvent({ type: 'cold_start_time', id: this.userId!, duration: time })
+-	}
+-
+-	broadcast(message: ZServerSentMessage) {
+-		this.logEvent({ type: 'broadcast_message', id: this.userId! })
+-		this.maybeReportColdStartTime(message.type)
+-		const msg = JSON.stringify(message)
+-		for (const socket of this.sockets) {
+-			if (socket.readyState === WebSocket.OPEN) {
+-				socket.send(msg)
+-			} else if (
+-				socket.readyState === WebSocket.CLOSED ||
+-				socket.readyState === WebSocket.CLOSING
+-			) {
+-				this.sockets.delete(socket)
+-			}
+-		}
+-	}
+-	private readonly messageQueue = new ExecutionQueue()
+-
+ 	async onRequest(req: IRequest) {
+ 		assert(this.userId, 'User ID not set')
+-		// handle legacy param names
+-
+ 		const url = new URL(req.url)
+ 		const params = Object.fromEntries(url.searchParams.entries())
+ 		const { sessionId } = params
+-
+ 		const protocolVersion = params.protocolVersion ? Number(params.protocolVersion) : 1
+ 
+ 		assert(sessionId, 'Session ID is required')
+@@ -180,15 +147,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 
+ 		this.assertCache()
+ 
+-		// Create the websocket pair for the client
+ 		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+ 		serverWebSocket.accept()
+-
+-		if (Number(protocolVersion) !== Z_PROTOCOL_VERSION || this.__test__isForceDowngraded) {
+-			serverWebSocket.close(TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+-			return new Response(null, { status: 101, webSocket: clientWebSocket })
+-		}
+-
+ 		serverWebSocket.addEventListener('message', (e) =>
+ 			this.messageQueue.push(() => this.handleSocketMessage(serverWebSocket, e.data.toString()))
+ 		)
+@@ -199,9 +159,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 			this.captureException(e, { source: 'serverWebSocket "error" event' })
+ 			this.sockets.delete(serverWebSocket)
+ 		})
+-
+ 		this.sockets.add(serverWebSocket)
+-		this.maybeStartInterval()
++
++		if (Number(protocolVersion) !== Z_PROTOCOL_VERSION || this.__test__isForceDowngraded) {
++			serverWebSocket.close(TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
++			return new Response(null, { status: 101, webSocket: clientWebSocket })
++		}
+ 
+ 		const initialData = this.cache.store.getCommittedData()
+ 		if (initialData) {
+@@ -222,7 +185,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async handleSocketMessage(socket: WebSocket, message: string) {
+ 		const rateLimited = await isRateLimited(this.env, this.userId!)
+ 		this.assertCache()
+-
++		await this.cache.waitUntilConnected()
+ 		const msg = JSON.parse(message) as any as ZClientSentMessage
+ 		switch (msg.type) {
+ 			case 'mutate':
+@@ -239,22 +202,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	async bumpMutationNumber(db: Kysely<DB> | Transaction<DB>) {
+-		return db
+-			.insertInto('user_mutation_number')
+-			.values({
+-				userId: this.userId!,
+-				mutationNumber: 1,
+-			})
+-			.onConflict((oc) =>
+-				oc.column('userId').doUpdateSet({
+-					mutationNumber: sql`user_mutation_number."mutationNumber" + 1`,
+-				})
+-			)
+-			.returning('mutationNumber')
+-			.executeTakeFirstOrThrow()
+-	}
+-
+ 	private async rejectMutation(socket: WebSocket, mutationId: string, errorCode: ZErrorCode) {
+ 		this.assertCache()
+ 		this.logEvent({ type: 'reject_mutation', id: this.userId! })
+@@ -270,12 +217,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	}
+ 
+ 	private async assertValidMutation(update: ZRowUpdate, tx: Transaction<DB>) {
+-		// s is the entire set of data that the user has access to
+-		// and is up to date with all committed mutations so far.
+-		// we commit each mutation one at a time before handling the next.
+ 		const s = this.cache!.store.getFullData()
+ 		if (!s) {
+-			// This should never happen
+ 			throw new ZMutationError(ZErrorCode.unknown_error, 'Store data not fetched')
+ 		}
+ 		switch (update.table) {
+@@ -286,7 +229,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 						ZErrorCode.forbidden,
+ 						'Cannot update user record that is not our own: ' + (update.row as TlaUser).id
+ 					)
+-				// todo: prevent user from updating their email?
+ 				return
+ 			}
+ 			case 'file': {
+@@ -302,10 +244,7 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				}
+ 				if (prevFile.isDeleted)
+ 					throw new ZMutationError(ZErrorCode.forbidden, 'Cannot update a deleted file')
+-				// Owners are allowed to make changes
+ 				if (prevFile.ownerId === this.userId) return
+-
+-				// We can make changes to updatedAt field in a shared, editable file
+ 				if (prevFile.shared && prevFile.sharedLinkType === 'edit') {
+ 					const { id: _id, ...rest } = nextFile
+ 					if (Object.keys(rest).length === 1 && rest.updatedAt !== undefined) return
+@@ -324,8 +263,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 				const nextFileState = update.row as TlaFileStatePartial
+ 				let file = s.files.find((f) => f.id === nextFileState.fileId)
+ 				if (!file) {
+-					// The user might not have access to this file yet, because they just followed a link
+-					// let's allow them to create a file state for it if it exists and is shared.
+ 					file = await tx
+ 						.selectFrom('file')
+ 						.selectAll()
+@@ -390,7 +327,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 								const count =
+ 									this.cache.store
+ 										.getFullData()
+-										?.files.filter((f) => f.ownerId === this.userId && !f.isDeleted).length ?? 0
++										?.files.filter((f) => f.ownerId === this.userId && !f.isDeleted).length ??
++									0
+ 								if (count >= MAX_NUMBER_OF_FILES) {
+ 									throw new ZMutationError(
+ 										ZErrorCode.max_files_reached,
+@@ -428,11 +366,15 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 								.execute()
+ 						} else {
+ 							const { id } = update.row as any
+-							await tx.updateTable(update.table).set(updates).where('id', '=', id).execute()
++							await tx
++								.updateTable(update.table)
++								.set(updates)
++								.where('id', '=', id)
++								.execute()
+ 						}
+ 						break
+ 					}
+-					case 'delete':
++					case 'delete': {
+ 						if (update.table === 'file_state') {
+ 							const { fileId, userId } = update.row as any
+ 							await tx
+@@ -445,26 +387,12 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 							await tx.deleteFrom(update.table).where('id', '=', id).execute()
+ 						}
+ 						break
++					}
+ 				}
+ 				this.cache.store.updateOptimisticData([update], msg.mutationId)
+ 			}
+-			const result = await this.bumpMutationNumber(tx)
+-
+-			const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
+-			const mutationNumber = result.mutationNumber
+-			assert(
+-				mutationNumber > currentMutationNumber,
+-				`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
+-			)
+-			this.log.debug('pushing mutation to cache', this.userId, mutationNumber)
+-			this.cache.mutations.push({
+-				mutationNumber,
+-				mutationId: msg.mutationId,
+-				timestamp: Date.now(),
+-			})
+ 			return { insertedFiles, newGuestFiles }
+ 		})
+-
+ 		for (const file of insertedFiles) {
+ 			getRoomDurableObject(this.env, file.id).appFileRecordCreated(file)
+ 		}
+@@ -476,19 +404,41 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 	private async handleMutate(socket: WebSocket, msg: ZClientSentMessage) {
+ 		this.assertCache()
+ 		while (!this.cache.store.getCommittedData()) {
+-			// this could happen if the cache was cleared due to a full db reboot
+ 			await sleep(100)
+ 		}
+ 		this.log.debug('mutation', this.userId, msg)
+ 		try {
+-			// we connect to pg via a pooler, so in the case that the pool is exhausted
+-			// we need to retry the connection. (also in the case that a neon branch is asleep apparently?)
+ 			await retryOnConnectionFailure(
+ 				() => this._doMutate(msg),
+ 				() => {
+ 					this.logEvent({ type: 'connect_retry', id: this.userId! })
+ 				}
+ 			)
++			this.log.debug('mutation success', this.userId, 'new guest files')
++			await this.db
++				.transaction()
++				.execute(async (tx) => {
++					const result = await this.bumpMutationNumber(tx)
++
++					this.nextMutationTimestamp = Date.now() + 5 * 60 * 1000
++
++					const currentMutationNumber = this.cache.mutations.at(-1)?.mutationNumber ?? 0
++					const mutationNumber = result.mutationNumber
++					assert(
++						mutationNumber > currentMutationNumber,
++						`mutation number did not increment mutationNumber: ${mutationNumber} current: ${currentMutationNumber}`
++					)
++					this.log.debug('pushing mutation to cache', this.userId, mutationNumber)
++					this.cache.mutations.push({
++						mutationNumber,
++						mutationId: msg.mutationId,
++						timestamp: Date.now(),
++					})
++				})
++				.catch((e) => {
++					this.cache.mutations = this.cache.mutations.filter((m) => m.mutationId !== msg.mutationId)
++					throw e
++				})
+ 		} catch (e: any) {
+ 			const code = e instanceof ZMutationError ? e.errorCode : ZErrorCode.unknown_error
+ 			this.captureException(e, {
+@@ -499,8 +449,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 	}
+ 
+-	/* ------- RPCs -------  */
+-
+ 	async handleReplicationEvent(event: ZReplicationEvent) {
+ 		this.logEvent({ type: 'replication_event', id: this.userId ?? 'anon' })
+ 		this.log.debug('replication event', event, !!this.cache)
+@@ -522,7 +470,21 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		return !this.cache
+ 	}
+ 
+-	/* --------------  */
++	private async bumpMutationNumber(db: Kysely<DB> | Transaction<DB>) {
++		return db
++			.insertInto('user_mutation_number')
++			.values({
++				userId: this.userId!,
++				mutationNumber: 1,
++			})
++			.onConflict((oc) =>
++				oc.column('userId').doUpdateSet({
++					mutationNumber: sql`user_mutation_number."mutationNumber" + 1`,
++				})
++			)
++			.returning('mutationNumber')
++			.executeTakeFirstOrThrow()
++	}
+ 
+ 	private writeEvent(eventData: EventData) {
+ 		writeDataPoint(this.sentry, this.measure, this.env, 'user_durable_object', eventData)
+@@ -542,25 +504,11 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 					doubles: [event.duration],
+ 				})
+ 				break
+-
+ 			default:
+ 				this.writeEvent({ blobs: [event.type, event.id] })
+ 		}
+ 	}
+ 
+-	/** sneaky test stuff */
+-	// this allows us to test the 'your client is out of date please refresh' flow
+-	private __test__isForceDowngraded = false
+-	async __test__downgradeClient(isDowngraded: boolean) {
+-		if (this.env.IS_LOCAL !== 'true') {
+-			return
+-		}
+-		this.__test__isForceDowngraded = isDowngraded
+-		this.sockets.forEach((socket) => {
+-			socket.close()
+-		})
+-	}
+-
+ 	async admin_forceHardReboot(userId: string) {
+ 		if (this.cache) {
+ 			await this.cache?.reboot({ hard: true, delay: false, source: 'admin' })
+@@ -586,8 +534,23 @@ export class TLUserDurableObject extends DurableObject<Environment> {
+ 		}
+ 		return cache.store.getCommittedData()
+ 	}
++
++	/** sneaky test stuff */
++	// this allows us to test the 'your client is out of date please refresh' flow
++	private __test__isForceDowngraded = false
++	async __test__downgradeClient(isDowngraded: boolean) {
++		if (this.env.IS_LOCAL !== 'true') {
++			return
++		}
++		this.__test__isForceDowngraded = isDowngraded
++		this.sockets.forEach((socket) => {
++			socket.close()
++		})
++	}
+ }
+ 
++/* Helper function removed (listAllObjectKeys) */
++
+ class ZMutationError extends Error {
+ 	constructor(
+ 		public errorCode: ZErrorCode,

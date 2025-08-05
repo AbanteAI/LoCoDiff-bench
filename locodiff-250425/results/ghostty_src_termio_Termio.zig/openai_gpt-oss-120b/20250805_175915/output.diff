@@ -1,0 +1,579 @@
+
+index 5c2b8b3f1..e2347df6b 100644
+--- a/ghostty_src_termio_Termio.zig_expectedoutput.txt (expected):tmp/tmplq7a4b3z_expected.txt	
++++ b/ghostty_src_termio_Termio.zig_extracted.txt (actual):tmp/tmp2478sv_o_actual.txt	
+@@ -29,15 +29,7 @@ const shell_integration = @import("shell_integration.zig");
+ 
+ const log = std.log.scoped(.io_exec);
+ 
+-/// Allocator
+ alloc: Allocator,
+-
+-/// This is the implementation responsible for io.
+-backend: termio.Backend,
+-
+-/// The derived configuration for this termio implementation.
+-config: DerivedConfig,
+-
+ /// The terminal emulator internal state. This is the abstract "terminal"
+ /// that manages input, grid updating, etc. and is renderer-agnostic. It
+ /// just stores internal state about a grid.
+@@ -62,6 +54,9 @@ size: renderer.Size,
+ /// The mailbox implementation to use.
+ mailbox: termio.Mailbox,
+ 
++/// The backend implementation responsible for io.
++backend: termio.Backend,
++
+ /// The stream parser. This parses the stream of escape codes and so on
+ /// from the child process and calls callbacks in the stream handler.
+ terminal_stream: terminalpkg.Stream(StreamHandler),
+@@ -70,9 +65,7 @@ terminal_stream: terminalpkg.Stream(StreamHandler),
+ /// flooding with cursor resets.
+ last_cursor_reset: ?std.time.Instant = null,
+ 
+-/// The configuration for this IO that is derived from the main
+-/// configuration. This must be exported so that we don't need to
+-/// pass around Config pointers which makes memory management a pain.
++/// The derived configuration for this termio implementation.
+ pub const DerivedConfig = struct {
+     arena: ArenaAllocator,
+ 
+@@ -158,24 +151,12 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
+     term.default_palette = opts.config.palette;
+     term.color_palette.colors = opts.config.palette;
+ 
+-    // Set the image size limits
+-    try term.screen.kitty_images.setLimit(
+-        alloc,
+-        &term.screen,
+-        opts.config.image_storage_limit,
+-    );
+-    try term.secondary_screen.kitty_images.setLimit(
+-        alloc,
+-        &term.secondary_screen,
+-        opts.config.image_storage_limit,
+-    );
+-
+     // Set our default cursor style
+     term.screen.cursor.cursor_style = opts.config.cursor_style;
+ 
+     // Setup our terminal size in pixels for certain requests.
+-    term.width_px = term.cols * opts.size.cell.width;
+-    term.height_px = term.rows * opts.size.cell.height;
++    term.width_px = opts.size.grid().columns * opts.size.cell.width;
++    term.height_px = opts.size.grid().rows * opts.size.cell.height;
+ 
+     // Setup our backend.
+     var backend = opts.backend;
+@@ -191,12 +172,12 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
+ 
+         break :handler .{
+             .alloc = alloc,
+-            .termio_mailbox = &self.mailbox,
++            .writer = &self.mailbox,
+             .surface_mailbox = opts.surface_mailbox,
+             .renderer_state = opts.renderer_state,
+             .renderer_wakeup = opts.renderer_wakeup,
+             .renderer_mailbox = opts.renderer_mailbox,
+-            .size = &self.size,
++            .grid_size = &self.size,
+             .terminal = &self.terminal,
+             .osc_color_report_format = opts.config.osc_color_report_format,
+             .enquiry_response = opts.config.enquiry_response,
+@@ -205,23 +186,24 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
+             .default_cursor_style = opts.config.cursor_style,
+             .default_cursor_blink = opts.config.cursor_blink,
+             .default_cursor_color = default_cursor_color,
+-            .cursor_color = null,
++            .cursor_color = default_cursor_color,
+             .foreground_color = null,
+             .background_color = null,
+         };
+     };
++    errdefer self.terminal_stream.handler.deinit();
++    errdefer self.terminal_stream.deinit();
+ 
+     self.* = .{
+         .alloc = alloc,
+         .terminal = term,
+-        .config = opts.config,
+         .renderer_state = opts.renderer_state,
+         .renderer_wakeup = opts.renderer_wakeup,
+         .renderer_mailbox = opts.renderer_mailbox,
+         .surface_mailbox = opts.surface_mailbox,
+         .size = opts.size,
+-        .backend = backend,
+         .mailbox = opts.mailbox,
++        .backend = backend,
+         .terminal_stream = .{
+             .handler = handler,
+             .parser = .{
+@@ -240,31 +222,62 @@ pub fn deinit(self: *Termio) void {
+     self.terminal.deinit(self.alloc);
+     self.config.deinit();
+     self.mailbox.deinit(self.alloc);
+-
+-    // Clear any StreamHandler state
+     self.terminal_stream.handler.deinit();
+     self.terminal_stream.deinit();
+ }
+ 
++/// Thread-local data needed for threadEnter.
++pub const ThreadData = struct {
++    /// Allocator used for the event data
++    alloc: Allocator,
++    /// The event loop associated with this thread.
++    loop: *xev.Loop,
++    /// The shared render state
++    renderer_state: *renderer.State,
++    /// Mailbox for the surface.
++    surface_mailbox: apprt.surface.Mailbox,
++    /// Mailbox implementation pointer.
++    mailbox: *termio.Mailbox,
++    /// Data associated with the backend implementation (i.e. pty/exec state)
++    backend: termio.backend.ThreadData,
++
++    pub fn deinit(self: *ThreadData) void {
++        self.backend.deinit(self.alloc);
++        self.* = undefined;
++    }
++};
++
+ pub fn threadEnter(self: *Termio, thread: *termio.Thread, data: *ThreadData) !void {
++    const alloc = self.alloc;
++
++    // Wakeup watcher for the writer thread.
++    var wakeup = try xev.Async.init();
++    errdefer wakeup.deinit();
++
++    // Setup our thread data
+     data.* = .{
+-        .alloc = self.alloc,
++        .alloc = alloc,
+         .loop = &thread.loop,
+         .renderer_state = self.renderer_state,
+         .surface_mailbox = self.surface_mailbox,
+         .mailbox = &self.mailbox,
+-        .backend = undefined, // Backend must replace this on threadEnter
++        // Placeholder until setup below
++        .backend = .{ .manual = {} },
+     };
+ 
+     // Setup our backend
+-    try self.backend.threadEnter(self.alloc, self, data);
++    try self.backend.threadEnter(alloc, self, data);
+ }
+ 
+ pub fn threadExit(self: *Termio, data: *ThreadData) void {
+     self.backend.threadExit(data);
++    // Clear our read data pointer (if any)
++    self.renderer_state.mutex.lock();
++    defer self.renderer_state.mutex.unlock();
++    // No explicit read data field any more.
+ }
+ 
+-/// Send a message to the the mailbox. Depending on the mailbox type in
++/// Send a message using the mailbox. Depending on the mailbox type in
+ /// use this may process now or it may just enqueue and process later.
+ ///
+ /// This will also notify the mailbox thread to process the message. If
+@@ -285,8 +298,8 @@ pub fn queueMessage(
+ /// Queue a write directly to the pty.
+ ///
+ /// If you're using termio.Thread, this must ONLY be called from the
+-/// mailbox thread. If you're not on the thread, use queueMessage with
+-/// mailbox messages instead.
++/// writer thread. If you're not on the thread, use queueMessage with
++/// writer messages instead.
+ ///
+ /// If you're not using termio.Thread, this is not threadsafe.
+ pub inline fn queueWrite(
+@@ -298,7 +311,76 @@ pub inline fn queueWrite(
+     try self.backend.queueWrite(self.alloc, td, data, linefeed);
+ }
+ 
+-/// Update the configuration.
++// -----------------------------------------------------------------------------
++// Terminal operations
++// -----------------------------------------------------------------------------
++
++pub fn resetSynchronizedOutput(self: *Termio) void {
++    self.renderer_state.mutex.lock();
++    defer self.renderer_state.mutex.unlock();
++    self.terminal.modes.set(.synchronized_output, false);
++    self.renderer_wakeup.notify() catch {};
++}
++
++pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
++    {
++        self.renderer_state.mutex.lock();
++        defer self.renderer_state.mutex.unlock();
++
++        // If we're on the alternate screen, we do not clear. Since this is an
++        // emulator-level screen clear, this messes up the running programs
++        // knowledge of where the cursor is and causes rendering issues. So,
++        // for alt screen, we do nothing.
++        if (self.terminal.active_screen == .alternate) return;
++
++        // Clear our scrollback
++        if (history) self.terminal.eraseDisplay(.scrollback, false);
++
++        // If we're not at a prompt, we just delete above the cursor.
++        if (!self.terminal.cursorIsAtPrompt()) {
++            if (self.terminal.screen.cursor.y > 0) {
++                self.terminal.screen.eraseRows(
++                    .{ .active = .{ .y = 0 } },
++                    .{ .active = .{ .y = self.terminal.screen.cursor.y - 1 } },
++                );
++            }
++
++            return;
++        }
++
++        // At a prompt, we want to first fully clear the screen, and then after
++        // send a FF (0x0C) to the shell so that it can repaint the screen.
++        // Mark the current row as a not a prompt so we can properly
++        // clear the full screen in the next eraseDisplay call.
++        self.terminal.markSemanticPrompt(.command);
++        assert(!self.terminal.cursorIsAtPrompt());
++        self.terminal.eraseDisplay(.complete, false);
++    }
++
++    // If we reached here it means we're at a prompt, so we send a form-feed.
++    try self.queueWrite(td, &[_]u8{0x0C}, false);
++}
++
++pub fn scrollViewport(self: *Termio, scroll: terminalpkg.Terminal.ScrollViewport) !void {
++    self.renderer_state.mutex.lock();
++    defer self.renderer_state.mutex.unlock();
++    try self.terminal.scrollViewport(scroll);
++}
++
++pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
++    {
++        self.renderer_state.mutex.lock();
++        defer self.renderer_state.mutex.unlock();
++        self.terminal.screen.scroll(.{ .delta_prompt = delta });
++    }
++
++    try self.renderer_wakeup.notify();
++}
++
++// -----------------------------------------------------------------------------
++// Configuration changes
++// -----------------------------------------------------------------------------
++
+ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
+     // The remainder of this function is modifying terminal state or
+     // the read thread data, all of which requires holding the renderer
+@@ -349,37 +431,33 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
+     );
+ }
+ 
+-/// Resize the terminal.
++// -----------------------------------------------------------------------------
++// Resize handling
++// -----------------------------------------------------------------------------
++
+ pub fn resize(
+     self: *Termio,
+     td: *ThreadData,
+     size: renderer.Size,
+ ) !void {
+-    self.size = size;
+     const grid_size = size.grid();
+ 
+     // Update the size of our pty.
+     try self.backend.resize(grid_size, size.terminal());
+ 
++    // Update our cached size info
++    self.size = size;
++
+     // Enter the critical area that we want to keep small
+     {
+         self.renderer_state.mutex.lock();
+         defer self.renderer_state.mutex.unlock();
+ 
+-        // Update the size of our terminal state
+-        try self.terminal.resize(
+-            self.alloc,
+-            grid_size.columns,
+-            grid_size.rows,
+-        );
+-
+-        // Update our pixel sizes
++        try self.terminal.resize(self.alloc, grid_size.columns, grid_size.rows);
+         self.terminal.width_px = grid_size.columns * self.size.cell.width;
+         self.terminal.height_px = grid_size.rows * self.size.cell.height;
+-
+-        // Disable synchronized output mode so that we show changes
+-        // immediately for a resize. This is allowed by the spec.
+         self.terminal.modes.set(.synchronized_output, false);
++        self.renderer_wakeup.notify() catch {};
+ 
+         // If we have size reporting enabled we need to send a report.
+         if (self.terminal.modes.get(.in_band_size_reports)) {
+@@ -392,6 +470,10 @@ pub fn resize(
+     self.renderer_wakeup.notify() catch {};
+ }
+ 
++// -----------------------------------------------------------------------------
++// Size reports
++// -----------------------------------------------------------------------------
++
+ /// Make a size report.
+ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+     self.renderer_state.mutex.lock();
+@@ -400,8 +482,6 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
+ }
+ 
+ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+-    const grid_size = self.size.grid();
+-
+     // 1024 bytes should be enough for size report since report
+     // in columns and pixels.
+     var buf: [1024]u8 = undefined;
+@@ -410,18 +490,18 @@ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeRe
+             &buf,
+             "\x1B[48;{};{};{};{}t",
+             .{
+-                grid_size.rows,
+-                grid_size.columns,
+-                grid_size.rows * self.size.cell.height,
+-                grid_size.columns * self.size.cell.width,
++                self.size.grid().rows,
++                self.size.grid().columns,
++                self.size.grid().rows * self.size.cell.height,
++                self.size.grid().columns * self.size.cell.width,
+             },
+         ),
+         .csi_14_t => try std.fmt.bufPrint(
+             &buf,
+             "\x1b[4;{};{}t",
+             .{
+-                grid_size.rows * self.size.cell.height,
+-                grid_size.columns * self.size.cell.width,
++                self.size.grid().rows * self.size.cell.height,
++                self.size.grid().columns * self.size.cell.width,
+             },
+         ),
+         .csi_16_t => try std.fmt.bufPrint(
+@@ -436,209 +516,20 @@ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeRe
+             &buf,
+             "\x1b[8;{};{}t",
+             .{
+-                grid_size.rows,
+-                grid_size.columns,
++                self.size.grid().rows,
++                self.size.grid().columns,
+             },
+         ),
+     };
+-
+     try self.queueWrite(td, message, false);
+ }
+ 
+-/// Reset the synchronized output mode. This is usually called by timer
+-/// expiration from the termio thread.
+-pub fn resetSynchronizedOutput(self: *Termio) void {
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    self.terminal.modes.set(.synchronized_output, false);
+-    self.renderer_wakeup.notify() catch {};
+-}
+-
+-/// Clear the screen.
+-pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+-    {
+-        self.renderer_state.mutex.lock();
+-        defer self.renderer_state.mutex.unlock();
+-
+-        // If we're on the alternate screen, we do not clear. Since this is an
+-        // emulator-level screen clear, this messes up the running programs
+-        // knowledge of where the cursor is and causes rendering issues. So,
+-        // for alt screen, we do nothing.
+-        if (self.terminal.active_screen == .alternate) return;
+-
+-        // Clear our selection
+-        self.terminal.screen.clearSelection();
+-
+-        // Clear our scrollback
+-        if (history) self.terminal.eraseDisplay(.scrollback, false);
+-
+-        // If we're not at a prompt, we just delete above the cursor.
+-        if (!self.terminal.cursorIsAtPrompt()) {
+-            if (self.terminal.screen.cursor.y > 0) {
+-                self.terminal.screen.eraseRows(
+-                    .{ .active = .{ .y = 0 } },
+-                    .{ .active = .{ .y = self.terminal.screen.cursor.y - 1 } },
+-                );
+-            }
+-
+-            // Clear all Kitty graphics state for this screen. This copies
+-            // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
+-            // didn't spend time researching whether it only deletes Kitty
+-            // graphics that are placed baove the cursor or if it deletes
+-            // all of them. We delete all of them for now but if this behavior
+-            // isn't fully correct we should fix this later.
+-            self.terminal.screen.kitty_images.delete(
+-                self.terminal.screen.alloc,
+-                &self.terminal,
+-                .{ .all = true },
+-            );
++// -----------------------------------------------------------------------------
++// Terminal scroll viewport
++// -----------------------------------------------------------------------------
+ 
+-            return;
+-        }
+-
+-        // At a prompt, we want to first fully clear the screen, and then after
+-        // send a FF (0x0C) to the shell so that it can repaint the screen.
+-        // Mark the current row as a not a prompt so we can properly
+-        // clear the full screen in the next eraseDisplay call.
+-        self.terminal.markSemanticPrompt(.command);
+-        assert(!self.terminal.cursorIsAtPrompt());
+-        self.terminal.eraseDisplay(.complete, false);
+-    }
+-
+-    // If we reached here it means we're at a prompt, so we send a form-feed.
+-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+-}
+-
+-/// Scroll the viewport
+ pub fn scrollViewport(self: *Termio, scroll: terminalpkg.Terminal.ScrollViewport) !void {
+     self.renderer_state.mutex.lock();
+     defer self.renderer_state.mutex.unlock();
+     try self.terminal.scrollViewport(scroll);
+-}
+-
+-/// Jump the viewport to the prompt.
+-pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
+-    {
+-        self.renderer_state.mutex.lock();
+-        defer self.renderer_state.mutex.unlock();
+-        self.terminal.screen.scroll(.{ .delta_prompt = delta });
+-    }
+-
+-    try self.renderer_wakeup.notify();
+-}
+-
+-/// Called when the child process exited abnormally but before
+-/// the surface is notified.
+-pub fn childExitedAbnormally(self: *Termio, exit_code: u32, runtime_ms: u64) !void {
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    const t = self.renderer_state.terminal;
+-    try self.backend.childExitedAbnormally(self.alloc, t, exit_code, runtime_ms);
+-}
+-
+-/// Called when focus is gained or lost (when focus events are enabled)
+-pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
+-    self.renderer_state.mutex.lock();
+-    const focus_event = self.renderer_state.terminal.modes.get(.focus_event);
+-    self.renderer_state.mutex.unlock();
+-
+-    // If we have focus events enabled, we send the focus event.
+-    if (focus_event) {
+-        const seq = if (focused) "\x1b[I" else "\x1b[O";
+-        try self.queueWrite(td, seq, false);
+-    }
+-
+-    // We always notify our backend of focus changes.
+-    try self.backend.focusGained(td, focused);
+-}
+-
+-/// Process output from the pty. This is the manual API that users can
+-/// call with pty data but it is also called by the read thread when using
+-/// an exec subprocess.
+-pub fn processOutput(self: *Termio, buf: []const u8) void {
+-    // We are modifying terminal state from here on out and we need
+-    // the lock to grab our read data.
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    self.processOutputLocked(buf);
+-}
+-
+-/// Process output from readdata but the lock is already held.
+-fn processOutputLocked(self: *Termio, buf: []const u8) void {
+-    // Schedule a render. We can call this first because we have the lock.
+-    self.terminal_stream.handler.queueRender() catch unreachable;
+-
+-    // Whenever a character is typed, we ensure the cursor is in the
+-    // non-blink state so it is rendered if visible. If we're under
+-    // HEAVY read load, we don't want to send a ton of these so we
+-    // use a timer under the covers
+-    if (std.time.Instant.now()) |now| cursor_reset: {
+-        if (self.last_cursor_reset) |last| {
+-            if (now.since(last) <= (500 * std.time.ns_per_ms)) {
+-                break :cursor_reset;
+-            }
+-        }
+-
+-        self.last_cursor_reset = now;
+-        _ = self.renderer_mailbox.push(.{
+-            .reset_cursor_blink = {},
+-        }, .{ .instant = {} });
+-    } else |err| {
+-        log.warn("failed to get current time err={}", .{err});
+-    }
+-
+-    // If we have an inspector, we enter SLOW MODE because we need to
+-    // process a byte at a time alternating between the inspector handler
+-    // and the termio handler. This is very slow compared to our optimizations
+-    // below but at least users only pay for it if they're using the inspector.
+-    if (self.renderer_state.inspector) |insp| {
+-        for (buf, 0..) |byte, i| {
+-            insp.recordPtyRead(buf[i .. i + 1]) catch |err| {
+-                log.err("error recording pty read in inspector err={}", .{err});
+-            };
+-
+-            self.terminal_stream.next(byte) catch |err|
+-                log.err("error processing terminal data: {}", .{err});
+-        }
+-    } else {
+-        self.terminal_stream.nextSlice(buf) catch |err|
+-            log.err("error processing terminal data: {}", .{err});
+-    }
+-
+-    // If our stream handling caused messages to be sent to the mailbox
+-    // thread, then we need to wake it up so that it processes them.
+-    if (self.terminal_stream.handler.termio_messaged) {
+-        self.terminal_stream.handler.termio_messaged = false;
+-        self.mailbox.notify();
+-    }
+-}
+-
+-/// ThreadData is the data created and stored in the termio thread
+-/// when the thread is started and destroyed when the thread is
+-/// stopped.
+-///
+-/// All of the fields in this struct should only be read/written by
+-/// the termio thread. As such, a lock is not necessary.
+-pub const ThreadData = struct {
+-    /// Allocator used for the event data
+-    alloc: Allocator,
+-
+-    /// The event loop associated with this thread. This is owned by
+-    /// the Thread but we have a pointer so we can queue new work to it.
+-    loop: *xev.Loop,
+-
+-    /// The shared render state
+-    renderer_state: *renderer.State,
+-
+-    /// Mailboxes for different threads
+-    surface_mailbox: apprt.surface.Mailbox,
+-
+-    /// Data associated with the backend implementation (i.e. pty/exec state)
+-    backend: termio.backend.ThreadData,
+-    mailbox: *termio.Mailbox,
+-
+-    pub fn deinit(self: *ThreadData) void {
+-        self.backend.deinit(self.alloc);
+-        self.* = undefined;
+-    }
+-};
+\ No newline at end of file
++}
+\ No newline at end of file

@@ -1,0 +1,433 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+const posix = std.posix;
+
+const log = std.log.scoped(.flatpak);
+
+/// Returns true if we're running in a Flatpak environment.
+pub fn isFlatpak() bool {
+    // If we're not on Linux then we'll make this comptime false.
+    if (comptime builtin.os.tag != .linux) return false;
+    return if (std.fs.accessAbsolute("/.flatpak-info", .{})) true else |_| false;
+}
+
+// -----------------------------------------------------------------------------
+// FlatpakHostCommand
+// -----------------------------------------------------------------------------
+pub const FlatpakHostCommand = struct {
+    const fd_t = posix.fd_t;
+    const EnvMap = std.process.EnvMap;
+    const c = @cImport({
+        @cInclude("gio/gio.h");
+        @cInclude("gio/gunixfdlist.h");
+    });
+
+    /// argv[0] is the command to execute on the host.
+    argv: []const []const u8,
+    /// Current working directory. Uses caller's cwd if null.
+    cwd: ?[:0]const u8 = null,
+    /// Environment variables to send. null means don't send any.
+    env: ?*const EnvMap = null,
+
+    /// File descriptors to send to the child process.
+    stdin: fd_t,
+    stdout: fd_t,
+    stderr: fd_t,
+
+    /// State of the command.
+    state: State = .{ .init = {} },
+    state_mutex: std.Thread.Mutex = .{},
+    state_cv: std.Thread.Condition = .{},
+
+    const State = union(enum) {
+        /// Initial state
+        init: void,
+        /// Error while spawning
+        err: void,
+        /// Process started
+        started: struct {
+            pid: u32,
+            subscription: c.guint,
+            loop: *c.GMainLoop,
+            completion: ?*Completion,
+            loop_xev: ?*xev.Loop,
+        },
+        /// Process exited
+        exited: struct {
+            pid: u32,
+            status: u8,
+        },
+    };
+
+    pub const Completion = struct {
+        callback: *const fn (ud: ?*anyopaque, l: *xev.Loop, c: *Completion, r: WaitError!u8) void = &noopCallback,
+        c_xev: xev.Completion = .{},
+        userdata: ?*anyopaque = null,
+        timer: ?xev.Timer = null,
+        result: ?WaitError!u8 = null,
+    };
+
+    /// Errors that may be returned.
+    pub const Error = error{
+        FlatpakMustBeStarted,
+        FlatpakSpawnFail,
+        FlatpakSetupFail,
+        FlatpakRPCFail,
+    };
+
+    pub const WaitError = xev.Timer.RunError || Error;
+
+    /// Spawn the command. Returns the host PID.
+    pub fn spawn(self: *FlatpakHostCommand, alloc: Allocator) !u32 {
+        const thread = try std.Thread.spawn(.{}, threadMain, .{ self, alloc });
+        thread.setName("flatpak-host-command") catch {};
+
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+
+        while (self.state == .init) self.state_cv.wait(&self.state_mutex);
+
+        return switch (self.state) {
+            .init => unreachable,
+            .err => Error.FlatpakSpawnFail,
+            .started => |v| v.pid,
+            .exited => |v| v.pid,
+        };
+    }
+
+    /// Wait synchronously for the process to exit.
+    pub fn wait(self: *FlatpakHostCommand) !u8 {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+
+        while (true) {
+            switch (self.state) {
+                .init => return Error.FlatpakMustBeStarted,
+                .err => return Error.FlatpakSpawnFail,
+                .started => {},
+                .exited => |v| {
+                    self.state = .{ .init = {} };
+                    self.state_cv.broadcast();
+                    return v.status;
+                },
+            }
+            self.state_cv.wait(&self.state_mutex);
+        }
+    }
+
+    /// Wait asynchronously using libxev.
+    pub fn waitXev(
+        self: *FlatpakHostCommand,
+        loop: *xev.Loop,
+        completion: *Completion,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c: *Completion,
+            r: WaitError!u8,
+        ) void,
+    ) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+
+        completion.* = .{
+            .callback = (struct {
+                fn _callback(
+                    ud_: ?*anyopaque,
+                    l_inner: *xev.Loop,
+                    c_inner: *Completion,
+                    r: WaitError!u8,
+                ) void {
+                    const ud = @as(?*Userdata, if (Userdata == void) null else @ptrCast(ud_?));
+                    @call(.always_inline, cb, .{ ud, l_inner, c_inner, r });
+                }
+            })._callback,
+            .userdata = userdata,
+            .timer = xev.Timer.init() catch unreachable,
+        };
+
+        switch (self.state) {
+            .init => completion.result = Error.FlatpakMustBeStarted,
+            .err => completion.result = Error.FlatpakSpawnFail,
+            .started => |*v| {
+                v.loop_xev = loop;
+                v.completion = completion;
+                return;
+            },
+            .exited => |v| {
+                completion.result = v.status;
+            },
+        }
+
+        completion.timer.?.run(
+            loop,
+            &completion.c_xev,
+            0,
+            anyopaque,
+            completion.userdata,
+            (struct {
+                fn _callback(
+                    ud: ?*anyopaque,
+                    l_inner: *xev.Loop,
+                    c_inner: *xev.Completion,
+                    r: xev.Timer.RunError!void,
+                ) xev.CallbackAction {
+                    const c_outer: *Completion = @fieldParentPtr("c_xev", c_inner);
+                    defer if (c_outer.timer) |*t| t.deinit();
+
+                    const result = if (r) |_| c_outer.result.? else |e| e;
+                    c_outer.callback(ud, l_inner, c_outer, result);
+                    return .disarm;
+                }
+            })._callback,
+        );
+    }
+
+    /// Send a signal to the started command (if started).
+    pub fn signal(self: *FlatpakHostCommand, sig: u8, pg: bool) !void {
+        const pid = pid: {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            switch (self.state) {
+                .started => |v| break :pid v.pid,
+                else => return,
+            }
+        };
+
+        var g_err: [*c]c.GError = null;
+        const bus = c.g_bus_get_sync(c.G_BUS_TYPE_SESSION, null, &g_err) orelse {
+            log.warn("signal error getting bus: {s}", .{g_err.*.message});
+            return Error.FlatpadSetupFail;
+        };
+        defer c.g_object_unref(bus);
+
+        const reply = c.g_dbus_connection_call_sync(
+            bus,
+            "org.freedesktop.Flatpak",
+            "/org/freedesktop/Flatpak/Development",
+            "org.freedesktop.Flatpak.Development",
+            "HostCommandSignal",
+            c.g_variant_new(
+                "(uub)",
+                pid,
+                sig,
+                @as(c_int, @intFromBool(pg)),
+            ),
+            c.G_VARIANT_TYPE("()"),
+            c.G_DBUS_CALL_FLAGS_NONE,
+            c.G_MAXINT,
+            null,
+            &g_err,
+        );
+        if (g_err) |err| {
+            log.warn("signal send error: {s}", .{err.*.message});
+            return;
+        }
+        defer c.g_variant_unref(reply);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal implementation
+    // -------------------------------------------------------------------------
+    fn threadMain(self: *FlatpakHostCommand, alloc: Allocator) void {
+        const ctx = c.g_main_context_new();
+        defer c.g_main_context_unref(ctx);
+        c.g_main_context_push_thread_default(ctx);
+        defer c.g_main_context_pop_thread_default(ctx);
+
+        const loop = c.g_main_loop_new(c.g_main_context_get_thread_default(), 1).?;
+        defer c.g_main_loop_unref(loop);
+
+        var g_err: [*c]c.GError = null;
+        const bus = c.g_bus_get_sync(c.G_BUS_TYPE_SESSION, null, &g_err) orelse {
+            log.warn("spawn error getting bus: {s}", .{g_err.*.message});
+            self.updateState(.{ .err = {} });
+            return;
+        };
+        defer c.g_object_unref(bus);
+
+        self.start(alloc, bus, loop) catch |err| {
+            log.warn("error starting host command: {}", .{err});
+            self.updateState(.{ .err = {} });
+            return;
+        };
+        c.g_main_loop_run(loop);
+    }
+
+    fn start(
+        self: *FlatpakHostCommand,
+        alloc: Allocator,
+        bus: *c.GDBusConnection,
+        loop: *c.GMainLoop,
+    ) !void {
+        var err: [*c]c.GError = null;
+
+        // Setup fd list
+        const fd_list = c.g_unix_fd_list_new();
+        defer c.g_object_unref(fd_list);
+        if (c.g_unix_fd_list_append(fd_list, self.stdin, &err) < 0) {
+            log.warn("error adding fd: {s}", .{err.*.message});
+            return error.FlatpakSetupFail;
+        }
+        if (c.g_unix_fd_list_append(fd_list, self.stdout, &err) < 0) {
+            log.warn("error adding fd: {s}", .{err.*.message});
+            return error.FlatpakSetupFail;
+        }
+        if (c.g_unix_fd_list_append(fd_list, self.stderr, &err) < 0) {
+            log.warn("error adding fd: {s}", .{err.*.message});
+            return error.FlatpakSetupFail;
+        }
+
+        // Build fd variant
+        const fd_builder = c.g_variant_builder_new(c.G_VARIANT_TYPE("a{uh}"));
+        defer c.g_variant_builder_unref(fd_builder);
+        c.g_variant_builder_add(fd_builder, "{uh}", @as(c_int, 0), self.stdin);
+        c.g_variant_builder_add(fd_builder, "{uh}", @as(c_int, 1), self.stdout);
+        c.g_variant_builder_add(fd_builder, "{uh}", @as(c_int, 2), self.stderr);
+
+        // env
+        const env_builder = c.g_variant_builder_new(c.G_VARIANT_TYPE("a{ss}"));
+        defer c.g_variant_builder_unref(env_builder);
+        if (self.env) |env| {
+            var it = env.iterator();
+            while (it.next()) |pair| {
+                const key = try alloc.dupeZ(u8, pair.key);
+                const val = try alloc.dupeZ(u8, pair.value);
+                c.g_variant_builder_add(env_builder, "{ss}", key.ptr, val.ptr);
+            }
+        }
+
+        // Build args array (null-terminated)
+        const args = try alloc.alloc(?[*:0]u8, self.argv.len + 1);
+        defer alloc.free(args);
+        for (self.argv, 0..) |arg, i| {
+            const dup = try alloc.dupeZ(u8, arg);
+            args[i] = dup.ptr;
+        }
+        args[args.len - 1] = null;
+        const args_ptr = @ptrCast([*]const ?[*:0]u8, args.ptr);
+
+        // cwd
+        const g_cwd = c.g_get_current_dir();
+        defer c.g_free(g_cwd);
+
+        // Params
+        const params = c.g_variant_new(
+            "(^ay^aay@a{uh}@a{ss}u)",
+            @as(*const anyopaque, if (self.cwd) |*c| c.ptr else g_cwd),
+            args_ptr,
+            c.g_variant_builder_end(fd_builder),
+            c.g_variant_builder_end(env_builder),
+            @as(c_int, 0),
+        );
+        _ = c.g_variant_ref_sink(params);
+        defer c.g_variant_unref(params);
+
+        // Subscribe to exit signal
+        const subscription_id = c.g_dbus_connection_signal_subscribe(
+            bus,
+            "org.freedesktop.Flatpak",
+            "org.freedesktop.Flatpak.Development",
+            "HostCommandExited",
+            "/org/freedesktop/Flatpak/Development",
+            null,
+            0,
+            onExit,
+            self,
+            null,
+        );
+        defer c.g_dbus_connection_signal_unsubscribe(bus, subscription_id);
+
+        // Call HostCommand
+        const reply = c.g_dbus_connection_call_with_unix_fd_list_sync(
+            bus,
+            "org.freedesktop.Flatpak",
+            "/org/freedesktop/Flatpak/Development",
+            "org.freedesktop.Flatpak.Development",
+            "HostCommand",
+            params,
+            c.G_VARIANT_TYPE("(u)"),
+            c.G_DBUS_CALL_FLAGS_NONE,
+            c.G_MAXINT,
+            fd_list,
+            null,
+            null,
+            &err,
+        ) orelse {
+            log.warn("Flatpak.HostCommand failed: {s}", .{err.*.message});
+            return error.FlatpakRPCFail;
+        };
+        defer c.g_variant_unref(reply);
+
+        var pid: u32 = 0;
+        c.g_variant_get(reply, "(u)", &pid);
+        log.debug("HostCommand started pid={} subscription={}", .{
+            pid,
+            subscription_id,
+        });
+
+        self.updateState(.{
+            .started = .{
+                .pid = pid,
+                .subscription = subscription_id,
+                .loop = loop,
+                .completion = null,
+                .loop_xev = null,
+            },
+        });
+    }
+
+    fn updateState(self: *FlatpakHostCommand, s: State) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        self.state = s;
+        self.state_cv.broadcast();
+    }
+
+    // -------------------------------------------------------------------------
+    // Signal handlers
+    // -------------------------------------------------------------------------
+    fn onExit(
+        bus: ?*c.GDBusConnection,
+        _: [*c]const u8,
+        _: [*c]const u8,
+        _: [*c]const u8,
+        _: [*c]const u8,
+        params: ?*c.GVariant,
+        ud: ?*anyopaque,
+    ) callconv(.C) void {
+        const self = @as(*FlatpakHostCommand, @alignCast(@ptrCast(ud)));
+
+        const state = blk: {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+                break :blk self.state.started;
+            };
+
+        var pid: u32 = 0;
+        var exit_raw: u32 = 0;
+        c.g_variant_get(params.?, "(uu)", &pid, &exit_raw);
+        if (state.pid != pid) return;
+
+        const exit_status = posix.W.EXITSTATUS(exit_raw);
+        self.updateState(.{
+            .exited = .{
+                .pid = pid,
+                .status = @intCast(u8, exit_status),
+            },
+        });
+        log.debug("HostCommand exited pid={} status={}", .{ pid, exit_status });
+
+        c.g_dbus_connection_signal_unsubscribe(bus.?, state.subscription);
+        c.g_main_loop_quit(state.loop);
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper
+    // -------------------------------------------------------------------------
+    fn noopCallback(_: ?*anyopaque, _: *xev.Loop, _: *Completion, _: WaitError!u8) void {}
+};
