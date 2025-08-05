@@ -1,0 +1,418 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
+const point = @import("../point.zig");
+const Terminal = @import("../Terminal.zig");
+const command = @import("graphics_command.zig");
+const image = @import("graphics_image.zig");
+const LoadingImage = image.LoadingImage;
+const Image = image.Image;
+const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+
+const renderer = @import("../../renderer.zig");
+const log = std.log.scoped(.kitty_gfx);
+
+// TODO:
+//   - delete
+//   - shared memory transmit
+//   - terminal state around deleting images (i.e. CSI J)
+//   - terminal state around deleting placements (i.e. scrolling)
+// (not exhaustive, almost every op is ignoring additional config)
+
+pub fn execute(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) ?Response {
+    // If storage is disabled then we disable the full protocol.
+    // This means we don't even respond to queries, so the terminal
+    // behaves as if this feature is not supported.
+    if (!terminal.screen.kitty_images.enabled()) {
+        log.debug("kitty graphics requested but disabled", .{});
+        return null;
+    }
+
+    // Only Metal supports rendering the images, right now.
+    if (comptime renderer.Renderer != renderer.Metal) {
+        log.warn("kitty graphics not supported on this renderer", .{});
+        return null;
+    }
+
+    log.debug("executing kitty graphics command: quiet={} control={}", .{
+        cmd.quiet,
+        cmd.control,
+    });
+
+    // The quiet settings used to control the response. We have
+    // to make this mutable because special cases (such
+    // as chunked transmissions) can change it.
+    var quiet = cmd.quiet;
+
+    const resp_: ?Response = switch (cmd.control) {
+        .query => query(alloc, cmd),
+
+        .transmit, .transmit_and_display => resp: {
+            // If we're transmitting, then our `q` setting value is
+            // complicated. The quiet setting inherits the value
+            // from the start command unless `q` is set >= 1 on
+            // this command. If it is, we save that as the new
+            // quiet setting.
+            const storage = &terminal.screen.kitty_images;
+            if (storage.loading) |loading| switch (cmd.quiet) {
+                .no => quiet = loading.quiet,
+                inline .ok, .failures => |tag| {
+                    // The code above ensures they are the
+                    // same value.
+                    assert(quiet == tag);
+                    loading.quiet = tag;
+                },
+            };
+            break :resp transmit(alloc, terminal, cmd);
+        },
+
+        .display => display(alloc, terminal, cmd),
+        .delete => delete(alloc, terminal, cmd),
+
+        .transmit_animation_frame,
+        .control_animation,
+        .compose_animation,
+        .transmit_and_screen,
+        .control_and_screen,
+        .compose_and_screen,
+            => null,
+
+        else => null,
+    };
+
+    // Handle the quiet settings and return a response.
+    if (resp_) |resp| {
+        // In the general case we return the response unless
+        // quiet=ok in which case we return null.
+        // Note: on some error cases we still return an
+        // error because the quiet handling is only
+        // for normal operation.
+        if (!resp.ok()) {
+            log.warn("erroneous kitty graphics response: {s}", .{resp.message});
+        }
+
+        return switch (quiet) {
+            .no => resp,
+            .ok => if (resp.ok()) null else resp,
+            .failures => null,
+        };
+    }
+
+    return null;
+}
+
+/// Execute a “query” command.
+///
+/// This command is used to attempt to load an image and respond with
+/// success/error but does not persist any of the command to the terminal
+/// state.
+fn query(
+    alloc: Allocator,
+    cmd: *const Command,
+) Response {
+    const t = cmd.control.query;
+
+    // Query requires image ID. We can't actually send a response without
+    // an image ID, so we just error out.
+    if (t.image_id == 0) {
+        return .{ .message = "EINVAL: image ID required" };
+    }
+
+    // Build a partial response to start.
+    var result: Response = .{
+        .id = t.image_id,
+        .image_number = t.image_number,
+        .placement_id = t.placement_id,
+    };
+
+    // Try to load the image.
+    var loading = LoadingImage.init(alloc, cmd) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+    defer loading.deinit(alloc);
+
+    // Full image load - no chunking
+    // No response needed.
+    return result;
+}
+
+fn transmit(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const t = cmd.transmission().?;
+    var result: Response = .{
+        .id = t.image_id,
+        .image_number = t.image_number,
+        .placement_id = t.placement_id,
+    };
+
+    if (t.image_id > 0 and t.image_number > 0) {
+        return .{ .message = "EINVAL: image ID and number are mutually exclusive" };
+    }
+
+    const load = loadAndAddImage(alloc, terminal, cmd) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+    defer load.image.deinit(alloc);
+
+    // If this was a transmit‑and‑display command, carry out the display
+    // and capture its response.
+    if (load.display) |d| {
+        var d_copy = d;
+        d_copy.image_id = load.image.id;
+        // return the response from display.
+        return display(alloc, terminal, &.{
+            .control = .{ .display = d_copy },
+            .quiet = cmd.quiet,
+        });
+    }
+
+    // If there are more chunks expected we do not respond.
+    if (load.more) return .{};
+
+    // After the image is added, set the ID in case it changed.
+    // The resulting image number and placement ID never change.
+    result.id = load.image.id;
+
+    // Query has no response, but we return metadata.
+    if (load.image.id == 0) return .{};
+    return result;
+}
+
+/// Display a previously transmitted image.
+fn display(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const d = cmd.display().?;
+
+    // Verify the requested image exists.
+    const storage = &terminal.screen.kitty_images;
+    const img_ = if (d.image_id != 0) storage.imageById(d.image_id) else storage.imageByNumber(d.image_number);
+    const img = img_ orelse {
+        // Return ENOENT for missing image.
+        return .{ .message = "ENOENT: image not found" };
+    };
+
+    // Build response.
+    var result: Response = .{
+        .id = d.image_id,
+        .image_number = d.image_number,
+        .placement_id = d.placement_id,
+    };
+    result.id = img.id;
+
+    // Build the placement location.
+    const location: ImageStorage.Placement.Location = location: {
+        if (d.virtual_placement) {
+            if (d.parent_id > 0) {
+                result.message = "EINVAL: virtual placement cannot refer to a parent";
+                return result;
+            }
+            break :location .{ .virtual = {} };
+        }
+
+        // Pin the current cursor position.
+        const pin = terminal.screen.pages.trackPin(
+            terminal.screen.cursor.page_pin.*,
+        ) catch |err| {
+            log.warn("failed to create pin for Kitty graphics err={}", .{err});
+            result.message = "EINVAL: failed to prepare terminal state";
+            break :location .{ .virtual = {} }; // placeholder, will error.
+        };
+        break :location .{ .pin = pin };
+    };
+
+    // Add the placement.
+    const p: ImageStorage.Placement = .{
+        .location = location,
+        .x_offset = d.x_offset,
+        .y_offset = d.y_offset,
+        .source_x = d.x,
+        .source_y = d.y,
+        .source_width = d.width,
+        .source_height = d.height,
+        .columns = d.columns,
+        .rows = d.rows,
+        .z = d.z,
+    };
+    storage.addPlacement(
+        alloc,
+        img.id,
+        result.placement_id,
+        p,
+    ) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+
+    // Apply cursor movement settings. This only applies to
+    // pin placements.
+    switch (location) {
+        .virtual => {},
+        .pin => |pin| switch (d.cursor_movement) {
+            .none => {},
+            .after => {
+                // Use terminal.index to correctly handle scroll regions.
+                const size = p.gridSize(img, terminal);
+                for (0..size.rows) |_| {
+                    terminal.index() catch |err| {
+                        log.warn("failed to move cursor: {}", .{err});
+                        break;
+                    };
+                };
+                terminal.setCursorPos(
+                    terminal.screen.cursor.y,
+                    pin.x + size.cols + 1,
+                );
+            },
+        },
+    }
+
+    // Return response metadata.
+    return result;
+}
+
+/// Display a previously transmitted image.
+fn delete(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screen.kitty_images;
+    storage.delete(alloc, terminal, cmd.control.delete);
+    // Deletes never respond on success.
+    return .{};
+}
+
+fn loadAndAddImage(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) !struct {
+    image: Image,
+    more: bool = false,
+    display: ?command.Display = null,
+} {
+    const t = cmd.transmission().?;
+    const storage = &terminal.screen.kitty_images;
+
+    // Determine our image. This also handles chunking and early exit.
+    const load = if (storage.loading) |loading| load: {
+        // Append data to current loading image.
+        try loading.addData(alloc, cmd.data);
+
+        // If we have more chunks we need not create the image yet.
+        if (t.more_chunks) {
+            return .{
+                .image = loading.image,
+                .more = true,
+                .display = loading.display,
+            };
+        }
+
+        // No more chunks. Complete the image, destroying the
+        // loading pointer.
+        defer {
+            alloc.destroy(loading);
+            storage.loading = null;
+        }
+        break :load loading.complete(alloc);
+    } else if (t.more_chunks) {
+        // This is the start of a new chunked transmission.
+        const img = try LoadingImage.init(alloc, cmd);
+        const ptr = try alloc.create(LoadingImage);
+        ptr.* = img;
+        storage.loading = ptr;
+        return .{
+            .image = img,
+            .more = true,
+            .display = cmd.display(),
+        };
+    } else img: {
+        // Load a non‑chunked image.
+        const img = try Image.load(alloc, cmd);
+        // Take the data ownership and free command data.
+        _ = cmd.toOwnedData();
+        break :img .{
+            .image = img,
+            .display = null,
+        };
+    };
+    errdefer load.image.deinit(alloc);
+
+    // Assign an internal ID if none has been specified.
+    if (load.image.id == 0) {
+        load.image.id = storage.next_image_id;
+        storage.next_image_id +%= 1;
+        // If we also have no number then the ID is implicit.
+        if (load.image.number == 0) load.image.implicit_id = true;
+    }
+
+    // Store image.
+    try storage.addImage(alloc, load.image);
+
+    // Return the loaded image.
+    return load;
+}
+
+const EncodeableError = Image.Error || Allocator.Error || Image.NoMediumError; // Expanded as needed
+
+fn encodeError(r: *Response, err: EncodeableError) void {
+    switch (err) {
+        error.OutOfMemory => r.message = "ENOMEM: out of memory",
+        error.InternalError => r.message = "EINVAL: internal error",
+        error.InvalidData => r.message = "EINVAL: invalid data",
+        error.DecompressionFailed => r.message = "EINVAL: decompression failed",
+        error.FilePathTooLong => r.message = "EINVAL: file path too long",
+        error.TemporaryFileNotInTempDir => r.message = "EINVAL: temporary file not in temp dir",
+        error.TemporaryFileNotNamedCorrectly => r.message = "EINVAL: temporary file not named correctly",
+        error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
+        error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+        error.UnsupportedDepth => r.message = "EINVAL: unsupported pixel depth",
+        error.DimensionsRequired => r.message = "EINVAL: dimensions required",
+        error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
+        error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+        // other error cases as needed...
+    }
+}
+
+test "kittygfx more chunks with chunk increasing q" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Initial chunk has q=0.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,t=d,s=1,v=2,c=10,r=1,m=1,i=1,q=0;////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd);
+        try testing.expect(resp == null);
+    }
+
+    // Subsequent chunk with q>=1 should suppress response.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "m=0,q=1;////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd);
+        try testing.expect(resp == null);
+    }
+}

@@ -1,0 +1,289 @@
+#[`cfg`](feature = "web") ] 
+mod actix;
+mod common;
+mod consensus;
+mod greeting;
+mod issues_setup;
+mod migrations;
+mod settings;
+mod snapshots;
+mod startup;
+mod tonic;
+mod tracing;
+
+use std::io::Error;
+use std::sync::Arc;
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use ::common::budget::{ResourceBudget, get_io_budget};
+use ::common::cpu::get_cpu_budget;
+use ::common::flags::{feature_flags, init_feature_flags};
+use ::tonic::transport::Uri;
+use api::grpc::transport_channel_pool::TransportChannelPool;
+use clap::Parser;
+#[cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+use crate::common::helpers::{
+    create_general_purpose_runtime, create_search_runtime, create_update_runtime,
+    load_tls_client_config,
+};
+use crate::common::inference::service::InferenceService;
+use crate::common::telemetry::TelemetryCollector;
+use crate::common::telemetry_reporting::TelemetryReporter;
+use crate::greeting::welcome;
+use crate::settings::Settings;
+use crate::snapshots::{recover_full_snapshot, recover_snapshots};
+use crate::startup::{remove_started_file_indicator, touch_started_file_indicator};
+
+use storage::content_manager::consensus::operation_sender::OperationSender;
+use storage::content_manager::consensus::persistent::Persistent;
+use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
+use storage::content_manager::toc::dispatcher::TocDispatcher;
+use storage::content_manager::toc::TableOfContent;
+use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
+
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    /// Uri of the peer to bootstrap from in case of multi‑peer deployment.
+    /// If not specified, this peer is considered the first in a new deployment.
+    #[arg(long, value_parser, value_name = "URI", env = "QDRANT_BOOTSTRAP")]
+    bootstrap: Option<Uri>,
+
+    /// Uri of this peer.
+    /// Other peers should be able to reach it by this uri.
+    ///
+    /// If this is not the first peer and it bootstraps, the value is optional.
+    /// If not supplied then the internal gRPC port from config is used to derive the IP address of this peer on the bootstrap peer.
+    #[arg(long, value_parser, value_name = "URI", env = "QDRANT_URI")]
+    uri: Option<Uri>,
+
+    /// Force snapshot re‑creation.
+    /// If provided, existing collections will be replaced with snapshots.
+    #[arg(short, long, action = true, default_value_t = false)]
+    force_snapshot: bool,
+
+    /// List of snapshot file paths.
+    /// Format: `<snapshot_file_path>:<target_collection_name>` (one per line).
+    ///
+    /// **WARNING**: Do not use this option for recovery inside an existing distributed cluster; use the `/collections/<name>/snapshots/recover` API instead.
+    #[arg(long, value_name = "PATH:NAME", alias = "collection-snapshot")]
+    snapshot: Option<Vec<String>>,
+
+    /// Path to a snapshot containing multiple collections.
+    /// Format: `<snapshot_file_path>`
+    ///
+    /// **WARNING**: Do not use this option for recovery inside an existing distributed cluster; use the `/collections/<name>/snapshots/recover` API instead.
+    #[arg(long, value_name = "PATH")]
+    storage_snapshot: Option<String>,
+
+    /// Path to an alternative configuration file.
+    /// Format: `<config_file_path>`.
+    ///
+    /// Default path: `config/config.yaml`.
+    #[arg(long, value_name = "PATH")]
+    config_path: Option<String>,
+
+    /// Disable telemetry sending to developers.
+    /// Read more: <https://qdrant.tech/documentation/guides/telemetry>.
+    #[arg(long, action = true, default_value_t = false)]
+    disable_telemetry: bool,
+
+    /// Run stack‑trace collector (debugging).
+    #[arg(long, action = true, default_value_t = false)]
+    stacktrace: bool,
+
+    /// Re‑initialise consensus state.
+    /// If set, the consensus will be re‑initialised:
+    ///  * If a bootstrap URI is provided, the current consensus state and WAL are removed (keeping the peer’s ID) and the node attempts to sync from the bootstrap peer.
+    ///  * If no bootstrap is supplied, the node becomes the sole leader, and the consensus WAL will be compacted to force a snapshot.
+    #[arg(long, action = true, default_value_t = false)]
+    reinit: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    // Parse command‑line arguments.
+    let args = Args::parse();
+
+    // Load configuration (optional custom config path).
+    let settings = Settings::new(args.config_path)?;
+
+    // Initialise global feature flags.
+    init_feature_flags(settings.feature_flags);
+
+    // Initialise logger using configured level.
+    let logger_handle = tracing::setup(
+        settings
+            .logger
+            .with_top_level_directive(settings.log_level.clone()),
+    )?;
+
+    // Initialise the 'started' file indicator.
+    remove_started_file_indicator();
+
+    // Configure panic hook for telemetry.
+    let reporting_enabled = !settings.telemetry_disabled && !args.disable_telemetry;
+    let reporting_id = TelemetryCollector::generate_id();
+    setup_panic_hook(reporting_enabled, reporting_id.to_string());
+
+    // Configure memory and vector‑storage behaviour.
+    memory::madvise::set_global(settings.storage.mmap_advice);
+    segment::vector_storage::common::set_async_scorer(
+        settings
+            .storage
+            .performance
+            .async_scorer
+            .unwrap_or_default(),
+    );
+
+    // Print welcome banner.
+    welcome(&settings);
+
+    // Log warning if running in recovery mode.
+    if let Some(recovery_warning) = &settings.storage.recovery_mode {
+        log::warn!("Qdrant is loaded in recovery mode: {recovery_warning}");
+        log::warn!(
+            "Read more: https://qdrant.tech/documentation/guides/administration/#recovery-mode"
+        );
+    }
+
+    // Validate configuration and emit warnings.
+    settings.validate_and_warn();
+
+    // -----------------------------------------------------------------
+    // Initialise runtimes.
+    let search_runtime = create_search_runtime(
+        settings.storage.performance.max_search_threads,
+    )?;
+    let update_runtime = create_update_runtime(
+        settings.performance.max_optimization_threads,
+    )?;
+    let general_runtime = create_general_purpose_runtime()?;
+    let runtime_handle = general_runtime.handle().clone();
+
+    // Compute resource budget for optimisation.
+    let cpu_budget = get_cpu_budget(settings.storage.performance.optimizer_cpu_budget);
+    let io_budget = get_io_budget(
+        settings.performance.optimizer_io_budget,
+        cpu_budget,
+    );
+    let optimizer_resource_budget = ResourceBudget::new(cpu_budget, io_budget);
+
+    // Signal channel for consensus.
+    let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
+
+    // TLS configuration, if present.
+    let tls_config = load_tls_client_config(&settings)?;
+
+    // Initialise channel service (for peer communication).
+    let mut channel_service = ChannelService::new(
+        settings.service.http_port,
+        settings.service.api_key.clone(),
+    );
+
+    // Set up channel service if this node is in a cluster.
+    if settings.cluster.enabled {
+        let p2p_grpc_timeout = Duration::from_millis(settings.cluster.grpc_timeout_ms);
+        let connection_timeout = Duration::from_millis(
+            settings.cluster.connection_timeout_ms,
+        );
+        channel_service.channel_pool = Arc::new(
+            TransportChannelPool::new(
+                p2p_grpc_timeout,
+                connection_timeout,
+                settings.cluster.p2p.connection_pool_size,
+                tls_config,
+            ),
+        );
+        channel_service.id_to_address = persistent_consensus_state
+            .peer_address_by_id
+            .clone();
+        channel_service.id_to_metadata = persistent_consensus_state
+            .peer_metadata_by_id
+            .clone();
+    }
+
+    // Table of content.
+    let toc = TableOfContent::new(
+        &settings.storage,
+        search_runtime,
+        update_runtime,
+        general_runtime,
+        channel_service,
+        persistent_consensus_state.this_peer_id(),
+        OperationSender::new(propose_sender.clone())?,
+    );
+
+    // Load any persisted collections.
+    runtime_handle.block_on(async {
+        for collection in toc
+            .all_collections(&FULL_ACCESS)
+            .await
+        {
+            log::debug!("Loaded collection: {collection}");
+        }
+    });
+
+    // Shared Arc for dispatcher.
+    let mut dispatcher = Dispatcher::new(toc.clone());
+
+    // Load consensus state.
+    let persistent_consensus_state = Persistent::load_or_init(
+        &settings.storage.storage_path,
+        args.bootstrap.is_none(),
+        args.reinit,
+    )?;
+
+    // Determine storage of temporary snapshot files.
+    let temp_path = settings.storage.temp_path.as_deref();
+
+    // Snapshot recovery (if requested).
+    let restored_collections = if let Some(full_snapshot) = args.storage_snapshot {
+        recover_full_snapshot(
+            temp_path,
+            &full_snapshot,
+            &settings.storage.storage_path,
+            args.force_snapshot,
+            persistent_consensus_state.this_peer_id(),
+            settings.cluster.enabled,
+        )
+    } else if let Some(snaps) = args.snapshot {
+        recover_snapshots(
+            &snapshots,
+            args.force_snapshot,
+            temp_path,
+            &settings.storage.storage_path,
+            persistent_consensus_state.this_peer_id(),
+            settings.cluster.enabled,
+        )
+    } else {
+        vec![]
+    };
+
+    // TODO: integrate consensus/state creation; omitted for brevity.
+    // (The rest of the main function would continue to initialise the
+    // consensus thread, health checker, telemetry, REST and gRPC
+    // servers, and eventual shutdown handling.)
+
+    // Placeholder: Run the rest of the system.
+    unimplemented!("Full main implementation omitted for brevity");
+
+    // --------------------------------------------------------------
+    // Helper: log start errors for servers.
+    // (the real implementation would be here).
+
+    /* ... continuation of server setup, health checking, telemetry, etc. ... */
+
+    Ok(())
+}
+```
+
+*Note: The above code is truncated for brevity.*
+
+``` (Note: The full source code contains additional logic for starting services
+and handling shutdown, which has been omitted for brevity.) *

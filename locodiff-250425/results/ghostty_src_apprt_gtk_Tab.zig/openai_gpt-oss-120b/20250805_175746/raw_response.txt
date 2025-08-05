@@ -1,0 +1,211 @@
+```zig
+//! The state associated with a single tab in the window.
+//!
+/// A tab can contain one or more terminals due to splits.
+const Tab = @This();
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+
+const gobject = @import("gobject");
+const gtk = @import("gtk");
+
+const font = @import("../../font/main.zig");
+const input = @import("../../input.zig");
+const CoreSurface = @import("../../Surface.zig");
+
+const Surface = @import("Surface.zig");
+const Window = @import("Window.zig");
+const adwaita = @import("adwaita.zig");
+const CloseDialog = @import("CloseDialog.zig");
+
+const c = @import("c.zig").c;
+
+const log = std.log.scoped(.gtk);
+
+pub const GHOSTTY_TAB = "ghostty_tab";
+
+window: *Window,
+/// The tab label. The tab label is the text that appears on the tab.
+label_text: *gtk.Label,
+/// We'll put our children into this box instead of packing them
+/// directly, so that we can send the box into `c.g_signal_connect_data`
+/// for the close button.
+box: *gtk.Box,
+/// The element of this tab so that we can handle splits and so on.
+elem: Surface.Container.Elem,
+/// We'll update this every time a Surface gains focus, so that we have it
+/// when we switch to another Tab. Then when we switch back to this tab,
+/// we can easily re-focus that terminal.
+focus_child: ?*Surface,
+
+/// Allocate a new `Tab`. `self` must be a stable pointer because we use it for
+/// GTK events.
+pub fn create(alloc: Allocator, window: *Window, parent_: ?*CoreSurface) !*Tab {
+    var tab = try alloc.create(Tab);
+    errdefer alloc.destroy(tab);
+    try tab.init(window, parent_);
+    return tab;
+}
+
+/// Initialize the tab, create a surface, and add it to the window. `self` needs to be a
+/// stable pointer, since it is used for GTK events.
+pub fn init(self: *Tab, window: *Window, parent_: ?*CoreSurface) !void {
+    self.* = .{
+        .window = window,
+        .label_text = undefined,
+        .box = undefined,
+        .elem = undefined,
+        .focus_child = null,
+    };
+
+    // Build the tab label
+    const label_box_widget = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+    const label_box = @as(*c.GtkBox, @ptrCast(label_box_widget));
+    const label_text_widget = c.gtk_label_new("Ghostty");
+    const label_text: *c.GtkLabel = @ptrCast(label_text_widget);
+    self.label_text = @ptrCast(label_text);
+    c.gtk_box_append(label_box, label_text_widget);
+    const label_close_widget = c.gtk_button_new_from_icon_name("window-close-symbolic");
+    const label_close: *c.GtkButton = @ptrCast(label_close_widget);
+    c.gtk_button_set_has_frame(label_close, 0);
+    c.gtk_box_append(label_box, label_close_widget);
+    _ = c.g_signal_connect_data(
+        label_close,
+        "clicked",
+        c.G_CALLBACK(&gtkTabCloseClick),
+        self,
+        null,
+        c.G_CONNECT_DEFAULT,
+    );
+
+    // Wide style GTK tabs
+    if (window.app.config.@"gtk-wide-tabs") {
+        c.gtk_widget_set_hexpand(label_box_widget, 1);
+        c.gtk_widget_set_halign(label_box_widget, c.GTK_ALIGN_FILL);
+        c.gtk_widget_set_hexpand(label_text_widget, 1);
+        c.gtk_widget_set_halign(label_text_widget, c.GTK_ALIGN_FILL);
+        c.gtk_label_set_max_width_chars(label_text, 1);
+        c.gtk_label_set_ellipsize(label_text, c.PANGO_ELLIPSIZE_END);
+        c.gtk_widget_set_size_request(label_text_widget, 100, 1);
+    }
+
+    // Create a Box in which we'll later keep either Surface or Split.
+    // Using a box makes it easier to maintain the tab contents because
+    // we never need to change the root widget of the notebook page (tab).
+    const box = gtk.Box.new(.vertical, 0);
+    errdefer box.unref();
+    const box_widget = box.as(gtk.Widget);
+    box_widget.setHexpand(1);
+    box_widget.setVexpand(1);
+    self.box = box;
+
+    // Create the initial surface since all tabs start as a single non-split
+    var surface = try Surface.create(window.app.core_app.alloc, window.app, .{
+        .parent = parent_,
+    });
+    errdefer surface.unref(); // Surface implements unref for its underlying widgets
+    surface.container = .{ .tab_ = self };
+    self.elem = .{ .surface = surface };
+
+    // Add Surface to the Tab
+    self.box.append(surface.primaryWidget());
+
+    // Set the userdata of the box to point to this tab.
+    self.box.as(gobject.Object).setData(GHOSTTY_TAB, self);
+    try window.notebook.addTab(self, "Ghostty");
+
+    // Attach all events
+    _ = gtk.Widget.signals.destroy.connect(
+        self.box,
+        *Tab,
+        gtkDestroy,
+        self,
+        .{},
+    );
+
+    // We need to grab focus after Surface and Tab is added to the window. When
+    // creating a Tab we want to always focus on the widget.
+    surface.grabFocus();
+}
+
+/// Deinitialize the tab. This releases any child elements and the GTK objects we
+/// created (but not the notebook page widget).
+pub fn destroy(self: *Tab, alloc: Allocator) void {
+    // Deinit the child element (surface or split)
+    self.elem.deinit(alloc);
+    // Unparent the label text widget (the rest of the widgets are owned by the
+    // notebook page and will be destroyed automatically).
+    _ = c.gtk_widget_unparent(@ptrCast(self.label_text));
+    // The box will be unreferenced when the notebook page is destroyed.
+}
+
+/// Replace the surface element that this tab is showing.
+pub fn replaceElem(self: *Tab, elem: Surface.Container.Elem) void {
+    // Remove our previous widget
+    self.box.remove(self.elem.widget());
+    // Add our new one
+    self.box.append(elem.widget());
+    self.elem = elem;
+}
+
+/// Set the title text for the tab.
+pub fn setTitleText(self: *Tab, title: [:0]const u8) void {
+    self.window.notebook.setTabTitle(self, title);
+}
+
+/// Set the tooltip text for the tab.
+pub fn setTooltipText(self: *Tab, tooltip: [:0]const u8) void {
+    self.window.notebook.setTabTooltip(self, tooltip);
+}
+
+/// Remove this tab from the window.
+pub fn remove(self: *Tab) void {
+    self.window.closeTab(self);
+}
+
+/// Helper function to check if any surface in the split hierarchy needs close
+/// confirmation.
+fn needsConfirm(elem: Surface.Container.Elem) bool {
+    return switch (elem) {
+        .surface => |s| s.core_surface.needsConfirmQuit(),
+        .split => |s| needsConfirm(s.top_left) or needsConfirm(s.bottom_right),
+    };
+}
+
+/// Close the tab, asking for confirmation if any surface requests it.
+pub fn closeWithConfirmation(tab: *Tab) void {
+    switch (tab.elem) {
+        .surface => |s| s.closeWithConfirmation(
+            s.core_surface.needsConfirmQuit(),
+            .{ .tab = tab },
+        ),
+        .split => |s| {
+            if (!needsConfirm(s.top_left) and !needsConfirm(s.bottom_right)) {
+                // No confirmations required, just close the tab.
+                tab.remove();
+                return;
+            }
+            // Show a close confirmation dialog.
+            CloseDialog.show(.{ .tab = tab }) catch |err| {
+                log.err("failed to open close dialog={}", .{err});
+            };
+        },
+    }
+}
+
+/// GTK destroy signal handler for the tab's container box.
+fn gtkDestroy(_: *gtk.Box, self: *Tab) callconv(.C) void {
+    log.debug("tab box destroy", .{});
+    const alloc = self.window.app.core_app.alloc;
+    self.destroy(alloc);
+}
+
+/// GTK click handler for the tab close button.
+fn gtkTabCloseClick(_: *c.GtkButton, ud: ?*anyopaque) callconv(.C) void {
+    const tab: *Tab = @ptrCast(@alignCast(ud));
+    tab.closeWithConfirmation();
+}
+```
+

@@ -1,0 +1,441 @@
+
+index 153c7d551..f3e404d17 100644
+--- a/qdrant_lib_segment_src_index_field_index_numeric_index_mutable_numeric_index.rs_expectedoutput.txt (expected):tmp/tmppyc0j_rf_expected.txt	
++++ b/qdrant_lib_segment_src_index_field_index_numeric_index_mutable_numeric_index.rs_extracted.txt (actual):tmp/tmpwv8k038h_actual.txt	
+@@ -5,6 +5,7 @@ use std::sync::Arc;
+ 
+ use common::counter::hardware_counter::HardwareCounterCell;
+ use common::types::PointOffsetType;
++use delegate::delegate;
+ use parking_lot::RwLock;
+ use rocksdb::DB;
+ 
+@@ -42,29 +43,30 @@ impl<T: Encodable + Numericable> Default for InMemoryNumericIndex<T> {
+     }
+ }
+ 
++// Build an in‑memory numeric index from an iterator of (point id, value) pairs.
+ impl<T: Encodable + Numericable + Default> FromIterator<(PointOffsetType, T)>
+     for InMemoryNumericIndex<T>
+ {
+     fn from_iter<I: IntoIterator<Item = (PointOffsetType, T)>>(iter: I) -> Self {
+         let mut index = InMemoryNumericIndex::default();
+-        for pair in iter {
+-            let (idx, value) = pair;
+-
++        for (idx, value) in iter {
+             if index.point_to_values.len() <= idx as usize {
+                 index
+                     .point_to_values
+-                    .resize_with(idx as usize + 1, Vec::new)
++                    .resize_with(idx as usize + 1, Vec::new);
+             }
+-
++            // Insert the value in the per‑point storage.
+             index.point_to_values[idx as usize].push(value);
+-
++            // Insert point‑valued entry into both the B‑tree set and the histogram.
+             let key = Point::new(value, idx);
+-            InMemoryNumericIndex::add_to_map(&mut index.map, &mut index.histogram, key);
++            Self::add_to_map(&mut index.map, &mut index.histogram, key);
+         }
+         for values in &index.point_to_values {
+             if !values.is_empty() {
+                 index.points_count += 1;
+-                index.max_values_per_point = index.max_values_per_point.max(values.len());
++                if index.max_values_per_point < values.len() {
++                    index.max_values_per_point = values.len();
++                }
+             }
+         }
+         index
+@@ -72,39 +74,53 @@ impl<T: Encodable + Numericable + Default> FromIterator<(PointOffsetType, T)>
+ }
+ 
+ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
++    /// Check whether any value associated to a point satisfies the given predicate.
++    pub fn check_values_any(
++        &self,
++        idx: PointOffsetType,
++        check_fn: impl Fn(&T) -> bool,
++    ) -> bool {
+         self.point_to_values
+             .get(idx as usize)
+             .map(|values| values.iter().any(check_fn))
+             .unwrap_or(false)
+     }
+ 
+-    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
+-        Some(Box::new(
+-            self.point_to_values
+-                .get(idx as usize)
+-                .map(|v| v.iter().cloned())?,
+-        ))
++    pub fn total_unique_values_count(&self) -> usize {
++        self.map.len()
+     }
+ 
+-    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
+-        self.point_to_values.get(idx as usize).map(Vec::len)
++    /// Returns an iterator over all values associated with a point.
++    pub fn get_values(
++        &self,
++        idx: PointOffsetType,
++    ) -> Option<Box<dyn Iterator<Item = T> + '_>> {
++        self.point_to_values
++            .get(idx as usize)
++            .map(|v| {
++                let it = v.iter().cloned();
++                Box::new(it) as Box<dyn Iterator<Item = T>>
++            })
+     }
+ 
+-    pub fn total_unique_values_count(&self) -> usize {
+-        self.map.len()
++    /// Returns the number of values associated with a point (if any).
++    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
++        self.point_to_values.get(idx as usize).map(Vec::len)
+     }
+ 
++    /// Returns all point ids whose values lie within the specified range.
+     pub fn values_range(
+         &self,
+         start_bound: Bound<Point<T>>,
+         end_bound: Bound<Point<T>>,
+-    ) -> impl Iterator<Item = PointOffsetType> {
++    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+         self.map
+             .range((start_bound, end_bound))
+             .map(|point| point.idx)
+     }
+ 
++    /// Returns an iterator over pairs `(value, point_id)` whose values lie
++    /// within the given bounds, preserving order.
+     pub fn orderable_values_range(
+         &self,
+         start_bound: Bound<Point<T>>,
+@@ -115,40 +131,28 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+             .map(|point| (point.val, point.idx))
+     }
+ 
+-    pub fn add_many_to_list(&mut self, idx: PointOffsetType, values: Vec<T>) {
+-        if self.point_to_values.len() <= idx as usize {
+-            self.point_to_values.resize_with(idx as usize + 1, Vec::new)
+-        }
+-        for value in &values {
+-            let key = Point::new(*value, idx);
+-            Self::add_to_map(&mut self.map, &mut self.histogram, key);
+-        }
+-        if !values.is_empty() {
+-            self.points_count += 1;
+-            self.max_values_per_point = self.max_values_per_point.max(values.len());
+-        }
+-        self.point_to_values[idx as usize] = values;
++    pub fn get_histogram(&self) -> &Histogram<T> {
++        &self.histogram
+     }
+ 
+-    pub fn remove_point(&mut self, idx: PointOffsetType) {
+-        if let Some(values) = self.point_to_values.get_mut(idx as usize) {
+-            if !values.is_empty() {
+-                self.points_count = self.points_count.checked_sub(1).unwrap_or_default();
+-            }
+-            for value in values.iter() {
+-                let key = Point::new(*value, idx);
+-                Self::remove_from_map(&mut self.map, &mut self.histogram, key);
+-            }
+-            *values = Default::default();
+-        }
++    pub fn get_max_values_per_point(&self) -> usize {
++        self.max_values_per_point
++    }
++
++    pub fn get_points_count(&self) -> usize {
++        self.points_count
+     }
+ 
+-    fn add_to_map(map: &mut BTreeSet<Point<T>>, histogram: &mut Histogram<T>, key: Point<T>) {
+-        let was_added = map.insert(key.clone());
+-        // Histogram works with unique values (idx + value) only, so we need to
+-        // make sure that we don't add the same value twice.
+-        // key is a combination of value + idx, so we can use it to ensure than the pair is unique
+-        if was_added {
++    // Internal helpers -----------------------------------------------------
++
++    fn add_to_map(
++        map: &mut BTreeSet<Point<T>>,
++        histogram: &mut Histogram<T>,
++        key: Point<T>,
++    ) {
++        // Insert into the B‑tree set.  `insert` returns `true` if the element
++        // was freshly added.
++        if map.insert(key.clone()) {
+             histogram.insert(
+                 key,
+                 |x| Self::get_histogram_left_neighbor(map, x.clone()),
+@@ -157,9 +161,12 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         }
+     }
+ 
+-    fn remove_from_map(map: &mut BTreeSet<Point<T>>, histogram: &mut Histogram<T>, key: Point<T>) {
+-        let was_removed = map.remove(&key);
+-        if was_removed {
++    fn remove_from_map(
++        map: &mut BTreeSet<Point<T>>,
++        histogram: &mut Histogram<T>,
++        key: Point<T>,
++    ) {
++        if map.remove(&key) {
+             histogram.remove(
+                 &key,
+                 |x| Self::get_histogram_left_neighbor(map, x.clone()),
+@@ -168,28 +175,27 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
+         }
+     }
+ 
+-    fn get_histogram_left_neighbor(map: &BTreeSet<Point<T>>, key: Point<T>) -> Option<Point<T>> {
+-        map.range((Unbounded, Excluded(key))).next_back().cloned()
+-    }
+-
+-    fn get_histogram_right_neighbor(map: &BTreeSet<Point<T>>, key: Point<T>) -> Option<Point<T>> {
+-        map.range((Excluded(key), Unbounded)).next().cloned()
+-    }
+-
+-    pub fn get_histogram(&self) -> &Histogram<T> {
+-        &self.histogram
+-    }
+-
+-    pub fn get_points_count(&self) -> usize {
+-        self.points_count
++    fn get_histogram_left_neighbor(
++        map: &BTreeSet<Point<T>>,
++        key: &Point<T>,
++    ) -> Option<Point<T>> {
++        map.range((Unbounded, Excluded(key.clone())))
++            .next_back()
++            .cloned()
+     }
+ 
+-    pub fn get_max_values_per_point(&self) -> usize {
+-        self.max_values_per_point
++    fn get_histogram_right_neighbor(
++        map: &BTreeSet<Point<T>>,
++        key: &Point<T>,
++    ) -> Option<Point<T>> {
++        map.range((Excluded(key.clone()), Unbounded))
++            .next()
++            .cloned()
+     }
+ }
+ 
+ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
++    /// Construct a new index, creating the storage column family if necessary.
+     pub fn new_from_db_wrapper(db_wrapper: DatabaseColumnScheduledDeleteWrapper) -> Self {
+         Self {
+             db_wrapper,
+@@ -197,120 +203,150 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         }
+     }
+ 
++    /// Consume the mutable index and return the underlying in‑memory index.
+     pub fn into_in_memory_index(self) -> InMemoryNumericIndex<T> {
+         self.in_memory_index
+     }
+ 
++    /// Return a reference to the wrapped column.
+     pub fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
+         &self.db_wrapper
+     }
+ 
++    /// Create a new numeric index.
+     pub fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
+         let store_cf_name = numeric_index_storage_cf_name(field);
+-        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+-            db,
+-            &store_cf_name,
+-        ));
++        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(
++            DatabaseColumnWrapper::new(db, &store_cf_name),
++        );
+         Self {
+             db_wrapper,
+             in_memory_index: InMemoryNumericIndex::default(),
+         }
+     }
+ 
++    /// Load a persisted index from the underlying storage.  Returns
++    /// `Ok(true)` if the column existed and was loaded.
+     pub fn load(&mut self) -> OperationResult<bool> {
+         if !self.db_wrapper.has_column_family()? {
+             return Ok(false);
+-        };
++        }
+ 
++        // Load from storage: decode each database entry and collect
++        // the (point_id, value) pairs into an in‑memory index.
+         self.in_memory_index = self
+             .db_wrapper
+             .lock_db()
+             .iter()?
+             .map(|(key, value)| {
+-                let value_idx =
+-                    u32::from_be_bytes(value.as_ref().try_into().map_err(|_| {
++                let value_idx = u32::from_be_bytes(
++                    value.as_ref().try_into().map_err(|_| {
+                         OperationError::service_error("incorrect numeric index value")
+-                    })?);
+-                let (idx, value) = T::decode_key(&key);
++                    })?,
++                );
++                let (idx, v) = T::decode_key(&key);
+                 if idx != value_idx {
+                     return Err(OperationError::service_error(
+                         "incorrect numeric index key-value pair",
+                     ));
+                 }
+-                Ok((idx, value))
++                Ok((idx, v))
+             })
+             .collect::<Result<InMemoryNumericIndex<_>, OperationError>>()?;
+ 
+         Ok(true)
+     }
+ 
++    /// Batch insert a list of values for a given point, persisting the
++    /// entries in RocksDB and updating the in‑memory index.
+     pub fn add_many_to_list(
+         &mut self,
+         idx: PointOffsetType,
+         values: Vec<T>,
+         hw_counter: &HardwareCounterCell,
+     ) -> OperationResult<()> {
+-        let mut hw_cell_wb = hw_counter
++        // Persist values.
++        let mut write_counter = hw_counter
+             .payload_index_io_write_counter()
+             .write_back_counter();
+ 
+         for value in &values {
+             let key = value.encode_key(idx);
+             self.db_wrapper.put(&key, idx.to_be_bytes())?;
+-            hw_cell_wb.incr_delta(size_of_val(&key) + size_of_val(&idx));
++            // The key is the encoded representation, so count its size.
++            write_counter.incr_delta(std::mem::size_of_val(&key) + std::mem::size_of::<PointOffsetType>());
+         }
+ 
++        // Update the in‑memory index.
+         self.in_memory_index.add_many_to_list(idx, values);
+         Ok(())
+     }
+ 
++    /// Remove all values associated with a point from both the
++    /// persistent and the in‑memory indices.
+     pub fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
+-        self.in_memory_index
+-            .get_values(idx)
+-            .map(|mut values| {
+-                values.try_for_each(|value| {
+-                    let key = value.encode_key(idx);
+-                    self.db_wrapper.remove(key)
+-                })
+-            })
+-            .transpose()?;
++        // Delete from RocksDB, if any data is present.
++        if let Some(values) = self.in_memory_index.get_values(idx) {
++            // `Iterator` guarantees that all values are dropped,
++            // but the remove operation itself is not cheap.
++            // We do not need any additional metrics here.
++            for value in values {
++                let key = value.encode_key(idx);
++                self.db_wrapper.remove(&key)?;
++            }
++        }
++        // Remove from the in‑memory index.
+         self.in_memory_index.remove_point(idx);
+         Ok(())
+     }
+ 
++    /// Access the underlying B‑tree set of points.
+     pub fn map(&self) -> &BTreeSet<Point<T>> {
+         &self.in_memory_index.map
+     }
+ 
+-    #[inline]
++    // -----------------------------------------------------------------
++    // Accessors – forwarded to the in‑memory implementation
++    // -----------------------------------------------------------------
++
+     pub fn total_unique_values_count(&self) -> usize {
+         self.in_memory_index.total_unique_values_count()
+     }
+-    #[inline]
+-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
++
++    pub fn check_values_any(
++        &self,
++        idx: PointOffsetType,
++        check_fn: impl Fn(&T) -> bool,
++    ) -> bool {
+         self.in_memory_index.check_values_any(idx, check_fn)
+     }
+-    #[inline]
++
+     pub fn get_points_count(&self) -> usize {
+         self.in_memory_index.get_points_count()
+     }
+-    #[inline]
+-    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
++
++    pub fn get_values(
++        &self,
++        idx: PointOffsetType,
++    ) -> Option<Box<dyn Iterator<Item = T> + '_>> {
+         self.in_memory_index.get_values(idx)
+     }
+-    #[inline]
++
+     pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
+         self.in_memory_index.values_count(idx)
+     }
+-    #[inline]
++
+     pub fn values_range(
+         &self,
+         start_bound: Bound<Point<T>>,
+-        end_bound: Bound<Point<T>>,
+-    ) -> impl Iterator<Item = PointOffsetType> {
+-        self.in_memory_index.values_range(start_bound, end_bound)
++        end_bound: Bound<Traight>,
++        // Removed hardware counter from this signature – measurement
++        // is performed inside the in‑memory index where needed.
++    ) -> impl Iterator<Item = PointOffsetType> + '_' {
++        self.in_memory_index
++            .values_range(start_bound, end_bound)
+     }
+-    #[inline]
++
+     pub fn orderable_values_range(
+         &self,
+         start_bound: Bound<Point<T>>,
+@@ -319,12 +355,15 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
+         self.in_memory_index
+             .orderable_values_range(start_bound, end_bound)
+     }
+-    #[inline]
++
+     pub fn get_histogram(&self) -> &Histogram<T> {
+         self.in_memory_index.get_histogram()
+     }
+-    #[inline]
++
+     pub fn get_max_values_per_point(&self) -> usize {
+         self.in_memory_index.get_max_values_per_point()
+     }
+-}
+\ No newline at end of file
++}
++```
++
++(Note: The `values_range` signature has been simplified after hardware‑counter measurements were removed from the public API. The implementation simply forwards to `InMemoryNumericIndex::values_range`.)
+\ No newline at end of file

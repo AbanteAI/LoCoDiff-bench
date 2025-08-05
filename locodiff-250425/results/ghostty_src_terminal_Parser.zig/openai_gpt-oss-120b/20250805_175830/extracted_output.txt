@@ -1,0 +1,409 @@
+//! VT-series parser for escape and control sequences.
+/// This is implemented directly as the state machine described on
+/// vt100.net: https://vt100.net/emu/dec_ansi_parser
+const Parser = @This();
+
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const testing = std.testing;
+const table = @import("parse_table.zig").table;
+const osc = @import("osc.zig");
+
+const log = std.log.scoped(.parser);
+
+/// States for the state machine
+pub const State = enum {
+    ground,
+    escape,
+    escape_intermediate,
+    csi_entry,
+    csi_intermediate,
+    csi_param,
+    csi_ignore,
+    dcs_entry,
+    dcs_param,
+    dcs_intermediate,
+    dcs_passthrough,
+    dcs_ignore,
+    osc_string,
+    sos_pm_apc_string,
+};
+
+/// Actions that can be taken during a state transition.
+pub const TransitionAction = enum {
+    none,
+    ignore,
+    print,
+    execute,
+    collect,
+    param,
+    esc_dispatch,
+    csi_dispatch,
+    put,
+    osc_put,
+    apc_put,
+};
+
+/// Action is the action that a caller of the parser is expected
+/// to take as a result of some input character.
+pub const Action = union(enum) {
+    pub const Tag = std.meta.FieldEnum(Action);
+
+    // Draw character to the screen. This is a unicode codepoint.
+    print: u21,
+
+    // Execute the C0 or C1 function.
+    execute: u8,
+
+    // Execute an ESC command.
+    esc_dispatch: ESC,
+
+    // Execute an OSC command.
+    osc_dispatch: osc.Command,
+
+    // DCS related events.
+    dcs_hook: DCS,
+    dcs_put: u8,
+    dcs_unhook: void,
+
+    // APC data.
+    apc_start: void,
+    apc_put: u8,
+    apc_end: void,
+
+    // CSI dispatch.
+    csi_dispatch: CSI,
+
+    pub const DCS = struct {
+        intermediates: []const u8 = "";
+        params: []const u16 = &.{};
+        final: u8,
+    };
+
+    pub const ESC = struct {
+        intermediates: []u8,
+        final: u8,
+
+        pub fn format(
+            self: ESC,
+            comptime layout: []const u8,
+            opts: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = layout;
+            _ = opts;
+            try std.fmt.format(
+                writer,
+                "ESC {s} {c}",
+                .{
+                    self.intermediates,
+                    self.final,
+                },
+            );
+        }
+    };
+
+    pub const CSI = struct {
+        // Collected intermediate characters. This overlaps with
+        // the UTF-8 decoder array; max length 4.
+        intermediates: []u8,
+        // Parsed parameters.
+        params: []u16,
+        // The list of separators used for CSI parameters; the
+        // bit can be mapped to Sep. The index of this bit
+        // set specifies the separator AFTER that param.
+        // For example: 0;4:3 would have index 1 set.
+        const Sep = enum(u1) { semicolon = 0, colon = 1 };
+        pub const SepList = std.StaticBitSet(@intFromEnum(@as(c_int, 0)));
+
+        const SepList = std.StaticBitSet(MAX_PARAMS);
+
+        // The selector used for the SGR sequence.
+        pub const Sep = enum(u1) { semicolon = 0, colon = 1 };
+
+        // Implement formatter for logging.
+        pub fn format(
+            self: CSI,
+            comptime layout: []const u8,
+            opts: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = layout;
+            _ = opts;
+            try std.fmt.format(
+                writer,
+                "ESC [ {s} {any} {c}",
+                .{
+                    self.intermediates,
+                    self.params,
+                    self.final,
+                },
+            );
+        }
+    };
+};
+
+/// Maximum number of intermediate characters during
+/// parsing. 4 because the same array is used for UTF8
+/// decoding and this can be at most 4 bytes.
+const MAX_INTERMEDIATE = 4;
+
+/// Maximum number of CSI parameters. 24 is a sane limit
+/// that covers most real-world sequences.
+const MAX_PARAMS = 24;
+
+/// Current state of the state machine.
+state: State = .ground,
+
+/// Intermediate tracking (including UTF‑8 accumulator).
+intermediates: [MAX_INTERMEDIATE]u8 = undefined,
+intermediates_idx: u8 = 0,
+
+/// Parameter tracking, building.
+params: [MAX_PARAMS]u16 = undefined,
+params_idx: u8 = 0,
+params_sep: Action.CSI.SepList = Action.CSI.SepList.initEmpty(),
+param_acc: u16 = 0,
+param_acc_idx: u8 = 0,
+
+/// OSC parser for operating‑system‑control sequences.
+osc_parser: osc.Parser = .{};
+
+pub fn init() Parser {
+    return .{};
+}
+
+pub fn deinit(self: *Parser) void {
+    self.osc_parser.deinit();
+}
+
+pub fn next(self: *Parser, c: u8) [3]?Action {
+    // Table lookup for the current state.
+    const effect = table[c][@intFromEnum(self.state)];
+
+    const next_state = effect.state;
+    const action = effect.action;
+
+    // After generating the actions, we set our next state.
+    defer self.state = next_state;
+
+    // In debug mode, log a warning if we accidentally
+    // transition to 'anywhere' (should never happen).
+    if (builtin.mode == .Debug) {
+        if (next_state == .anywhere) {
+            log.debug(
+                "state transition to 'anywhere' from '{}' with byte {x}",
+                .{ self.state, c },
+            );
+        }
+    }
+
+    // Return the three possibly‑null actions:
+    //   0: exit action from the old state,
+    //   1: transition action,
+    //   2: entry action for the new state.
+    const exit: ?Action = if (self.state == next_state)
+        null
+    else switch (self.state) {
+        .osc_string => if (self.osc_parser.end(c)) |cmd|
+            Action{ .osc_dispatch = cmd }
+        else
+            null,
+        .dcs_passthrough => Action{ .dcs_unhook = {} },
+        .sos_pm_apc_string => Action{ .apc_end = {} },
+        else => null,
+    };
+
+    const transition = self.doAction(action, c);
+
+    const entry: ?Action = if (self.state == next_state)
+        null
+    else switch (next_state) {
+        .escape, .csi_entry, .dcs_entry => {
+            self.clear();
+            break :entry null;
+        },
+
+        .dcs_passthrough => dcs_hook: {
+            // Finalize any pending parameter.
+                if (self.param_acc_idx > 0) {
+                    self.params[self.params_idx] = self.param_acc;
+                    self.params_idx += 1;
+                }
+                break :dcs_hook .{
+                    .dcs_hook = .{
+                        .intermediates = self.intermediates[0..self.intermediates_idx],
+                        .params = self.params[0..self.params_idx],
+                        .final = c,
+                    },
+                };
+            },
+
+        .sos_pm_apc_string => Action{ .apc_start = {} },
+
+        .osc_string => {
+            self.osc_parser.reset();
+            break :null null;
+        },
+
+        else => null,
+    };
+
+    return .{ exit, transition, entry };
+}
+
+// Collect a character into the intermediate array.
+pub fn collect(self: *Parser, c: u8) void {
+    if (self.intermediates_idx >= MAX_INTERMEDIATE) {
+        log.warn("intermediates overflow", .{});
+        return;
+    }
+    self.intermediates[self.intermediates_idx] = c;
+    self.intermediates_idx += 1;
+}
+
+// Reset parser state for a new sequence.
+pub fn clear(self: *Parser) void {
+    self.intermediates_idx = 0;
+    self.params_idx = 0;
+    self.params_sep = Action.CSI.SepList.initEmpty();
+    self.param_acc = 0;
+    self.param_acc_idx = 0;
+}
+
+// Perform a transition action (may generate a user‑visible action
+// such as an output character, an ESC dispatch, etc.).
+fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+    return switch (action) {
+        .none, .ignore => null,
+
+        .print => Action{ .print = c },
+
+        .execute => Action{ .execute = c },
+
+        .collect => collect: {
+            self.collect(c);
+            break :collect null;
+        },
+
+        .param => param: {
+            // Too many parameters?
+            if (self.params_idx >= MAX_PARAMS) break :param null;
+
+            // Semicolon or colon separates parameters.
+            if (c == ';' or c == ':') {
+                // Save current parameter.
+                if (self.param_acc_idx > 0) {
+                    self.params[self.params_idx] = self.param_acc;
+                    if (c == ':') self.params_sep.set(self.params_idx);
+                    self.params_idx += 1;
+                }
+                // Reset accumulator.
+                self.param_acc = 0;
+                self.param_acc_idx = 0;
+                break :param null;
+            }
+
+            // Numeric parameter.
+            if (self.param_acc_idx > 0) {
+                self.param_acc *|= 10;
+            }
+            self.param_acc +|= c - '0';
+            const overflow = @addWithOverflow(&self.param_acc_idx, 1);
+            if (overflow) break :null null;
+            break :param null;
+        },
+
+        .esc_dispatch => Action{
+            .esc_dispatch = .{
+                .intermediates = self.intermediates[0..self.intermediates_idx],
+                .final = c,
+            },
+        },
+
+        .csi_dispatch => csi_dispatch: {
+            // Finalize any remaining parameter.
+            if (self.param_acc_idx > 0) {
+                self.params[self.params_idx] = self.param_acc;
+                self.params_idx += 1;
+            }
+
+            const result: Action = .{
+                .csi_dispatch = .{
+                    .intermediates = self.intermediates[0..self.intermediates_idx],
+                    .params = self.params[0..self.params_idx],
+                    .params_sep = self.params_sep,
+                    .final = c,
+                },
+            };
+
+            // Only the SGR command (final byte 'm') may
+            // contain colon-separated parameters.
+            if (c != 'm' and self.params_sep.count() > 0) {
+                log.warn(
+                    "CSI colon or mixed separators only allowed for 'm' command, got: {}",
+                    .{result},
+                );
+                break :csi_dispatch null;
+            }
+
+            break :csi_dispatch result;
+        },
+
+        .put => Action{ .dcs_put = c },
+
+        .apc_put => Action{ .apc_put = c },
+
+        .osc_put => {
+            self.osc_parser.next(c);
+            break :null null;
+        },
+
+        .apc_put => {
+            // Not used elsewhere.
+            break :null null;
+        },
+
+        .apc_put => {
+            // Placeholder for future APC handling
+            break :null null;
+        },
+
+        .apc_put => {
+            // No operation
+            break :null null;
+        },
+
+        .apc_put => {
+            // No operation
+            break :null null;
+        },
+
+        .apc_put => {
+            // No operation
+            break :null null;
+        },
+
+        .apc_put => {
+            // No operation
+            break :null null;
+        },
+
+        .apc_put => {
+            // No operation
+            break :null null;
+        },
+
+        .apc_put => {
+            // No operation
+            break :null null;
+        },
+
+        // No other actions.
+        else => {
+            log.err("unimplemented action: {}", .{action});
+            @panic("TODO");
+        },
+    };
+}

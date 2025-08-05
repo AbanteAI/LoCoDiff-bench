@@ -1,0 +1,694 @@
+
+index 71e15f9b2..37a0e683c 100644
+--- a/qdrant_lib_collection_src_collection_mod.rs_expectedoutput.txt (expected):tmp/tmpksgd8n_o_expected.txt	
++++ b/qdrant_lib_collection_src_collection_mod.rs_extracted.txt (actual):tmp/tmp_ety7c13_actual.txt	
+@@ -12,7 +12,7 @@ mod sharding_keys;
+ mod snapshots;
+ mod state_management;
+ 
+-use std::collections::HashMap;
++use std::collections::HashSet;
+ use std::ops::Deref;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+@@ -29,9 +29,6 @@ use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+ 
+ use crate::collection::payload_index_schema::PayloadIndexSchema;
+ use crate::collection_state::{ShardInfo, State};
+-use crate::common::collection_size_stats::{
+-    CollectionSizeAtomicStats, CollectionSizeStats, CollectionSizeStatsCache,
+-};
+ use crate::common::is_ready::IsReady;
+ use crate::config::CollectionConfigInternal;
+ use crate::operations::config_diff::{DiffConfig, OptimizersConfigDiff};
+@@ -42,13 +39,14 @@ use crate::save_on_disk::SaveOnDisk;
+ use crate::shards::channel_service::ChannelService;
+ use crate::shards::collection_shard_distribution::CollectionShardDistribution;
+ use crate::shards::local_shard::clock_map::RecoveryPoint;
+-use crate::shards::replica_set::ReplicaState::{Active, Dead, Initializing, Listener};
+ use crate::shards::replica_set::{
+     ChangePeerFromState, ChangePeerState, ReplicaState, ShardReplicaSet,
+ };
++use crate::shards::resharding::ReshardKey;
+ use crate::shards::shard::{PeerId, ShardId};
+-use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
+-use crate::shards::shard_holder::{LockedShardHolder, ShardHolder, shard_not_found_error};
++use crate::shards::shard_holder::{
++    shard_not_found_error, LockedShardHolder, ShardHolder, shard_mapping::ShardKeyMapping,
++};
+ use crate::shards::transfer::helpers::check_transfer_conflicts_strict;
+ use crate::shards::transfer::transfer_tasks_pool::{TaskResult, TransferTasksPool};
+ use crate::shards::transfer::{ShardTransfer, ShardTransferMethod};
+@@ -59,10 +57,10 @@ use crate::telemetry::{
+ 
+ /// Collection's data is split into several shards.
+ pub struct Collection {
+-    pub(crate) id: CollectionId,
+-    pub(crate) shards_holder: Arc<LockedShardHolder>,
+-    pub(crate) collection_config: Arc<RwLock<CollectionConfigInternal>>,
+-    pub(crate) shared_storage_config: Arc<SharedStorageConfig>,
++    id: CollectionId,
++    shards_holder: Arc<LockedShardHolder>,
++    collection_config: Arc<RwLock<CollectionConfigInternal>>,
++    shared_storage_config: Arc<SharedStorageConfig>,
+     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+     optimizers_overwrite: Option<OptimizersConfigDiff>,
+     this_peer_id: PeerId,
+@@ -74,29 +72,17 @@ pub struct Collection {
+     notify_peer_failure_cb: ChangePeerFromState,
+     abort_shard_transfer_cb: replica_set::AbortShardTransfer,
+     init_time: Duration,
+-    // One-way boolean flag that is set to true when the collection is fully initialized
+-    // i.e. all shards are activated for the first time.
+     is_initialized: Arc<IsReady>,
+-    // Lock to temporary block collection update operations while the collection is being migrated.
+-    // Lock is acquired for read on update operation and can be acquired for write externally,
+-    // which will block all update operations until the lock is released.
+     updates_lock: Arc<RwLock<()>>,
+-    // Update runtime handle.
+     update_runtime: Handle,
+-    // Search runtime handle.
+     search_runtime: Handle,
+     optimizer_resource_budget: ResourceBudget,
+-    // Cached statistics of collection size, may be outdated.
+     collection_stats_cache: CollectionSizeStatsCache,
+-    // Background tasks to clean shards
+     shard_clean_tasks: ShardCleanTasks,
+ }
+ 
+ pub type RequestShardTransfer = Arc<dyn Fn(ShardTransfer) + Send + Sync>;
+ 
+-pub type OnTransferFailure = Arc<dyn Fn(ShardTransfer, CollectionId, &str) + Send + Sync>;
+-pub type OnTransferSuccess = Arc<dyn Fn(ShardTransfer, CollectionId) + Send + Sync>;
+-
+ impl Collection {
+     #[allow(clippy::too_many_arguments)]
+     pub async fn new(
+@@ -128,12 +114,6 @@ impl Collection {
+         for (shard_id, mut peers) in shard_distribution.shards {
+             let is_local = peers.remove(&this_peer_id);
+ 
+-            let mut effective_optimizers_config = collection_config.optimizer_config.clone();
+-            if let Some(optimizers_overwrite) = optimizers_overwrite.clone() {
+-                effective_optimizers_config =
+-                    optimizers_overwrite.update(&effective_optimizers_config)?;
+-            }
+-
+             let shard_key = shard_key_mapping
+                 .as_ref()
+                 .and_then(|mapping| mapping.shard_key(shard_id));
+@@ -148,14 +128,11 @@ impl Collection {
+                 abort_shard_transfer.clone(),
+                 path,
+                 shared_collection_config.clone(),
+-                effective_optimizers_config,
++                collection_config.optimizer_config.clone(),
+                 shared_storage_config.clone(),
+-                payload_index_schema.clone(),
+                 channel_service.clone(),
+                 update_runtime.clone().unwrap_or_else(Handle::current),
+                 search_runtime.clone().unwrap_or_else(Handle::current),
+-                optimizer_resource_budget.clone(),
+-                None,
+             )
+             .await?;
+ 
+@@ -168,7 +145,6 @@ impl Collection {
+             Self::estimate_collection_size_stats(&locked_shard_holder).await,
+         );
+ 
+-        // Once the config is persisted - the collection is considered to be successfully created.
+         CollectionVersion::save(path)?;
+         collection_config.save(path)?;
+ 
+@@ -176,9 +152,9 @@ impl Collection {
+             id: name.clone(),
+             shards_holder: locked_shard_holder,
+             collection_config: shared_collection_config,
+-            optimizers_overwrite,
+-            payload_index_schema,
+             shared_storage_config,
++            payload_index_schema,
++            optimizers_overwrite,
+             this_peer_id,
+             path: path.to_owned(),
+             snapshots_path: snapshots_path.to_owned(),
+@@ -199,14 +175,15 @@ impl Collection {
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-    pub async fn load(
++    pub fn load(
+         collection_id: CollectionId,
+         this_peer_id: PeerId,
+         path: &Path,
+         snapshots_path: &Path,
+         shared_storage_config: Arc<SharedStorageConfig>,
++        shard_key_mapping: Option<ShardKeyMapping>,
+         channel_service: ChannelService,
+-        on_replica_failure: replica_set::ChangePeerFromState,
++        on_replica_failure: ChangePeerFromState,
+         request_shard_transfer: RequestShardTransfer,
+         abort_shard_transfer: replica_set::AbortShardTransfer,
+         search_runtime: Option<Handle>,
+@@ -232,30 +209,16 @@ impl Collection {
+                     .unwrap_or_else(|err| panic!("Can't save collection version {err}"));
+             } else {
+                 log::error!("Cannot upgrade version {stored_version} to {app_version}.");
+-                panic!(
+-                    "Cannot upgrade version {stored_version} to {app_version}. Try to use older version of Qdrant first.",
+-                );
++                panic!("Cannot upgrade version {stored_version} to {app_version}. Try to use older version of Qdrant first.");
+             }
+         }
+ 
+-        let collection_config = CollectionConfigInternal::load(path).unwrap_or_else(|err| {
+-            panic!(
+-                "Can't read collection config due to {}\nat {}",
+-                err,
+-                path.to_str().unwrap(),
+-            )
+-        });
++        let collection_config = CollectionConfigInternal::load(path)
++            .unwrap_or_else(|err| panic!("Can't read collection config due to {}\nat {}", err, path.to_str().unwrap()));
+         collection_config.validate_and_warn();
+ 
+         let mut shard_holder = ShardHolder::new(path).expect("Can not create shard holder");
+-
+-        let mut effective_optimizers_config = collection_config.optimizer_config.clone();
+-
+-        if let Some(optimizers_overwrite) = optimizers_overwrite.clone() {
+-            effective_optimizers_config = optimizers_overwrite
+-                .update(&effective_optimizers_config)
+-                .expect("Can not apply optimizer overwrite");
+-        }
++        shard_holder.set_shard_key_mappings(shard_key_mapping.clone().unwrap_or_default()).expect("Failed to set shard key mappings");
+ 
+         let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
+ 
+@@ -269,16 +232,14 @@ impl Collection {
+                 path,
+                 &collection_id,
+                 shared_collection_config.clone(),
+-                effective_optimizers_config,
++                collection_config.optimizer_config.clone(),
+                 shared_storage_config.clone(),
+-                payload_index_schema.clone(),
+                 channel_service.clone(),
+                 on_replica_failure.clone(),
+                 abort_shard_transfer.clone(),
+                 this_peer_id,
+                 update_runtime.clone().unwrap_or_else(Handle::current),
+                 search_runtime.clone().unwrap_or_else(Handle::current),
+-                optimizer_resource_budget.clone(),
+             )
+             .await;
+ 
+@@ -292,9 +253,9 @@ impl Collection {
+             id: collection_id.clone(),
+             shards_holder: locked_shard_holder,
+             collection_config: shared_collection_config,
+-            optimizers_overwrite,
+-            payload_index_schema,
+             shared_storage_config,
++            payload_index_schema,
++            optimizers_overwrite,
+             this_peer_id,
+             path: path.to_owned(),
+             snapshots_path: snapshots_path.to_owned(),
+@@ -314,37 +275,10 @@ impl Collection {
+         }
+     }
+ 
+-    /// Check if stored version have consequent version.
+-    /// If major version is different, then it is not compatible.
+-    /// If the difference in consecutive versions is greater than 1 in patch,
+-    /// then the collection is not compatible with the current version.
+-    ///
+-    /// Example:
+-    ///   0.4.0 -> 0.4.1 = true
+-    ///   0.4.0 -> 0.4.2 = false
+-    ///   0.4.0 -> 0.5.0 = false
+-    ///   0.4.0 -> 0.5.1 = false
+-    pub fn can_upgrade_storage(stored: &Version, app: &Version) -> bool {
+-        if stored.major != app.major {
+-            return false;
+-        }
+-        if stored.minor != app.minor {
+-            return false;
+-        }
+-        if stored.patch + 1 < app.patch {
+-            return false;
+-        }
+-        true
+-    }
+-
+     pub fn name(&self) -> String {
+         self.id.clone()
+     }
+ 
+-    pub async fn uuid(&self) -> Option<uuid::Uuid> {
+-        self.collection_config.read().await.uuid
+-    }
+-
+     pub async fn get_shard_keys(&self) -> Vec<ShardKey> {
+         self.shards_holder
+             .read()
+@@ -355,7 +289,6 @@ impl Collection {
+             .collect()
+     }
+ 
+-    /// Return a list of local shards, present on this peer
+     pub async fn get_local_shards(&self) -> Vec<ShardId> {
+         self.shards_holder.read().await.get_local_shards().await
+     }
+@@ -402,107 +335,66 @@ impl Collection {
+ 
+         let current_state = replica_set.peer_state(peer_id);
+ 
+-        // Validation:
+-        //
+-        // 1. Check that peer exists in the cluster (peer might *not* exist, if it was removed from
+-        //    the cluster right before `SetShardReplicaSet` was proposed)
+         let peer_exists = self
+             .channel_service
+             .id_to_address
+             .read()
+             .contains_key(&peer_id);
+-
+         let replica_exists = replica_set.peer_state(peer_id).is_some();
+ 
+         if !peer_exists && !replica_exists {
+             return Err(CollectionError::bad_input(format!(
+-                "Can't set replica {peer_id}:{shard_id} state to {new_state:?}, \
+-                 because replica {peer_id}:{shard_id} does not exist \
+-                 and peer {peer_id} is not part of the cluster"
++                "Can't set replica {peer_id}:{shard_id} state to {new_state:?}, because replica {peer_id}:{shard_id} does not exist and peer {peer_id} is not part of the cluster"
+             )));
+         }
+ 
+-        // 2. Check that `from_state` matches current state
+         if from_state.is_some() && current_state != from_state {
+             return Err(CollectionError::bad_input(format!(
+                 "Replica {peer_id} of shard {shard_id} has state {current_state:?}, but expected {from_state:?}"
+             )));
+         }
+ 
+-        // 3. Do not deactivate the last active replica
+-        //
+-        // `is_last_active_replica` counts both `Active` and `ReshardingScaleDown` replicas!
+-        if replica_set.is_last_active_replica(peer_id) && !new_state.is_active() {
++        if new_state != ReplicaState::Active && replica_set.is_last_active_replica(peer_id) {
+             return Err(CollectionError::bad_input(format!(
+                 "Cannot deactivate the last active replica {peer_id} of shard {shard_id}"
+             )));
+         }
+ 
+-        // Update replica status
+-        replica_set
+-            .ensure_replica_with_state(peer_id, new_state)
+-            .await?;
+-
+-        if new_state == ReplicaState::Dead {
+-            let resharding_state = shard_holder.resharding_state.read().clone();
+-            let related_transfers = shard_holder.get_related_transfers(shard_id, peer_id);
+-
+-            // Functions below lock `shard_holder`!
++        let is_resharding = current_state
++            .as_ref()
++            .is_some_and(ReplicaState::is_resharding);
++        if is_resharding && new_state == ReplicaState::Dead {
+             drop(shard_holder);
+-
+-            let mut abort_resharding_result = CollectionResult::Ok(());
+-
+-            // Abort resharding, if resharding shard is marked as `Dead`.
+-            //
+-            // This branch should only be triggered, if resharding is currently at `MigratingPoints`
+-            // stage, because target shard should be marked as `Active`, when all resharding transfers
+-            // are successfully completed, and so the check *right above* this one would be triggered.
+-            //
+-            // So, if resharding reached `ReadHashRingCommitted`, this branch *won't* be triggered,
+-            // and resharding *won't* be cancelled. The update request should *fail* with "failed to
+-            // update all replicas of a shard" error.
+-            //
+-            // If resharding reached `ReadHashRingCommitted`, and this branch is triggered *somehow*,
+-            // then `Collection::abort_resharding` call should return an error, so no special handling
+-            // is needed.
+-            let is_resharding = current_state
+-                .as_ref()
+-                .is_some_and(ReplicaState::is_resharding);
+-            if is_resharding {
+-                if let Some(state) = resharding_state {
+-                    abort_resharding_result = self.abort_resharding(state.key(), false).await;
++            if let Some(state) = self.resharding_state().await {
++                if state.peer_id == peer_id {
++                    self.abort_resharding(state.key(), false).await?;
+                 }
+             }
++        }
++
++        replica_set.ensure_replica_with_state(peer_id, new_state).await?;
+ 
+-            // Terminate transfer if source or target replicas are now dead
++        if new_state == ReplicaState::Dead {
++            let related_transfers = shard_holder.get_related_transfers(shard_id, peer_id);
++            drop(shard_holder);
+             for transfer in related_transfers {
+                 self.abort_shard_transfer(transfer.key(), None).await?;
+             }
+-
+-            // Propagate resharding errors now
+-            abort_resharding_result?;
+         }
+ 
+-        // If not initialized yet, we need to check if it was initialized by this call
+         if !self.is_initialized.check_ready() {
+             let state = self.state().await;
+-
+             let mut is_ready = true;
+-
+             for (_shard_id, shard_info) in state.shards {
+-                let all_replicas_active = shard_info.replicas.into_iter().all(|(_, state)| {
+-                    matches!(
+-                        state,
+-                        ReplicaState::Active | ReplicaState::ReshardingScaleDown
+-                    )
+-                });
+-
+-                if !all_replicas_active {
++                if shard_info
++                    .replicas
++                    .into_iter()
++                    .any(|(_peer_id, state)| !state.is_active())
++                {
+                     is_ready = false;
+                     break;
+                 }
+             }
+-
+             if is_ready {
+                 self.is_initialized.make_ready();
+             }
+@@ -563,30 +455,6 @@ impl Collection {
+         }
+     }
+ 
+-    pub async fn remove_shards_at_peer(&self, peer_id: PeerId) -> CollectionResult<()> {
+-        // Abort resharding, if shards are removed from peer driving resharding
+-        // (which *usually* means the *peer* is being removed from consensus)
+-        let resharding_state = self
+-            .resharding_state()
+-            .await
+-            .filter(|state| state.peer_id == peer_id);
+-
+-        if let Some(state) = resharding_state {
+-            if let Err(err) = self.abort_resharding(state.key(), true).await {
+-                log::error!(
+-                    "Failed to abort resharding {} while removing peer {peer_id}: {err}",
+-                    state.key(),
+-                );
+-            }
+-        }
+-
+-        self.shards_holder
+-            .read()
+-            .await
+-            .remove_shards_at_peer(peer_id)
+-            .await
+-    }
+-
+     pub async fn sync_local_state(
+         &self,
+         on_transfer_failure: OnTransferFailure,
+@@ -595,19 +463,11 @@ impl Collection {
+         on_convert_to_listener: ChangePeerState,
+         on_convert_from_listener: ChangePeerState,
+     ) -> CollectionResult<()> {
+-        // Check for disabled replicas
+         let shard_holder = self.shards_holder.read().await;
+-
+-        let get_shard_transfers = |shard_id, from| {
+-            shard_holder
+-                .get_transfers(|transfer| transfer.shard_id == shard_id && transfer.from == from)
+-        };
+-
+         for replica_set in shard_holder.all_shards() {
+-            replica_set.sync_local_state(get_shard_transfers)?;
++            replica_set.sync_local_state().await?;
+         }
+ 
+-        // Check for un-reported finished transfers
+         let outgoing_transfers = shard_holder.get_outgoing_transfers(self.this_peer_id);
+         let tasks_lock = self.transfer_tasks.lock().await;
+         for transfer in outgoing_transfers {
+@@ -640,69 +500,38 @@ impl Collection {
+             }
+         }
+ 
+-        // Count how many transfers we are now proposing
+-        // We must track this here so we can reference it when checking for tranfser limits,
+-        // because transfers we propose now will not be in the consensus state within the lifetime
+-        // of this function
+         let mut proposed = HashMap::<PeerId, usize>::new();
+ 
+-        // Check for proper replica states
+         for replica_set in shard_holder.all_shards() {
+             let this_peer_id = replica_set.this_peer_id();
+             let shard_id = replica_set.shard_id;
+ 
+             let peers = replica_set.peers();
+             let this_peer_state = peers.get(&this_peer_id).copied();
++            let is_last_active = peers.values().filter(|state| **state == Active).count() == 1;
+ 
+             if this_peer_state == Some(Initializing) {
+-                // It is possible, that collection creation didn't report
+-                // Try to activate shard, as the collection clearly exists
+                 on_finish_init(this_peer_id, shard_id);
+                 continue;
+             }
+ 
+             if self.shared_storage_config.node_type == NodeType::Listener {
+-                // We probably should not switch node type during resharding, so we only check for `Active`,
+-                // but not `ReshardingScaleDown` replica state here...
+-                let is_last_active = peers.values().filter(|&&state| state == Active).count() == 1;
+-
+                 if this_peer_state == Some(Active) && !is_last_active {
+-                    // Convert active node from active to listener
+                     on_convert_to_listener(this_peer_id, shard_id);
+                     continue;
+                 }
+             } else if this_peer_state == Some(Listener) {
+-                // Convert listener node to active
+                 on_convert_from_listener(this_peer_id, shard_id);
+                 continue;
+             }
+ 
+-            // Don't automatically recover replicas if started in recovery mode
+-            if self.shared_storage_config.recovery_mode.is_some() {
++            if this_peer_state != Some(Dead) || replica_set.is_dummy().await {
+                 continue;
+             }
+ 
+-            // Don't recover replicas if not dead
+-            let is_dead = this_peer_state == Some(Dead);
+-            if !is_dead {
+-                continue;
+-            }
+-
+-            // Try to find dead replicas with no active transfers
+             let transfers = shard_holder.get_transfers(|_| true);
+ 
+-            // Respect shard transfer limit, consider already proposed transfers in our counts
+-            let (mut incoming, outgoing) = shard_holder.count_shard_transfer_io(this_peer_id);
+-            incoming += proposed.get(&this_peer_id).copied().unwrap_or(0);
+-            if self.check_auto_shard_transfer_limit(incoming, outgoing) {
+-                log::trace!(
+-                    "Postponing automatic shard {shard_id} transfer to stay below limit on this node (incoming: {incoming}, outgoing: {outgoing})",
+-                );
+-                continue;
+-            }
+-
+-            // Select shard transfer method, prefer user configured method or choose one now
+-            // If all peers are 1.8+, we try WAL delta transfer, otherwise we use the default method
++            // Select shard transfer method
+             let shard_transfer_method = self
+                 .shared_storage_config
+                 .default_shard_transfer_method
+@@ -717,9 +546,6 @@ impl Collection {
+                     }
+                 });
+ 
+-            // Try to find a replica to transfer from
+-            //
+-            // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
+             for replica_id in replica_set.active_remote_shards() {
+                 let transfer = ShardTransfer {
+                     from: replica_id,
+@@ -727,43 +553,37 @@ impl Collection {
+                     shard_id,
+                     to_shard_id: None,
+                     sync: true,
+-                    // For automatic shard transfers, always select some default method from this point on
+                     method: Some(shard_transfer_method),
+                 };
+ 
+                 if check_transfer_conflicts_strict(&transfer, transfers.iter()).is_some() {
+-                    continue; // this transfer won't work
++                    continue;
++                }
++
++                let (mut incoming, outgoing) = shard_holder.count_shard_transfer_io(this_peer_id);
++                incoming += proposed.get(&this_peer_id).copied().unwrap_or(0);
++                if self.check_auto_shard_transfer_limit(incoming, outgoing) {
++                    log::trace!("Postponing automatic shard {shard_id} transfer to stay below limit on this node (incoming: {incoming}, outgoing: {outgoing})");
++                    continue;
+                 }
+ 
+-                // Respect shard transfer limit, consider already proposed transfers in our counts
+                 let (incoming, mut outgoing) = shard_holder.count_shard_transfer_io(replica_id);
+                 outgoing += proposed.get(&replica_id).copied().unwrap_or(0);
+                 if self.check_auto_shard_transfer_limit(incoming, outgoing) {
+-                    log::trace!(
+-                        "Postponing automatic shard {shard_id} transfer to stay below limit on peer {replica_id} (incoming: {incoming}, outgoing: {outgoing})",
+-                    );
++                    log::trace!("Postponing automatic shard {shard_id} transfer to stay below limit on peer {replica_id} (incoming: {incoming}, outgoing: {outgoing})");
+                     continue;
+                 }
+ 
+-                // TODO: Should we, maybe, throttle/backoff this requests a bit?
+                 if let Err(err) = replica_set.health_check(replica_id).await {
+-                    // TODO: This is rather verbose, not sure if we want to log this at all... :/
+                     log::trace!(
+-                        "Replica {replica_id}/{}:{} is not available \
+-                         to request shard transfer from: \
+-                         {err}",
+-                        self.id,
+-                        replica_set.shard_id,
++                        "Replica {replica_id}/{self.id}:{replica_set.shard_id} is not available to request shard transfer from: {err}"
+                     );
+                     continue;
+                 }
+ 
+                 log::debug!(
+-                    "Recovering shard {}:{shard_id} on peer {this_peer_id} by requesting it from {replica_id}",
+-                    self.name(),
++                    "Recovering shard {}:{shard_id} on peer {this_peer_id} by requesting it from {replica_id}"
+                 );
+-
+-                // Update our counters for proposed transfers, then request (propose) shard transfer
+                 *proposed.entry(transfer.from).or_default() += 1;
+                 *proposed.entry(transfer.to).or_default() += 1;
+                 self.request_shard_transfer(transfer);
+@@ -775,25 +595,25 @@ impl Collection {
+     }
+ 
+     pub async fn get_telemetry_data(&self, detail: TelemetryDetail) -> CollectionTelemetry {
+-        let (shards_telemetry, transfers, resharding) = {
+-            if detail.level >= DetailsLevel::Level3 {
+-                let shards_holder = self.shards_holder.read().await;
+-                let mut shards_telemetry = Vec::new();
+-                for shard in shards_holder.all_shards() {
+-                    shards_telemetry.push(shard.get_telemetry_data(detail).await)
+-                }
+-                (
+-                    Some(shards_telemetry),
+-                    Some(shards_holder.get_shard_transfer_info(&*self.transfer_tasks.lock().await)),
+-                    Some(
+-                        shards_holder
+-                            .get_resharding_operations_info()
+-                            .unwrap_or_default(),
+-                    ),
+-                )
+-            } else {
+-                (None, None, None)
++        let (shards_telemetry, transfers, resharding) = if detail.level >= DetailsLevel::Level3 {
++            let shards_holder = self.shards_holder.read().await;
++            let mut shards_vec = Vec::new();
++            for shard in shards_holder.all_shards() {
++                shards_vec.push(shard.get_telemetry_data(detail).await);
+             }
++            (
++                Some(shards_vec),
++                Some(
++                    shards_holder.get_shard_transfer_info(&*self.transfer_tasks.lock().await)
++                ),
++                Some(
++                    shards_holder
++                        .get_resharding_operations_info()
++                        .unwrap_or_default(),
++                ),
++            )
++        } else {
++            (None, None, None)
+         };
+ 
+         let shard_clean_tasks = self.clean_local_shards_statuses();
+@@ -838,16 +658,6 @@ impl Collection {
+         }
+     }
+ 
+-    pub async fn effective_optimizers_config(&self) -> CollectionResult<OptimizersConfig> {
+-        let config = self.collection_config.read().await;
+-
+-        if let Some(optimizers_overwrite) = self.optimizers_overwrite.clone() {
+-            Ok(optimizers_overwrite.update(&config.optimizer_config)?)
+-        } else {
+-            Ok(config.optimizer_config.clone())
+-        }
+-    }
+-
+     pub async fn lock_updates(&self) -> RwLockWriteGuard<()> {
+         self.updates_lock.write().await
+     }
+@@ -859,39 +669,18 @@ impl Collection {
+     pub fn request_shard_transfer(&self, shard_transfer: ShardTransfer) {
+         self.request_shard_transfer_cb.deref()(shard_transfer)
+     }
+-
+-    pub fn snapshots_path(&self) -> &Path {
+-        &self.snapshots_path
+-    }
+-
+-    pub fn shards_holder(&self) -> Arc<LockedShardHolder> {
+-        self.shards_holder.clone()
+-    }
+-
+-    pub async fn trigger_optimizers(&self) {
+-        self.shards_holder.read().await.trigger_optimizers().await;
+-    }
+-
+-    async fn estimate_collection_size_stats(
+-        shards_holder: &Arc<RwLock<ShardHolder>>,
+-    ) -> Option<CollectionSizeStats> {
+-        let shard_lock = shards_holder.read().await;
+-        shard_lock.estimate_collection_size_stats().await
+-    }
+-
+-    /// Returns estimations of collection sizes. This values are cached and might be not 100% up to date.
+-    /// The cache gets updated every 32 calls.
+-    pub(crate) async fn estimated_collection_stats(&self) -> Option<&CollectionSizeAtomicStats> {
+-        self.collection_stats_cache
+-            .get_or_update_cache(|| Self::estimate_collection_size_stats(&self.shards_holder))
+-            .await
+-    }
+ }
+ 
+-struct CollectionVersion;
++impl Collection {
++    fn resharding_state_file(collection_path: &Path) -> PathBuf {
++        collection_path.join(RESHARDING_STATE_FILE)
++    }
+ 
+-impl StorageVersion for CollectionVersion {
+-    fn current_raw() -> &'static str {
+-        env!("CARGO_PKG_VERSION")
++    fn load_resharding_state(
++        collection_path: &Path,
++    ) -> CollectionResult<SaveOnDisk<Option<ReshardingState>>> {
++        let resharding_state_file = Self::resharding_state_file(collection_path);
++        let resharding_state = SaveOnDisk::load_or_init(resharding_state_file)?;
++        Ok(resharding_state)
+     }
+ }
+\ No newline at end of file

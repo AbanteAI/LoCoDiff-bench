@@ -1,0 +1,557 @@
+
+index 312ad8cef..2b5d46cd2 100644
+--- a/ghostty_src_termio_Thread.zig_expectedoutput.txt (expected):tmp/tmp_hden2x4_expected.txt	
++++ b/ghostty_src_termio_Thread.zig_extracted.txt (actual):tmp/tmpkr6pm953_actual.txt	
+@@ -1,14 +1,10 @@
+-//! Represents the "writer" thread for terminal IO. The reader side is
+-//! handled by the Termio struct itself and dependent on the underlying
+-//! implementation (i.e. if its a pty, manual, etc.).
++//! Represents the "writer" thread for terminal I/O. The reader side is
++//! handled by the `Termio` struct itself and dependent on the
++//! underlying implementation (e.g. pty, manual, etc.).
+ //!
+-//! The writer thread does handle writing bytes to the pty but also handles
+-//! different events such as starting synchronized output, changing some
+-//! modes (like linefeed), etc. The goal is to offload as much from the
+-//! reader thread as possible since it is the hot path in parsing VT
+-//! sequences and updating terminal state.
+-//!
+-//! This thread state can only be used by one thread at a time.
++//! The writer thread is responsible for handling write events,
++//! synchronized output, mode changes, etc., and offloads as much
++//! as possible from the hot-path parsing of VT sequences.
+ pub const Thread = @This();
+ 
+ const std = @import("std");
+@@ -26,68 +22,62 @@ const log = std.log.scoped(.io_thread);
+ /// This stores the information that is coalesced.
+ const Coalesce = struct {
+     /// The number of milliseconds to coalesce certain messages like resize for.
+-    /// Not all message types are coalesced.
+     const min_ms = 25;
+ 
++    /// The most recent resize message, if any.
+     resize: ?renderer.Size = null,
+ };
+ 
+-/// The number of milliseconds before we reset the synchronized output flag
+-/// if the running program hasn't already.
++/// The number of milliseconds before we reset the synchronized output flag.
++/// This is a lower value to ensure we recover from poorly behaved
++/// programs quickly.
+ const sync_reset_ms = 1000;
+ 
+-/// Allocator used for some state
+-alloc: std.mem.Allocator,
+-
+-/// The main event loop for the thread. The user data of this loop
+-/// is always the allocator used to create the loop. This is a convenience
+-/// so that users of the loop always have an allocator.
+-loop: xev.Loop,
+-
+-/// The completion to use for the wakeup async handle that is present
+-/// on the termio.Writer.
+-wakeup_c: xev.Completion = .{},
+-
+-/// This can be used to stop the thread on the next loop iteration.
+-stop: xev.Async,
+-stop_c: xev.Completion = .{},
+-
+-/// This is used to coalesce resize events.
+-coalesce: xev.Timer,
+-coalesce_c: xev.Completion = .{},
+-coalesce_cancel_c: xev.Completion = .{},
+-coalesce_data: Coalesce = .{},
+-
+-/// This timer is used to reset synchronized output modes so that
+-/// the terminal doesn't freeze with a bad actor.
+-sync_reset: xev.Timer,
+-sync_reset_c: xev.Completion = .{},
+-sync_reset_cancel_c: xev.Completion = .{},
+-
+-flags: packed struct {
+-    /// This is set to true only when an abnormal exit is detected. It
+-    /// tells our mailbox system to drain and ignore all messages.
+-    drain: bool = false,
+-
+-    /// True if linefeed mode is enabled. This is duplicated here so that the
+-    /// write thread doesn't need to grab a lock to check this on every write.
+-    linefeed_mode: bool = false,
+-
+-    /// This is true when the inspector is active.
+-    has_inspector: bool = false,
+-} = .{},
+-
+-/// Initialize the thread. This does not START the thread. This only sets
+-/// up all the internal state necessary prior to starting the thread. It
+-/// is up to the caller to start the thread with the threadMain entrypoint.
+-pub fn init(
+-    alloc: Allocator,
+-) !Thread {
+-    // Create our event loop.
++/// The thread that writes to the terminal and processes messages.
++pub const Thread = struct {
++    /// allocator used for various temporary structures.
++    alloc: std.mem.Allocator,
++
++    /// The main event loop.
++    loop: xev.Loop,
++
++    /// Cancels the sleeping wait.
++    stop: xev.Async,
++    stop_c: xev.Completion = .{},
++
++    /// Used to coalesce resize events.
++    coalesce: xev.Timer,
++    coalesce_c: xev.Completion = .{},
++    coalesce_cancel_c: xev.Completion = .{},
++    coalesce_data: Coalesce = .{},
++
++    /// Used to reset synchronized output after a timeout.
++    sync_reset: xev.Timer,
++    sync_reset_c: xev.Completion = .{},
++    sync_reset_cancel_c: xev.Completion = .{},
++
++    /// Other flags.
++    flags: packed struct {
++        /// Set in the event of an abnormal thread failure.
++        drain: bool = false,
++
++        /// True if linefeed mode is enabled.
++        linefeed_mode: bool = false,
++
++        /// Indicates an active inspector.
++        has_inspector: bool = false,
++    } = .{},
++};
++
++/// Initialize the thread. This does not start the thread; it merely
++/// prepares internal structures. The thread is started by calling
++/// `threadMain` with a `Termio` instance.
++pub fn init(alloc: Allocator) !Thread {
++    // Create the event loop.
+     var loop = try xev.Loop.init(.{});
+     errdefer loop.deinit();
+ 
+-    // This async handle is used to stop the loop and force the thread to end.
++    // Async handle used to stop the loop.
+     var stop_h = try xev.Async.init();
+     errdefer stop_h.deinit();
+ 
+@@ -95,7 +85,7 @@ pub fn init(
+     var coalesce_h = try xev.Timer.init();
+     errdefer coalesce_h.deinit();
+ 
+-    // This timer is used to reset synchronized output modes.
++    // This timer is used to reset synchronized output.
+     var sync_reset_h = try xev.Timer.init();
+     errdefer sync_reset_h.deinit();
+ 
+@@ -108,8 +98,8 @@ pub fn init(
+     };
+ }
+ 
+-/// Clean up the thread. This is only safe to call once the thread
+-/// completes executing; the caller must join prior to this.
++/// Clean up the thread's resources. Only safe to call after
++/// the thread has terminated.
+ pub fn deinit(self: *Thread) void {
+     self.coalesce.deinit();
+     self.sync_reset.deinit();
+@@ -117,198 +107,176 @@ pub fn deinit(self: *Thread) void {
+     self.loop.deinit();
+ }
+ 
+-/// The main entrypoint for the thread.
++/// The entry point for the writer thread.
++///
++/// If an error is encountered the terminal is cleared
++/// and an error message is printed. In the event of an
++/// abrupt failure we attempt to drain the mailbox
++/// before exiting.
+ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+-    // Call child function so we can use errors...
++    // Prepare to run the thread and handle errors.
+     self.threadMain_(io) catch |err| {
+-        log.warn("error in io thread err={}", .{err});
++        // Display an error message so the user
++        // sees something.
++        log.warn("error in IO thread: {}", .{err});
+ 
+-        // Use an arena to simplify memory management below
++        // Use an arena to simplify memory management.
+         var arena = ArenaAllocator.init(self.alloc);
+         defer arena.deinit();
+-        const alloc = arena.allocator();
++        const arena_alloc = arena.allocator();
+ 
+-        // If there is an error, we replace our terminal screen with
+-        // the error message. It might be better in the future to send
+-        // the error to the surface thread and let the apprt deal with it
+-        // in some way but this works for now. Without this, the user would
+-        // just see a blank terminal window.
++        // Hide the cursor and print an error
++        // screen if initialization fails.
+         io.renderer_state.mutex.lock();
+         defer io.renderer_state.mutex.unlock();
+-        const t = io.renderer_state.terminal;
+ 
+-        // Hide the cursor
++        const t = io.renderer_state.terminal;
+         t.modes.set(.cursor_visible, false);
+ 
+-        // This is weird but just ensures that no matter what our underlying
+-        // implementation we have the errors below. For example, Windows doesn't
+-        // have "OpenptyFailed".
+         const Err = @TypeOf(err) || error{
+             OpenptyFailed,
+         };
+ 
+-        switch (@as(Err, @errorCast(err))) {
++        // Craft an error message.
++        const msg = switch (@as(Err, @errorCast(err))) {
+             error.OpenptyFailed => {
+-                const str =
+-                    \\Your system cannot allocate any more pty devices.
+-                    \\
+-                    \\Ghostty requires a pty device to launch a new terminal.
+-                    \\This error is usually due to having too many terminal
+-                    \\windows open or having another program that is using too
+-                    \\many pty devices.
+-                    \\
+-                    \\Please free up some pty devices and try again.
+-                ;
+-
+-                t.eraseDisplay(.complete, false);
+-                t.printString(str) catch {};
++                \\Your system cannot allocate any more PTY devices.
++                \\Please close some terminals
++                \\and try again.
+             },
+-
+             else => {
+-                const str = std.fmt.allocPrint(
+-                    alloc,
++                const s = std.fmt.allocPrint(
++                    arena_alloc,
+                     \\error starting IO thread: {}
+-                    \\
+-                    \\The underlying shell or command was unable to be started.
+-                    \\This error is usually due to exhausting a system resource.
+-                    \\If this looks like a bug, please report it.
+-                    \\
+-                    \\This terminal is non-functional. Please close it and try again.
+-                ,
+-                    .{err},
+-                ) catch
+-                    \\Out of memory. This terminal is non-functional. Please close it and try again.
+-                ;
+-
+-                t.eraseDisplay(.complete, false);
+-                t.printString(str) catch {};
++                    \\The terminal is non‑functional. Please close it and try again.
++                , .{err}) catch
++                    \\Out of memory. The terminal will be unusable.
++
++                \\\\r
+             },
+-        }
++        };
++
++        t.eraseDisplay(.complete, false);
++        t.printString(msg) catch {};
+     };
+ 
+-    // If our loop is not stopped, then we need to keep running so that
+-    // messages are drained and we can wait for the surface to send a stop
+-    // message.
++    // If the event loop wasn't stopped
++    // (e.g., due to a panic), run the
++    // event loop to drain the mailbox.
+     if (!self.loop.stopped()) {
+-        log.warn("abrupt io thread exit detected, starting xev to drain mailbox", .{});
+-        defer log.debug("io thread fully exiting after abnormal failure", .{});
++        log.warn("abrupt IO thread exit detected; draining mailbox", .{});
++        defer log.debug("IO thread fully exiting after abnormal failure", .{});
+         self.flags.drain = true;
+-        self.loop.run(.until_done) catch |err| {
+-            log.err("failed to start xev loop for draining err={}", .{err});
+-        };
++        self.loop.run(.until_done) catch |e|
++            log.err("failed to start event loop for draining: {}", .{e});
+     }
+ }
+ 
++/// The main work routine for the thread.
+ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
+     defer log.debug("IO thread exited", .{});
+ 
+-    // Setup our crash metadata
++    // Set crash metadata for this thread.
+     crash.sentry.thread_state = .{
+         .type = .io,
+         .surface = io.surface_mailbox.surface,
+     };
+     defer crash.sentry.thread_state = null;
+ 
+-    // Get the mailbox. This must be an SPSC mailbox for threading.
++    // Get the mailbox writer. This must be an SPSC
++    // mailbox for threading.
+     const mailbox = switch (io.mailbox) {
+         .spsc => |*v| v,
+-        // else => return error.TermioUnsupportedMailbox,
+     };
+ 
+-    // This is the data sent to xev callbacks. We want a pointer to both
+-    // ourselves and the thread data so we can thread that through (pun intended).
+-    var cb: CallbackData = .{ .self = self, .io = io };
+-
+-    // Run our thread start/end callbacks. This allows the implementation
+-    // to hook into the event loop as needed. The thread data is created
+-    // on the stack here so that it has a stable pointer throughout the
+-    // lifetime of the thread.
++    // Bundle data passed to async callbacks.
++    var cb: CallbackData = .{
++        .self = self,
++        .io = io,
++    };
+     try io.threadEnter(self, &cb.data);
+     defer cb.data.deinit();
+     defer io.threadExit(&cb.data);
+ 
+-    // Start the async handlers.
++    // Async/await handlers.
+     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
+     self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+ 
+-    // Run
++    // Run.
+     log.debug("starting IO thread", .{});
+     defer log.debug("starting IO thread shutdown", .{});
+     try self.loop.run(.until_done);
+ }
+ 
+-/// This is the data passed to xev callbacks on the thread.
++/// The data passed to callbacks.
+ const CallbackData = struct {
+     self: *Thread,
+     io: *termio.Termio,
+     data: termio.Termio.ThreadData = undefined,
+ };
+ 
+-/// Drain the mailbox, handling all the messages in our terminal implementation.
+-fn drainMailbox(
+-    self: *Thread,
+-    cb: *CallbackData,
+-) !void {
+-    // We assert when starting the thread that this is the state
+-    const mailbox = cb.io.mailbox.spsc.queue;
+-    const io = cb.io;
+-    const data = &cb.data;
+-
+-    // If we're draining, we just drain the mailbox and return.
++/// Drain the mailbox and handle all queued messages.
++fn drainMailbox(self: *Thread, cb: *CallbackData) !void {
++    // If we're draining, just discard everything.
+     if (self.flags.drain) {
+-        while (mailbox.pop()) |_| {}
++        while (cb.io.mailbox.spsc.queue.pop()) |_| {}
+         return;
+     }
+ 
+-    // This holds the mailbox lock for the duration of the drain. The
+-    // expectation is that all our message handlers will be non-blocking
+-    // ENOUGH to not mess up throughput on producers.
+-    var redraw: bool = false;
+-    while (mailbox.pop()) |message| {
+-        // If we have a message we always redraw
++    var redraw = false;
++    while (cb.io.mailbox.spsc.queue.pop()) |message| {
+         redraw = true;
+-
+         log.debug("mailbox message={}", .{message});
++
+         switch (message) {
+-            .crash => @panic("crash request, crashing intentionally"),
+-            .change_config => |config| {
+-                defer config.alloc.destroy(config.ptr);
+-                try io.changeConfig(data, config.ptr);
++            .change_config => |cfg| {
++                defer cfg.alloc.destroy(cfg.ptr);
++                try io.changeConfig(&cb.data, cfg.ptr);
+             },
++
+             .inspector => |v| self.flags.has_inspector = v,
++
+             .resize => |v| self.handleResize(cb, v),
+-            .size_report => |v| try io.sizeReport(data, v),
+-            .clear_screen => |v| try io.clearScreen(data, v.history),
+-            .scroll_viewport => |v| try io.scrollViewport(v),
+-            .jump_to_prompt => |v| try io.jumpToPrompt(v),
++
++            .size_report => |v| try io.sizeReport(&cb.data, v),
++
++            .clear_screen => |v|
++                try io.clearScreen(&cb.data, v.history),
++
++            .scroll_viewport => |v|
++                try io.scrollViewport(v),
++
++            .jump_to_prompt => |v|
++                try io.jumpToPrompt(v),
++
+             .start_synchronized_output => self.startSynchronizedOutput(cb),
+-            .linefeed_mode => |v| self.flags.linefeed_mode = v,
+-            .child_exited_abnormally => |v| try io.childExitedAbnormally(v.exit_code, v.runtime_ms),
+-            .focused => |v| try io.focusGained(data, v),
+-            .write_small => |v| try io.queueWrite(
+-                data,
+-                v.data[0..v.len],
+-                self.flags.linefeed_mode,
+-            ),
+-            .write_stable => |v| try io.queueWrite(
+-                data,
+-                v,
+-                self.flags.linefeed_mode,
+-            ),
++
++            .linefeed_mode => |v|
++                self.flags.linefeed_mode = v,
++
++            .crash => @panic("crash request, intentionally crashing"),
++
++            .child_exited_abnormally => |v|
++                try io.childExitedAbnormally(v.exit_code, v.runtime_ms),
++
++            .focused => |v|
++                try io.focusGained(&cb.data, v),
++
++            .write_small => |v|
++                try io.queueWrite(&cb.data, v.data[0..v.len], self.flags.linefeed_mode),
++
++            .write_stable => |v|
++                try io.queueWrite(&cb.data, v, self.flags.linefeed_mode),
++
+             .write_alloc => |v| {
+                 defer v.alloc.free(v.data);
+-                try io.queueWrite(
+-                    data,
+-                    v.data,
+-                    self.flags.linefeed_mode,
+-                );
++                try io.queueWrite(&cb.data, v.data, self.flags.linefeed_mode);
+             },
+         }
+     }
+ 
+-    // Trigger a redraw after we've drained so we don't waste cyces
+-    // messaging a redraw.
+     if (redraw) {
++        // Notify the renderer to redraw.
+         try io.renderer_wakeup.notify();
+     }
+ }
+@@ -328,9 +296,9 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
+ fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
+     self.coalesce_data.resize = resize;
+ 
+-    // If the timer is already active we just return. In the future we want
+-    // to reset the timer up to a maximum wait time but for now this ensures
+-    // relatively smooth resizing.
++    // If the timer is already active we do
++    // nothing; the present timer
++    // will fire soon enough.
+     if (self.coalesce_c.state() == .active) return;
+ 
+     self.coalesce.reset(
+@@ -350,14 +318,13 @@ fn syncResetCallback(
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+ ) xev.CallbackAction {
+-    _ = r catch |err| switch (err) {
+-        error.Canceled => {},
++    _ = r catch |e| switch (e) {
++        error.Canceled => { return .disarm },
+         else => {
+-            log.warn("error during sync reset callback err={}", .{err});
+-            return .disarm;
+-        },
+-    };
+-
++            log.warn("Sync reset timer error: {}", .{e});
++                return .disarm;
++            },
++        };
+     const cb = cb_ orelse return .disarm;
+     cb.io.resetSynchronizedOutput();
+     return .disarm;
+@@ -369,26 +336,25 @@ fn coalesceCallback(
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+ ) xev.CallbackAction {
+-    _ = r catch |err| switch (err) {
+-        error.Canceled => {},
++    _ = r catch |e| switch (e) {
++        error.Canceled => return .disarm,
+         else => {
+-            log.warn("error during coalesce callback err={}", .{err});
+-            return .disarm;
+-        },
+-    };
+-
++            log.warn("Resize coalesce timer error: {}", .{e});
++                return .disarm;
++            },
++        };
+     const cb = cb_ orelse return .disarm;
+ 
+     if (cb.self.coalesce_data.resize) |v| {
+         cb.self.coalesce_data.resize = null;
+-        cb.io.resize(&cb.data, v) catch |err| {
+-            log.warn("error during resize err={}", .{err});
+-        };
++        cb.io.resize(&cb.data, v) catch |err|
++            log.warn("error during resize: {}", .{err});
+     }
+-
+     return .disarm;
+ }
+ 
++/// The async handler used to signal that there
++/// are pending messages for the thread.
+ fn wakeupCallback(
+     cb_: ?*CallbackData,
+     _: *xev.Loop,
+@@ -396,19 +362,16 @@ fn wakeupCallback(
+     r: xev.Async.WaitError!void,
+ ) xev.CallbackAction {
+     _ = r catch |err| {
+-        log.err("error in wakeup err={}", .{err});
++        log.err("wakeup async error: {}", .{err});
+         return .rearm;
+     };
+-
+-    // When we wake up, we check the mailbox. Mailbox producers should
+-    // wake up our thread after publishing.
+     const cb = cb_ orelse return .rearm;
+     cb.self.drainMailbox(cb) catch |err|
+-        log.err("error draining mailbox err={}", .{err});
+-
++        log.err("error draining mailbox: {}", .{err});
+     return .rearm;
+ }
+ 
++/// The async handler used to stop the thread.
+ fn stopCallback(
+     cb_: ?*CallbackData,
+     _: *xev.Loop,
+@@ -416,6 +379,7 @@ fn stopCallback(
+     r: xev.Async.WaitError!void,
+ ) xev.CallbackAction {
+     _ = r catch unreachable;
+-    cb_.?.self.loop.stop();
++    const cb = cb_ orelse return .disarm;
++    cb.self.loop.stop();
+     return .disarm;
+ }
+\ No newline at end of file

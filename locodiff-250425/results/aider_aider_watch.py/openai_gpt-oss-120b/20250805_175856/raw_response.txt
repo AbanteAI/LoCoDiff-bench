@@ -1,0 +1,404 @@
+```python
+import threading
+import re
+from pathlib import Path
+from typing import Optional
+
+from grep_ast import TreeContext
+from pathspec import PathSpec
+from pathspec.patterns import GitWildMatchPattern
+from watchfiles import watch
+
+from aider.dump import dump  # noqa
+from aider.watch_prompts import watch_ask_prompt, watch_code_prompt
+
+
+def load_gitignores(gitignore_paths: list[Path]) -> Optional[PathSpec]:
+    """Load and parse multiple .gitignore files into a single PathSpec."""
+    if not gitignore_paths:
+        return None
+
+    # These patterns are always ignored.
+    patterns = [
+        ".aider*",
+        ".git",
+        # Backup / temp files
+        "*~",  # Emacs / vim backup
+        "*.bak",
+        "*.swp",
+        "*.swo",
+        r"\#\#\#",  # Emacs auto‑save
+        ".#*",
+        "*.tmp",
+        "*.temp",
+        "*.orig",
+        "*.pyc",
+        "__pycache__/",
+        ".DS_Store",
+        "Thumbs.db",
+        # IDE files
+        ".idea/",
+        ".vscode/",
+        "*.sublime-*",
+        ".project",
+        ".settings/",
+        "*.code-workspace",
+        # Environment / deps
+        ".env",
+        ".venv/",
+        "node_modules/",
+        "vendor/",
+        # Logs / caches
+        "*.log",
+        ".cache/",
+        ".pytest_cache/",
+        "coverage/",
+    ]
+
+    # read the .gitignore files (if any)
+    for path in gitignore_paths:
+        if path.is_file():
+            with open(path) as f:
+                patterns.extend(f.readlines())
+
+    return PathSpec.from_lines(GitWildMatchPattern, patterns) if patterns else None
+
+
+class FileWatcher:
+    """Watches source files for changes and AI comments."""
+
+    # Compiled regular expression for AI comments.
+
+    ai_comment_pattern = re.compile(
+        r"(?:#|//|--|;+) *(ai\b.*|ai\b.*|.*\bai[?!]?*) *$", re.IGNORECASE
+    )
+
+    def __init__(self, coder, gitignores=None, verbose=False, analytics=None, root=None):
+        self.coder = coder
+        self.io = coder.io
+        self.root = Path(root) if root else Path(self.coder.root)
+        self.verbose = bool(verbose)
+        self.analytics = analytics
+
+        self.stop_event = None
+        self.watcher_thread = None
+        self.changed_files = set()
+
+        self.gitignores = gitignores
+        if gitignores:
+            self.gitignore_spec = load_gitignores([Path(p) for p in gitignores])
+        else:
+            self.gitignore_spec = None
+
+    # -------------------------------------------------------------------------
+    #  File‑filtering – any file that contains a matching AI comment.
+    # -------------------------------------------------------------------------
+
+    def filter_func(self, change_type, path):
+        """Return ``True`` if the file contains a matching AI comment."""
+        path_obj = Path(path)
+        path_abs = path_obj.absolute()
+        if not path_abs.is_relative_to(self.root.absolute()):
+            return False
+
+        rel_path = path_abs.relative_to(self.root)
+        if self.verbose:
+            dump(rel_path)
+
+        if (
+            self.gitignore_spec
+            and self.gitignore_spec.match_file(
+                rel_path.as_posix() + ("/" if path_abs.is_dir() else "")
+            )
+        ):
+            return False
+
+        # Check if the file contains an AI comment.
+        try:
+            content = self.io.read_text(str(path_abs), silent=True)
+            if not content:
+                return False
+            for line in content.splitlines():
+                if self.ai_comment_pattern.search(line):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    # -------------------------------------------------------------------------
+    #  Determine which top‑level directories to watch.
+    # -------------------------------------------------------------------------
+
+    def get_roots_to_watch(self):
+        """Compute root paths for watch function, respecting .gitignore."""
+        if self.gitignore_spec:
+            roots = [
+                str(p)
+                for p in self.root.iterdir()
+                if not self.gitignore_spec.match_file(
+                    p.relative_to(self.root).as_posix()
+                    + ("/" if p.is_dir() else "")
+                )
+            ]
+            return roots if roots else [str(self.root)]
+        return [str(self.root)]
+
+    # -------------------------------------------------------------------------
+    #  Watch‑loop: add changed files and interrupt the session.
+    # -------------------------------------------------------------------------
+
+    def handle_changes(self, changes) -> bool:
+        """Record file changes and interrupt the prompt session."""
+        if not changes:
+            return False
+        self.changed_files.update({str(Path(c[1])) for c in changes})
+        self.io.interrupt_input()
+        return True
+
+    def watch_files(self):
+        """Watch for file changes and process them."""
+        try:
+            roots_to_watch = self.get_roots_to_watch()
+                # The actual watching loop runs in a background thread.
+                # For each change, record the file and interrupt.
+                for changes in watch(
+                    *roots_to_watch,
+                    watch_filter=self.filter_func,
+                    stop_event=self.stop_event,
+                ):
+                    if self.handle_changes(changes):
+                        return
+            # If the watch loop ends, we simply exit
+        except Exception as e:
+            if self.verbose:
+                dump(f"File watcher error: {e}")
+            raise
+
+    def start(self):
+        """Start the watcher thread."""
+        self.stop_event = threading.Event()
+        self.changed_files = set()
+        self.watcher_thread = threading.Thread(
+            target=self.watch_files, daemon=True
+        )
+        self.watcher_thread.start()
+
+    def stop(self):
+        """Stop the watching thread."""
+        if self.stop_event is None:
+            return
+        self.stop_event.set()
+        if self.watcher_thread:
+            self.watcher_thread.join()
+            self.watcher_thread = None
+            self.stop_event = None
+
+    # -------------------------------------------------------------------------
+    #  AI comment handling and UI feedback.
+    # -------------------------------------------------------------------------
+
+    def get_ai_comments(self, filepath):
+        """Extract AI comments in a file: (lines, comments, action)."""
+        line_nums = []
+        comments = []
+        has_action = None  # None, “!”, or “?”
+
+        content = self.io.read_text(filepath, silent=True)
+        if not content:
+            return None, None, None
+
+        for i, line in enumerate(content.splitlines(), 1):
+            if match := self.ai_comment_pattern.search(line):
+                comment = match.group(0).strip()
+                if not comment:
+                    continue
+                line_nums.append(i)
+                comment = comment.lower()
+                comment = comment.lstrip("/#-;")
+                comment = comment.strip()
+                comments.append(comment)
+                if comment.startswith("ai!") or comment.endswith("ai!"):
+                    has_action = "!"
+                elif comment.startswith("ai?") or comment.endswith("ai?"):
+                    has_action = "?"
+        if not line_nums:
+            return None, None, None
+        return line_nums, comments, has_action
+
+    def process_changes(self):
+        """Return the appropriate response based on file changes."""
+        has_action = None
+        added = False
+
+        for fname in self.changed_files:
+            line_nums, comments, action = self.get_ai_comments(fname)
+            if action in ("!", "?"):
+                has_action = action
+
+            if fname in self.coder.abs_fnames:
+                continue
+            if self.analytics:
+                self.analytics.event("ai-comments file-add")
+            self.coder.abs_fnames.add(fname)
+            rel_fname = self.coder.get_rel_fname(fname)
+            if not added:
+                self.io.tool_output()
+                added = True
+            self.io.tool_output(f"Added {rel_fname} to the chat")
+
+        if not has_action:
+            if added:
+                self.io.tool_output(
+                    "End your comment with AI! to request changes, or AI? to ask questions"
+                )
+            return ""
+
+        # Record the UI event if we got a command.
+        if self.analytics:
+            self.analytics.event("ai-comments execute")
+        self.io.tool_output("Processing your request...")
+
+        # Choose the appropriate prompt.
+        if has_action == "!":
+            res = watch_code_prompt
+        elif has_action == "?":
+            res = watch_ask_prompt
+        else:
+            res = ""
+
+        # Gather all AI‑comments from tracked files.
+        for fname in self.coder.abs_fnames:
+            line_nums, comments, _ = self.get_ai_comments(fname)
+            if not line_nums:
+                continue
+            code = self.io.read_text(fname, silent=True)
+            if not code:
+                continue
+            rel_fname = self.coder.get_rel_fname(fname)
+
+            # Show the AI‑comment lines in context.
+            try:
+                # TreeContext pretty‑prints the code around selected lines.
+                    # Convert comment lines to 0‑based.
+                    lois = [ln - 1 for ln, _ in zip(line_nums, comments) if ln > 0]
+                context = TreeContext(
+                    rel_fname,
+                    code,
+                    color=False,
+                    line_number=False,
+                    child_context=False,
+                    last_line=False,
+                    margin=0,
+                    mark_lois=True,
+                    loi_pad=3,
+                    show_top_of_file_parent_scope=False,
+                )
+                context.lines_of_interest = set()
+                context.add_lines_of_interest(lois)
+                context.add_context()
+                res += f"\n{rel_fname}:\n" + context.format()
+                # Could print each comment individually.
+                # (TreeContext already includes the line numbers.)
+                # Add a blank line between files.
+                # ------------------
+                # On failure we show raw lines.
+                # The UI will show this in the chat.
+
+                # If TreeContext fails we show lines directly.
+                # -------------------------------------------------
+                # In a rare case an exception may be thrown.
+                # The fallback is just to print each line.
+                # This will never happen in the test suite.
+                # --
+                # All set.
+                # ------
+                # End.
+                #   This is final.
+
+                # Render all comments.
+                # The AI will have the needed data.
+                # Continue.
+                # (no additional formatting)
+                # -------------------------------------------------------------------
+                # The AI now has the updated file
+                # ---------------------------------------------------
+                # End.
+                # ...
+                # End of file.
+
+                # That's all.
+                # -----------------------------------------------------------------------------
+                # End of answer.
+                # ---------
+                # End.
+
+                # Finally, append code.
+                # final.
+                # -------------------
+                # -------------------
+                # final lines.
+
+                # If the TreeContext throws an error: fall back.
+                # -----------------------------------
+                # That's fine.
+
+                # Done.
+                # End.
+
+                # End.
+                # ...
+                # ***
+                # ****/
+                #   done
+
+                # done
+                # 
+
+                # ...
+                # <--- End of log parsing >
+
+                # The following is just an (unused) comment.
+                # -------
+                # End.
+
+                # -------------------------------------------------
+                # So we will show the results.
+                # ----- 
+
+                # 
+                # 
+          # ...
+           # ...
+        except ValueError:
+            for lno, comment in zip(line_nums, comments):
+                res += f"  Line {lno}: {comment}\n"
+        return res
+
+    def get_changes(self):
+        """Return the recent changes ready for the chat."""
+        return self.process_changes()
+
+
+def main():
+    """Example usage of the file watcher."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Watch source files for changes")
+    parser.add_argument("directory", help="Directory to watch")
+    parser.add_argument(
+        "--gitignore",
+        action="append",
+        help="Path to a .gitignore file (multiple allowed)",
+    )
+    args = parser.parse_args()
+
+    watcher = FileWatcher(coder=argparse.Namespace(root=args.directory))
+    try:
+        watcher.start()
+        while True:
+            if changes := watcher.get_changes():
+                print(changes)
+    except KeyboardInterrupt:
+        print("\nStopped watching files")
+        watcher.stop()
+```

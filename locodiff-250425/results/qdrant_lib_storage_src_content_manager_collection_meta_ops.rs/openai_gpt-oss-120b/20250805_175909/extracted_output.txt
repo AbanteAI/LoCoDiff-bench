@@ -1,0 +1,439 @@
+use std::collections::BTreeMap;
+
+use collection::config::{CollectionConfigInternal, CollectionParams, ShardingMethod};
+use collection::operations::config_diff::{
+    CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
+    WalConfigDiff,
+};
+use collection::operations::types::{
+    SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
+};
+use collection::shards::replica_set::ReplicaState;
+use collection::shards::resharding::ReshardKey;
+use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
+use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
+use collection::shards::{CollectionId, replica_set};
+use schemars::JsonSchema;
+use segment::types::{
+    PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+    VectorNameBuf,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use validator::Validate;
+
+use crate::content_manager::shard_distribution::ShardDistributionProposal;
+use crate::content_manager::errors::{StorageError, StorageResult};
+
+/// Operation wrapper structure is only required for better OpenAPI generation
+
+/// Create alternative name for a collection.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateAlias {
+    pub collection_name: String,
+    pub alias_name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateAliasOperation {
+    pub create_alias: CreateAlias,
+}
+
+/// Delete alias if exists.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct DeleteAlias {
+    pub alias_name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct DeleteAliasOperation {
+    pub delete_alias: DeleteAlias,
+}
+
+/// Change alias to a new one.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct RenameAlias {
+    pub old_alias_name: String,
+    pub new_alias_name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct RenameAliasOperation {
+    pub rename_alias: RenameAlias,
+}
+
+/// Group of all possible operations related to collection aliases.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum AliasOperations {
+    CreateAlias(CreateAliasOperation),
+    DeleteAlias(DeleteAliasOperation),
+    RenameAlias(RenameAliasOperation),
+}
+
+impl From<CreateAlias> for AliasOperations {
+    fn from(create_alias: CreateAlias) -> Self {
+        AliasOperations::CreateAlias(CreateAliasOperation { create_alias })
+    }
+}
+impl From<DeleteAlias> for AliasOperations {
+    fn from(delete_alias: DeleteAlias) -> Self {
+        AliasOperations::Delete(DeleteAliasOperation { delete_alias })
+    }
+}
+impl From<RenameAlias> for AliasOperations {
+    fn from(rename_alias: RenameAlias) -> Self {
+        AliasOperations::Rename(RenameAliasOperation { rename_alias })
+    }
+}
+
+/// Used for creating a collection from an existing collection.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+pub struct InitFrom {
+    pub collection: CollectionId,
+}
+
+/// Create a new collection.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateCollection {
+    /// Vector data configuration.
+    #[serde(default)]
+    #[validate(nested)]
+    pub vectors: VectorsConfig,
+    /// For auto-sharding:
+    ///
+    /// Number of shards in the collection.
+    ///   - Default is 1 for standalone, otherwise equal to the number of nodes.
+    ///   - Minimum is 1
+    ///
+    /// For custom sharding:
+    ///
+    /// Number of shards in the collection per shard group.
+    ///   - Default is 1, meaning that each shard key will be mapped to a single shard.
+    ///   - Minimum is 1
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub shard_number: Option<u32>,
+    /// Sharding method.
+    #[serde(default)]
+    pub sharding_method: Option<ShardingMethod>,
+    /// Number of shards replicas.
+    /// Default is 1.
+    /// Minimum is 1.
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub replication_factor: Option<u32>,
+    /// Number of replicas that must apply the operation for it to be considered successful.
+    #[serde(default)]
+    #[range(min = 1)]
+    pub write_consistency_factor: Option<u32>,
+    /// If `true` the point's payload is stored on disk.
+    /// Default: true.
+    #[serde(default)]
+    pub on_disk_payload: Option<bool>,
+    /// Custom HNSW configuration.
+    #[validate(nested)]
+    pub hnsw_config: Option<HnswConfigDiff>,
+    /// Custom WAL configuration.
+    #[validate(nested)]
+    pub wal_config: Option<WalConfigDiff>,
+    /// Optimizer configuration.
+    #[serde(alias = "optimizer_config")]
+    #[validate(nested)]
+    pub optimizers_config: Option<OptimizersConfigDiff>,
+    /// Specify other collection to copy data from.
+    #[serde(default)]
+    pub init_from: Option<InitFrom>,
+    /// Quantisation configuration.
+    #[serde(default, alias = "quantization")]
+    #[validate(nested)]
+    pub quantization_config: Option<QuantizationConfig>,
+    /// Sparse vector data configuration.
+    #[validate(nested)]
+    pub sparse_vectors: Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
+    /// Strict-mode configuration.
+    #[validate(nested)]
+    #[schemars(skip)]
+    pub strict_mode_config: Option<StrictModeConfig>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub uuid: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateCollectionOperation {
+    pub collection_name: String,
+    pub create_collection: CreateCollection,
+    distribution: Option<ShardDistributionProposal>,
+}
+
+impl CreateCollectionOperation {
+    /// Creates a new `CreateCollectionOperation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dense and sparse vector names conflict.
+    pub fn new(
+        collection_name: String,
+        create_collection: CreateCollection,
+    ) -> StorageResult<Self> {
+        // Ensure dense and sparse vector names are unique.
+        if let Some(sparse) = &create_collection.sparse_vectors {
+            let dense_names = create_collection.vectors.params_iter().map(|p| p.0);
+            if let Some(duplicate) = dense_names.find(|n| sparse.contains_key(*n)) {
+                return Err(StorageError::bad_input(format!(
+                    "Dense and sparse vector names must be unique - duplicate found with '{duplicate}'"
+                )));
+            }
+        }
+        Ok(Self {
+            collection_name,
+            create_collection,
+            distribution: None,
+        })
+    }
+
+    pub fn is_distribution_set(&self) -> bool {
+        self.distribution.is_some()
+    }
+
+    pub fn take_distribution(&mut self) -> Option<ShardDistributionProposal> {
+        self.distribution.take()
+    }
+
+    pub fn set_distribution(&mut self, distribution: ShardDistributionProposal) {
+        self.distribution = Some(distribution);
+    }
+}
+
+/// Use config of an existing collection to create a new collection.
+impl From<CollectionConfigInternal> for CreateCollection {
+    fn from(value: CollectionConfigInternal) -> Self {
+        let CollectionConfigInternal {
+            params:
+                CollectionParams {
+                    vectors,
+                    shard_number,
+                    sharding_method,
+                    replication_factor,
+                    write_consistency_factor,
+                    read_fan_out_factor: _,
+                    on_disk_payload,
+                    sparse_vectors,
+                },
+                hnsw_config,
+                optimizer_config,
+                wal_config,
+                quantization_config,
+                strict_mode_config,
+                uuid,
+            } = value;
+
+            Self {
+                vectors,
+                shard_number: Some(shard_number.get()),
+                sharding_method,
+                replication_factor: Some(replication_factor.get()),
+                write_consistency_factor: Some(write_consistency_factor.get()),
+                on_disk_payload: Some(on_disk_payload),
+                hnsw_config: Some(hnsw_config.into()),
+                wal_config: Some(wal_config.into()),
+                optimizers_config: Some(optimizer_config.into()),
+                init_from: None,
+                quantization_config,
+                sparse_vectors,
+                strict_mode_config,
+                uuid,
+            }
+        }
+    }
+
+/// Update collection parameters.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct UpdateCollection {
+    /// Vector parameters to update.
+    #[validate(nested)]
+    pub vectors: Option<VectorsConfigDiff>,
+    /// Optimizer configuration.
+    #[serde(alias = "optimizer_config")]
+    #[validate(nested)]
+    pub optimizers_config: Option<OptimizersConfigDiff>,
+    /// Base collection parameters.
+    pub params: Option<CollectionParamsDiff>,
+    /// HNSW configuration.
+    #[validate(nested)]
+    pub hnsw_config: Option<HnswConfigDiff>,
+    /// Quantisation configuration.
+    #[serde(default, alias = "quantization")]
+    #[validate(nested)]
+    pub quantization_config: Option<QuantizationConfigDiff>,
+    /// Sparse vector configuration.
+    #[validate(nested)]
+    pub sparse_vectors: Option<SparseVectorsConfig>,
+    #[validate(nested)]
+    pub strict_mode_config: Option<StrictModeConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct UpdateCollectionOperation {
+    pub collection_name: String,
+    pub update_collection: UpdateCollection,
+    shard_replica_changes: Option<Vec<replica_set::Change>>,
+}
+
+impl UpdateCollectionOperation {
+    pub fn new_empty(collection_name: String) -> Self {
+        Self {
+            collection_name,
+            update_collection: UpdateCollection {
+                vectors: None,
+                optimizers_config: None,
+                params: None,
+                hnsw_config: None,
+                quantization_config: None,
+                sparse_vectors: None,
+                strict_mode_config: None,
+            },
+            shard_replica_changes: None,
+        }
+    }
+
+    pub fn new(collection_name: String, update_collection: UpdateCollection) -> Self {
+        Self {
+            collection_name,
+            update_collection,
+            shard_replica_changes: None,
+        }
+    }
+
+    pub fn set_shard_replica_changes(&mut self, changes: Vec<replica_set::Change>) {
+        if changes.is_empty() {
+            self.shard_replica_changes = None;
+        } else {
+            self.shard_replica_changes = Some(changes);
+        }
+    }
+
+    pub fn take_shard_replica_changes(&mut self) -> Option<Vec<replica_set::Change>> {
+        self.shard_replica_changes.take()
+    }
+}
+
+/// Change the aliases of a collection.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct ChangeAliasesOperation {
+    pub actions: Vec<AliasOperations>,
+}
+
+/// Delete a collection.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct DeleteCollectionOperation(pub String);
+
+/// Operations for shard transfers.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub enum ShardTransferOperations {
+    /// Start a transfer.
+    Start(ShardTransfer),
+    /// Restart an existing transfer with a new configuration.
+    Restart(ShardTransferRestart),
+    /// Finish a transfer.
+    Finish(ShardTransfer),
+    /// Deprecated since Qdrant 1.9.0, used in Qdrant 1.7.0 and 1.8.0.
+    ///
+    /// Used for `ShardTransferMethod::Snapshot`.
+    ///
+    /// Called when the snapshot has been recovered on the remote, moving the
+    /// transfer to the next stage.
+    SnapshotRecovered(ShardTransferKey),
+    /// Used for `ShardTransferMethod::Snapshot` and `ShardTransferMethod::WalDelta`.
+    ///
+    /// Called when the first stage of the transfer has been
+    /// successfully finished, moving the transfer to the next stage.
+    RecoveryToPartial(ShardTransferKey),
+    /// Abort a transfer.
+    Abort {
+        transfer: ShardTransferKey,
+        reason: String,
+    },
+}
+
+/// Ensure the replica is in a valid state before applying a transition.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct SetShardReplicaState {
+    pub collection_name: String,
+    pub shard_id: ShardId,
+    pub peer_id: PeerId,
+    pub state: ReplicaState,
+    #[serde(default)]
+    pub from_state: Option<ReplicaState>,
+}
+
+/// Create a shard key.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct CreateShardKey {
+    pub collection_name: String,
+    pub shard_key: ShardKey,
+    pub placement: ShardsPlacement,
+}
+
+/// Drop a shard key.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct DropShardKey {
+    pub collection_name: String,
+    pub shard_key: ShardKey,
+}
+
+/// Create payload index for a collection field.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct CreatePayloadIndex {
+    pub collection_name: String,
+    pub field_name: PayloadKeyType,
+    pub field_schema: PayloadFieldSchema,
+}
+
+/// Drop a payload index from a collection field.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct DropPayloadIndex {
+    pub collection_name: String,
+    pub field_name: PayloadKeyType,
+}
+
+/// Resharding operations.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum ReshardingOperation {
+    Start(ReshardKey),
+    CommitRead(ReshardKey),
+    CommitWrite(ReshardKey),
+    Finish(ReshardKey),
+    Abort(ReshardKey),
+}
+
+/// All possible collection operations.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionMetaOperations {
+    CreateCollection(CreateCollectionOperation),
+    UpdateCollection(UpdateCollectionOperation),
+    DeleteCollection(DeleteCollectionOperation),
+    ChangeAliases(ChangeAliasesOperation),
+    TransferShard(CollectionId, ShardTransferOperations),
+    SetShardReplicaState(SetShardReplicaState),
+    CreateShardKey(CreateShardKey),
+    DropShardKey(DropShardKey),
+    CreatePayloadIndex(CreatePayloadIndex),
+    DropPayloadIndex(DropPayloadIndex),
+    Resharding(CollectionId, ReshardingOperation),
+    Nop { token: usize },
+}

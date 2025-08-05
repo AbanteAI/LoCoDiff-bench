@@ -1,0 +1,323 @@
+```python
+import os
+import re
+import subprocess
+import sys
+import traceback
+import warnings
+import shlex
+from dataclasses import dataclass
+from pathlib import Path
+
+from grep_ast import TreeContext, filename_to_lang
+from grep_ast.tsl import get_parser  # noqa: E402
+
+from aider.run_cmd import run_cmd_subprocess  # noqa: F401
+
+# tree_sitter is throwing a FutureWarning
+warnings.simplefilter("ignore", category=FutureWarning)
+
+
+@dataclass
+class LintResult:
+    text: str
+    lines: list
+
+
+class Linter:
+    def __init__(self, encoding: str = "utf-8", root=None):
+        self.encoding = encoding
+        self.root = root
+
+        self.languages = {"python": self.py_lint}
+        self.all_lint_cmd = None
+
+        self._check_eslint()
+
+    def _check_eslint(self):
+        """Detect a local eslint for TypeScript files and set a linter command."""
+        eslint_names = ["eslint", "eslint.cmd", "eslint.exe"]
+        eslint_paths = [
+            Path(".") / "node_modules" / ".bin",
+            Path(self.root) / "node_modules" / ".bin"
+            if self.root
+            else None,
+        ]
+
+        for path in eslint_paths:
+            if not path:
+                continue
+            for name in eslint_names:
+                eslint_file = path / name
+                # Avoid paths with spaces – they cause shell parsing problems.
+                if eslint_file.is_file() and " " not in str(eslint_file)):
+                    self.languages["typescript"] = f"{eslint_file} --format unix"
+                    return
+
+    def set_linter(self, lang: str | None, cmd: str | None):
+        """Set a custom linter command for a language, or a global command."""
+        if lang:
+            self.languages[lang] = cmd
+            return
+        self.all_lint_cmd = cmd
+
+    def get_rel_fname(self, fname: str) -> str:
+        """Return a path relative to the root, handling errors."""
+        if self.root:
+            try:
+                return os.path.relpath(fname, self.root)
+            except ValueError:
+                return fname
+        return fname
+
+    def run_cmd(self, cmd: str, rel_fname: str, code: str):
+        """Execute a linter command, returning a LintResult."""
+        cmd = f"{cmd} {shlex.quote(rel_fname)}"
+
+        returncode = 0
+        stdout = ""
+
+        try:
+            returncode, stdout = run_cmd_subprocess(
+                cmd,
+                cwd=self.root,
+                encoding=self.encoding,
+            )
+        except OSError as err:
+            print(f"Unable to execute lint command: {err}")
+            return
+
+        errors = stdout
+        if returncode == 0:
+            return  # zero exit status
+
+        # prepend a header describing the command that was run
+        res = f"## Running: {cmd}\n\n"
+        res += errors
+
+        return self.errors_to_lint_result(rel_fname, res)
+
+    def errors_to_lint_result(self, rel_fname: str, errors: str):
+        """Convert raw lint output into a LintResult, extracting line numbers."""
+        if not errors:
+            return
+
+        linenums: list[int] = []
+        filenames_linenums = find_filenames_and_linenums(errors, [rel_fname])
+        if filenames_linenums:
+            _fname, linenums = next(iter(filenames_linenums.items()))
+            linenums = [num - 1 for num in linenums]  # adjust to 0‑based
+
+        return LintResult(text=errors, lines=linenums)
+
+    def lint(self, fname: str, cmd: str | None = None):
+        """Run the appropriate linter for the given file."""
+        rel_fname = self.get_rel_fname(fname)
+
+        # read the file – we replace errors with the Unicode replacement character
+        # to avoid UnicodeDecodeError on binary files.
+        code = Path(fname).read_text(encoding=self.encoding, errors="replace")
+
+        if cmd:
+            cmd = cmd.strip()
+
+        if not cmd:
+            lang = filename_to_lang(fname)
+            if not lang:
+                return
+            cmd = self.languages.get(lang)
+
+        if callable(cmd):
+            lint_res = cmd(fname, rel_fname, code)
+        elif cmd:
+            lint_res = self.run_cmd(cmd, rel_fname=rel_fname, code=code)
+        else:
+            # fallback to the tree‑sitter based basic lint
+            lint_res = basic_lint(rel_fname, code)
+
+        if not lint_res:
+            return
+
+        # Compose the final output for the user.
+        res = "# Fix any errors below, if possible.\n\n"
+        res += lint_res.text
+        res += "\n"
+        # The tree should be displayed with the same relative name that was
+        # passed to the linter, not the absolute path (easier to read).
+        res += tree_context(rel_fname, code, lint_res.lines)
+        return res
+
+    def py_lint(self, fname: str, rel_fname: str, code: str):
+        """Run Python‑specific linters (tree‑sitter, pycompile and flake8)."""
+        basic_res = basic_lint(rel_fname, code)
+        compile_res = lint_python_compile(fname, code)
+
+        result_text = ""
+        result_lines = set()
+
+        for res in [basic_res, compile_res]:
+            if not res:
+                continue
+            if isinstance(res, LintResult):
+                result_text += res.text + ("\n" if result_text else "")
+                result_lines.update(res.lines)
+
+        flake_res = self.flake8_lint(rel_fname)
+        if flake_res:
+            result_text += flake_res.text + ("\n" if result_text else "")
+            result_lines.update(flake_res.lines)
+
+        if result_text or result_lines:
+            return LintResult(text=result_text, lines=list(result_lines))
+
+    def flake8_lint(self, rel_fname: str):
+        """Run Flake8 on a Python file and return a LintResult."""
+        fatal = "E9,F821,F823,F831,F406,F407,F701,F702,F704,F706"
+        flake8_cmd = [
+            sys.executable,
+            "-m",
+            "flake8",
+            f"--select={fatal}",
+            "--show-source",
+            "--isolated",
+            rel_fname,
+        ]
+
+        try:
+            result = subprocess.run(
+                flake8_cmd,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                check=False,
+                encoding=self.encoding,
+                errors="replace",
+            )
+            errors = result.stdout + result.stderr
+        except Exception as e:
+            errors = f"Error running flake8: {str(e)}"
+
+        if not errors:
+            return
+
+        text = f"## Running: {' '.join(flake8_cmd)}\n\n"
+        # convert flake8 output into a LintResult (extract filenames and line numbers)
+        return self.errors_to_lint_result(rel_fname, text + errors)
+
+
+def lint_python_compile(fname: str, code: str):
+    """Compile Python source, returning error details if compilation fails."""
+    try:
+        compile(code, fname, "exec")
+        return
+    except Exception as err:
+        # Determine the range of lines that may be problematic.
+        end_lineno = getattr(err, "end_lineno", err.lineno)
+        line_numbers = list(range(err.lineno - 1, end_lineno))
+
+        # Produce a traceback that excludes the location
+        # of the file that we are linting (the outermost call).
+        tb_lines = traceback.format_exception(type(err), err,
+                                               err.__traceback__)
+        # Find the stack frame entry containing the
+        # file name of the file we have just
+        # linted.
+        last_file_i = 0
+
+        for i, line in enumerate(tb_lines):
+            if "File " in line:
+                last_file_i = i
+
+        # Skip that entry.
+        tb_lines = tb_lines[:1] + tb_lines[last_file_i + 1 :]
+
+        # Put everything together.
+        res = "".join(tb_lines)
+
+        return LintResult(text=res, lines=line_numbers)
+
+
+def basic_lint(fname: str, code: str):
+    """Parse a file using tree‑sitter and return a LintResult."""
+    # Try to infer the language from the filename.
+    lang = filename_to_lang(fname)
+    if not lang:
+        return
+
+    # Tree‑sitter currently does not know how to parse TypeScript.
+    if lang == "typescript":
+        return
+
+    # Load the language parser.
+    try:
+        parser = get_parser(lang)
+    except Exception as err:
+        # get_parser may raise a number of different exceptions
+        # depending on the missing language (e.g. OSError).
+        print(f"Unable to load parser: {err}")
+        return
+
+    tree = parser.parse(bytes(code, "utf-8"))
+    try:
+        errors = traverse_tree(tree.root_node)
+    except RecursionError:
+        print(f"Unable to lint {fname} due to RecursionError")
+        return
+
+    if not errors:
+        # No errors, nothing to return.
+        return
+
+    return LintResult(text="", lines=errors)
+
+
+def tree_context(fname: str, code: str, line_nums: list[int] | set[int]):
+    """Wrap the TreeContext code in a nicely‑formatted result."""
+    context = TreeContext(
+        fname,
+        code,
+        color=False,
+        line_number=True,
+        child_context=False,
+        last_line=False,
+        margin=0,
+        mark_lois=True,
+        loi_pad=3,
+        show_top_of_file_parent_scope=False,
+    )
+    line_nums = set(line_nums)
+    context.add_lines_of_interest(line_nums)
+    context.add_context()
+    s = "s" if len(line_nums) > 1 else ""
+    output = f"## See relevant line{s} below marked with █.\n\n"
+    output += fname + ":\n"
+    output += context.format()
+    return output
+
+
+def traverse_tree(node):
+    """Recursively walk the tree, looking for ERROR‑type nodes."""
+    errors = []
+    if node.type == "ERROR" or node.is_missing:
+        errors.append(node.start_point[0])
+    for child in node.children:
+        errors.extend(traverse_tree(child))
+    return errors
+
+
+def find_filenames_and_linenums(text: str, fnames: list[str]):
+    """
+    Search text for all occurrences of <filename>:<linenum> patterns where
+    <filename> is one of the filenames in ``fnames``.
+    Returns a mapping `{filename: {linenum, ...}}`.
+    """
+    pattern = re.compile(
+        r"(\b(?:" + "|".join(re.escape(fname) for fname in fnames) + r"):\d+\b)"
+    )
+    matches = pattern.findall(text)
+    result: dict[str, set[int]] = {}
+    for match in matches:
+        fname, linenum = match.rsplit(":", 1)
+        result.setdefault(fname, set()).add(int(linenum)))
+    return result
+```
