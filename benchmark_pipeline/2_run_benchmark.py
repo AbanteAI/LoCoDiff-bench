@@ -152,6 +152,9 @@ async def get_model_response_openrouter(
                 "max_tokens": 50000,
             }
         }
+    elif model_name == "openai/gpt-5:minimal":
+        model_name = "openai/gpt-5"
+        extra_body = {"reasoning": {"effort": "minimal"}}
     elif model_name == "google/gemini-2.5-pro-preview-06-05":
         # OpenRouter uses the generic "gemini-2.5-pro-preview" endpoint for the latest preview version
         model_name = "google/gemini-2.5-pro-preview"
