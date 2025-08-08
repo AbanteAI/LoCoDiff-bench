@@ -1,0 +1,442 @@
+
+index 1790a2e6e..721804139 100644
+--- a/ghostty_src_font_face_coretext.zig_expectedoutput.txt (expected):tmp/tmpsu7o_jrt_expected.txt	
++++ b/ghostty_src_font_face_coretext.zig_extracted.txt (actual):tmp/tmp5zd4rlw0_actual.txt	
+@@ -18,6 +18,9 @@ pub const Face = struct {
+     /// if we're using Harfbuzz.
+     hb_font: if (harfbuzz_shaper) harfbuzz.Font else void,
+ 
++    /// Metrics for this font face. These are useful for renderers.
++    metrics: font.face.Metrics,
++
+     /// Set quirks.disableDefaultFontFeatures
+     quirks_disable_default_font_features: bool = false,
+ 
+@@ -84,6 +87,11 @@ pub const Face = struct {
+     /// the CTFont. This does NOT copy or retain the CTFont.
+     pub fn initFont(ct_font: *macos.text.Font, opts: font.face.Options) !Face {
+         const traits = ct_font.getSymbolicTraits();
++        const metrics = metrics: {
++            var metrics = try calcMetrics(ct_font);
++            if (opts.metric_modifiers) |v| metrics.apply(v.*);
++            break :metrics metrics;
++        };
+ 
+         var hb_font = if (comptime harfbuzz_shaper) font: {
+             var hb_font = try harfbuzz.coretext.createFont(ct_font);
+@@ -101,6 +109,7 @@ pub const Face = struct {
+         var result: Face = .{
+             .font = ct_font,
+             .hb_font = hb_font,
++            .metrics = metrics,
+             .color = color,
+         };
+         result.quirks_disable_default_font_features = quirks.disableDefaultFontFeatures(&result);
+@@ -331,8 +340,36 @@ pub const Face = struct {
+             .advance_x = 0,
+         };
+ 
+-        const width: u32 = @intCast(x1 - x0);
+-        const height: u32 = @intCast(y1 - y0);
++        // Additional padding we need to add to the bitmap context itself
++        // due to the glyph being larger than standard.
++        // The extra +1 only applies to the right and bottom edges, since
++        // we already give those only glyphs a one pixel separation in the
++        // atlas itself.
++        const padding_ctx: u32 = padding_ctx: {
++            var result: u32 = 0;
++
++            // If we're doing thicken, add padding of up to one px
++            // (but not for sbix glyphs, see above).
++            if (opts.thicken and !sbix) result += 1;
++
++            // If we have a synthetic bold, add padding for the stroke width
++            if (self.synthetic_bold) |line_width| {
++                result += @intFromFloat(@ceil(line_width) / 2);
++            }
++
++            break :padding_ctx result;
++        };
++
++        // Since we're sampling from the output buffer into the atlas with
++        // bi-linear filtering we add a 1px separation between all glyphs,
++        // but only on the right and bottom edge.
++        const padding: u32 = 1;
++
++        // Our width is the distance from x1 to x0 plus any padding.
++        const padded_width: u32 = @intCast(x1 - x0) + padding_ctx + padding;
++
++        // Our height is the distance from y1 to y0 plus any padding.
++        const padded_height: u32 = @intCast(y1 - y0) + padding_ctx + padding;
+ 
+         // Settings that are specific to if we are rendering text or emoji.
+         const color: struct {
+@@ -343,12 +380,13 @@ pub const Face = struct {
+         } = if (!self.isColorGlyph(glyph_index)) .{
+             .color = false,
+             .depth = 1,
+-            .space = try macos.graphics.ColorSpace.createNamed(.linearGray),
+-            .context_opts = @intFromEnum(macos.graphics.ImageAlphaInfo.only),
++            .space = try macos.graphics.ColorSpace.createDeviceGray(),
++            .context_opts = @intFromEnum(macos.graphics.BitmapInfo.alpha_mask) &
++                @intFromEnum(macos.graphics.ImageAlphaInfo.none),
+         } else .{
+             .color = true,
+             .depth = 4,
+-            .space = try macos.graphics.ColorSpace.createNamed(.displayP3),
++            .space = try macos.graphics.ColorSpace.createDeviceRGB(),
+             .context_opts = @intFromEnum(macos.graphics.BitmapInfo.byte_order_32_little) |
+                 @intFromEnum(macos.graphics.ImageAlphaInfo.premultiplied_first),
+         };
+@@ -367,17 +405,17 @@ pub const Face = struct {
+         // usually stabilizes pretty quickly and is very infrequent so I think
+         // the allocation overhead is acceptable compared to the cost of
+         // caching it forever or having to deal with a cache lifetime.
+-        const buf = try alloc.alloc(u8, width * height * color.depth);
++        const buf = try alloc.alloc(u8, padded_width * padded_height * color.depth);
+         defer alloc.free(buf);
+         @memset(buf, 0);
+ 
+         const context = macos.graphics.BitmapContext.context;
+         const ctx = try macos.graphics.BitmapContext.create(
+             buf,
+-            width,
+-            height,
++            padded_width,
++            padded_height,
+             8,
+-            width * color.depth,
++            padded_width * color.depth,
+             color.space,
+             color.context_opts,
+         );
+@@ -388,12 +426,12 @@ pub const Face = struct {
+         if (color.color)
+             context.setRGBFillColor(ctx, 1, 1, 1, 0)
+         else
+-            context.setGrayFillColor(ctx, 1, 0);
++            context.setGrayFillColor(ctx, 0, 0);
+         context.fillRect(ctx, .{
+             .origin = .{ .x = 0, .y = 0 },
+             .size = .{
+-                .width = @floatFromInt(width),
+-                .height = @floatFromInt(height),
++                .width = @floatFromInt(padded_width),
++                .height = @floatFromInt(padded_height),
+             },
+         });
+ 
+@@ -411,9 +449,8 @@ pub const Face = struct {
+             context.setRGBFillColor(ctx, 1, 1, 1, 1);
+             context.setRGBStrokeColor(ctx, 1, 1, 1, 1);
+         } else {
+-            const strength: f64 = @floatFromInt(opts.thicken_strength);
+-            context.setGrayFillColor(ctx, strength / 255.0, 1);
+-            context.setGrayStrokeColor(ctx, strength / 255.0, 1);
++            context.setGrayFillColor(ctx, 1, 1);
++            context.setGrayStrokeColor(ctx, 1, 1);
+         }
+ 
+         // If we are drawing with synthetic bold then use a fill stroke
+@@ -423,59 +460,64 @@ pub const Face = struct {
+             context.setLineWidth(ctx, line_width);
+         }
+ 
+-        // We want to render the glyphs at (0,0), but the glyphs themselves
+-        // are offset by bearings, so we have to undo those bearings in order
+-        // to get them to 0,0.
++        // We want to render the glyphs so that their bounding box has its
++        // bottom left corner at [padding_ctx, padding_ctx] in the output.
++        const padding_ctx_f64: f64 = @floatFromInt(padding_ctx);
+         self.font.drawGlyphs(&glyphs, &.{
+             .{
+-                .x = @floatFromInt(-x0),
+-                .y = @floatFromInt(-y0),
++                .x = padding_ctx_f64 - @as(f64, @floatFromInt(x0)),
++                .y = padding_ctx_f64 - @as(f64, @floatFromInt(y0)),
+             },
+         }, ctx);
+ 
+         const region = region: {
+-            // We reserve a region that's 1px wider and taller than we need
+-            // in order to create a 1px separation between adjacent glyphs
+-            // to prevent interpolation with adjacent glyphs while sampling
+-            // from the atlas.
++            // Get the full padded region
+             var region = try atlas.reserve(
+                 alloc,
+-                width + 1,
+-                height + 1,
++                padded_width + padding, // +1 because we pad the right edge
++                padded_height + padding, // +1 because we pad the bottom edge
+             );
+ 
+-            // We adjust the region width and height back down since we
+-            // don't need the extra pixel, we just needed to reserve it
+-            // so that it isn't used for other glyphs in the future.
+-            region.width -= 1;
+-            region.height -= 1;
++            // Move up and left by one so that we have a proper margin.
++            region.width -= padding;
++            region.height -= padding;
++
+             break :region region;
+         };
+         atlas.set(region, buf);
+ 
+-        const metrics = opts.grid_metrics;
++        const metrics = opts.grid_metrics orelse self.metrics;
++        const offset_y: i32 = offset_y: {
++            // Our Y coordinate in 3D is (0, 0) bottom left, +y is UP.
++            // We need to calculate our baseline from the bottom of a cell.
++            const baseline_from_bottom: f64 = @floatFromInt(metrics.cell_baseline);
+ 
+-        // This should be the distance from the bottom of
+-        // the cell to the top of the glyph's bounding box.
+-        //
+-        // The calculation is distance from bottom of cell to
+-        // baseline plus distance from baseline to top of glyph.
+-        const offset_y: i32 = @as(i32, @intCast(metrics.cell_baseline)) + y1;
++            // The ascent is the number of pixels above the baseline;
++            // this also accounts for everything that's above y0 and
++            // rounded up so that it looks even.
++            const glyph_ascent: f64 = @floatFromInt(y1 - y0);
++
++            // Next we offset our baseline by the bearing in the font. We
++            // ADD here because CoreText y is UP.
++            const baseline_with_offset = baseline_from_bottom + glyph_ascent;
++
++            // Add our context padding we may have created.
++            const baseline_with_padding = baseline_with_offset + padding_ctx_f64;
++
++            break :offset_y @intFromFloat(@ceil(baseline_with_padding));
++        };
+ 
+-        // This should be the distance from the left of
+-        // the cell to the left of the glyph's bounding box.
+         const offset_x: i32 = offset_x: {
+-            var result: i32 = x0;
++            // Don't forget to apply our context padding if we have one
++            var result: i32 = @intFromFloat(@as(f64, @floatFromInt(x0)) - padding_ctx_f64);
+ 
+-            // If our cell was resized then we adjust our glyph's
+-            // position relative to the new center. This keeps glyphs
+-            // centered in the cell whether it was made wider or narrower.
++            // If our cell was resized to be wider then we center our
++            // glyph in the cell.
+             if (metrics.original_cell_width) |original_width| {
+-                const before: i32 = @intCast(original_width);
+-                const after: i32 = @intCast(metrics.cell_width);
+-                // Increase the offset by half of the difference
+-                // between the widths to keep things centered.
+-                result += @divTrunc(after - before, 2);
++                if (original_width < metrics.cell_width) {
++                    const diff = (metrics.cell_width - original_width) / 2;
++                    result += @intCast(diff);
++                }
+             }
+ 
+             break :offset_x result;
+@@ -485,9 +527,21 @@ pub const Face = struct {
+         var advances: [glyphs.len]macos.graphics.Size = undefined;
+         _ = self.font.getAdvancesForGlyphs(.horizontal, &glyphs, &advances);
+ 
++        // std.log.warn("renderGlyph rect={} width={} height={} render_x={} render_y={} offset_y={} ascent={} cell_height={} cell_baseline={}", .{
++        //     rect,
++        //     width,
++        //     height,
++        //     render_x,
++        //     render_y,
++        //     offset_y,
++        //     glyph_ascent,
++        //     self.metrics.cell_height,
++        //     self.metrics.cell_baseline,
++        // });
++
+         return .{
+-            .width = width,
+-            .height = height,
++            .width = padded_width,
++            .height = padded_height,
+             .offset_x = offset_x,
+             .offset_y = offset_y,
+             .atlas_x = region.x,
+@@ -496,30 +550,18 @@ pub const Face = struct {
+         };
+     }
+ 
+-    pub const GetMetricsError = error{
++    const CalcMetricsError = error{
+         CopyTableError,
+         InvalidHeadTable,
+         InvalidPostTable,
+         InvalidHheaTable,
+     };
+ 
+-    /// Get the `FaceMetrics` for this face.
+-    pub fn getMetrics(self: *Face) GetMetricsError!font.Metrics.FaceMetrics {
+-        const ct_font = self.font;
+-
++    fn calcMetrics(ct_font: *macos.text.Font) CalcMetricsError!font.face.Metrics {
+         // Read the 'head' table out of the font data.
+         const head: opentype.Head = head: {
+-            // macOS bitmap-only fonts use a 'bhed' tag rather than 'head', but
+-            // the table format is byte-identical to the 'head' table, so if we
+-            // can't find 'head' we try 'bhed' instead before failing.
+-            //
+-            // ref: https://fontforge.org/docs/techref/bitmaponlysfnt.html
+-            const head_tag = macos.text.FontTableTag.init("head");
+-            const bhed_tag = macos.text.FontTableTag.init("bhed");
+-            const data =
+-                ct_font.copyTable(head_tag) orelse
+-                ct_font.copyTable(bhed_tag) orelse
+-                return error.CopyTableError;
++            const tag = macos.text.FontTableTag.init("head");
++            const data = ct_font.copyTable(tag) orelse return error.CopyTableError;
+             defer data.release();
+             const ptr = data.getPointer();
+             const len = data.getLength();
+@@ -724,7 +766,7 @@ pub const Face = struct {
+             break :cell_width max;
+         };
+ 
+-        return .{
++        return font.face.Metrics.calc(.{
+             .cell_width = cell_width,
+             .ascent = ascent,
+             .descent = descent,
+@@ -735,7 +777,7 @@ pub const Face = struct {
+             .strikethrough_thickness = strikethrough_thickness,
+             .cap_height = cap_height,
+             .ex_height = ex_height,
+-        };
++        });
+     }
+ 
+     /// Copy the font table data for the given tag.
+@@ -759,7 +801,7 @@ pub const Face = struct {
+ };
+ 
+ /// The state associated with a font face that may have colorized glyphs.
+-/// This is used to determine if a specific glyph ID is colorized.
++— This is used to determine if a specific glyph ID is colorized.
+ const ColorState = struct {
+     /// True if there is an sbix font table. For now, the mere presence
+     /// of an sbix font table causes us to assume the glyph is colored.
+@@ -859,12 +901,7 @@ test {
+     var i: u8 = 32;
+     while (i < 127) : (i += 1) {
+         try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
++        _ = try face.renderGlyph(alloc, &atlas, face.glyphIndex(i).?, .{});
+     }
+ }
+ 
+@@ -924,12 +961,7 @@ test "in-memory" {
+     var i: u8 = 32;
+     while (i < 127) : (i += 1) {
+         try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
++        _ = try face.renderGlyph(alloc, &atlas, face.glyphIndex(i).?, .{});
+     }
+ }
+ 
+@@ -951,12 +983,7 @@ test "variable" {
+     var i: u8 = 32;
+     while (i < 127) : (i += 1) {
+         try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
++        _ = try face.renderGlyph(alloc, &atlas, face.glyphIndex(i).?, .{});
+     }
+ }
+ 
+@@ -982,12 +1009,7 @@ test "variable set variation" {
+     var i: u8 = 32;
+     while (i < 127) : (i += 1) {
+         try testing.expect(face.glyphIndex(i) != null);
+-        _ = try face.renderGlyph(
+-            alloc,
+-            &atlas,
+-            face.glyphIndex(i).?,
+-            .{ .grid_metrics = font.Metrics.calc(try face.getMetrics()) },
+-        );
++        _ = try face.renderGlyph(alloc, &atlas, face.glyphIndex(i).?, .{});
+     }
+ }
+ 
+@@ -1029,4 +1051,59 @@ test "glyphIndex colored vs text" {
+         try testing.expectEqual(11482, glyph);
+         try testing.expect(face.isColorGlyph(glyph));
+     }
++}
++
++test "coretext: metrics" {
++    const testFont = font.embedded.inconsolata;
++    const alloc = std.testing.allocator;
++
++    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
++    defer atlas.deinit(alloc);
++
++    var ct_font = try Face.init(
++        undefined,
++        testFont,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer ct_font.deinit();
++
++    try std.testing.expectEqual(font.face.Metrics{
++        .cell_width = 8,
++        // The cell height is 17 px because the calculation is
++        //
++        //  ascender - descender + gap
++        //
++        // which, for inconsolata is
++        //
++        //  859 - -190 + 0
++        //
++        // font units, at 1000 units per em that works out to 1.049 em,
++        // and 1em should be the point size * dpi scale, so 12 * (96/72)
++        // which is 16, and 16 * 1.049 = 16.784, which finally is rounded
++        // to 17.
++        .cell_height = 17,
++        .cell_baseline = 3,
++        .underline_position = 17,
++        .underline_thickness = 1,
++        .strikethrough_position = 10,
++        .strikethrough_thickness = 1,
++        .overline_position = 0,
++        .overline_thickness = 1,
++        .box_thickness = 1,
++    }, ct_font.metrics);
++
++    // Resize should change metrics
++    try ct_font.setSize(.{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } });
++    try std.testing.expectEqual(font.face.Metrics{
++        .cell_width = 16,
++        .cell_height = 34,
++        .cell_baseline = 6,
++        .underline_position = 34,
++        .underline_thickness = 2,
++        .strikethrough_position = 19,
++        .strikethrough_thickness = 2,
++        .overline_position = 0,
++        .overline_thickness = 2,
++        .box_thickness = 2,
++    }, ct_font.metrics);
+ }
+\ No newline at end of file
