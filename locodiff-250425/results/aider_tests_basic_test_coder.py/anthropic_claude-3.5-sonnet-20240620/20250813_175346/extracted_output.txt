@@ -1,0 +1,492 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import git
+
+from aider.coders import Coder
+from aider.coders.base_coder import FinishReasonLength, UnknownEditFormat
+from aider.dump import dump  # noqa: F401
+from aider.io import InputOutput
+from aider.models import Model
+from aider.repo import GitRepo
+from aider.sendchat import sanity_check_messages
+from aider.utils import GitTemporaryDirectory
+
+
+class TestCoder(unittest.TestCase):
+    def setUp(self):
+        self.GPT35 = Model("gpt-3.5-turbo")
+        self.webbrowser_patcher = patch("aider.io.webbrowser.open")
+        self.mock_webbrowser = self.webbrowser_patcher.start()
+
+    def test_allowed_to_edit(self):
+        with GitTemporaryDirectory():
+            repo = git.Repo()
+
+            fname = Path("added.txt")
+            fname.touch()
+            repo.git.add(str(fname))
+
+            fname = Path("repo.txt")
+            fname.touch()
+            repo.git.add(str(fname))
+
+            repo.git.commit("-m", "init")
+
+            # YES!
+            # Use a completely mocked IO object instead of a real one
+            io = MagicMock()
+            io.confirm_ask = MagicMock(return_value=True)
+            coder = Coder.create(self.GPT35, None, io, fnames=["added.txt"])
+
+            self.assertTrue(coder.allowed_to_edit("added.txt"))
+            self.assertTrue(coder.allowed_to_edit("repo.txt"))
+            self.assertTrue(coder.allowed_to_edit("new.txt"))
+
+            self.assertIn("repo.txt", str(coder.abs_fnames))
+            self.assertIn("new.txt", str(coder.abs_fnames))
+
+            self.assertFalse(coder.need_commit_before_edits)
+
+    def test_allowed_to_edit_no(self):
+        with GitTemporaryDirectory():
+            repo = git.Repo()
+
+            fname = Path("added.txt")
+            fname.touch()
+            repo.git.add(str(fname))
+
+            fname = Path("repo.txt")
+            fname.touch()
+            repo.git.add(str(fname))
+
+            repo.git.commit("-m", "init")
+
+            # say NO
+            io = InputOutput(yes=False)
+
+            coder = Coder.create(self.GPT35, None, io, fnames=["added.txt"])
+
+            self.assertTrue(coder.allowed_to_edit("added.txt"))
+            self.assertFalse(coder.allowed_to_edit("repo.txt"))
+            self.assertFalse(coder.allowed_to_edit("new.txt"))
+
+            self.assertNotIn("repo.txt", str(coder.abs_fnames))
+            self.assertNotIn("new.txt", str(coder.abs_fnames))
+
+            self.assertFalse(coder.need_commit_before_edits)
+
+    def test_allowed_to_edit_dirty(self):
+        with GitTemporaryDirectory():
+            repo = git.Repo()
+
+            fname = Path("added.txt")
+            fname.touch()
+            repo.git.add(str(fname))
+
+            repo.git.commit("-m", "init")
+
+            # say NO
+            io = InputOutput(yes=False)
+
+            coder = Coder.create(self.GPT35, None, io, fnames=["added.txt"])
+
+            self.assertTrue(coder.allowed_to_edit("added.txt"))
+            self.assertFalse(coder.need_commit_before_edits)
+
+            fname.write_text("dirty!")
+            self.assertTrue(coder.allowed_to_edit("added.txt"))
+            self.assertTrue(coder.need_commit_before_edits)
+
+    def test_get_files_content(self):
+        tempdir = Path(tempfile.mkdtemp())
+
+        file1 = tempdir / "file1.txt"
+        file2 = tempdir / "file2.txt"
+
+        file1.touch()
+        file2.touch()
+
+        files = [file1, file2]
+
+        # Initialize the Coder object with the mocked IO and mocked repo
+        coder = Coder.create(self.GPT35, None, io=InputOutput(), fnames=files)
+
+        content = coder.get_files_content().splitlines()
+        self.assertIn("file1.txt", content)
+        self.assertIn("file2.txt", content)
+
+    def test_check_for_filename_mentions(self):
+        with GitTemporaryDirectory():
+            repo = git.Repo()
+
+            mock_io = MagicMock()
+
+            fname1 = Path("file1.txt")
+            fname2 = Path("file2.py")
+
+            fname1.write_text("one\n")
+            fname2.write_text("two\n")
+
+            repo.git.add(str(fname1))
+            repo.git.add(str(fname2))
+            repo.git.commit("-m", "new")
+
+            # Initialize the Coder object with the mocked IO and mocked repo
+            coder = Coder.create(self.GPT35, None, mock_io)
+
+            # Call the check_for_file_mentions method
+            coder.check_for_file_mentions("Please check file1.txt and file2.py")
+
+            # Check if coder.abs_fnames contains both files
+            expected_files = set(
+                [
+                    str(Path(coder.root) / fname1),
+                    str(Path(coder.root) / fname2),
+                ]
+            )
+
+            self.assertEqual(coder.abs_fnames, expected_files)
+
+    def test_check_for_ambiguous_filename_mentions_of_longer_paths(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=True)
+            coder = Coder.create(self.GPT35, None, io)
+
+            fname = Path("file1.txt")
+            fname.touch()
+
+            other_fname = Path("other") / "file1.txt"
+            other_fname.parent.mkdir(parents=True, exist_ok=True)
+            other_fname.touch()
+
+            mock = MagicMock()
+            mock.return_value = set([str(fname), str(other_fname)])
+            coder.repo.get_tracked_files = mock
+
+            # Call the check_for_file_mentions method
+            coder.check_for_file_mentions(f"Please check {fname}!")
+
+            self.assertEqual(coder.abs_fnames, set([str(fname.resolve())]))
+
+    def test_check_for_file_mentions_read_only(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(
+                pretty=False,
+                yes=True,
+            )
+            coder = Coder.create(self.GPT35, None, io)
+
+            fname = Path("readonly_file.txt")
+            fname.touch()
+
+            coder.abs_read_only_fnames.add(str(fname.resolve()))
+
+            # Mock the get_tracked_files method
+            mock = MagicMock()
+            mock.return_value = set([str(fname)])
+            coder.repo.get_tracked_files = mock
+
+            # Call the check_for_file_mentions method
+            result = coder.check_for_file_mentions(f"Please check {fname}!")
+
+            # Assert that the method returns None (user not asked to add the file)
+            self.assertIsNone(result)
+
+            # Assert that abs_fnames is still empty (file not added)
+            self.assertEqual(coder.abs_fnames, set())
+
+    def test_check_for_file_mentions_with_mocked_confirm(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False)
+            coder = Coder.create(self.GPT35, None, io)
+
+            # Mock get_file_mentions to return two file names
+            coder.get_file_mentions = MagicMock(return_value=set(["file1.txt", "file2.txt"]))
+
+            # Mock confirm_ask to return False for the first call and True for the second
+            io.confirm_ask = MagicMock(side_effect=[False, True, True])
+
+            # First call to check_for_file_mentions
+            coder.check_for_file_mentions("Please check file1.txt for the info")
+
+            # Assert that confirm_ask was called twice
+            self.assertEqual(io.confirm_ask.call_count, 2)
+
+            # Assert that only file2.txt was added to abs_fnames
+            self.assertEqual(len(coder.abs_fnames), 1)
+            self.assertIn("file2.txt", str(coder.abs_fnames))
+
+            # Reset the mock
+            io.confirm_ask.reset_mock()
+
+            # Second call to check_for_file_mentions
+            coder.check_for_file_mentions("Please check file1.txt and file2.txt again")
+
+            # Assert that confirm_ask was called only once (for file1.txt)
+            self.assertEqual(io.confirm_ask.call_count, 1)
+
+            # Assert that abs_fnames still contains only file2.txt
+            self.assertEqual(len(coder.abs_fnames), 1)
+            self.assertIn("file2.txt", str(coder.abs_fnames))
+
+            # Assert that file1.txt is in ignore_mentions
+            self.assertIn("file1.txt", coder.ignore_mentions)
+
+    def test_check_for_subdir_mention(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=True)
+            coder = Coder.create(self.GPT35, None, io)
+
+            fname = Path("other") / "file1.txt"
+            fname.parent.mkdir(parents=True, exist_ok=True)
+            fname.touch()
+
+            mock = MagicMock()
+            mock.return_value = set([str(fname)])
+            coder.repo.get_tracked_files = mock
+
+            # Call the check_for_file_mentions method
+            coder.check_for_file_mentions(f"Please check `{fname}`")
+
+            self.assertEqual(coder.abs_fnames, set([str(fname.resolve())]))
+
+    def test_get_file_mentions_various_formats(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=True)
+            coder = Coder.create(self.GPT35, None, io)
+
+            # Create test files
+            test_files = [
+                "file1.txt",
+                "file2.py",
+                "dir/nested_file.js",
+                "dir/subdir/deep_file.html",
+                "file99.txt",
+                "special_chars!@#.md",
+            ]
+
+            # Pre-format the Windows path to avoid backslash issues in f-string expressions
+            windows_path = test_files[2].replace("/", "\\")
+            win_path3 = test_files[3].replace("/", "\\")
+
+            for fname in test_files:
+                fpath = Path(fname)
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.touch()
+
+            # Mock get_addable_relative_files to return our test files
+            coder.get_addable_relative_files = MagicMock(return_value=set(test_files))
+
+            # Test different mention formats
+            test_cases = [
+                # Simple plain text mentions
+                (f"You should edit {test_files[0]} first", {test_files[0]}),
+                # Multiple files in plain text
+                (f"Edit both {test_files[0]} and {test_files[1]}", {test_files[0], test_files[1]}),
+                # Files in backticks
+                (f"Check the file `{test_files[2]}`", {test_files[2]}),
+                # Files in code blocks
+                (f"```\n{test_files[3]}\n```", {test_files[3]}),
+                # Files in code blocks with language specifier
+                # (
+                #    f"```python\nwith open('{test_files[1]}', 'r') as f:\n"
+                #    f"    data = f.read()\n```",
+                #    {test_files[1]},
+                # ),
+                # Files with Windows-style paths
+                (f"Edit the file {windows_path}", {test_files[2]}),
+                # Files with different quote styles
+                (f'Check "{test_files[5]}" now', {test_files[5]}),
+                # All files in one complex message
+                (
+                    (
+                        f"First, edit `{test_files[0]}`. Then modify {test_files[1]}.\n"
+                        f"```js\n// Update this file\nconst file = '{test_files[2]}';\n```\n"
+                        f"Finally check {win_path3}"
+                    ),
+                    {test_files[0], test_files[1], test_files[2], test_files[3]},
+                ),
+                # Files mentioned in markdown bold format
+                (f"You should check **{test_files[0]}** for issues", {test_files[0]}),
+                (
+                    f"Look at both **{test_files[1]}** and **{test_files[2]}**",
+                    {test_files[1], test_files[2]},
+                ),
+                (
+                    f"The file **{win_path3}** needs updating",
+                    {test_files[3]},
+                ),
+                (
+                    f"Files to modify:\n- **{test_files[0]}**\n- **{test_files[4]}**",
+                    {test_files[0], test_files[4]},
+                ),
+            ]
+
+            for content, expected_mentions in test_cases:
+                with self.subTest(content=content):
+                    mentioned_files = coder.get_file_mentions(content)
+                    self.assertEqual(
+                        mentioned_files,
+                        expected_mentions,
+                        f"Failed to extract mentions from: {content}",
+                    )
+
+    def test_get_file_mentions_multiline_backticks(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=True)
+            coder = Coder.create(self.GPT35, None, io)
+
+            # Create test files
+            test_files = [
+                "swebench/harness/test_spec/python.py",
+                "swebench/harness/test_spec/javascript.py",
+            ]
+            for fname in test_files:
+                fpath = Path(fname)
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.touch()
+
+            # Mock get_addable_relative_files to return our test files
+            coder.get_addable_relative_files = MagicMock(return_value=set(test_files))
+
+            # Input text with multiline backticked filenames
+            content = """
+Could you please **add the following files to the chat**?
+
+1.  `swebench/harness/test_spec/python.py`
+2.  `swebench/harness/test_spec/javascript.py`
+
+Once I have these, I can show you precisely how to do the thing.
+"""
+            expected_mentions = {
+                "swebench/harness/test_spec/python.py",
+                "swebench/harness/test_spec/javascript.py",
+            }
+
+            mentioned_files = coder.get_file_mentions(content)
+            self.assertEqual(
+                mentioned_files,
+                expected_mentions,
+                f"Failed to extract mentions from multiline backticked content: {content}",
+            )
+
+    def test_get_file_mentions_path_formats(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=True)
+            coder = Coder.create(self.GPT35, None, io)
+
+            # Create files with same basename in different directories
+            fname1 = Path("dir1") / "file.txt"
+            fname2 = Path("dir2") / "file.txt"
+            fname3 = Path("dir3") / "unique.txt"
+
+            for fname in [fname1, fname2, fname3]:
+                fname.parent.mkdir(parents=True, exist_ok=True)
+                fname.touch()
+
+            # Add one file to chat
+            coder.add_rel_fname(str(fname1))
+
+            # Mock get_tracked_files to return all files
+            mock = MagicMock()
+            mock.return_value = set([str(fname1), str(fname2), str(fname3)])
+            coder.repo.get_tracked_files = mock
+
+            # Check that file mentions of a pure basename skips files with duplicate basenames
+            mentioned = coder.get_file_mentions(f"Check {fname2.name} and {fname3}")
+            self.assertEqual(mentioned, {str(fname3)})
+
+            # Add a read-only file with same basename
+            coder.abs_read_only_fnames.add(str(fname2.resolve()))
+            mentioned = coder.get_file_mentions(f"Check {fname1} and {fname3}")
+            self.assertEqual(mentioned, {str(fname3)})
+
+    def test_run_with_file_deletion(self):
+        # Create a few temporary files
+
+        tempdir = Path(tempfile.mkdtemp())
+
+        file1 = tempdir / "file1.txt"
+        file2 = tempdir / "file2.txt"
+
+        file1.touch()
+        file2.touch()
+
+        files = [file1, file2]
+
+        # Initialize the Coder object with the mocked IO and mocked repo
+        coder = Coder.create(self.GPT35, None, io=InputOutput(), fnames=files)
+
+        def mock_send(*args, **kwargs):
+            coder.partial_response_content = "ok"
+            coder.partial_response_function_call = dict()
+            return []
+
+        coder.send = mock_send
+
+        # Call the run method with a message
+        coder.run(with_message="hi")
+        self.assertEqual(len(coder.abs_fnames), 2)
+
+        file1.unlink()
+
+        # Call the run method again with a message
+        coder.run(with_message="hi")
+        self.assertEqual(len(coder.abs_fnames), 1)
+
+    def test_run_with_file_unicode_error(self):
+        # Create a few temporary files
+        _, file1 = tempfile.mkstemp()
+        _, file2 = tempfile.mkstemp()
+
+        files = [file1, file2]
+
+        # Initialize the Coder object with the mocked IO and mocked repo
+        coder = Coder.create(self.GPT35, None, io=InputOutput(), fnames=files)
+
+        def mock_send(*args, **kwargs):
+            coder.partial_response_content = "ok"
+            coder.partial_response_function_call = dict()
+            return []
+
+        coder.send = mock_send
+
+        # Call the run method with a message
+        coder.run(with_message="hi")
+        self.assertEqual(len(coder.abs_fnames), 2)
+
+        # Write some non-UTF8 text into the file
+        with open(file1, "wb") as f:
+            f.write(b"\x80abc")
+
+        # Call the run method again with a message
+        coder.run(with_message="hi")
+        self.assertEqual(len(coder.abs_fnames), 1)
+
+    def test_choose_fence(self):
+        # Create a few temporary files
+        _, file1 = tempfile.mkstemp()
+
+        with open(file1, "wb") as f:
+            f.write(b"this contains\n```\nbackticks")
+
+        files = [file1]
+
+        # Initialize the Coder object with the mocked IO and mocked repo
+        coder = Coder.create(self.GPT35, None, io=InputOutput(), fnames=files)
+
+        def mock_send(*args, **kwargs):
+            coder.partial_response_content = "ok"
+            coder.partial_response_function_call = dict()
+            return []
+
+        coder.send = mock_send
+
+        # Call the run method with a message
+        coder.run(with_message="hi")
+
+        self.assertNotEqual(coder.fence[0], "
