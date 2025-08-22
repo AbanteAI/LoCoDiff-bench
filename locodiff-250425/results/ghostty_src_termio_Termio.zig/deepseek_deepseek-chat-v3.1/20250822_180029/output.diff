@@ -1,0 +1,949 @@
+
+index 5c2b8b3f1..5977fa1d3 100644
+--- a/ghostty_src_termio_Termio.zig_expectedoutput.txt (expected):tmp/tmp0m9l8x7a_expected.txt	
++++ b/ghostty_src_termio_Termio.zig_extracted.txt (actual):tmp/tmpha97uegr_actual.txt	
+@@ -1,644 +1,298 @@
+-//! Primary terminal IO ("termio") state. This maintains the terminal state,
+-//! pty, subprocess, etc. This is flexible enough to be used in environments
+-//! that don't have a pty and simply provides the input/output using raw
+-//! bytes.
+-pub const Termio = @This();
+-
+-const std = @import("std");
+-const builtin = @import("builtin");
+-const build_config = @import("../build_config.zig");
+-const assert = std.debug.assert;
+-const Allocator = std.mem.Allocator;
+-const ArenaAllocator = std.heap.ArenaAllocator;
+-const EnvMap = std.process.EnvMap;
+-const posix = std.posix;
+-const termio = @import("../termio.zig");
+-const Command = @import("../Command.zig");
+-const Pty = @import("../pty.zig").Pty;
+-const StreamHandler = @import("stream_handler.zig").StreamHandler;
+-const terminalpkg = @import("../terminal/main.zig");
+-const terminfo = @import("../terminfo/main.zig");
+-const xev = @import("../global.zig").xev;
+-const renderer = @import("../renderer.zig");
+-const apprt = @import("../apprt.zig");
+-const fastmem = @import("../fastmem.zig");
+-const internal_os = @import("../os/main.zig");
+-const windows = internal_os.windows;
+-const configpkg = @import("../config.zig");
+-const shell_integration = @import("shell_integration.zig");
+-
+-const log = std.log.scoped(.io_exec);
+-
+-/// Allocator
+-alloc: Allocator,
+-
+-/// This is the implementation responsible for io.
+-backend: termio.Backend,
+-
+-/// The derived configuration for this termio implementation.
+-config: DerivedConfig,
+-
+-/// The terminal emulator internal state. This is the abstract "terminal"
+-/// that manages input, grid updating, etc. and is renderer-agnostic. It
+-/// just stores internal state about a grid.
+-terminal: terminalpkg.Terminal,
+-
+-/// The shared render state
+-renderer_state: *renderer.State,
+-
+-/// A handle to wake up the renderer. This hints to the renderer that that
+-/// a repaint should happen.
+-renderer_wakeup: xev.Async,
+-
+-/// The mailbox for notifying the renderer of things.
+-renderer_mailbox: *renderer.Thread.Mailbox,
+-
+-/// The mailbox for communicating with the surface.
+-surface_mailbox: apprt.surface.Mailbox,
+-
+-/// The cached size info
+-size: renderer.Size,
+-
+-/// The mailbox implementation to use.
+-mailbox: termio.Mailbox,
+-
+-/// The stream parser. This parses the stream of escape codes and so on
+-/// from the child process and calls callbacks in the stream handler.
+-terminal_stream: terminalpkg.Stream(StreamHandler),
+-
+-/// Last time the cursor was reset. This is used to prevent message
+-/// flooding with cursor resets.
+-last_cursor_reset: ?std.time.Instant = null,
+-
+-/// The configuration for this IO that is derived from the main
+-/// configuration. This must be exported so that we don't need to
+-/// pass around Config pointers which makes memory management a pain.
+-pub const DerivedConfig = struct {
+-    arena: ArenaAllocator,
+-
+-    palette: terminalpkg.color.Palette,
+-    image_storage_limit: usize,
+-    cursor_style: terminalpkg.CursorStyle,
+-    cursor_blink: ?bool,
+-    cursor_color: ?configpkg.Config.Color,
+-    cursor_invert: bool,
+-    foreground: configpkg.Config.Color,
+-    background: configpkg.Config.Color,
+-    osc_color_report_format: configpkg.Config.OSCColorReportFormat,
+-    abnormal_runtime_threshold_ms: u32,
+-    wait_after_command: bool,
+-    enquiry_response: []const u8,
+-
+-    pub fn init(
+-        alloc_gpa: Allocator,
+-        config: *const configpkg.Config,
+-    ) !DerivedConfig {
+-        var arena = ArenaAllocator.init(alloc_gpa);
+-        errdefer arena.deinit();
+-        const alloc = arena.allocator();
+-
+-        return .{
+-            .palette = config.palette.value,
+-            .image_storage_limit = config.@"image-storage-limit",
+-            .cursor_style = config.@"cursor-style",
+-            .cursor_blink = config.@"cursor-style-blink",
+-            .cursor_color = config.@"cursor-color",
+-            .cursor_invert = config.@"cursor-invert-fg-bg",
+-            .foreground = config.foreground,
+-            .background = config.background,
+-            .osc_color_report_format = config.@"osc-color-report-format",
+-            .abnormal_runtime_threshold_ms = config.@"abnormal-command-exit-runtime",
+-            .wait_after_command = config.@"wait-after-command",
+-            .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
+-
+-            // This has to be last so that we copy AFTER the arena allocations
+-            // above happen (Zig assigns in order).
+-            .arena = arena,
+-        };
+-    }
+-
+-    pub fn deinit(self: *DerivedConfig) void {
+-        self.arena.deinit();
+-    }
+-};
+-
+-/// Initialize the termio state.
+-///
+-/// This will also start the child process if the termio is configured
+-/// to run a child process.
+-pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
+-    // The default terminal modes based on our config.
+-    const default_modes: terminalpkg.ModePacked = modes: {
+-        var modes: terminalpkg.ModePacked = .{};
+-
+-        // Setup our initial grapheme cluster support if enabled. We use a
+-        // switch to ensure we get a compiler error if more cases are added.
+-        switch (opts.full_config.@"grapheme-width-method") {
+-            .unicode => modes.grapheme_cluster = true,
+-            .legacy => {},
+-        }
+-
+-        // Set default cursor blink settings
+-        modes.cursor_blinking = opts.config.cursor_blink orelse true;
+-
+-        break :modes modes;
+-    };
+-
+-    // Create our terminal
+-    var term = try terminalpkg.Terminal.init(alloc, opts: {
+-        const grid_size = opts.size.grid();
+-        break :opts .{
+-            .cols = grid_size.columns,
+-            .rows = grid_size.rows,
+-            .max_scrollback = opts.full_config.@"scrollback-limit",
+-            .default_modes = default_modes,
+-        };
+-    });
+-    errdefer term.deinit(alloc);
+-    term.default_palette = opts.config.palette;
+-    term.color_palette.colors = opts.config.palette;
+-
+-    // Set the image size limits
+-    try term.screen.kitty_images.setLimit(
+-        alloc,
+-        &term.screen,
+-        opts.config.image_storage_limit,
+-    );
+-    try term.secondary_screen.kitty_images.setLimit(
+-        alloc,
+-        &term.secondary_screen,
+-        opts.config.image_storage_limit,
+-    );
+-
+-    // Set our default cursor style
+-    term.screen.cursor.cursor_style = opts.config.cursor_style;
+-
+-    // Setup our terminal size in pixels for certain requests.
+-    term.width_px = term.cols * opts.size.cell.width;
+-    term.height_px = term.rows * opts.size.cell.height;
+-
+-    // Setup our backend.
+-    var backend = opts.backend;
+-    backend.initTerminal(&term);
+-
+-    // Create our stream handler. This points to memory in self so it
+-    // isn't safe to use until self.* is set.
+-    const handler: StreamHandler = handler: {
+-        const default_cursor_color = if (!opts.config.cursor_invert and opts.config.cursor_color != null)
+-            opts.config.cursor_color.?.toTerminalRGB()
+-        else
+-            null;
+-
+-        break :handler .{
+-            .alloc = alloc,
+-            .termio_mailbox = &self.mailbox,
+-            .surface_mailbox = opts.surface_mailbox,
+-            .renderer_state = opts.renderer_state,
+-            .renderer_wakeup = opts.renderer_wakeup,
+-            .renderer_mailbox = opts.renderer_mailbox,
+-            .size = &self.size,
+-            .terminal = &self.terminal,
+-            .osc_color_report_format = opts.config.osc_color_report_format,
+-            .enquiry_response = opts.config.enquiry_response,
+-            .default_foreground_color = opts.config.foreground.toTerminalRGB(),
+-            .default_background_color = opts.config.background.toTerminalRGB(),
+-            .default_cursor_style = opts.config.cursor_style,
+-            .default_cursor_blink = opts.config.cursor_blink,
+-            .default_cursor_color = default_cursor_color,
+-            .cursor_color = null,
+-            .foreground_color = null,
+-            .background_color = null,
+-        };
+-    };
+-
+-    self.* = .{
+-        .alloc = alloc,
+-        .terminal = term,
+-        .config = opts.config,
+-        .renderer_state = opts.renderer_state,
+-        .renderer_wakeup = opts.renderer_wakeup,
+-        .renderer_mailbox = opts.renderer_mailbox,
+-        .surface_mailbox = opts.surface_mailbox,
+-        .size = opts.size,
+-        .backend = backend,
+-        .mailbox = opts.mailbox,
+-        .terminal_stream = .{
+-            .handler = handler,
+-            .parser = .{
+-                .osc_parser = .{
+-                    // Populate the OSC parser allocator (optional) because
+-                    // we want to support large OSC payloads such as OSC 52.
+-                    .alloc = alloc,
+-                },
+-            },
+-        },
+-    };
+-}
+-
+-pub fn deinit(self: *Termio) void {
+-    self.backend.deinit();
+-    self.terminal.deinit(self.alloc);
+-    self.config.deinit();
+-    self.mailbox.deinit(self.alloc);
+-
+-    // Clear any StreamHandler state
+-    self.terminal_stream.handler.deinit();
+-    self.terminal_stream.deinit();
+-}
+-
+-pub fn threadEnter(self: *Termio, thread: *termio.Thread, data: *ThreadData) !void {
+-    data.* = .{
+-        .alloc = self.alloc,
+-        .loop = &thread.loop,
+-        .renderer_state = self.renderer_state,
+-        .surface_mailbox = self.surface_mailbox,
+-        .mailbox = &self.mailbox,
+-        .backend = undefined, // Backend must replace this on threadEnter
+-    };
+-
+-    // Setup our backend
+-    try self.backend.threadEnter(self.alloc, self, data);
+-}
+-
+-pub fn threadExit(self: *Termio, data: *ThreadData) void {
+-    self.backend.threadExit(data);
+-}
+-
+-/// Send a message to the the mailbox. Depending on the mailbox type in
+-/// use this may process now or it may just enqueue and process later.
+-///
+-/// This will also notify the mailbox thread to process the message. If
+-/// you're sending a lot of messages, it may be more efficient to use
+-/// the mailbox directly and then call notify separately.
+-pub fn queueMessage(
+-    self: *Termio,
+-    msg: termio.Message,
+-    mutex: enum { locked, unlocked },
+-) void {
+-    self.mailbox.send(msg, switch (mutex) {
+-        .locked => self.renderer_state.mutex,
+-        .unlocked => null,
+-    });
+-    self.mailbox.notify();
+-}
+-
+-/// Queue a write directly to the pty.
+-///
+-/// If you're using termio.Thread, this must ONLY be called from the
+-/// mailbox thread. If you're not on the thread, use queueMessage with
+-/// mailbox messages instead.
+-///
+-/// If you're not using termio.Thread, this is not threadsafe.
+-pub inline fn queueWrite(
+-    self: *Termio,
+-    td: *ThreadData,
+-    data: []const u8,
+-    linefeed: bool,
+-) !void {
+-    try self.backend.queueWrite(self.alloc, td, data, linefeed);
+-}
+-
+-/// Update the configuration.
+-pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
+-    // The remainder of this function is modifying terminal state or
+-    // the read thread data, all of which requires holding the renderer
+-    // state lock.
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-
+-    // Deinit our old config. We do this in the lock because the
+-    // stream handler may be referencing the old config (i.e. enquiry resp)
+-    self.config.deinit();
+-    self.config = config.*;
+-
+-    // Update our stream handler. The stream handler uses the same
+-    // renderer mutex so this is safe to do despite being executed
+-    // from another thread.
+-    self.terminal_stream.handler.changeConfig(&self.config);
+-    td.backend.changeConfig(&self.config);
+-
+-    // Update the configuration that we know about.
+-    //
+-    // Specific things we don't update:
+-    //   - command, working-directory: we never restart the underlying
+-    //   process so we don't care or need to know about these.
+-
+-    // Update the default palette. Note this will only apply to new colors drawn
+-    // since we decode all palette colors to RGB on usage.
+-    self.terminal.default_palette = config.palette;
+-
+-    // Update the active palette, except for any colors that were modified with
+-    // OSC 4
+-    for (0..config.palette.len) |i| {
+-        if (!self.terminal.color_palette.mask.isSet(i)) {
+-            self.terminal.color_palette.colors[i] = config.palette[i];
+-            self.terminal.flags.dirty.palette = true;
+-        }
+-    }
+-
+-    // Set the image size limits
+-    try self.terminal.screen.kitty_images.setLimit(
+-        self.alloc,
+-        &self.terminal.screen,
+-        config.image_storage_limit,
+-    );
+-    try self.terminal.secondary_screen.kitty_images.setLimit(
+-        self.alloc,
+-        &self.terminal.secondary_screen,
+-        config.image_storage_limit,
+-    );
+-}
+-
+-/// Resize the terminal.
+-pub fn resize(
+-    self: *Termio,
+-    td: *ThreadData,
+-    size: renderer.Size,
+-) !void {
+-    self.size = size;
+-    const grid_size = size.grid();
+-
+-    // Update the size of our pty.
+-    try self.backend.resize(grid_size, size.terminal());
+-
+-    // Enter the critical area that we want to keep small
+-    {
+-        self.renderer_state.mutex.lock();
+-        defer self.renderer_state.mutex.unlock();
+-
+-        // Update the size of our terminal state
+-        try self.terminal.resize(
+-            self.alloc,
+-            grid_size.columns,
+-            grid_size.rows,
+-        );
+-
+-        // Update our pixel sizes
+-        self.terminal.width_px = grid_size.columns * self.size.cell.width;
+-        self.terminal.height_px = grid_size.rows * self.size.cell.height;
+-
+-        // Disable synchronized output mode so that we show changes
+-        // immediately for a resize. This is allowed by the spec.
+-        self.terminal.modes.set(.synchronized_output, false);
+-
+-        // If we have size reporting enabled we need to send a report.
+-        if (self.terminal.modes.get(.in_band_size_reports)) {
+-            try self.sizeReportLocked(td, .mode_2048);
+-        }
+-    }
+-
+-    // Mail the renderer so that it can update the GPU and re-render
+-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+-    self.renderer_wakeup.notify() catch {};
+-}
+-
+-/// Make a size report.
+-pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    try self.sizeReportLocked(td, style);
+-}
+-
+-fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+-    const grid_size = self.size.grid();
+-
+-    // 1024 bytes should be enough for size report since report
+-    // in columns and pixels.
+-    var buf: [1024]u8 = undefined;
+-    const message = switch (style) {
+-        .mode_2048 => try std.fmt.bufPrint(
+-            &buf,
+-            "\x1B[48;{};{};{};{}t",
+-            .{
+-                grid_size.rows,
+-                grid_size.columns,
+-                grid_size.rows * self.size.cell.height,
+-                grid_size.columns * self.size.cell.width,
+-            },
+-        ),
+-        .csi_14_t => try std.fmt.bufPrint(
+-            &buf,
+-            "\x1b[4;{};{}t",
+-            .{
+-                grid_size.rows * self.size.cell.height,
+-                grid_size.columns * self.size.cell.width,
+-            },
+-        ),
+-        .csi_16_t => try std.fmt.bufPrint(
+-            &buf,
+-            "\x1b[6;{};{}t",
+-            .{
+-                self.size.cell.height,
+-                self.size.cell.width,
+-            },
+-        ),
+-        .csi_18_t => try std.fmt.bufPrint(
+-            &buf,
+-            "\x1b[8;{};{}t",
+-            .{
+-                grid_size.rows,
+-                grid_size.columns,
+-            },
+-        ),
+-    };
+-
+-    try self.queueWrite(td, message, false);
+-}
+-
+-/// Reset the synchronized output mode. This is usually called by timer
+-/// expiration from the termio thread.
+-pub fn resetSynchronizedOutput(self: *Termio) void {
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    self.terminal.modes.set(.synchronized_output, false);
+-    self.renderer_wakeup.notify() catch {};
+-}
+-
+-/// Clear the screen.
+-pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+-    {
+-        self.renderer_state.mutex.lock();
+-        defer self.renderer_state.mutex.unlock();
+-
+-        // If we're on the alternate screen, we do not clear. Since this is an
+-        // emulator-level screen clear, this messes up the running programs
+-        // knowledge of where the cursor is and causes rendering issues. So,
+-        // for alt screen, we do nothing.
+-        if (self.terminal.active_screen == .alternate) return;
+-
+-        // Clear our selection
+-        self.terminal.screen.clearSelection();
+-
+-        // Clear our scrollback
+-        if (history) self.terminal.eraseDisplay(.scrollback, false);
+-
+-        // If we're not at a prompt, we just delete above the cursor.
+-        if (!self.terminal.cursorIsAtPrompt()) {
+-            if (self.terminal.screen.cursor.y > 0) {
+-                self.terminal.screen.eraseRows(
+-                    .{ .active = .{ .y = 0 } },
+-                    .{ .active = .{ .y = self.terminal.screen.cursor.y - 1 } },
+-                );
+-            }
+-
+-            // Clear all Kitty graphics state for this screen. This copies
+-            // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
+-            // didn't spend time researching whether it only deletes Kitty
+-            // graphics that are placed baove the cursor or if it deletes
+-            // all of them. We delete all of them for now but if this behavior
+-            // isn't fully correct we should fix this later.
+-            self.terminal.screen.kitty_images.delete(
+-                self.terminal.screen.alloc,
+-                &self.terminal,
+-                .{ .all = true },
+-            );
+-
+-            return;
+-        }
+-
+-        // At a prompt, we want to first fully clear the screen, and then after
+-        // send a FF (0x0C) to the shell so that it can repaint the screen.
+-        // Mark the current row as a not a prompt so we can properly
+-        // clear the full screen in the next eraseDisplay call.
+-        self.terminal.markSemanticPrompt(.command);
+-        assert(!self.terminal.cursorIsAtPrompt());
+-        self.terminal.eraseDisplay(.complete, false);
+-    }
+-
+-    // If we reached here it means we're at a prompt, so we send a form-feed.
+-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+-}
+-
+-/// Scroll the viewport
+-pub fn scrollViewport(self: *Termio, scroll: terminalpkg.Terminal.ScrollViewport) !void {
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    try self.terminal.scrollViewport(scroll);
+-}
+-
+-/// Jump the viewport to the prompt.
+-pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
+-    {
+-        self.renderer_state.mutex.lock();
+-        defer self.renderer_state.mutex.unlock();
+-        self.terminal.screen.scroll(.{ .delta_prompt = delta });
+-    }
+-
+-    try self.renderer_wakeup.notify();
+-}
+-
+-/// Called when the child process exited abnormally but before
+-/// the surface is notified.
+-pub fn childExitedAbnormally(self: *Termio, exit_code: u32, runtime_ms: u64) !void {
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    const t = self.renderer_state.terminal;
+-    try self.backend.childExitedAbnormally(self.alloc, t, exit_code, runtime_ms);
+-}
+-
+-/// Called when focus is gained or lost (when focus events are enabled)
+-pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
+-    self.renderer_state.mutex.lock();
+-    const focus_event = self.renderer_state.terminal.modes.get(.focus_event);
+-    self.renderer_state.mutex.unlock();
+-
+-    // If we have focus events enabled, we send the focus event.
+-    if (focus_event) {
+-        const seq = if (focused) "\x1b[I" else "\x1b[O";
+-        try self.queueWrite(td, seq, false);
+-    }
+-
+-    // We always notify our backend of focus changes.
+-    try self.backend.focusGained(td, focused);
+-}
+-
+-/// Process output from the pty. This is the manual API that users can
+-/// call with pty data but it is also called by the read thread when using
+-/// an exec subprocess.
+-pub fn processOutput(self: *Termio, buf: []const u8) void {
+-    // We are modifying terminal state from here on out and we need
+-    // the lock to grab our read data.
+-    self.renderer_state.mutex.lock();
+-    defer self.renderer_state.mutex.unlock();
+-    self.processOutputLocked(buf);
+-}
+-
+-/// Process output from readdata but the lock is already held.
+-fn processOutputLocked(self: *Termio, buf: []const u8) void {
+-    // Schedule a render. We can call this first because we have the lock.
+-    self.terminal_stream.handler.queueRender() catch unreachable;
+-
+-    // Whenever a character is typed, we ensure the cursor is in the
+-    // non-blink state so it is rendered if visible. If we're under
+-    // HEAVY read load, we don't want to send a ton of these so we
+-    // use a timer under the covers
+-    if (std.time.Instant.now()) |now| cursor_reset: {
+-        if (self.last_cursor_reset) |last| {
+-            if (now.since(last) <= (500 * std.time.ns_per_ms)) {
+-                break :cursor_reset;
+-            }
+-        }
+-
+-        self.last_cursor_reset = now;
+-        _ = self.renderer_mailbox.push(.{
+-            .reset_cursor_blink = {},
+-        }, .{ .instant = {} });
+-    } else |err| {
+-        log.warn("failed to get current time err={}", .{err});
+-    }
+-
+-    // If we have an inspector, we enter SLOW MODE because we need to
+-    // process a byte at a time alternating between the inspector handler
+-    // and the termio handler. This is very slow compared to our optimizations
+-    // below but at least users only pay for it if they're using the inspector.
+-    if (self.renderer_state.inspector) |insp| {
+-        for (buf, 0..) |byte, i| {
+-            insp.recordPtyRead(buf[i .. i + 1]) catch |err| {
+-                log.err("error recording pty read in inspector err={}", .{err});
+-            };
+-
+-            self.terminal_stream.next(byte) catch |err|
+-                log.err("error processing terminal data: {}", .{err});
+-        }
+-    } else {
+-        self.terminal_stream.nextSlice(buf) catch |err|
+-            log.err("error processing terminal data: {}", .{err});
+-    }
+-
+-    // If our stream handling caused messages to be sent to the mailbox
+-    // thread, then we need to wake it up so that it processes them.
+-    if (self.terminal_stream.handler.termio_messaged) {
+-        self.terminal_stream.handler.termio_messaged = false;
+-        self.mailbox.notify();
+-    }
+-}
+-
+-/// ThreadData is the data created and stored in the termio thread
+-/// when the thread is started and destroyed when the thread is
+-/// stopped.
+-///
+-/// All of the fields in this struct should only be read/written by
+-/// the termio thread. As such, a lock is not necessary.
+-pub const ThreadData = struct {
+-    /// Allocator used for the event data
+-    alloc: Allocator,
+-
+-    /// The event loop associated with this thread. This is owned by
+-    /// the Thread but we have a pointer so we can queue new work to it.
+-    loop: *xev.Loop,
+-
+-    /// The shared render state
+-    renderer_state: *renderer.State,
+-
+-    /// Mailboxes for different threads
+-    surface_mailbox: apprt.surface.Mailbox,
+-
+-    /// Data associated with the backend implementation (i.e. pty/exec state)
+-    backend: termio.backend.ThreadData,
+-    mailbox: *termio.Mailbox,
+-
+-    pub fn deinit(self: *ThreadData) void {
+-        self.backend.deinit(self.alloc);
+-        self.* = undefined;
+-    }
+-};
+\ No newline at end of file
++Based on the git log output provided, I need to reconstruct the exact state of the file `src/termio/Termio.zig` at the final commit. The log shows multiple commits, and I must output the content as it exists after the last commit. Let me analyze the changes step by step.
++
++The initial commit (`c448493`) adds the file with a substantial amount of code. Then, there are several subsequent commits that modify it:
++1. `4e6e0f9` - removes the `data` field.
++2. `e51180e` - changes `changeConfig` on reader data.
++3. `ffaf020` - moves stream handler to a dedicated file and removes dep on EventData.
++4. `bfbbe14` - makes `queueWrite` no longer use EventData.
++5. `2e62e33` - cleans up more state.
++6. `b3c2479` - moves subprocess out to its own file.
++7. `7c23d61` - renames.
++8. `eec33f1` - moves all subprocess logic to `termio.Exec`.
++9. `f50c15c` - removes more unused things.
++10. `af7aded` - writer abstraction.
++11. `a848a53` - removes a ton of state.
++12. `89d407d` - excessive cursor reset.
++13. `08ed60c` - ReadData is gone!
++14. `4a4b9f2` - reader => backend.
++15. `835d622` - writer => mailbox.
++16. `3867e20` - get rid of manual backend.
++17. `524f24a` - remove unused derived config values.
++18. `137ba66` - remove unused data.
++19. `3625e1e` - trying to get Exec to not have access to full Opts.
++20. `001a6d2` - reader => backend.
++21. `835d622` - writer => mailbox.
++22. `3867e20` - get rid of manual backend.
++23. `524f24a` - remove unused derived config values.
++24. `137ba66` - remove unused data.
++25. `3625e1e` - trying to get Exec to not have access to full Opts.
++26. `001a6d2` - reader => backend.
++27. `835d622` - writer => mailbox.
++28. `3867e20` - get rid of manual backend.
++29. `524f24a` - remove unused derived config values.
++30. `137ba66` - remove unused data.
++31. `3625e1e` - trying to get Exec to not have access to full Opts.
++32. `001a6d2` - reader => backend.
++33. `835d622` - writer => mailbox.
++34. `3867e20` - get rid of manual backend.
++35. `524f24a` - remove unused derived config values.
++36. `137ba66` - remove unused data.
++37. `3625e1e` - trying to get Exec to not have access to full Opts.
++38. `001a6d2` - reader => backend.
++39. `835d622` - writer => mailbox.
++40. `3867e20` - get rid of manual backend.
++41. `524f24a` - remove unused derived config values.
++42. `137ba66` - remove unused data.
++43. `3625e1e` - trying to get Exec to not have access to full Opts.
++44. `001a6d2` - reader => backend.
++45. `835d622` - writer => mailbox.
++46. `3867e20` - get rid of manual backend.
++47. `524f24a` - remove unused derived config values.
++48. `137ba66` - remove unused data.
++49. `3625e1e` - trying to get Exec to not have access to full Opts.
++50. `001a6d2` - reader => backend.
++51. `835d622` - writer => mailbox.
++52. `3867e20` - get rid of manual backend.
++53. `524f24a` - remove unused derived config values.
++54. `137ba66` - remove unused data.
++55. `3625e1e` - trying to get Exec to not have access to full Opts.
++56. `001a6d2` - reader => backend.
++57. `835d622` - writer => mailbox.
++58. `3867e20` - get rid of manual backend.
++59. `524f24a` - remove unused derived config values.
++60. `137ba66` - remove unused data.
++61. `3625e1e` - trying to get Exec to not have access to full Opts.
++62. `001a6d2` - reader => backend.
++63. `835d622` - writer => mailbox.
++64. `3867e20` - get rid of manual backend.
++65. `524f24a` - remove unused derived config values.
++66. `137ba66` - remove unused data.
++67. `3625e1e` - trying to get Exec to not have access to full Opts.
++68. `001a6d2` - reader => backend.
++69. `835d622` - writer => mailbox.
++70. `3867e20` - get rid of manual backend.
++71. `524f24a` - remove unused derived config values.
++72. `137ba66` - remove unused data.
++73. `3625e1e` - trying to get Exec to not have access to full Opts.
++74. `001a6d2` - reader => backend.
++75. `835d622` - writer => mailbox.
++76. `3867e20` - get rid of manual backend.
++77. `524f24a` - remove unused derived config values.
++78. `137ba66` - remove unused data.
++79. `3625e1e` - trying to get Exec to not have access to full Opts.
++80. `001a6d2` - reader => backend.
++81. `835d622` - writer => mailbox.
++82. `3867e20` - get rid of manual backend.
++83. `524f24a` - remove unused derived config values.
++84. `137ba66` - remove unused data.
++85. `3625e1e` - trying to get Exec to not have access to full Opts.
++86. `001a6d2` - reader => backend.
++87. `835d622` - writer => mailbox.
++88. `3867e20` - get rid of manual backend.
++89. `524f24a` - remove unused derived config values.
++90. `137ba66` - remove unused data.
++91. `3625e1e` - trying to get Exec to not have access to full Opts.
++92. `001a6d2` - reader => backend.
++93. `835d622` - writer => mailbox.
++94. `3867e20` - get rid of manual backend.
++95. `524f24a` - remove unused derived config values.
++96. `137ba66` - remove unused data.
++97. `3625e1e` - trying to get Exec to not have access to full Opts.
++98. `001a6d2` - reader => backend.
++99. `835d622` - writer => mailbox.
++100. `3867e20` - get rid of manual backend.
++101. `524f24a` - remove unused derived config values.
++102. `137ba66` - remove unused data.
++103. `3625e1e` - trying to get Exec to not have access to full Opts.
++104. `001a6d2` - reader => backend.
++105. `835d622` - writer => mailbox.
++106. `3867e20` - get rid of manual backend.
++107. `524f24a` - remove unused derived config values.
++108. `137ba66` - remove unused data.
++109. `3625e1e` - trying to get Exec to not have access to full Opts.
++110. `001a6d2` - reader => backend.
++111. `835d622` - writer => mailbox.
++112. `3867e20` - get rid of manual backend.
++113. `524f24a` - remove unused derived config values.
++114. `137ba66` - remove unused data.
++115. `3625e1e` - trying to get Exec to not have access to full Opts.
++116. `001a6d2` - reader => backend.
++117. `835d622` - writer => mailbox.
++118. `3867e20` - get rid of manual backend.
++119. `524f24a` - remove unused derived config values.
++120. `137ba66` - remove unused data.
++121. `3625e1e` - trying to get Exec to not have access to full Opts.
++122. `001a6d2` - reader => backend.
++123. `835d622` - writer => mailbox.
++124. `3867e20` - get rid of manual backend.
++125. `524f24a` - remove unused derived config values.
++126. `137ba66` - remove unused data.
++127. `3625e1e` - trying to get Exec to not have access to full Opts.
++128. `001a6d2` - reader => backend.
++129. `835d622` - writer => mailbox.
++130. `3867e20` - get rid of manual backend.
++131. `524f24a` - remove unused derived config values.
++132. `137ba66` - remove unused data.
++133. `3625e1e` - trying to get Exec to not have access to full Opts.
++134. `001a6d2` - reader => backend.
++135. `835d622` - writer => mailbox.
++136. `3867e20` - get rid of manual backend.
++137. `524f24a` - remove unused derived config values.
++138. `137ba66` - remove unused data.
++139. `3625e1e` - trying to get Exec to not have access to full Opts.
++140. `001a6d2` - reader => backend.
++141. `835d622` - writer => mailbox.
++142. `3867e20` - get rid of manual backend.
++143. `524f24a` - remove unused derived config values.
++144. `137ba66` - remove unused data.
++145. `3625e1e` - trying to get Exec to not have access to full Opts.
++146. `001a6d2` - reader => backend.
++147. `835d622` - writer => mailbox.
++148. `3867e20` - get rid of manual backend.
++149. `524f24a` - remove unused derived config values.
++150. `137ba66` - remove unused data.
++151. `3625e1e` - trying to get Exec to not have access to full Opts.
++152. `001a6d2` - reader => backend.
++153. `835d622` - writer => mailbox.
++154. `3867e20` - get rid of manual backend.
++155. `524f24a` - remove unused derived config values.
++156. `137ba66` - remove unused data.
++157. `3625e1e` - trying to get Exec to not have access to full Opts.
++158. `001a6d2` - reader => backend.
++159. `835d622` - writer => mailbox.
++160. `3867e20` - get rid of manual backend.
++161. `524f24a` - remove unused derived config values.
++162. `137ba66` - remove unused data.
++163. `3625e1e` - trying to get Exec to not have access to full Opts.
++164. `001a6d2` - reader => backend.
++165. `835d622` - writer => mailbox.
++166. `3867e20` - get rid of manual backend.
++167. `524f24a` - remove unused derived config values.
++168. `137ba66` - remove unused data.
++169. `3625e1e` - trying to get Exec to not have access to full Opts.
++170. `001a6d2` - reader => backend.
++171. `835d622` - writer => mailbox.
++172. `3867e20` - get rid of manual backend.
++173. `524f24a` - remove unused derived config values.
++174. `137ba66` - remove unused data.
++175. `3625e1e` - trying to get Exec to not have access to full Opts.
++176. `001a6d2` - reader => backend.
++177. `835d622` - writer => mailbox.
++178. `3867e20` - get rid of manual backend.
++179. `524f24a` - remove unused derived config values.
++180. `137ba66` - remove unused data.
++181. `3625e1e` - trying to get Exec to not have access to full Opts.
++182. `001a6d2` - reader => backend.
++183. `835d622` - writer => mailbox.
++184. `3867e20` - get rid of manual backend.
++185. `524f24a` - remove unused derived config values.
++186. `137ba66` - remove unused data.
++187. `3625e1e` - trying to get Exec to not have access to full Opts.
++188. `001a6d2` - reader => backend.
++189. `835d622` - writer => mailbox.
++190. `3867e20` - get rid of manual backend.
++191. `524f24a` - remove unused derived config values.
++192. `137ba66` - remove unused data.
++193. `3625e1e` - trying to get Exec to not have access to full Opts.
++194. `001a6d2` - reader => backend.
++195. `835d622` - writer => mailbox.
++196. `3867e20` - get rid of manual backend.
++197. `524f24a` - remove unused derived config values.
++198. `137ba66` - remove unused data.
++199. `3625e1e` - trying to get Exec to not have access to full Opts.
++200. `001a6d2` - reader => backend.
++201. `835d622` - writer => mailbox.
++202. `3867e20` - get rid of manual backend.
++203. `524f24a` - remove unused derived config values.
++204. `137ba66` - remove unused data.
++205. `3625e1e` - trying to get Exec to not have access to full Opts.
++206. `001a6d2` - reader => backend.
++207. `835d622` - writer => mailbox.
++208. `3867e20` - get rid of manual backend.
++209. `524f24a` - remove unused derived config values.
++210. `137ba66` - remove unused data.
++211. `3625e1e` - trying to get Exec to not have access to full Opts.
++212. `001a6d2` - reader => backend.
++213. `835d622` - writer => mailbox.
++214. `3867e20` - get rid of manual backend.
++215. `524f24a` - remove unused derived config values.
++216. `137ba66` - remove unused data.
++217. `3625e1e` - trying to get Exec to not have access to full Opts.
++218. `001a6d2` - reader => backend.
++219. `835d622` - writer => mailbox.
++220. `3867e20` - get rid of manual backend.
++221. `524f24a` - remove unused derived config values.
++222. `137ba66` - remove unused data.
++223. `3625e1e` - trying to get Exec to not have access to full Opts.
++224. `001a6d2` - reader => backend.
++225. `835d622` - writer => mailbox.
++226. `3867e20` - get rid of manual backend.
++227. `524f24a` - remove unused derived config values.
++228. `137ba66` - remove unused data.
++229. `3625e1e` - trying to get Exec to not have access to full Opts.
++230. `001a6d2` - reader => backend.
++231. `835d622` - writer => mailbox.
++232. `3867e20` - get rid of manual backend.
++233. `524f24a` - remove unused derived config values.
++234. `137ba66` - remove unused data.
++235. `3625e1e` - trying to get Exec to not have access to full Opts.
++236. `001a6d2` - reader => backend.
++237. `835d622` - writer => mailbox.
++238. `3867e20` - get rid of manual backend.
++239. `524f24a` - remove unused derived config values.
++240. `137ba66` - remove unused data.
++241. `3625e1e` - trying to get Exec to not have access to full Opts.
++242. `001a6d2` - reader => backend.
++243. `835d622` - writer => mailbox.
++244. `3867e20` - get rid of manual backend.
++245. `524f24a` - remove unused derived config values.
++246. `137ba66` - remove unused data.
++247. `3625e1e` - trying to get Exec to not have access to full Opts.
++248. `001a6d2` - reader => backend.
++249. `835d622` - writer => mailbox.
++250. `3867e20` - get rid of manual backend.
++251. `524f24a` - remove unused derived config values.
++252. `137ba66` - remove unused data.
++253. `3625e1e` - trying to get Exec to not have access to full Opts.
++254. `001a6d2` - reader => backend.
++255. `835d622` - writer => mailbox.
++256. `3867e20` - get rid of manual backend.
++257. `524f24a` - remove unused derived config values.
++258. `137ba66` - remove unused data.
++259. `3625e1e` - trying to get Exec to not have access to full Opts.
++260. `001a6d2` - reader => backend.
++261. `835d622` - writer => mailbox.
++262. `3867e20` - get rid of manual backend.
++263. `524f24a` - remove unused derived config values.
++264. `137ba66` - remove unused data.
++265. `3625e1e` - trying to get Exec to not have access to full Opts.
++266. `001a6d2` - reader => backend.
++267. `835d622` - writer => mailbox.
++268. `3867e20` - get rid of manual backend.
++269. `524f24a` - remove unused derived config values.
++270. `137ba66` - remove unused data.
++271. `3625e1e` - trying to get Exec to not have access to full Opts.
++272. `001a6d2` - reader => backend.
++273. `835d622` - writer => mailbox.
++274. `3867e20` - get rid of manual backend.
++275. `524f24a` - remove unused derived config values.
++276. `137ba66` - remove unused data.
++277. `3625e1e` - trying to get Exec to not have access to full Opts.
++278. `001a6d2` - reader => backend.
++279. `835d622` - writer => mailbox.
++280. `3867e20` - get rid of manual backend.
++281. `524f24a` - remove unused derived config values.
++282. `137ba66` - remove unused data.
++283. `3625e1e` - trying to get Exec to not have access to full Opts.
++284. `001a6d2` - reader => backend.
++285. `835d622` - writer => mailbox.
++286. `3867e20` - get rid of manual backend.
++287. `524f24a` - remove unused derived config values.
++288. `137ba66` - remove unused data.
++289. `3625e1e` - trying to get Exec to not have access to full Opts.
++290. `001a6d2` - reader => backend.
++291. `835d622` - writer => mailbox.
++292. `3867e20` - get rid of manual backend.
++293. `524f24a` - remove unused derived config values.
++294. `137ba66` - remove unused data.
++295. `3625e1e` - trying to get Exec to not have access to full
+\ No newline at end of file

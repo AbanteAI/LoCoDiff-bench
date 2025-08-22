@@ -1,0 +1,191 @@
+use std::collections::{HashMap, HashSet};
+use std::fs::create_dir_all;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ahash::AHashSet;
+use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+use common::flags::feature_flags;
+use common::types::PointOffsetType;
+use itertools::Either;
+use log::debug;
+use parking_lot::RwLock;
+use rocksdb::DB;
+use schemars::_serde_json::Value;
+
+use super::field_index::FieldIndexBuilderTrait as _;
+use super::field_index::facet_index::FacetIndexEnum;
+use super::field_index::index_selector::{IndexSelector, IndexSelectorMmap, IndexSelectorRocksDb};
+use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
+use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
+use crate::common::utils::IndexesMap;
+use crate::id_tracker::IdTrackerSS;
+use crate::index::PayloadIndex;
+use crate::index::field_index::{
+    CardinalityEstimation, FieldIndex, PayloadBlockCondition, PrimaryCondition,
+};
+use crate::index::payload_config::PayloadConfig;
+use crate::index::query_estimator::estimate_filter;
+use crate::index::query_optimization::payload_provider::PayloadProvider;
+use crate::index::struct_filter_context::StructFilterContext;
+use crate::index::visited_pool::VisitedPool;
+use crate::json_path::JsonPath;
+use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+use crate::payload_storage::{FilterContext, PayloadStorage};
+use crate::telemetry::PayloadIndexTelemetry;
+use crate::types::{
+    Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition, Payload,
+    PayloadContainer, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
+    VectorNameBuf, infer_collection_value_type, infer_value_type,
+};
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+
+#[derive(Debug)]
+enum StorageType {
+    Appendable(Arc<RwLock<DB>>),
+    NonAppendableRocksDb(Arc<RwLock<DB>>),
+    NonAppendable,
+}
+
+/// `PayloadIndex` implementation, which actually uses index structures for providing faster search
+#[derive(Debug)]
+pub struct StructPayloadIndex {
+    /// Payload storage
+    pub(super) payload: Arc<AtomicRefCell<PayloadStorageEnum>>,
+    /// Used for `has_id` condition and estimating cardinality
+    pub(super) id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    /// Vector storages for each field, used for `has_vector` condition
+    pub(super) vector_storages: HashMap<VectorNameBuf, Arc<AtomicRefCell<VectorStorageEnum>>>,
+    /// Indexes, associated with fields
+    pub field_indexes: IndexesMap,
+    config: PayloadConfig,
+    /// Root of index persistence dir
+    path: PathBuf,
+    /// Used to select unique point ids
+    visited_pool: VisitedPool,
+    storage_type: StorageType,
+}
+
+impl StructPayloadIndex {
+    pub fn estimate_field_condition(
+        &self,
+        condition: &FieldCondition,
+        nested_path: Option<&JsonPath>,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<CardinalityEstimation> {
+        let full_path = JsonPath::extend_or_new(nested_path, &condition.key);
+        self.field_indexes.get(&full_path).and_then(|indexes| {
+            // rewrite condition with fullpath to enable cardinality estimation
+            let full_path_condition = FieldCondition {
+                key: full_path,
+                ..condition.clone()
+            };
+
+            indexes
+                .iter()
+                .find_map(|index| index.estimate_cardinality(&full_path_condition, hw_counter))
+        })
+    }
+
+    fn query_field<'a>(
+        &'a self,
+        condition: &'a PrimaryCondition,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
+        match condition {
+            PrimaryCondition::Condition(field_condition) => {
+                let field_key = &field_condition.key;
+                let field_indexes = self.field_indexes.get(field_key)?;
+                field_indexes
+                    .iter()
+                    .find_map(|field_index| field_index.filter(field_condition, hw_counter))
+            }
+            PrimaryCondition::Ids(ids) => Some(Box::new(ids.iter().copied())),
+            PrimaryCondition::HasVector(_) => None,
+        }
+    }
+
+    fn config_path(&self) -> PathBuf {
+        PayloadConfig::get_config_path(&self.path)
+    }
+
+    fn save_config(&self) -> OperationResult<()> {
+        let config_path = self.config_path();
+        self.config.save(&config_path)
+    }
+
+    fn load_all_fields(&mut self) -> OperationResult<()> {
+        let mut field_indexes: IndexesMap = Default::default();
+
+        for (field, payload_schema) in &self.config.indexed_fields {
+            let field_index = self.load_from_db(field, payload_schema)?;
+            field_indexes.insert(field.clone(), field_index);
+        }
+        self.field_indexes = field_indexes;
+        Ok(())
+    }
+
+    fn load_from_db(
+        &self,
+        field: PayloadKeyTypeRef,
+        payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<Vec<FieldIndex>> {
+        let mut indexes = self
+            .selector(payload_schema)
+            .new_index(field, payload_schema)?;
+
+        let mut is_loaded = true;
+        for ref mut index in indexes.iter_mut() {
+            if !index.load()? {
+                is_loaded = false;
+                break;
+            }
+        }
+        if !is_loaded {
+            debug!("Index for `{field}` was not loaded. Building...");
+            // todo(ivan): decide what to do with indexes, which were not loaded
+            indexes = self.build_field_indexes(
+                field,
+                payload_schema,
+                &HardwareCounterCell::disposable(), // Internal operation.
+            )?;
+        }
+
+        Ok(indexes)
+    }
+
+    pub fn open(
+        payload: Arc<AtomicRefCell<PayloadStorageEnum>>,
+        id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+        vector_storages: HashMap<VectorNameBuf, Arc<AtomicRefCell<VectorStorageEnum>>>,
+        path: &Path,
+        is_appendable: bool,
+    ) -> OperationResult<Self> {
+        create_dir_all(path)?;
+        let config_path = PayloadConfig::get_config_path(path);
+        let config = if config_path.exists() {
+            PayloadConfig::load(&config_path)?
+        } else {
+            let mut new_config = PayloadConfig::default();
+            if feature_flags().payload_index_skip_rocksdb && !is_appendable {
+                new_config.skip_rocksdb = Some(true);
+            }
+            new_config
+        };
+
+        let skip_rocksdb = config.skip_rocksdb.unwrap_or(false);
+
+        let storage_type = if is_appendable {
+            let db = open_db_with_existing_cf(path).map_err(|err| {
+                OperationError::service_error(format!("RocksDB open error: {err}"))
+            })?;
+            StorageType::Appendable(db)
+        } else if skip_rocksdb {
+            StorageType::NonAppendable
+        } else {
+            let db = open_db_with_existing_cf(path).map_err(|err| {
+                OperationError::service_error(format!("RocksDB open error: {err}"))
+            })
