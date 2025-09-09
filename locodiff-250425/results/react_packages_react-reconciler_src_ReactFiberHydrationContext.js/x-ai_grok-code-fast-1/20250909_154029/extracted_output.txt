@@ -1,0 +1,260 @@
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @flow
+ */
+
+import type {Fiber} from './ReactInternalTypes';
+import type {
+  Instance,
+  TextInstance,
+  HydratableInstance,
+  ActivityInstance,
+  SuspenseInstance,
+  Container,
+  HostContext,
+} from './ReactFiberConfig';
+import type {ActivityState} from './ReactFiberActivityComponent';
+import type {SuspenseState} from './ReactFiberSuspenseComponent';
+import type {TreeContext} from './ReactFiberTreeContext';
+import type {CapturedValue, HydrationDiffNode} from './ReactCapturedValue';
+
+import {
+  HostComponent,
+  HostSingleton,
+  HostText,
+  HostRoot,
+  SuspenseComponent,
+  ActivityComponent,
+} from './ReactWorkTags';
+import {favorSafetyOverHydrationPerf} from 'shared/ReactFeatureFlags';
+import {createCapturedValueAtFiber} from './ReactCapturedValue';
+
+// The deepest Fiber on the stack involved in a hydration context.
+// This may be an insertion or a hydration.
+let hydrationParentFiber: null | Fiber = null;
+let nextHydratableInstance: null | HydratableInstance = null;
+let isHydrating: boolean = false;
+let didSuspendOrErrorDEV: boolean = false;
+let hydrationErrors: Array<CapturedValue<mixed>> | null = null;
+let hydrationDiffRootDEV: null | HydrationDiffNode = null;
+let rootOrSingletonContext = false;
+
+// Builds a common ancestor tree from the root down for collecting diffs.
+function buildHydrationDiffNode(
+  fiber: Fiber,
+  distanceFromLeaf: number,
+): HydrationDiffNode {
+  if (fiber.return === null) {
+    // We're at the root.
+    if (hydrationDiffRootDEV === null) {
+      hydrationDiffRootDEV = {
+        fiber: fiber,
+        children: [],
+        serverProps: undefined,
+        serverTail: [],
+        distanceFromLeaf: distanceFromLeaf,
+      };
+    } else if (hydrationDiffRootDEV.fiber !== fiber) {
+      throw new Error(
+        'Saw multiple hydration diff roots in a pass. This is a bug in React.',
+      );
+    } else if (hydrationDiffRootDEV.distanceFromLeaf > distanceFromLeaf) {
+      hydrationDiffRootDEV.distanceFromLeaf = distanceFromLeaf;
+    }
+    return hydrationDiffRootDEV;
+  }
+  const siblings = buildHydrationDiffNode(
+    fiber.return,
+    distanceFromLeaf + 1,
+  ).children;
+  // The same node may already exist in the parent. Since we currently always render depth first
+  // and rerender if we suspend or terminate early, if a shared ancestor was added we should still
+  // be inside of that shared ancestor which means it was the last one to be added. If this changes
+  // we may need to scan the whole set.
+  if (siblings.length > 0 && siblings[siblings.length - 1].fiber === fiber) {
+    const existing = siblings[siblings.length - 1];
+    if (existing.distanceFromLeaf > distanceFromLeaf) {
+      existing.distanceFromLeaf = distanceFromLeaf;
+    }
+    return existing;
+  }
+  const newNode: HydrationDiffNode = {
+    fiber: fiber,
+    children: [],
+    serverProps: undefined,
+    serverTail: [],
+    distanceFromLeaf: distanceFromLeaf,
+  };
+  siblings.push(newNode);
+  return newNode;
+}
+
+function warnIfHydrating() {
+  if (__DEV__) {
+    if (isHydrating) {
+      console.error(
+        'We should not be hydrating here. This is a bug in React. Please file a bug.',
+      );
+    }
+  }
+}
+
+function markDidThrowWhileHydratingDEV() {
+  if (__DEV__) {
+    didSuspendOrErrorDEV = true;
+  }
+}
+
+export function didSuspendOrErrorWhileHydratingDEV(): boolean {
+  if (__DEV__) {
+    return didSuspendOrErrorDEV;
+  }
+  return false;
+}
+
+function enterHydrationState(fiber: Fiber): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+
+  const parentInstance: Container = fiber.stateNode.containerInfo;
+  nextHydratableInstance =
+    getFirstHydratableChildWithinContainer(parentInstance);
+  hydrationParentFiber = fiber;
+  isHydrating = true;
+  hydrationErrors = null;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+  rootOrSingletonContext = true;
+  return true;
+}
+
+function reenterHydrationStateFromDehydratedActivityInstance(
+  fiber: Fiber,
+  activityInstance: ActivityInstance,
+  treeContext: TreeContext | null,
+): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+  nextHydratableInstance =
+    getFirstHydratableChildWithinActivityInstance(activityInstance);
+  hydrationParentFiber = fiber;
+  isHydrating = true;
+  hydrationErrors = null;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+  rootOrSingletonContext = false;
+  if (treeContext !== null) {
+    restoreSuspendedTreeContext(fiber, treeContext);
+  }
+  return true;
+}
+
+function reenterHydrationStateFromDehydratedSuspenseInstance(
+  fiber: Fiber,
+  suspenseInstance: SuspenseInstance,
+  treeContext: TreeContext | null,
+): boolean {
+  if (!supportsHydration) {
+    return false;
+  }
+  nextHydratableInstance =
+    getFirstHydratableChildWithinSuspenseInstance(suspenseInstance);
+  hydrationParentFiber = fiber;
+  isHydrating = true;
+  hydrationErrors = null;
+  didSuspendOrErrorDEV = false;
+  hydrationDiffRootDEV = null;
+  rootOrSingletonContext = false;
+  if (treeContext !== null) {
+    restoreSuspendedTreeContext(fiber, treeContext);
+  }
+  return true;
+}
+
+export function errorHydratingContainer(parentContainer: Container): void {
+  if (__DEV__) {
+    // TODO: This gets logged by onRecoverableError, too, so we should be
+    // able to remove it.
+    console.error(
+      'An error occurred during hydration. The server HTML was replaced with client content.',
+    );
+  }
+}
+
+function warnUnhydratedInstance(
+  returnFiber: Fiber,
+  instance: HydratableInstance,
+) {
+  if (__DEV__) {
+    if (didWarnInvalidHydration) {
+      return;
+    }
+    didWarnInvalidHydration = true;
+
+    switch (returnFiber.tag) {
+      case HostRoot:
+        const description = describeHydratableInstanceForDevWarnings(instance);
+        if (typeof description === 'string') {
+          console.error(
+            'Did not expect server HTML to contain the text node "%s" in the root.',
+            description,
+          );
+        } else {
+          console.error(
+            'Did not expect server HTML to contain a <%s> in the root.',
+            description.type,
+          );
+        }
+        break;
+      case HostSingleton:
+      case HostComponent:
+        warnForDeletedHydratableInstance(returnFiber.type, instance);
+        break;
+      case SuspenseComponent:
+        const suspenseState: SuspenseState = returnFiber.memoizedState;
+        if (suspenseState.dehydrated !== null)
+          warnForDeletedHydratableInstance('Suspense', instance);
+        break;
+    }
+  }
+}
+
+function warnNonHydratedInstance(
+  fiber: Fiber,
+  rejectedCandidate: null | HydratableInstance,
+) {
+  if (__DEV__) {
+    if (didSuspendOrErrorDEV) {
+      // Inside a boundary that already suspended. We're currently rendering the
+      // siblings of a suspended node. The mismatch may be due to the missing
+      // data, so it's probably a false positive.
+      return;
+    }
+
+    if (didWarnInvalidHydration) {
+      return;
+    }
+    didWarnInvalidHydration = true;
+
+    switch (fiber.return ? fiber.return.tag : null) {
+      case HostRoot: {
+        const parentContainer = fiber.return
+          ? fiber.return.stateNode.containerInfo
+          : null;
+        if (parentContainer) {
+          switch (fiber.tag) {
+            case HostSingleton:
+            case HostComponent:
+              const type = fiber.type;
+              const props = fiber.pendingProps;
+              didNotFindHydratableInstanceWithinContainer(
+                parentContainer,
+                type,
+                props,
+              );

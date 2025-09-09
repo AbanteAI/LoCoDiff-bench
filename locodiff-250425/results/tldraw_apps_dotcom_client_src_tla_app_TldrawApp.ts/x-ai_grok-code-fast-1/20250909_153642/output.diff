@@ -1,0 +1,309 @@
+
+index 1724dd1c8..490901992 100644
+--- a/tldraw_apps_dotcom_client_src_tla_app_TldrawApp.ts_expectedoutput.txt (expected):tmp/tmpugjf34k9_expected.txt	
++++ b/tldraw_apps_dotcom_client_src_tla_app_TldrawApp.ts_extracted.txt (actual):tmp/tmpklproejs_actual.txt	
+@@ -14,6 +14,7 @@ import {
+ 	TlaUser,
+ 	UserPreferencesKeys,
+ 	Z_PROTOCOL_VERSION,
++	ZErrorCode,
+ 	schema as zeroSchema,
+ 	ZErrorCode,
+ } from '@tldraw/dotcom-shared'
+@@ -30,6 +31,11 @@ import {
+ } from '@tldraw/utils'
+ import pick from 'lodash.pick'
+ import {
++	Signal,
++	TLDocument,
++	TLSessionStateSnapshot,
++	TLUiToastsContextType,
++	TLUserPreferences,
+ 	assertExists,
+ 	Atom,
+ 	atom,
+@@ -39,15 +45,11 @@ import {
+ 	dataUrlToFile,
+ 	defaultUserPreferences,
+ 	getUserPreferences,
++	isDocument,
+ 	objectMapFromEntries,
+ 	objectMapKeys,
+ 	parseTldrawJsonFile,
+ 	react,
+-	Signal,
+-	TLDocument,
+-	TLSessionStateSnapshot,
+-	TLUiToastsContextType,
+-	TLUserPreferences,
+ 	transact,
+ } from 'tldraw'
+ import { MULTIPLAYER_SERVER, ZERO_SERVER } from '../../utils/config'
+@@ -116,8 +118,6 @@ export class TldrawApp {
+ 		return val$
+ 	}
+ 
+-	toasts: TLUiToastsContextType | null = null
+-
+ 	private constructor(
+ 		public readonly userId: string,
+ 		getToken: () => Promise<string | undefined>,
+@@ -217,6 +217,7 @@ export class TldrawApp {
+ 		rate_limit_exceeded: {
+ 			defaultMessage: 'Rate limit exceeded, try again later.',
+ 		},
++		mutation_error_toast_title: { defaultMessage: 'Error' },
+ 		client_too_old: {
+ 			defaultMessage: 'Please refresh the page to get the latest version of tldraw.',
+ 		},
+@@ -286,6 +287,12 @@ export class TldrawApp {
+ 		},
+ 	})
+ 
++	// getAll<T extends keyof Schema['tables']>(
++	// 	typeName: T
++	// ): SchemaToRow<Schema['tables'][T]>[] {
++	// 	return this.z.query[typeName].run()
++	// }
++
+ 	getUserOwnFiles() {
+ 		const fileStates = this.getUserFileStates()
+ 		const files: TlaFile[] = []
+@@ -307,6 +314,8 @@ export class TldrawApp {
+ 
+ 	@computed
+ 	getUserRecentFiles() {
++		const userId = this.userId
++
+ 		const myFiles = objectMapFromEntries(this.getUserOwnFiles().map((f) => [f.id, f]))
+ 		const myStates = objectMapFromEntries(this.getUserFileStates().map((f) => [f.fileId, f]))
+ 
+@@ -325,7 +334,7 @@ export class TldrawApp {
+ 			if (!state && !file.isDeleted && file.ownerId === this.userId) {
+ 				// create a file state for this file
+ 				// this allows us to 'undelete' soft-deleted files by manually toggling 'isDeleted' in the backend
+-				state = this.fileStates$.get().find((fs) => fs.fileId === fileId)
++				state = this.getFileState(fileId)
+ 			}
+ 			if (!state) {
+ 				// if the file is deleted, we don't want to show it in the recent files
+@@ -347,6 +356,13 @@ export class TldrawApp {
+ 		// sort by date with most recent first
+ 		nextRecentFileOrdering.sort((a, b) => b.date - a.date)
+ 
++		// move pinned files to the top, stable sort
++		nextRecentFileOrdering.sort((a, b) => {
++			if (a.isPinned && !b.isPinned) return -1
++			if (!a.isPinned && b.isPinned) return 1
++			return 0
++		})
++
+ 		// stash the ordering for next time
+ 		this.lastRecentFileOrdering = nextRecentFileOrdering
+ 
+@@ -354,13 +370,16 @@ export class TldrawApp {
+ 	}
+ 
+ 	getUserSharedFiles() {
++		const userId = this.userId
+ 		return Array.from(
+ 			new Set(
+ 				this.getUserFileStates()
+ 					.map((s) => {
++						const file = s.file
++						if (!file) return
+ 						// skip files where the owner is the current user
+-						if (s.file!.ownerId === this.userId) return
+-						return s.file
++						if (file.ownerId === userId) return
++						return file
+ 					})
+ 					.filter(Boolean) as TlaFile[]
+ 			)
+@@ -446,11 +465,7 @@ export class TldrawApp {
+ 		if (typeof file === 'string') {
+ 			file = this.getFile(file)
+ 		}
+-		if (!file) {
+-			// possibly a published file
+-			return ''
+-		}
+-		assert(typeof file !== 'string', 'ok')
++		if (!file) return ''
+ 
+ 		if (typeof file.name === 'undefined') {
+ 			captureException(new Error('file name is undefined somehow: ' + JSON.stringify(file)))
+@@ -462,16 +477,16 @@ export class TldrawApp {
+ 		}
+ 
+ 		if (useDateFallback) {
+-			return this.getFallbackFileName(file.createdAt)
++			const createdAt = new Date(file.createdAt)
++			const format = getDateFormat(createdAt)
++			return this.getIntl().formatDate(createdAt, format)
+ 		}
+ 
+ 		return
+ 	}
+ 
+-	async slurpFile() {
+-		return await this.createFile({
+-			createSource: `${LOCAL_FILE_PREFIX}/${getScratchPersistenceKey()}`,
+-		})
++	async createFilesFromTldrFiles(files: File[]) {
++		this.uploadTldrFiles(files)
+ 	}
+ 
+ 	getFilePk(fileId: string) {
+@@ -491,16 +506,10 @@ export class TldrawApp {
+ 		})
+ 	}
+ 
+-	/**
+-	 * Publish a file or re-publish changes.
+-	 *
+-	 * @param fileId - The file id to unpublish.
+-	 * @returns A result indicating success or failure.
+-	 */
+-	publishFile(fileId: string) {
++	setFilePublished(fileId: string) {
+ 		const file = this.getUserOwnFiles().find((f) => f.id === fileId)
+ 		if (!file) throw Error(`No file with that id`)
+-		if (file.ownerId !== this.userId) throw Error('user cannot publish that file')
++		if (file.ownerId !== this.userId) throw Error('user cannot edit that file')
+ 
+ 		// We're going to bake the name of the file, if it's undefined
+ 		const name = this.getFileName(file)
+@@ -562,23 +571,6 @@ export class TldrawApp {
+ 		await this.z.mutate.file.deleteOrForget(file)
+ 	}
+ 
+-	/**
+-	 * Pin a file (or unpin it if it's already pinned).
+-	 *
+-	 * @param fileId - The file id.
+-	 */
+-	async pinOrUnpinFile(fileId: string) {
+-		const fileState = this.getFileState(fileId)
+-
+-		if (!fileState) return
+-
+-		return this.z.mutate.file_state.update({
+-			fileId,
+-			userId: this.userId,
+-			isPinned: !fileState.isPinned,
+-		})
+-	}
+-
+ 	setFileSharedLinkType(fileId: string, sharedLinkType: TlaFile['sharedLinkType'] | 'no-access') {
+ 		const file = this.requireFile(fileId)
+ 
+@@ -620,7 +612,6 @@ export class TldrawApp {
+ 				lastEditAt: null,
+ 				lastSessionState: null,
+ 				lastVisitAt: null,
+-				isPinned: false,
+ 				// doesn't really matter what this is because it is
+ 				// overwritten by postgres
+ 				isFileOwner: this.isFileOwner(fileId),
+@@ -662,7 +653,9 @@ export class TldrawApp {
+ 	}
+ 
+ 	onFileExit(fileId: string) {
+-		this.updateFileState(fileId, { lastVisitAt: Date.now() })
++		this.updateFileState(fileId, {
++			lastVisitAt: Date.now(),
++		})
+ 	}
+ 
+ 	static async create(opts: {
+@@ -670,7 +663,7 @@ export class TldrawApp {
+ 		fullName: string
+ 		email: string
+ 		avatar: string
+-		getToken(): Promise<string | undefined>
++		getToken(): Promise<string | null>
+ 		onClientTooOld(): void
+ 		trackEvent: TLAppUiContextType
+ 	}) {
+@@ -712,18 +705,6 @@ export class TldrawApp {
+ 		return { app, userId: opts.userId }
+ 	}
+ 
+-	getIntl() {
+-		const intl = createIntl()
+-		if (intl) return intl
+-		// intl should exists since IntlWrapper should create it before we get here, but let's use this just in case
+-		setupCreateIntl({
+-			defaultLocale: 'en',
+-			locale: this.user$.get()?.locale ?? 'en',
+-			messages: {},
+-		})
+-		return createIntl()!
+-	}
+-
+ 	async uploadTldrFiles(files: File[], onFirstFileUploaded?: (file: TlaFile) => void) {
+ 		const totalFiles = files.length
+ 		let uploadedFiles = 0
+@@ -738,11 +719,6 @@ export class TldrawApp {
+ 			Math.min(Math.round((bytesUploaded / approxTotalBytes) * 100), 100)
+ 		const updateProgress = () => updateToast({ description: `${getApproxPercentage()}%` })
+ 
+-		// only bother showing the percentage if it's going to take a while
+-
+-		let uploadingToastId = undefined as undefined | string
+-		let didFinishUploading = false
+-
+ 		// give it a second before we show the toast, in case the upload is fast
+ 		setTimeout(() => {
+ 			if (didFinishUploading || this.abortController.signal.aborted) return
+@@ -774,6 +750,9 @@ export class TldrawApp {
+ 			)
+ 		}
+ 
++		let didFinishUploading = false
++		let uploadingToastId = undefined as undefined | string
++
+ 		for (const f of files) {
+ 			const res = await this.uploadTldrFile(f, (bytes) => {
+ 				bytesUploaded += bytes
+@@ -889,4 +868,38 @@ export class TldrawApp {
+ 
+ 		return this.createFile({ id, name })
+ 	}
++
++	getIntl() {
++		const intl = createIntl()
++		if (intl) return intl
++		// intl should exists since IntlWrapper should create it before we get here, but let's use this just in case
++		setupCreateIntl({
++			defaultLocale: 'en',
++			locale: this.user$.get()?.locale ?? 'en',
++			messages: {},
++		})
++		return createIntl()!
++	}
++
++	async slurpFile() {
++		return await this.createFile({
++			createSource: `${LOCAL_FILE_PREFIX}/${getScratchPersistenceKey()}`,
++		})
++	}
++
++	pinOrUnpinFile(fileId: string) {
++		const fileState = this.getFileState(fileId)
++
++		if (!fileState) return
++
++		return this.z.mutate.file_state.update({
++			fileId,
++			userId: this.userId,
++			isPinned: !fileState.isPinned,
++		})
++	}
++
++	toasts: TLUiToastsContextType | null = null
++
++	intl: IntlShape | null = null
+ }
+\ No newline at end of file
