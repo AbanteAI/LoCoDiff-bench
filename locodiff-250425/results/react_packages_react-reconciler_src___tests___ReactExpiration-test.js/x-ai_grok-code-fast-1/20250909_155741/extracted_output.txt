@@ -1,0 +1,309 @@
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @jest-environment node
+ */
+
+'use strict';
+
+let React;
+let ReactNoop;
+let Scheduler;
+let readText;
+let resolveText;
+let startTransition;
+let useState;
+let useEffect;
+let assertLog;
+let waitFor;
+let waitForAll;
+let unstable_waitForExpired;
+let act;
+
+describe('ReactExpiration', () => {
+  beforeEach(() => {
+    jest.resetModules();
+
+    React = require('react');
+    ReactNoop = require('react-noop-renderer');
+    Scheduler = require('scheduler');
+    act = require('internal-test-utils').act;
+    startTransition = React.startTransition;
+    useState = React.useState;
+    useEffect = React.useEffect;
+
+    const InternalTestUtils = require('internal-test-utils');
+    assertLog = InternalTestUtils.assertLog;
+    waitFor = InternalTestUtils.waitFor;
+    waitForAll = InternalTestUtils.waitForAll;
+    unstable_waitForExpired = InternalTestUtils.unstable_waitForExpired;
+
+    const textCache = new Map();
+
+    readText = text => {
+      const record = textCache.get(text);
+      if (record !== undefined) {
+        switch (record.status) {
+          case 'pending':
+            throw record.promise;
+          case 'rejected':
+            throw Error('Failed to load: ' + text);
+          case 'resolved':
+            return text;
+        }
+      } else {
+        let ping;
+        const promise = new Promise(resolve => (ping = resolve));
+        const newRecord = {
+          status: 'pending',
+          ping: ping,
+          promise,
+        };
+        textCache.set(text, newRecord);
+        throw promise;
+      }
+    };
+
+    resolveText = text => {
+      const record = textCache.get(text);
+      if (record !== undefined) {
+        if (record.status === 'pending') {
+          Scheduler.log(`Promise resolved [${text}]`);
+          record.ping();
+          record.ping = null;
+          record.status = 'resolved';
+          clearTimeout(record.promise._timer);
+          record.promise = null;
+        }
+      } else {
+        const newRecord = {
+          ping: null,
+          status: 'resolved',
+          promise: null,
+        };
+        textCache.set(text, newRecord);
+      }
+    };
+  });
+
+  function Text(props) {
+    Scheduler.log(props.text);
+    return props.text;
+  }
+
+  function AsyncText(props) {
+    const text = props.text;
+    try {
+      readText(text);
+      Scheduler.log(text);
+      return text;
+    } catch (promise) {
+      if (typeof promise.then === 'function') {
+        Scheduler.log(`Suspend! [${text}]`);
+        if (typeof props.ms === 'number' && promise._timer === undefined) {
+          promise._timer = setTimeout(() => {
+            resolveText(text);
+          }, props.ms);
+        }
+      } else {
+        Scheduler.log(`Error! [${text}]`);
+      }
+      throw promise;
+    }
+  }
+
+  function span(prop) {
+    return {type: 'span', children: [], prop, hidden: false};
+  }
+
+  function flushNextRenderIfExpired() {
+    // This will start rendering the next level of work. If the work hasn't
+    // expired yet, React will exit without doing anything. If it has expired,
+    // it will schedule a sync task.
+    Scheduler.unstable_flushExpired();
+    // Flush the sync task.
+    ReactNoop.flushSync();
+  }
+
+  it('increases priority of updates as time progresses', async () => {
+    ReactNoop.render(<Text text="Step 1" />);
+    React.startTransition(() => {
+      ReactNoop.render(<Text text="Step 2" />);
+    });
+    await waitFor(['Step 1']);
+
+    expect(ReactNoop).toMatchRenderedOutput('Step 1');
+
+    // Nothing has expired yet because time hasn't advanced.
+    await unstable_waitForExpired([]);
+    expect(ReactNoop).toMatchRenderedOutput('Step 1');
+
+    // Advance time a bit, but not enough to expire the low pri update.
+    ReactNoop.expire(4500);
+    await unstable_waitForExpired([]);
+    expect(ReactNoop).toMatchRenderedOutput('Step 1');
+
+    // Advance by a little bit more. Now the update should expire and flush.
+    ReactNoop.expire(500);
+    await unstable_waitForExpired(['Step 2']);
+    expect(ReactNoop).toMatchRenderedOutput('Step 2');
+  });
+
+  it('two updates of like priority in the same event always flush within the same batch', async () => {
+    class TextClass extends React.Component {
+      componentDidMount() {
+        Scheduler.log(`${this.props.text} [commit]`);
+      }
+      componentDidUpdate() {
+        Scheduler.log(`${this.props.text} [commit]`);
+      }
+      render() {
+        Scheduler.log(`${this.props.text} [render]`);
+        return <span prop={this.props.text} />;
+      }
+    }
+
+    function interrupt() {
+      ReactNoop.flushSync(() => {
+        ReactNoop.renderToRootWithID(null, 'other-root');
+      });
+    }
+
+    // First, show what happens for updates in two separate events.
+    // Schedule an update.
+    React.startTransition(() => {
+      ReactNoop.render(<TextClass text="A" />);
+    });
+    // Advance the timer.
+    Scheduler.unstable_advanceTime(2000);
+    // Partially flush the first update, then interrupt it.
+    await waitFor(['A [render]']);
+    interrupt();
+
+    // Don't advance time by enough to expire the first update.
+    assertLog([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
+
+    // Schedule another update.
+    ReactNoop.render(<TextClass text="B" />);
+    // Both updates are batched
+    await waitForAll(['B [render]', 'B [commit]']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
+
+    // Now do the same thing again, except this time don't flush any work in
+    // between the two updates.
+    ReactNoop.render(<TextClass text="A" />);
+    Scheduler.unstable_advanceTime(2000);
+    assertLog([]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
+    // Schedule another update.
+    ReactNoop.render(<TextClass text="B" />);
+    // The updates should flush in the same batch, since as far as the scheduler
+    // knows, they may have occurred inside the same event.
+    await waitForAll(['B [render]', 'B [commit]']);
+  });
+
+  it('two updates of like priority in the same event always flush within the same batch, even if there\'s a sync update in between', async () => {
+    class TextClass extends React.Component {
+      componentDidMount() {
+        Scheduler.log(`${this.props.text} [commit]`);
+      }
+      componentDidUpdate() {
+        Scheduler.log(`${this.props.text} [commit]`);
+      }
+      render() {
+        Scheduler.log(`${this.props.text} [render]`);
+        return <span prop={this.props.text} />;
+      }
+    }
+
+    function interrupt() {
+      ReactNoop.flushSync(() => {
+        ReactNoop.renderToRootWithID(null, 'other-root');
+      });
+    }
+
+    // First, show what happens for updates in two separate events.
+    // Schedule an update.
+    React.startTransition(() => {
+      ReactNoop.render(<TextClass text="A" />);
+    });
+    // Advance the timer.
+    Scheduler.unstable_advanceTime(2000);
+    // Partially flush the first update, then interrupt it.
+    await waitFor(['A [render]']);
+    interrupt();
+
+    // Don't advance time by enough to expire the first update.
+    assertLog([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
+
+    // Schedule another update.
+    ReactNoop.render(<TextClass text="B" />);
+    // Both updates are batched
+    await waitForAll(['B [render]', 'B [commit]']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
+
+    // Now do the same thing again, except this time don't flush any work in
+    // between the two updates.
+    ReactNoop.render(<TextClass text="A" />);
+    Scheduler.unstable_advanceTime(2000);
+    assertLog([]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
+
+    // Perform some synchronous work. The scheduler must assume we're inside
+    // the same event.
+    interrupt();
+
+    // Schedule another update.
+    ReactNoop.render(<TextClass text="B" />);
+    // The updates should flush in the same batch, since as far as the scheduler
+    // knows, they may have occurred inside the same event.
+    await waitForAll(['B [render]', 'B [commit]']);
+  });
+
+  it('cannot update at the same expiration time that is already rendering', async () => {
+    const store = {text: 'initial'};
+    const subscribers = [];
+
+    class Connected extends React.Component {
+      state = {text: store.text};
+      componentDidMount() {
+        subscribers.push(this);
+        Scheduler.log(`${this.state.text} [${this.props.label}] [commit]`);
+      }
+      componentDidUpdate() {
+        Scheduler.log(`${this.state.text} [${this.props.label}] [commit]`);
+      }
+      render() {
+        Scheduler.log(`${this.state.text} [${this.props.label}] [render]`);
+        return <span prop={this.state.text} />;
+      }
+    }
+
+    function App() {
+      return (
+        <>
+          <Connected label="A" />
+          <Connected label="B" />
+          <Connected label="C" />
+          <Connected label="D" />
+        </>
+      );
+    }
+
+    // Initial mount
+    React.startTransition(() => {
+      ReactNoop.render(<App />);
+    });
+    await waitForAll([
+      'initial [A] [render]',
+      'initial [B] [render]',
+      'initial [C] [render]',
+      'initial [D] [render]',
+      'initial [A] [commit]',
+      'initial [B] [commit]',
+      'initial [C] [
