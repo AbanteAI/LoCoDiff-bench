@@ -1,0 +1,472 @@
+
+index 6abe1ca7f..4991ef0d6 100644
+--- a/ghostty_src_terminal_kitty_graphics_image.zig_expectedoutput.txt (expected):tmp/tmpav0iobm2_expected.txt	
++++ b/ghostty_src_terminal_kitty_graphics_image.zig_extracted.txt (actual):tmp/tmpx53raxj4_actual.txt	
+@@ -100,6 +100,162 @@ pub const LoadingImage = struct {
+         return result;
+     }
+ 
++    pub fn deinit(self: *LoadingImage, alloc: Allocator) void {
++        self.image.deinit(alloc);
++        self.data.deinit(alloc);
++    }
++
++    pub fn destroy(self: *LoadingImage, alloc: Allocator) void {
++        self.deinit(alloc);
++        alloc.destroy(self);
++    }
++
++    /// Adds a chunk of data to the image. Use this if the image
++    /// is coming in chunks (the "m" parameter in the protocol).
++    pub fn addData(self: *LoadingImage, alloc: Allocator, data: []const u8) !void {
++        // If no data, skip
++        if (data.len == 0) return;
++
++        // If our data would get too big, return an error
++        if (self.data.items.len + data.len > max_size) {
++            log.warn("image data too large max_size={}", .{max_size});
++            return error.InvalidData;
++        }
++
++        // Ensure we have enough room to add the data
++        // to the end of the ArrayList before doing so.
++        try self.data.ensureUnusedCapacity(alloc, data.len);
++
++        const start_i = self.data.items.len;
++        self.data.items.len = start_i + data.len;
++        fastmem.copy(u8, self.data.items[start_i..], data);
++    }
++
++    /// Complete the chunked image, returning a completed image.
++    pub fn complete(self: *LoadingImage, alloc: Allocator) !Image {
++        const img = &self.image;
++
++        // Decompress the data if it is compressed.
++        try self.decompress(alloc);
++
++        // Decode the png if we have to
++        if (img.format == .png) try self.decodePng(alloc);
++
++        // Validate our dimensions.
++        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
++        if (img.width > max_dimension or img.height > max_dimension) return error.DimensionsTooLarge;
++
++        // Data length must be what we expect
++        const bpp = img.format.bpp();
++        const expected_len = img.width * img.height * bpp;
++        const actual_len = self.data.items.len;
++        if (actual_len != expected_len) {
++            std.log.warn(
++                "unexpected length image id={} width={} height={} bpp={} expected_len={} actual_len={}",
++                .{ img.id, img.width, img.height, bpp, expected_len, actual_len },
++            );
++            return error.InvalidData;
++        }
++
++        // Everything looks good, copy the image data over.
++        var result = self.image;
++        result.data = try self.data.toOwnedSlice(alloc);
++        errdefer result.deinit(alloc);
++        self.image = .{};
++        try result.complete(alloc);
++        return result;
++    }
++
++    /// Debug function to write the data to a file. This is useful for
++    /// capturing some test data for unit tests.
++    pub fn debugDump(self: LoadingImage) !void {
++        if (comptime builtin.mode != .Debug) @compileError("debugDump in non-debug");
++
++        var buf: [1024]u8 = undefined;
++        const filename = try std.fmt.bufPrint(
++            &buf,
++            "image-{s}-{s}-{d}x{d}-{}.data",
++            .{
++                @tagName(self.image.format),
++                @tagName(self.image.compression),
++                self.image.width,
++                self.image.height,
++                self.image.id,
++            },
++        );
++        const cwd = std.fs.cwd();
++        const f = try cwd.createFile(filename, .{});
++        defer f.close();
++
++        const writer = f.writer();
++        try writer.writeAll(self.data.items);
++    }
++
++    /// Decompress the data in-place.
++    fn decompress(self: *LoadingImage, alloc: Allocator) !void {
++        return switch (self.image.compression) {
++            .none => {},
++            .zlib_deflate => self.decompressZlib(alloc),
++        };
++    }
++
++    fn decompressZlib(self: *LoadingImage, alloc: Allocator) !void {
++        // Open our zlib stream
++        var fbs = std.io.fixedBufferStream(self.data.items);
++        var stream = std.compress.zlib.decompressor(fbs.reader());
++
++        // Write it to an array list
++        var list = std.ArrayList(u8).init(alloc);
++        errdefer list.deinit();
++        stream.reader().readAllArrayList(&list, max_size) catch |err| {
++            log.warn("failed to read decompressed data: {}", .{err});
++            return error.DecompressionFailed;
++        };
++
++        // Empty our current data list, take ownership over managed array list
++        self.data.deinit(alloc);
++        self.data = .{ .items = list.items, .capacity = list.capacity };
++
++        // Make sure we note that our image is no longer compressed
++        self.image.compression = .none;
++    }
++
++    /// Decode the data as PNG. This will also updated the image dimensions.
++    fn decodePng(self: *LoadingImage, alloc: Allocator) !void {
++        assert(self.image.format == .png);
++
++        const result = wuffs.png.decode(
++            alloc,
++            self.data.items,
++        ) catch |err| switch (err) {
++            error.WuffsError => return error.InvalidData,
++            error.OutOfMemory => return error.OutOfMemory,
++        };
++        defer alloc.free(result.data);
++
++        if (result.data.len > max_size) {
++            log.warn("png image too large size={} max_size={}", .{ result.data.len, max_size });
++            return error.InvalidData;
++        }
++
++        // Validate our bpp
++        if (result.bytes_per_pixel < 1 or result.bytes_per_pixel > 4) {
++            log.warn("png with unsupported bpp={}", .{result.bytes_per_pixel});
++            return error.UnsupportedDepth;
++        }
++
++        // Replace our data
++        self.data.deinit(alloc);
++        self.data = .{};
++        try self.data.ensureUnusedCapacity(alloc, result.data.len);
++        try self.data.appendSlice(alloc, result.data[0..result.data.len]);
++
++        // Store updated image dimensions
++        self.image.width = result.width;
++        self.image.height = result.height;
++        self.image.format = .rgba;
++    }
++
+     /// Reads the data from a shared memory segment.
+     fn readSharedMemory(
+         self: *LoadingImage,
+@@ -179,8 +335,6 @@ pub const LoadingImage = struct {
+         };
+         defer std.posix.munmap(map);
+ 
+-        // Our end size always uses the expected size so we cut off the
+-        // padding for mmap alignment.
+         const start: usize = @intCast(t.offset);
+         const end: usize = if (t.size > 0) @min(
+             @as(usize, @intCast(t.offset)) + @as(usize, @intCast(t.size)),
+@@ -290,161 +444,6 @@ pub const LoadingImage = struct {
+ 
+         return false;
+     }
+-
+-    pub fn deinit(self: *LoadingImage, alloc: Allocator) void {
+-        self.image.deinit(alloc);
+-        self.data.deinit(alloc);
+-    }
+-
+-    pub fn destroy(self: *LoadingImage, alloc: Allocator) void {
+-        self.deinit(alloc);
+-        alloc.destroy(self);
+-    }
+-
+-    /// Adds a chunk of data to the image. Use this if the image
+-    /// is coming in chunks (the "m" parameter in the protocol).
+-    pub fn addData(self: *LoadingImage, alloc: Allocator, data: []const u8) !void {
+-        // If no data, skip
+-        if (data.len == 0) return;
+-
+-        // If our data would get too big, return an error
+-        if (self.data.items.len + data.len > max_size) {
+-            log.warn("image data too large max_size={}", .{max_size});
+-            return error.InvalidData;
+-        }
+-
+-        // Ensure we have enough room to add the data
+-        // to the end of the ArrayList before doing so.
+-        try self.data.ensureUnusedCapacity(alloc, data.len);
+-
+-        const start_i = self.data.items.len;
+-        self.data.items.len = start_i + data.len;
+-        fastmem.copy(u8, self.data.items[start_i..], data);
+-    }
+-
+-    /// Complete the chunked image, returning a completed image.
+-    pub fn complete(self: *LoadingImage, alloc: Allocator) !Image {
+-        const img = &self.image;
+-
+-        // Decompress the data if it is compressed.
+-        try self.decompress(alloc);
+-
+-        // Decode the png if we have to
+-        if (img.format == .png) try self.decodePng(alloc);
+-
+-        // Validate our dimensions.
+-        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
+-        if (img.width > max_dimension or img.height > max_dimension) return error.DimensionsTooLarge;
+-
+-        // Data length must be what we expect
+-        const bpp = img.format.bpp();
+-        const expected_len = img.width * img.height * bpp;
+-        const actual_len = self.data.items.len;
+-        if (actual_len != expected_len) {
+-            std.log.warn(
+-                "unexpected length image id={} width={} height={} bpp={} expected_len={} actual_len={}",
+-                .{ img.id, img.width, img.height, bpp, expected_len, actual_len },
+-            );
+-            return error.InvalidData;
+-        }
+-
+-        // Set our time
+-        self.image.transmit_time = std.time.Instant.now() catch |err| {
+-            log.warn("failed to get time: {}", .{err});
+-            return error.InternalError;
+-        };
+-
+-        // Everything looks good, copy the image data over.
+-        var result = self.image;
+-        result.data = try self.data.toOwnedSlice(alloc);
+-        errdefer result.deinit(alloc);
+-        self.image = .{};
+-        return result;
+-    }
+-
+-    /// Debug function to write the data to a file. This is useful for
+-    /// capturing some test data for unit tests.
+-    pub fn debugDump(self: LoadingImage) !void {
+-        if (comptime builtin.mode != .Debug) @compileError("debugDump in non-debug");
+-
+-        var buf: [1024]u8 = undefined;
+-        const filename = try std.fmt.bufPrint(
+-            &buf,
+-            "image-{s}-{s}-{d}x{d}-{}.data",
+-            .{
+-                @tagName(self.image.format),
+-                @tagName(self.image.compression),
+-                self.image.width,
+-                self.image.height,
+-                self.image.id,
+-            },
+-        );
+-        const cwd = std.fs.cwd();
+-        const f = try cwd.createFile(filename, .{});
+-        defer f.close();
+-
+-        const writer = f.writer();
+-        try writer.writeAll(self.data.items);
+-    }
+-
+-    /// Decompress the data in-place.
+-    fn decompress(self: *LoadingImage, alloc: Allocator) !void {
+-        return switch (self.image.compression) {
+-            .none => {},
+-            .zlib_deflate => self.decompressZlib(alloc),
+-        };
+-    }
+-
+-    fn decompressZlib(self: *LoadingImage, alloc: Allocator) !void {
+-        // Open our zlib stream
+-        var fbs = std.io.fixedBufferStream(self.data.items);
+-        var stream = std.compress.zlib.decompressor(fbs.reader());
+-
+-        // Write it to an array list
+-        var list = std.ArrayList(u8).init(alloc);
+-        errdefer list.deinit();
+-        stream.reader().readAllArrayList(&list, max_size) catch |err| {
+-            log.warn("failed to read decompressed data: {}", .{err});
+-            return error.DecompressionFailed;
+-        };
+-
+-        // Empty our current data list, take ownership over managed array list
+-        self.data.deinit(alloc);
+-        self.data = .{ .items = list.items, .capacity = list.capacity };
+-
+-        // Make sure we note that our image is no longer compressed
+-        self.image.compression = .none;
+-    }
+-
+-    /// Decode the data as PNG. This will also updated the image dimensions.
+-    fn decodePng(self: *LoadingImage, alloc: Allocator) !void {
+-        assert(self.image.format == .png);
+-
+-        const result = wuffs.png.decode(
+-            alloc,
+-            self.data.items,
+-        ) catch |err| switch (err) {
+-            error.WuffsError => return error.InvalidData,
+-            error.OutOfMemory => return error.OutOfMemory,
+-        };
+-        defer alloc.free(result.data);
+-
+-        if (result.data.len > max_size) {
+-            log.warn("png image too large size={} max_size={}", .{ result.data.len, max_size });
+-            return error.InvalidData;
+-        }
+-
+-        // Replace our data
+-        self.data.deinit(alloc);
+-        self.data = .{};
+-        try self.data.ensureUnusedCapacity(alloc, result.data.len);
+-        try self.data.appendSlice(alloc, result.data[0..result.data.len]);
+-
+-        // Store updated image dimensions
+-        self.image.width = result.width;
+-        self.image.height = result.height;
+-        self.image.format = .rgba;
+-    }
+ };
+ 
+ /// Image represents a single fully loaded image.
+@@ -488,6 +487,87 @@ pub const Image = struct {
+         copy.data = "";
+         return copy;
+     }
++
++    /// Debug function to write the data to a file. This is useful for
++    /// capturing some test data for unit tests.
++    pub fn debugDump(self: Image) !void {
++        if (comptime builtin.mode != .Debug) @compileError("debugDump in non-debug");
++
++        var buf: [1024]u8 = undefined;
++        const filename = try std.fmt.bufPrint(
++            &buf,
++            "image-{s}-{s}-{d}x{d}-{}.data",
++            .{
++                @tagName(self.format),
++                @tagName(self.compression),
++                self.width,
++                self.height,
++                self.id,
++            },
++        );
++        const cwd = std.fs.cwd();
++        const f = try cwd.createFile(filename, .{});
++        defer f.close();
++
++        const writer = f.writer();
++        try writer.writeAll(self.data);
++    }
++
++    /// Complete the image. This must be called after loading and after
++    /// being sure the data is complete (not chunked).
++    pub fn complete(self: *Image, alloc: Allocator) !void {
++        const bpp: u32 = switch (self.format) {
++            .gray => 1,
++            .gray_alpha => 2,
++            .rgb => 3,
++            .rgba => 4,
++            .png => unreachable, // png should be decoded by here
++        };
++
++        // Validate our dimensions.
++        if (self.width == 0 or self.height == 0) return error.DimensionsRequired;
++        if (self.width > max_dimension or self.height > max_dimension) return error.DimensionsTooLarge;
++
++        // Decompress the data if it is compressed.
++        try self.decompress(alloc);
++
++        // Data length must be what we expect
++        const expected_len = self.width * self.height * bpp;
++        const actual_len = self.data.len;
++        std.log.debug(
++            "complete image id={} width={} height={} bpp={} expected_len={} actual_len={}",
++            .{ self.id, self.width, self.height, bpp, expected_len, actual_len },
++        );
++        if (actual_len != expected_len) return error.InvalidData;
++    }
++
++    /// Decompress the image data in-place.
++    fn decompress(self: *Image, alloc: Allocator) !void {
++        return switch (self.compression) {
++            .none => {},
++            .zlib_deflate => self.decompressZlib(alloc),
++        };
++    }
++
++    fn decompressZlib(self: *Image, alloc: Allocator) !void {
++        // Open our zlib stream
++        var fbs = std.io.fixedBufferStream(self.data);
++        var stream = std.compress.zlib.decompressor(fbs.reader());
++
++        // Write it to an array list
++        var list = std.ArrayList(u8).init(alloc);
++        defer list.deinit();
++        stream.reader().readAllArrayList(&list, max_size) catch |err| {
++            log.warn("failed to read decompressed data: {}", .{err});
++            return error.DecompressionFailed;
++        };
++
++        // Swap our data out
++        alloc.free(self.data);
++        self.data = "";
++        self.data = try list.toOwnedSlice();
++        self.compression = .none;
++    }
+ };
+ 
+ /// The rect taken up by some image placement, in grid cells. This will
+@@ -523,6 +603,9 @@ test "image load with image too wide" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
++    var data = try alloc.dupe(u8, "AAAA");
++    defer alloc.free(data);
++
+     var cmd: command.Command = .{
+         .control = .{ .transmit = .{
+             .format = .rgb,
+@@ -530,7 +613,7 @@ test "image load with image too wide" {
+             .height = 1,
+             .image_id = 31,
+         } },
+-        .data = try alloc.dupe(u8, "AAAA"),
++        .data = data,
+     };
+     defer cmd.deinit(alloc);
+     var loading = try LoadingImage.init(alloc, &cmd);
+@@ -542,6 +625,9 @@ test "image load with image too tall" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
++    var data = try alloc.dupe(u8, "AAAA");
++    defer alloc.free(data);
++
+     var cmd: command.Command = .{
+         .control = .{ .transmit = .{
+             .format = .rgb,
+@@ -549,7 +635,7 @@ test "image load with image too tall" {
+             .width = 1,
+             .image_id = 31,
+         } },
+-        .data = try alloc.dupe(u8, "AAAA"),
++        .data = data,
+     };
+     defer cmd.deinit(alloc);
+     var loading = try LoadingImage.init(alloc, &cmd);
+@@ -764,12 +850,12 @@ test "image load: rgb, not compressed, regular file" {
+     defer tmp_dir.deinit();
+     const data = @embedFile("testdata/ghostty_src_terminal_kitty_graphics_image.zig_expectedoutput.txt (expected): [std.fs.max_path_bytes]u8 = undefined;
+-    const path = try tmp_dir.dir.realpath("image.data", &buf);
++    const path = try tmp_dir.dir.realpath("tty-graphics-protocol-image.data", &buf);
+ 
+     var cmd: command.Command = .{
+         .control = .{ .transmit = .{
