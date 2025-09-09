@@ -1,0 +1,222 @@
+use core::cmp;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use ahash::AHasher;
+use atomic_refcell::AtomicRefCell;
+use bitvec::macros::internal::funty::Integral;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::small_uint::U24;
+use common::types::PointOffsetType;
+use io::storage_version::StorageVersion;
+use itertools::Itertools;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+use super::{
+    create_mutable_id_tracker, create_payload_storage, create_sparse_vector_index,
+    create_sparse_vector_storage, get_payload_index_path, get_vector_index_path,
+    get_vector_storage_path, new_segment_path, open_segment_db, open_vector_storage,
+};
+use crate::common::error_logging::LogError;
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+use crate::entry::entry_point::SegmentEntry;
+use crate::id_tracker::compressed::compressed_point_mappings::CompressedPointMappings;
+use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
+use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
+use crate::id_tracker::{IdTracker, IdTrackerEnum, for_each_unique_point};
+use crate::index::field_index::FieldIndex;
+use crate::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
+use crate::index::struct_payload_index::StructPayloadIndex;
+use crate::index::{PayloadIndex, VectorIndexEnum};
+use crate::payload_storage::PayloadStorage;
+use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+use crate::segment::{Segment, SegmentVersion};
+use crate::segment_constructor::{
+    VectorIndexBuildArgs, VectorIndexOpenArgs, build_vector_index, load_segment,
+};
+use crate::types::{
+    CompactExtendedPointId, ExtendedPointId, PayloadFieldSchema, PayloadKeyType, SegmentConfig,
+    SegmentState, SeqNumberType, VectorNameBuf,
+};
+use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+
+/// Structure for constructing segment out of several other segments
+pub struct SegmentBuilder {
+    version: SeqNumberType,
+    id_tracker: IdTrackerEnum,
+    payload_storage: PayloadStorageEnum,
+    vector_data: HashMap<VectorNameBuf, VectorData>,
+    segment_config: SegmentConfig,
+
+    // The path, where fully created segment will be moved
+    destination_path: PathBuf,
+    // The temporary segment directory
+    temp_dir: TempDir,
+    indexed_fields: HashMap<PayloadKeyType, PayloadFieldSchema>,
+
+    // Payload key to defragment data to
+    defragment_keys: Vec<PayloadKeyType>,
+}
+
+struct VectorData {
+    vector_storage: VectorStorageEnum,
+    old_indices: Vec<Arc<AtomicRefCell<VectorIndexEnum>>>,
+}
+
+impl SegmentBuilder {
+    pub fn new(
+        segments_path: &Path,
+        temp_dir: &Path,
+        segment_config: &SegmentConfig,
+    ) -> OperationResult<Self> {
+        let temp_dir = create_temp_dir(temp_dir)?;
+
+        // When we build a new segment, it is empty at first,
+        // so we can ignore the `stopped` flag
+        let stopped = AtomicBool::new(false);
+
+        let database = open_segment_db(temp_dir.path(), segment_config)?;
+
+        let id_tracker = if segment_config.is_appendable() {
+            IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(temp_dir.path())?)
+        } else {
+            IdTrackerEnum::InMemoryIdTracker(InMemoryIdTracker::new())
+        };
+
+        let payload_storage =
+            create_payload_storage(database.clone(), segment_config, temp_dir.path())?;
+
+        let mut vector_data = HashMap::new();
+
+        for (vector_name, vector_config) in &segment_config.vector_data {
+            let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
+            let vector_storage = open_vector_storage(
+                &database,
+                vector_config,
+                &stopped,
+                &vector_storage_path,
+                vector_name,
+            )?;
+
+            vector_data.insert(
+                vector_name.to_owned(),
+                VectorData {
+                    vector_storage,
+                    old_indices: Vec::new(),
+                },
+            );
+        }
+
+        for (vector_name, sparse_vector_config) in &segment_config.sparse_vector_data {
+            let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
+
+            let vector_storage = create_sparse_vector_storage(
+                database.clone(),
+                &vector_storage_path,
+                vector_name,
+                &sparse_vector_config.storage_type,
+                &stopped,
+            )?;
+
+            vector_data.insert(
+                vector_name.to_owned(),
+                VectorData {
+                    vector_storage,
+                    old_indices: Vec::new(),
+                },
+            );
+        }
+
+        let destination_path = new_segment_path(segments_path);
+
+        Ok(SegmentBuilder {
+            version: Default::default(), // default version is 0
+            id_tracker,
+            payload_storage,
+            vector_data,
+            segment_config: segment_config.clone(),
+
+            destination_path,
+            temp_dir,
+            indexed_fields: Default::default(),
+            defragment_keys: vec![],
+        })
+    }
+
+    pub fn set_defragment_keys(&mut self, keys: Vec<PayloadKeyType>) {
+        self.defragment_keys = keys;
+    }
+
+    pub fn add_indexed_field(&mut self, field: PayloadKeyType, schema: PayloadFieldSchema) {
+        self.indexed_fields.insert(field, schema);
+    }
+
+    /// Get ordering value from the payload index
+    ///
+    /// Ordering value is used to sort points to keep points with the same payload together
+    /// Under the assumption that points are queried together, this will reduce the number of
+    /// random disk reads.
+    ///
+    /// Note: This value doesn't guarantee strict ordering in ambiguous cases.
+    ///       It should only be used in optimization purposes, not for correctness.
+    fn _get_ordering_value(internal_id: PointOffsetType, indices: &[FieldIndex]) -> u64 {
+        let mut ordering = 0;
+        for payload_index in indices {
+            match payload_index {
+                FieldIndex::IntMapIndex(index) => {
+                    if let Some(numbers) = index.get_values(internal_id) {
+                        for number in numbers {
+                            ordering = ordering.wrapping_add(*number as u64);
+                        }
+                    }
+                    break;
+                }
+                FieldIndex::UuidIndex(index) => {
+                    if let Some(ids) = index.get_values(internal_id) {
+                        uuid_hash(&mut ordering, ids);
+                    }
+                    break;
+                }
+                FieldIndex::UuidMapIndex(index) => {
+                    if let Some(ids) = index.get_values(internal_id) {
+                        uuid_hash(&mut ordering, ids.copied());
+                    }
+                    break;
+                }
+                FieldIndex::KeywordIndex(index) => {
+                    if let Some(keywords) = index.get_values(internal_id) {
+                        for keyword in keywords {
+                            let mut hasher = AHasher::default();
+                            keyword.hash(&mut hasher);
+                            ordering = ordering.wrapping_add(hasher.finish());
+                        }
+                    }
+                    break;
+                }
+                FieldIndex::IntIndex(index) => {
+                    if let Some(numbers) = index.get_values(internal_id) {
+                        for number in numbers {
+                            ordering = ordering.wrapping_add(number as u64);
+                        }
+                    }
+                    break;
+                }
+                FieldIndex::FloatIndex(index) => {
+                    if let Some(numbers) = index.get_values(internal_id) {
+                        for number in numbers {
+                            // Bit-level conversion of f64 to u64 preserves ordering
+                            // (for positive numbers)
+                            //
+                            // 0.001 -> 4562254508917369340
+                            // 0.01  -> 4576918229304087675
+                            // 0.05  -> 4587366580439587226
+                            // 0.1   -> 4591870180066957722
+                            // 1     -> 4607182418800017408
+                            //
