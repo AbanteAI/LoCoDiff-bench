@@ -1,0 +1,154 @@
+use std::collections::BTreeMap;
+
+use collection::config::{CollectionConfigInternal, CollectionParams, ShardingMethod};
+use collection::operations::config_diff::{
+    CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
+    WalConfigDiff,
+};
+use collection::operations::types::{
+    SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
+};
+use collection::shards::replica_set::ReplicaState;
+use collection::shards::resharding::ReshardKey;
+use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
+use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
+use collection::shards::{CollectionId, replica_set};
+use schemars::JsonSchema;
+use segment::types::{
+    PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+    VectorNameBuf,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use validator::Validate;
+
+use crate::content_manager::errors::{StorageError, StorageResult};
+use crate::content_manager::shard_distribution::ShardDistributionProposal;
+
+// *Operation wrapper structure is only required for better OpenAPI generation
+
+/// Create alternative name for a collection.
+/// Collection will be available under both names for search, retrieve,
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateAlias {
+    pub collection_name: String,
+    pub alias_name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateAliasOperation {
+    pub create_alias: CreateAlias,
+}
+
+/// Delete alias if exists
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct DeleteAlias {
+    pub alias_name: String,
+}
+
+/// Delete alias if exists
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct DeleteAliasOperation {
+    pub delete_alias: DeleteAlias,
+}
+
+/// Change alias to a new one
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct RenameAlias {
+    pub old_alias_name: String,
+    pub new_alias_name: String,
+}
+
+/// Change alias to a new one
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct RenameAliasOperation {
+    pub rename_alias: RenameAlias,
+}
+
+/// Group of all the possible operations related to collection aliases
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum AliasOperations {
+    CreateAlias(CreateAliasOperation),
+    DeleteAlias(DeleteAliasOperation),
+    RenameAlias(RenameAliasOperation),
+}
+
+impl From<CreateAlias> for AliasOperations {
+    fn from(create_alias: CreateAlias) -> Self {
+        AliasOperations::CreateAlias(CreateAliasOperation { create_alias })
+    }
+}
+
+impl From<DeleteAlias> for AliasOperations {
+    fn from(delete_alias: DeleteAlias) -> Self {
+        AliasOperations::DeleteAlias(DeleteAliasOperation { delete_alias })
+    }
+}
+
+impl From<RenameAlias> for AliasOperations {
+    fn from(rename_alias: RenameAlias) -> Self {
+        AliasOperations::RenameAlias(RenameAliasOperation { rename_alias })
+    }
+}
+
+/// Operation for creating new collection and (optionally) specify index params
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct InitFrom {
+    pub collection: CollectionId,
+}
+
+/// Operation for creating new collection and (optionally) specify index params
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateCollection {
+    /// Vector data config.
+    /// It is possible to provide one config for single vector mode and list of configs for multiple vectors mode.
+    #[serde(default)]
+    #[validate(nested)]
+    pub vectors: VectorsConfig,
+    /// For auto sharding:
+    /// Number of shards in collection.
+    ///  - Default is 1 for standalone, otherwise equal to the number of nodes
+    ///  - Minimum is 1
+    ///
+    /// For custom sharding:
+    /// Number of shards in collection per shard group.
+    ///  - Default is 1, meaning that each shard key will be mapped to a single shard
+    ///  - Minimum is 1
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub shard_number: Option<u32>,
+    /// Sharding method
+    /// Default is Auto - points are distributed across all available shards
+    /// Custom - points are distributed across shards according to shard key
+    #[serde(default)]
+    pub sharding_method: Option<ShardingMethod>,
+    /// Number of shards replicas.
+    /// Default is 1
+    /// Minimum is 1
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub replication_factor: Option<u32>,
+    /// Defines how many replicas should apply the operation for us to consider it successful.
+    /// Increasing this number will make the collection more resilient to inconsistencies, but will
+    /// also make it fail if not enough replicas are available.
+    /// Does not have any performance impact.
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub write_consistency_factor: Option<u32>,
+    /// If true - point's payload will not be stored in memory.
+    /// It will be read from the disk every time it is requested.
+    /// This setting saves RAM by (slightly) increasing the response time.
+    /// Note: those payload values that are involved in filtering and are indexed - remain in RAM.
+    ///
+    /// Default: true
+    #[serde(default)]
