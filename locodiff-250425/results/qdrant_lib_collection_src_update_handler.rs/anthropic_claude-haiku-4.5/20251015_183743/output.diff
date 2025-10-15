@@ -1,0 +1,170 @@
+
+index cb922e861..be5f26b04 100644
+--- a/qdrant_lib_collection_src_update_handler.rs_expectedoutput.txt (expected):tmp/tmp0m4s0juv_expected.txt	
++++ b/qdrant_lib_collection_src_update_handler.rs_extracted.txt (actual):tmp/tmp66olbq_o_actual.txt	
+@@ -263,6 +263,70 @@ impl UpdateHandler {
+         Ok(0)
+     }
+ 
++    /// Ensure there is at least one appendable segment with enough capacity
++    ///
++    /// If there is no appendable segment, or all are at or over capacity, a new empty one is
++    /// created.
++    ///
++    /// Capacity is determined based on `optimizers.max_segment_size_kb`.
++    pub(super) fn ensure_appendable_segment_with_capacity(
++        segments: &LockedSegmentHolder,
++        segments_path: &Path,
++        collection_params: &CollectionParams,
++        thresholds_config: &OptimizerThresholds,
++        payload_index_schema: &PayloadIndexSchema,
++    ) -> OperationResult<()> {
++        let no_segment_with_capacity = {
++            let segments_read = segments.read();
++            segments_read
++                .appendable_segments_ids()
++                .into_iter()
++                .filter_map(|segment_id| segments_read.get(segment_id))
++                .all(|segment| {
++                    let max_vector_size_bytes = segment
++                        .get()
++                        .read()
++                        .max_available_vectors_size_in_bytes()
++                        .unwrap_or_default();
++                    let max_segment_size_bytes = thresholds_config
++                        .max_segment_size_kb
++                        .saturating_mul(segment::common::BYTES_IN_KB);
++
++                    max_vector_size_bytes >= max_segment_size_bytes
++                })
++        };
++
++        if no_segment_with_capacity {
++            log::debug!("Creating new appendable segment, all existing segments are over capacity");
++            segments.write().create_appendable_segment(
++                segments_path,
++                collection_params,
++                payload_index_schema,
++            )?;
++        }
++
++        Ok(())
++    }
++
++    /// Checks the optimizer conditions.
++    ///
++    /// This function returns a tuple of two booleans:
++    /// - The first indicates if any optimizers have been triggered since startup.
++    /// - The second indicates if there are any pending/suboptimal optimizers.
++    pub(crate) fn check_optimizer_conditions(&self) -> (bool, bool) {
++        // Check if Qdrant triggered any optimizations since starting at all
++        let has_triggered_any_optimizers = self.has_triggered_optimizers.load(Ordering::Relaxed);
++
++        let excluded_ids = HashSet::<_>::default();
++        let has_suboptimal_optimizers = self.optimizers.iter().any(|optimizer| {
++            let nonoptimal_segment_ids =
++                optimizer.check_condition(self.segments.clone(), &excluded_ids);
++            !nonoptimal_segment_ids.is_empty()
++        });
++
++        (has_triggered_any_optimizers, has_suboptimal_optimizers)
++    }
++
+     /// Checks conditions for all optimizers until there is no suggested segment
+     /// Starts a task for each optimization
+     /// Returns handles for started tasks
+@@ -413,70 +477,6 @@ impl UpdateHandler {
+         handles
+     }
+ 
+-    /// Ensure there is at least one appendable segment with enough capacity
+-    ///
+-    /// If there is no appendable segment, or all are at or over capacity, a new empty one is
+-    /// created.
+-    ///
+-    /// Capacity is determined based on `optimizers.max_segment_size_kb`.
+-    pub(super) fn ensure_appendable_segment_with_capacity(
+-        segments: &LockedSegmentHolder,
+-        segments_path: &Path,
+-        collection_params: &CollectionParams,
+-        thresholds_config: &OptimizerThresholds,
+-        payload_index_schema: &PayloadIndexSchema,
+-    ) -> OperationResult<()> {
+-        let no_segment_with_capacity = {
+-            let segments_read = segments.read();
+-            segments_read
+-                .appendable_segments_ids()
+-                .into_iter()
+-                .filter_map(|segment_id| segments_read.get(segment_id))
+-                .all(|segment| {
+-                    let max_vector_size_bytes = segment
+-                        .get()
+-                        .read()
+-                        .max_available_vectors_size_in_bytes()
+-                        .unwrap_or_default();
+-                    let max_segment_size_bytes = thresholds_config
+-                        .max_segment_size_kb
+-                        .saturating_mul(segment::common::BYTES_IN_KB);
+-
+-                    max_vector_size_bytes >= max_segment_size_bytes
+-                })
+-        };
+-
+-        if no_segment_with_capacity {
+-            log::debug!("Creating new appendable segment, all existing segments are over capacity");
+-            segments.write().create_appendable_segment(
+-                segments_path,
+-                collection_params,
+-                payload_index_schema,
+-            )?;
+-        }
+-
+-        Ok(())
+-    }
+-
+-    /// Checks the optimizer conditions.
+-    ///
+-    /// This function returns a tuple of two booleans:
+-    /// - The first indicates if any optimizers have been triggered since startup.
+-    /// - The second indicates if there are any pending/suboptimal optimizers.
+-    pub(crate) fn check_optimizer_conditions(&self) -> (bool, bool) {
+-        // Check if Qdrant triggered any optimizations since starting at all
+-        let has_triggered_any_optimizers = self.has_triggered_optimizers.load(Ordering::Relaxed);
+-
+-        let excluded_ids = HashSet::<_>::default();
+-        let has_suboptimal_optimizers = self.optimizers.iter().any(|optimizer| {
+-            let nonoptimal_segment_ids =
+-                optimizer.check_condition(self.segments.clone(), &excluded_ids);
+-            !nonoptimal_segment_ids.is_empty()
+-        });
+-
+-        (has_triggered_any_optimizers, has_suboptimal_optimizers)
+-    }
+-
+     #[allow(clippy::too_many_arguments)]
+     pub(crate) async fn process_optimization(
+         optimizers: Arc<Vec<Arc<Optimizer>>>,
+@@ -797,6 +797,11 @@ impl UpdateHandler {
+                 }
+             };
+ 
++            if let Err(err) = clocks.store_if_changed(&shard_path).await {
++                log::warn!("Failed to store clock maps to disk: {err}");
++                segments.write().report_optimizer_error(err);
++            }
++
+             // Acknowledge confirmed version in WAL, but don't acknowledge the specified
+             // `keep_from` index or higher.
+             // This is to prevent truncating WAL entries that other bits of code still depend on
+@@ -811,11 +816,6 @@ impl UpdateHandler {
+ 
+             let ack = confirmed_version.min(keep_from.saturating_sub(1));
+ 
+-            if let Err(err) = clocks.store_if_changed(&shard_path).await {
+-                log::warn!("Failed to store clock maps to disk: {err}");
+-                segments.write().report_optimizer_error(err);
+-            }
+-
+             if let Err(err) = wal.lock().await.ack(ack) {
+                 log::warn!("Failed to acknowledge WAL version: {err}");
+                 segments.write().report_optimizer_error(err);
