@@ -1,0 +1,336 @@
+
+index cb922e861..ffd7bfaac 100644
+--- a/qdrant_lib_collection_src_update_handler.rs_expectedoutput.txt (expected):tmp/tmpkhlb4cxf_expected.txt	
++++ b/qdrant_lib_collection_src_update_handler.rs_extracted.txt (actual):tmp/tmpf67p8fh9_actual.txt	
+@@ -40,7 +40,7 @@ use crate::wal_delta::LockedWal;
+ 
+ /// Interval at which the optimizer worker cleans up old optimization handles
+ ///
+-/// The longer the duration, the longer it  takes for panicked tasks to be reported.
++/// The longer the duration, the longer it takes for panicked tasks to be reported.
+ const OPTIMIZER_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+ 
+ pub type Optimizer = dyn SegmentOptimizer + Sync + Send;
+@@ -91,7 +91,6 @@ pub struct UpdateHandler {
+     pub optimizers: Arc<Vec<Arc<Optimizer>>>,
+     /// Log of optimizer statuses
+     optimizers_log: Arc<Mutex<TrackerLog>>,
+-    /// Total number of optimized points since last start
+     total_optimized_points: Arc<AtomicUsize>,
+     /// Global CPU budget in number of cores for all optimization tasks.
+     /// Assigns CPU permits to tasks to limit overall resource utilization.
+@@ -148,61 +147,26 @@ impl UpdateHandler {
+             shared_storage_config,
+             payload_index_schema,
+             optimizers,
+-            segments,
+             update_worker: None,
+             optimizer_worker: None,
+             optimizers_log,
+             total_optimized_points,
+             optimizer_resource_budget,
++            flush_interval_sec,
++            segments,
+             flush_worker: None,
+             flush_stop: None,
+             runtime_handle,
+             wal,
+             wal_keep_from: Arc::new(u64::MAX.into()),
+-            flush_interval_sec,
+             optimization_handles: Arc::new(TokioMutex::new(vec![])),
+             max_optimization_threads,
+             clocks,
+             shard_path,
+-            has_triggered_optimizers: Default::default(),
++            has_triggered_optimizers: Arc::new(AtomicBool::new(false)),
+         }
+     }
+ 
+-    pub fn run_workers(&mut self, update_receiver: Receiver<UpdateSignal>) {
+-        let (tx, rx) = mpsc::channel(self.shared_storage_config.update_queue_size);
+-        self.optimizer_worker = Some(self.runtime_handle.spawn(Self::optimization_worker_fn(
+-            self.optimizers.clone(),
+-            tx.clone(),
+-            rx,
+-            self.segments.clone(),
+-            self.wal.clone(),
+-            self.optimization_handles.clone(),
+-            self.optimizers_log.clone(),
+-            self.total_optimized_points.clone(),
+-            self.optimizer_resource_budget.clone(),
+-            self.max_optimization_threads,
+-            self.has_triggered_optimizers.clone(),
+-            self.payload_index_schema.clone(),
+-        )));
+-        self.update_worker = Some(self.runtime_handle.spawn(Self::update_worker_fn(
+-            update_receiver,
+-            tx,
+-            self.wal.clone(),
+-            self.segments.clone(),
+-        )));
+-        let (flush_tx, flush_rx) = oneshot::channel();
+-        self.flush_worker = Some(self.runtime_handle.spawn(Self::flush_worker(
+-            self.segments.clone(),
+-            self.wal.clone(),
+-            self.wal_keep_from.clone(),
+-            self.flush_interval_sec,
+-            flush_rx,
+-            self.clocks.clone(),
+-            self.shard_path.clone(),
+-        )));
+-        self.flush_stop = Some(flush_tx);
+-    }
+-
+     pub fn stop_flush_worker(&mut self) {
+         if let Some(flush_stop) = self.flush_stop.take() {
+             if let Err(()) = flush_stop.send(()) {
+@@ -213,6 +177,7 @@ impl UpdateHandler {
+ 
+     /// Gracefully wait before all optimizations stop
+     /// If some optimization is in progress - it will be finished before shutdown.
++    /// Blocking function.
+     pub async fn wait_workers_stops(&mut self) -> CollectionResult<()> {
+         let maybe_handle = self.update_worker.take();
+         if let Some(handle) = maybe_handle {
+@@ -241,13 +206,48 @@ impl UpdateHandler {
+         Ok(())
+     }
+ 
++    pub fn run_workers(&mut self, update_receiver: Receiver<UpdateSignal>) {
++        let (tx, rx) = mpsc::channel(self.shared_storage_config.update_queue_size);
++        self.optimizer_worker = Some(self.runtime_handle.spawn(Self::optimization_worker_fn(
++            self.optimizers.clone(),
++            tx.clone(),
++            rx,
++            self.segments.clone(),
++            self.wal.clone(),
++            self.optimization_handles.clone(),
++            self.optimizers_log.clone(),
++            self.total_optimized_points.clone(),
++            self.optimizer_resource_budget.clone(),
++            self.max_optimization_threads,
++            self.has_triggered_optimizers.clone(),
++            self.payload_index_schema.clone(),
++        )));
++        self.update_worker = Some(self.runtime_handle.spawn(Self::update_worker_fn(
++            update_receiver,
++            tx,
++            self.segments.clone(),
++            self.wal.clone(),
++        )));
++        let (flush_tx, flush_rx) = oneshot::channel();
++        self.flush_worker = Some(self.runtime_handle.spawn(Self::flush_worker(
++            self.segments.clone(),
++            self.wal.clone(),
++            self.wal_keep_from.clone(),
++            self.flush_interval_sec,
++            flush_rx,
++            self.clocks.clone(),
++            self.shard_path.clone(),
++        )));
++        self.flush_stop = Some(flush_tx);
++    }
++
+     /// Checks if there are any failed operations.
+     /// If so - attempts to re-apply all failed operations.
+     async fn try_recover(segments: LockedSegmentHolder, wal: LockedWal) -> CollectionResult<usize> {
+         // Try to re-apply everything starting from the first failed operation
+         let first_failed_operation_option = segments.read().failed_operation.iter().cloned().min();
+         match first_failed_operation_option {
+-            None => {}
++            None => Ok(0),
+             Some(first_failed_op) => {
+                 let wal_lock = wal.lock().await;
+                 for (op_num, operation) in wal_lock.read(first_failed_op) {
+@@ -258,9 +258,31 @@ impl UpdateHandler {
+                         &HardwareCounterCell::disposable(), // Internal operation, no measurement needed
+                     )?;
+                 }
++                Err(CollectionError::service_error("Failed operation recovery should not return".to_string()))
+             }
+-        };
+-        Ok(0)
++        }
++    }
++
++    fn process_optimization(
++        optimizers: Arc<Vec<Arc<Optimizer>>>,
++        segments: LockedSegmentHolder,
++    ) -> Vec<JoinHandle<()>> {
++        for optimizer in optimizers.iter() {
++            let nonoptimal_segment_ids = optimizer.check_condition(segments.clone());
++            while !nonoptimal_segment_ids.is_empty() {
++                debug!(
++                    "Start optimization on segments: {:?}",
++                    nonoptimal_segment_ids
++                );
++                // If optimization fails, it could not be reported to anywhere except for console.
++                // So the only recovery here is to stop optimization and await for restart
++                if optimizer.optimize(segments.clone(), nonoptimal_segment_ids).is_err() {
++                    continue;
++                };
++                nonoptimal_segment_ids = optimizer.check_condition(segments.clone());
++            }
++        }
++        vec![]
+     }
+ 
+     /// Checks conditions for all optimizers until there is no suggested segment
+@@ -285,7 +307,7 @@ impl UpdateHandler {
+             loop {
+                 // Return early if we reached the optimization job limit
+                 if limit.map(|extra| handles.len() >= extra).unwrap_or(false) {
+-                    log::trace!("Reached optimization job limit, postponing other optimizations");
++                    info!("Reached optimization job limit, postponing other optimizations");
+                     break 'outer;
+                 }
+ 
+@@ -367,8 +389,7 @@ impl UpdateHandler {
+                                 Err(error) => match error {
+                                     CollectionError::Cancelled { description } => {
+                                         debug!("Optimization cancelled - {description}");
+-                                        tracker_handle
+-                                            .update(TrackerStatus::Cancelled(description));
++                                        tracker_handle.update(TrackerStatus::Cancelled(description));
+                                         false
+                                     }
+                                     _ => {
+@@ -380,8 +401,7 @@ impl UpdateHandler {
+                                         // optimization thread and log the error
+                                         log::error!("Optimization error: {error}");
+ 
+-                                        tracker_handle
+-                                            .update(TrackerStatus::Error(error.to_string()));
++                                        tracker_handle.update(TrackerStatus::Error(error.to_string()));
+ 
+                                         panic!("Optimization error: {error}");
+                                     }
+@@ -399,11 +419,9 @@ impl UpdateHandler {
+                              {separator}{message}"
+                         );
+ 
+-                        segments
+-                            .write()
+-                            .report_optimizer_error(CollectionError::service_error(format!(
+-                                "Optimization task panicked{separator}{message}"
+-                            )));
++                        segments.write().report_optimizer_error(CollectionError::service_error(format!(
++                            "Optimization task panicked{separator}{message}"
++                        )));
+                     })),
+                 );
+                 handles.push(handle);
+@@ -433,11 +451,8 @@ impl UpdateHandler {
+                 .into_iter()
+                 .filter_map(|segment_id| segments_read.get(segment_id))
+                 .all(|segment| {
+-                    let max_vector_size_bytes = segment
+-                        .get()
+-                        .read()
+-                        .max_available_vectors_size_in_bytes()
+-                        .unwrap_or_default();
++                    let max_vector_size_bytes =
++                        segment.get().read().max_available_vectors_size_in_bytes().unwrap_or_default();
+                     let max_segment_size_bytes = thresholds_config
+                         .max_segment_size_kb
+                         .saturating_mul(segment::common::BYTES_IN_KB);
+@@ -447,7 +462,7 @@ impl UpdateHandler {
+         };
+ 
+         if no_segment_with_capacity {
+-            log::debug!("Creating new appendable segment, all existing segments are over capacity");
++            debug!("Creating new appendable segment, all existing segments are over capacity");
+             segments.write().create_appendable_segment(
+                 segments_path,
+                 collection_params,
+@@ -505,6 +520,7 @@ impl UpdateHandler {
+         );
+         let mut handles = optimization_handles.lock().await;
+         handles.append(&mut new_handles);
++        handles.retain(|h| !h.is_finished())
+     }
+ 
+     /// Cleanup finalized optimization task handles
+@@ -561,14 +577,13 @@ impl UpdateHandler {
+             .map(|optimizer| optimizer.hnsw_config().max_indexing_threads)
+             .unwrap_or_default();
+ 
+-        // Asynchronous task to trigger optimizers once CPU budget is available again
++        // Asynchronous task to trigger optimizers once resource budget is available again
+         let mut resource_available_trigger: Option<JoinHandle<()>> = None;
+ 
+         loop {
+             let result = timeout(OPTIMIZER_CLEANUP_INTERVAL, receiver.recv()).await;
+ 
+-            let cleaned_any =
+-                Self::cleanup_optimization_handles(optimization_handles.clone()).await;
++            let cleaned_any = Self::cleanup_optimization_handles(optimization_handles.clone()).await;
+ 
+             // Either continue below here with the worker, or reloop/break
+             // Decision logic doing one of three things:
+@@ -612,9 +627,7 @@ impl UpdateHandler {
+                     &payload_index_schema.read(),
+                 );
+                 if let Err(err) = result {
+-                    log::error!(
+-                        "Failed to ensure there are appendable segments with capacity: {err}"
+-                    );
++                    log::error!("Failed to ensure there are appendable segments with capacity: {err}");
+                     panic!("Failed to ensure there are appendable segments with capacity: {err}");
+                 }
+             }
+@@ -679,8 +692,8 @@ impl UpdateHandler {
+     async fn update_worker_fn(
+         mut receiver: Receiver<UpdateSignal>,
+         optimize_sender: Sender<OptimizerSignal>,
+-        wal: LockedWal,
+         segments: LockedSegmentHolder,
++        wal: LockedWal,
+     ) {
+         while let Some(signal) = receiver.recv().await {
+             match signal {
+@@ -796,7 +809,6 @@ impl UpdateHandler {
+                     continue;
+                 }
+             };
+-
+             // Acknowledge confirmed version in WAL, but don't acknowledge the specified
+             // `keep_from` index or higher.
+             // This is to prevent truncating WAL entries that other bits of code still depend on
+@@ -808,7 +820,6 @@ impl UpdateHandler {
+             if keep_from == 0 {
+                 continue;
+             }
+-
+             let ack = confirmed_version.min(keep_from.saturating_sub(1));
+ 
+             if let Err(err) = clocks.store_if_changed(&shard_path).await {
+@@ -837,7 +848,7 @@ impl UpdateHandler {
+     }
+ }
+ 
+-/// Trigger optimizers when CPU budget is available
++/// Trigger optimizers when resource budget is available
+ fn trigger_optimizers_on_resource_budget(
+     optimizer_resource_budget: ResourceBudget,
+     desired_cpus: usize,
+@@ -845,15 +856,15 @@ fn trigger_optimizers_on_resource_budget(
+     sender: Sender<OptimizerSignal>,
+ ) -> JoinHandle<()> {
+     task::spawn(async move {
+-        log::trace!("Skipping optimization checks, waiting for CPU budget to be available");
++        log::trace!("Skipping optimization checks, waiting for resource budget to be available");
+         optimizer_resource_budget
+             .notify_on_budget_available(desired_cpus, desired_io)
+             .await;
+-        log::trace!("Continue optimization checks, new CPU budget available");
++        log::trace!("Continue optimization checks, new resource budget available");
+ 
+         // Trigger optimizers with Nop operation
+         sender.send(OptimizerSignal::Nop).await.unwrap_or_else(|_| {
+-            log::info!("Can't notify optimizers, assume process is dead. Restart is required")
++            info!("Can't notify optimizers, assume process is dead. Restart is required")
+         });
+     })
+ }
+\ No newline at end of file

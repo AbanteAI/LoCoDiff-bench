@@ -1,0 +1,104 @@
+mod collection_ops;
+mod point_ops;
+mod search;
+mod shard_transfer;
+mod snapshots;
+
+use std::collections::HashSet;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use segment::common::version::StorageVersion;
+use segment::types::ShardKey;
+use semver::Version;
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+
+use crate::collection_state::{ShardInfo, State};
+use crate::common::is_ready::IsReady;
+use crate::config::CollectionConfigInternal;
+use crate::operations::config_diff::{DiffConfig, OptimizersConfigDiff};
+use crate::operations::shared_storage_config::SharedStorageConfig;
+use crate::operations::types::{CollectionError, CollectionResult, NodeType, OptimizersStatus};
+use crate::optimizers_builder::OptimizersConfig;
+use crate::save_on_disk::SaveOnDisk;
+use crate::shards::channel_service::ChannelService;
+use crate::shards::collection_shard_distribution::CollectionShardDistribution;
+use crate::shards::local_shard::clock_map::RecoveryPoint;
+use crate::shards::replica_set::ReplicaState::{Active, Dead, Initializing, Listener};
+use crate::shards::replica_set::{ChangePeerFromState, ChangePeerState, ReplicaState, ShardReplicaSet};
+use crate::shards::resharding::tasks_pool::ReshardTasksPool;
+use crate::shards::resharding::ReshardKey;
+use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
+use crate::shards::shard_holder::{LockedShardHolder, ShardHolder, shard_not_found_error};
+use crate::shards::transfer::helpers::check_transfer_conflicts_strict;
+use crate::shards::transfer::transfer_tasks_pool::{TaskResult, TransferTasksPool};
+use crate::shards::transfer::{ShardTransfer, ShardTransferMethod};
+use crate::shards::{CollectionId, replica_set};
+use crate::telemetry::{CollectionConfigTelemetry, CollectionTelemetry, CollectionsAggregatedTelemetry];
+
+/// Collection's data is split into several shards.
+pub struct Collection {
+    pub(crate) id: CollectionId,
+    pub(crate) shards_holder: Arc<LockedShardHolder>,
+    pub(crate) collection_config: Arc<RwLock<CollectionConfigInternal>>,
+    pub(crate) shared_storage_config: Arc<SharedStorageConfig>,
+    payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    optimizers_overwrite: Option<OptimizersConfigDiff>,
+    this_peer_id: PeerId,
+    path: PathBuf,
+    snapshots_path: PathBuf,
+    channel_service: ChannelService,
+    transfer_tasks: Mutex<TransferTasksPool>,
+    reshard_tasks: Mutex<ReshardTasksPool>,
+    request_shard_transfer_cb: RequestShardTransfer,
+    notify_peer_failure_cb: ChangePeerFromState,
+    abort_shard_transfer_cb: replica_set::AbortShardTransfer,
+    init_time: Duration,
+    // One-way boolean flag that is set to true when the collection is fully initialized
+    // i.e. all shards are activated for the first time.
+    is_initialized: IsReady,
+    // Lock to temporary block collection update operations while the collection is being migrated.
+    // Lock is acquired for read on update operation and can be acquired for write externally,
+    // which will block all update operations until the lock is released.
+    updates_lock: Arc<RwLock<()>>,
+    // Update runtime handle.
+    update_runtime: Handle,
+    // Search runtime handle.
+    search_runtime: Handle,
+    optimizer_resource_budget: common::budget::ResourceBudget,
+    // Cached statistics of collection size, may be outdated.
+    collection_stats_cache: crate::common::collection_size_stats::CollectionSizeStatsCache,
+    // Background tasks to clean shards
+    shard_clean_tasks: clean::ShardCleanTasks,
+}
+
+pub type RequestShardTransfer = Arc<dyn Fn(ShardTransfer) + Send + Sync>;
+
+pub type OnTransferFailure = Arc<dyn Fn(ShardTransfer, CollectionId, &str) + Send + Sync>;
+pub type OnTransferSuccess = Arc<dyn Fn(ShardTransfer, CollectionId) + Send + Sync>;
+
+impl Collection {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        name: CollectionId,
+        this_peer_id: PeerId,
+        path: &Path,
+        snapshots_path: &Path,
+        collection_config: &CollectionConfigInternal,
+        shared_storage_config: Arc<SharedStorageConfig>,
+        shard_distribution: CollectionShardDistribution,
+        shard_key_mapping: Option<ShardKeyMapping>,
+        channel_service: ChannelService,
+        on_replica_failure: ChangePeerFromState,
+        request_shard_transfer: RequestShardTransfer,
+        abort_shard_transfer: replica_set::AbortShardTransfer,
+        search_runtime: Option<Handle>,
+        update_runtime: Option<Handle>,
+        optimizer_resource_budget: common::budget::ResourceBudget,
+        optimizers_overwrite: Option<OptimizersConfigDiff>,
+    ) -> Result<Self, CollectionError> {
+        let start_time = std

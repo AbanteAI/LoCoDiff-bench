@@ -1,0 +1,194 @@
+
+index 312ad8cef..d0cc6c94f 100644
+--- a/ghostty_src_termio_Thread.zig_expectedoutput.txt (expected):tmp/tmp8bb0zw0a_expected.txt	
++++ b/ghostty_src_termio_Thread.zig_extracted.txt (actual):tmp/tmpbjds1irv_actual.txt	
+@@ -64,6 +64,10 @@ sync_reset: xev.Timer,
+ sync_reset_c: xev.Completion = .{},
+ sync_reset_cancel_c: xev.Completion = .{},
+ 
++/// The mailbox that can be used to send this thread messages. Note
++/// this is a blocking queue so if it is full you will get errors (or block).
++mailbox: *Mailbox,
++
+ flags: packed struct {
+     /// This is set to true only when an abnormal exit is detected. It
+     /// tells our mailbox system to drain and ignore all messages.
+@@ -77,16 +81,32 @@ flags: packed struct {
+     has_inspector: bool = false,
+ } = .{},
+ 
++/// The type used for sending messages to the IO thread. For now this is
++/// hardcoded with a capacity. We can make this a comptime parameter in
++/// the future if we want it configurable.
++const Mailbox = BlockingQueue(termio.Message, 64);
++
+ /// Initialize the thread. This does not START the thread. This only sets
+ /// up all the internal state necessary prior to starting the thread. It
+ /// is up to the caller to start the thread with the threadMain entrypoint.
+ pub fn init(
+     alloc: Allocator,
++    impl: *termio.Impl,
+ ) !Thread {
++    // We always store allocator pointer on the loop data so that
++    // handles can use our global allocator.
++    const allocPtr = try alloc.create(Allocator);
++    errdefer alloc.destroy(allocPtr);
++    allocPtr.* = alloc;
++
+     // Create our event loop.
+     var loop = try xev.Loop.init(.{});
+     errdefer loop.deinit();
+ 
++    // This async handle is used to "wake up" the renderer and force a render.
++    var wakeup_h = try xev.Async.init();
++    errdefer wakeup_h.deinit();
++
+     // This async handle is used to stop the loop and force the thread to end.
+     var stop_h = try xev.Async.init();
+     errdefer stop_h.deinit();
+@@ -99,28 +119,63 @@ pub fn init(
+     var sync_reset_h = try xev.Timer.init();
+     errdefer sync_reset_h.deinit();
+ 
++    // The mailbox for messaging this thread
++    var mailbox = try Mailbox.create(alloc);
++    errdefer mailbox.destroy(alloc);
++
+     return Thread{
+         .alloc = alloc,
+         .loop = loop,
++        .wakeup = wakeup_h,
+         .stop = stop_h,
+         .coalesce = coalesce_h,
+         .sync_reset = sync_reset_h,
++        .impl = impl,
++        .mailbox = mailbox,
+     };
+ }
+ 
+ /// Clean up the thread. This is only safe to call once the thread
+ /// completes executing; the caller must join prior to this.
+ pub fn deinit(self: *Thread) void {
+-    self.coalesce.deinit();
+-    self.sync_reset.deinit();
+-    self.stop.deinit();
+-    self.loop.deinit();
++    // Get a copy to our allocator
++    const alloc_ptr = self.loop.getData(Allocator).?;
++    const alloc = alloc_ptr.*;
++
++    // Schedule our handles to close
++    self.stop.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
++    self.wakeup.close((struct {
++        fn callback(h: *libuv.Async) void {
++            const handle_alloc = h.loop().getData(Allocator).?.*;
++            h.deinit(handle_alloc);
++        }
++    }).callback);
++
++    // Run the loop one more time, because destroying our other things
++    // like windows usually cancel all our event loop stuff and we need
++    // one more run through to finalize all the closes.
++    _ = self.loop.run(.default) catch |err|
++        log.err("error finalizing event loop: {}", .{err});
++
++    // Nothing can possibly access the mailbox anymore, destroy it.
++    self.mailbox.destroy(alloc);
++
++    // Dealloc our allocator copy
++    alloc.destroy(alloc_ptr);
++
++    self.loop.deinit(alloc);
+ }
+ 
+ /// The main entrypoint for the thread.
+-pub fn threadMain(self: *Thread, io: *termio.Termio) void {
++pub fn threadMain(self: *Thread) void {
+     // Call child function so we can use errors...
+-    self.threadMain_(io) catch |err| {
++    self.threadMain_() catch |err| {
++        // In the future, we should expose this on the thread struct.
+         log.warn("error in io thread err={}", .{err});
+ 
+         // Use an arena to simplify memory management below
+@@ -133,9 +188,9 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+         // the error to the surface thread and let the apprt deal with it
+         // in some way but this works for now. Without this, the user would
+         // just see a blank terminal window.
+-        io.renderer_state.mutex.lock();
+-        defer io.renderer_state.mutex.unlock();
+-        const t = io.renderer_state.terminal;
++        self.impl.renderer_state.mutex.lock();
++        defer self.impl.renderer_state.mutex.unlock();
++        const t = self.impl.renderer_state.terminal;
+ 
+         // Hide the cursor
+         t.modes.set(.cursor_visible, false);
+@@ -199,7 +254,7 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+     }
+ }
+ 
+-fn threadMain_(self: *Thread, io: *termio.Termio) !void {
++fn threadMain_(self: *Thread) !void {
+     defer log.debug("IO thread exited", .{});
+ 
+     // Setup our crash metadata
+@@ -264,6 +319,7 @@ fn drainMailbox(
+     // expectation is that all our message handlers will be non-blocking
+     // ENOUGH to not mess up throughput on producers.
+     var redraw: bool = false;
++
+     while (mailbox.pop()) |message| {
+         // If we have a message we always redraw
+         redraw = true;
+@@ -345,7 +401,7 @@ fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
+ }
+ 
+ fn syncResetCallback(
+-    cb_: ?*CallbackData,
++    self_: ?*CallbackData,
+     _: *xev.Loop,
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+@@ -358,13 +414,13 @@ fn syncResetCallback(
+         },
+     };
+ 
+-    const cb = cb_ orelse return .disarm;
++    const cb = self_ orelse return .disarm;
+     cb.io.resetSynchronizedOutput();
+     return .disarm;
+ }
+ 
+ fn coalesceCallback(
+-    cb_: ?*CallbackData,
++    self_: ?*CallbackData,
+     _: *xev.Loop,
+     _: *xev.Completion,
+     r: xev.Timer.RunError!void,
+@@ -377,7 +433,7 @@ fn coalesceCallback(
+         },
+     };
+ 
+-    const cb = cb_ orelse return .disarm;
++    const cb = self_ orelse return .disarm;
+ 
+     if (cb.self.coalesce_data.resize) |v| {
+         cb.self.coalesce_data.resize = null;
+@@ -400,9 +456,10 @@ fn wakeupCallback(
+         return .rearm;
+     };
+ 
++    const cb = cb_ orelse return .rearm;
++
+     // When we wake up, we check the mailbox. Mailbox producers should
+     // wake up our thread after publishing.
+-    const cb = cb_ orelse return .rearm;
+     cb.self.drainMailbox(cb) catch |err|
+         log.err("error draining mailbox err={}", .{err});
+ 
